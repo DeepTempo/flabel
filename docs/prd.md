@@ -15,6 +15,7 @@
 | :-: | :-: | :-: | :-: |
 | **Date** | **Author** | **Version** | **Change Summary** |
 | 2026-08-11 | Craig | 0.1 | Initial draft |
+| 2026-08-11 | Craig | 0.2 | Output layout changed to sibling run directories named `{capture-name}_{datetime}`; `latest` pointer removed |
 
 ## 1. Problem Statement
 
@@ -146,21 +147,27 @@ The people affected are the engineers building DeepTempo's detection models, who
 
 ### 6.6 Output & Provenance
 
-**Description:** Writes Zeek logs and `labels.json` to a timestamped run directory, with complete provenance for the run.
+**Description:** Writes Zeek logs and `labels.json` to a per-run directory named after the capture and the run time, with complete provenance for the run.
 
 **Key Business Rules / Logic:**
 
-- Output layout — **each run gets its own directory**, so a re-run never destroys prior labels:
+- Output layout — **each run writes its own top-level directory named `{capture-name}_{datetime}`**, so runs of the same capture are siblings and a re-run never destroys prior labels:
 
 ```
-{input-pcap-name}/
-├── 2026-08-11T213045Z/
-│   ├── zeek/            # all Zeek logs
-│   └── labels.json
-└── latest -> 2026-08-11T213045Z/
+my-capture_2026-08-11T213045Z/
+├── zeek/            # all Zeek logs
+└── labels.json
+
+my-capture_2026-08-12T091500Z/
+├── zeek/
+└── labels.json
 ```
 
-- `latest` is a stable pointer for scripted consumers.
+- **Directory naming rules:**
+  - `{capture-name}` is the input filename with its extension stripped, including a trailing `.gz` (`my-capture.pcap.gz` → `my-capture`). Characters unsafe in a path are replaced.
+  - `{datetime}` is the run start in UTC, ISO-8601 with no colons — `2026-08-11T213045Z` — so the name is filesystem-safe on every platform.
+  - Because ISO-8601 sorts lexicographically, a plain sort of `{capture-name}_*` is also a chronological ordering, and the newest run is the last entry.
+- **No `latest` pointer.** A `{capture-name}_latest` symlink would be matched by the same `{capture-name}_*` glob used to enumerate runs, so it would corrupt iteration. Consumers needing the newest run sort and take the last.
 - `labels.json` contains **malicious flows only.** An unlabeled flow is *unlabeled*, not verified benign — this distinction is stated in the output schema itself so it cannot be lost downstream.
 - A capture with zero detections is a **successful run** producing an empty `labels` array, not an error.
 - Every run records: input file identity and status, normalization applied, ruleset snapshots per source, tool versions, tiers attempted, and coverage actually achieved.
@@ -210,7 +217,7 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 | US-03 | P0 | As a DME, I want each label to join directly to the Zeek flow record, so that I can extract features for the labeled flow. | Zeek `uid` |
 | US-04 | P0 | As a DME, I want a flow flagged by several sources to appear once with all sources listed, so that I don't have to deduplicate before training. | One entry per flow |
 | US-05 | P0 | As a DME, I want to know when a run's coverage was incomplete — truncated input, dropped packets, uncorrelated detections — so that I don't train on a label set I believe to be complete when it isn't. | Goal 3 |
-| US-06 | P0 | As a DME, I want re-running a capture to preserve the previous run's output, so that I can compare label sets across ruleset snapshots. | Timestamped run dirs |
+| US-06 | P0 | As a DME, I want re-running a capture to preserve the previous run's output, so that I can compare label sets across ruleset snapshots. | Sibling run dirs, `{capture}_{datetime}` |
 | US-07 | P0 | As an OPS, I want the same capture and ruleset snapshot to yield identical labels, so that I can verify the pipeline is behaving deterministically. | Goal 2; `--offline` |
 | US-08 | P1 | As an OPS, I want an `--offline` mode that runs without the NGFW, so that I can process captures and test the pipeline when the lab is unavailable. | Marked reduced coverage |
 | US-09 | P1 | As a DME, I want pcapng and gzipped captures accepted directly, so that I can use files as they come off Wireshark or a sensor without pre-processing. | Normalization |
@@ -225,7 +232,7 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 
 - **Label a capture (default).** `flabel capture.pcap` → normalize → Zeek + Suricata + PANW replay → consolidate → write run directory. Fails clearly if the lab is unreachable.
 - **Label without the lab.** `flabel --offline capture.pcap` → Tier 2 only → output stamped as reduced coverage.
-- **Compare across ruleset snapshots.** Re-run the same capture; each run lands in its own timestamped directory; `latest` points to the newest.
+- **Compare across ruleset snapshots.** Re-run the same capture; each run lands in its own sibling directory named `{capture-name}_{datetime}`; sorting the set gives them in chronological order.
 - **Inspect a label.** Read a label's `sources[]`, then join its `flow.uid` to `zeek/conn.log` for the full flow record.
 
 **Design Constraints / Guidelines:**
@@ -251,7 +258,8 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 
 ### US-01: Label a capture end to end
 
-- Given a valid pcap and a reachable lab, when `flabel capture.pcap` runs, then a timestamped run directory is created containing `zeek/` with the Zeek logs and `labels.json`.
+- Given a valid pcap and a reachable lab, when `flabel my-capture.pcap` runs, then a directory named `my-capture_{datetime}` is created containing `zeek/` with the Zeek logs and `labels.json`.
+- Given an input named `my-capture.pcap.gz`, when the run completes, then the output directory is named `my-capture_{datetime}` — both extensions stripped — and its `{datetime}` contains no colons.
 - Given a capture containing no detectable threats, when the run completes, then `labels.json` exists with an empty `labels` array and the run is reported as successful.
 - Given the NGFW is unreachable and `--offline` was not passed, when flabel runs, then it fails with a message naming the unreachable Tier 1 dependency, and no partial label file is written.
 
@@ -279,7 +287,8 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 
 ### US-06: Re-runs preserve history
 
-- Given a capture already processed, when flabel runs against it again, then a new timestamped directory is created, the previous run directory is unmodified, and `latest` points to the new run.
+- Given a capture already processed, when flabel runs against it again, then a new sibling directory `{capture-name}_{datetime}` is created and the previous run directory is unmodified.
+- Given two or more run directories for the same capture, when their names are sorted lexicographically, then they appear in chronological order and the last is the most recent.
 
 ### US-07: Reproducibility
 
@@ -386,7 +395,7 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 |  |  |  |  |  |
 | :-: | :-: | :-: | :-: | :-: |
 | **\#** | **Case** | **Expected Behavior** | **Observed Behavior** | **Pass/Fail** |
-| 1 | Valid pcap, lab reachable | Run directory created with `zeek/` and `labels.json`; `latest` points to it | | |
+| 1 | Valid pcap, lab reachable | Directory `{capture-name}_{datetime}` created with `zeek/` and `labels.json` | | |
 | 2 | Capture with no detections | Success; `labels` is an empty array | | |
 | 3 | pcapng input | Normalized to pcap, processed, conversion recorded in provenance | | |
 | 4 | Gzipped pcap input | Decompressed and processed | | |
@@ -395,7 +404,7 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 | 7 | Truncated capture | Processed; `input_status: partial` with packet count reached | | |
 | 8 | Flow flagged by both Tier 1 and Tier 2 | Single entry; both entries in `sources[]`; `max_tier` = 1 | | |
 | 9 | Detection uncorrelatable to any flow | Appears in `unmatched_detections[]` with reason; counted in run metadata | | |
-| 10 | Re-run of an already-processed capture | New timestamped directory; prior run untouched; `latest` updated | | |
+| 10 | Re-run of an already-processed capture | New sibling directory; prior run untouched; sorted names are chronological | | |
 | 11 | Two `--offline` runs, pinned snapshot | `labels.json` identical apart from run timestamps | | |
 | 12 | `--offline` with no lab reachable | Succeeds; Tier 2 labels only; output records Tier 1 not attempted | | |
 | 13 | Default run with lab unreachable | Fails naming the Tier 1 dependency; no partial label file | | |
