@@ -16,6 +16,7 @@
 | **Date** | **Author** | **Version** | **Change Summary** |
 | 2026-08-11 | Craig | 0.1 | Initial draft |
 | 2026-08-11 | Craig | 0.2 | Output layout changed to sibling run directories named `{capture-name}_{datetime}`; `latest` pointer removed |
+| 2026-08-11 | Craig | 0.3 | JA4 labeling moved into phase one as a first-class Tier 2 capability (US-14, US-15); only JA4 *rule content* remains out of scope |
 
 ## 1. Problem Statement
 
@@ -61,7 +62,7 @@ The people affected are the engineers building DeepTempo's detection models, who
 | :-: | :-: | :-: |
 | **Item** | **Reason** | **Future Phase?** |
 | Label validation against a ground-truth corpus | Trust-by-construction decided at Stage 1; trustworthiness argued from provenance | TBD — flagged for eng-review |
-| JA4 as a labeling source | ET Open ships no `ja4.hash` rules yet; no free maintained JA4 verdict feed exists. JA4 is computed as enrichment only | Yes — promotes into Tier 2 with no architectural change once ET publishes JA4 rules |
+| JA4 *rule content* — a source of malicious JA4 fingerprints | No admitted source publishes `ja4.hash` rules today, and no free maintained JA4 verdict feed exists. **The JA4 labeling capability itself is in phase one** (§6.3) — only the content is missing | Content only. The capability ships in v1 and begins producing labels the moment any admitted source publishes JA4 rules, with no code change |
 | Snort 3 as the Tier 2 engine | Suricata selected on free high-confidence ruleset volume and native fingerprint keywords | No |
 | FortiGate as the NGFW | PANW VM-Series selected as Tier 1 | No |
 | Free/OSS L7 equivalent to PANW App-ID | No free equivalent exists; line of inquiry closed | No |
@@ -107,7 +108,7 @@ The people affected are the engineers building DeepTempo's detection models, who
 
 - All Zeek logs generated for the capture are retained in the output.
 - JA4 (and JA4+, subject to the licence decision) is computed for every TLS connection via the `zeek/foxio/ja4` package.
-- **Fingerprints are recorded as attributes, never as verdicts.** A fingerprint value alone never produces a label.
+- **A computed fingerprint is an attribute, not a verdict.** Zeek's JA4 output never produces a label by itself. Labels arise only where a fingerprint **matches an admitted rule**, which happens in the Tier 2 path (§6.3) — the same way every other detection is produced.
 - Zeek `uid` is assigned to every flow and becomes the join key between `labels.json` and the Zeek logs.
 
 ### 6.3 Tier 2 Detection — Suricata
@@ -119,7 +120,9 @@ The people affected are the engineers building DeepTempo's detection models, who
 - **Per-source admission policy.** Signature rulesets (ET Open) are filtered on rule metadata: `confidence == High` **and** `signature_severity in (Major, Critical)`. IOC feeds (abuse.ch, malsilo, and similar) carry no such metadata and are admitted wholesale, with the feed snapshot date as their provenance.
 - Rules lacking a `confidence` tag are **excluded** (fail-closed).
 - Excluded sources: hunting/anomaly rulesets, self-described aggressive blacklists, and Positive Technologies.
-- Encrypted-traffic detection is part of this tier, via ET Open's JA3 rules matched with Suricata's native fingerprint keywords.
+- **Encrypted-traffic detection is part of this tier, and both fingerprint families are first-class in phase one.** Suricata's native `ja3.hash` **and** `ja4.hash` matching are both enabled, and JA4 rules pass through the identical per-source admission filter and snapshot provenance as any other rule.
+- **JA4 has the capability but not yet the content.** No admitted source currently publishes `ja4.hash` rules, so JA4 label output will be zero on release. This is a *content* gap, not a capability gap: when any admitted source ships JA4 rules, they are picked up and produce labels with **no code change**. The path is therefore built, enabled, and tested in v1 rather than deferred.
+- Because an inactive path is indistinguishable from a broken one, **the run records how many JA4 rules were admitted.** A zero count proves the path ran and found no content, rather than leaving silence to be misread as either working or failing.
 - **The admitted rule set is snapshotted per run** — source, version, and date — because filter output changes as vendors revise metadata. Without this, two runs of "the same" flabel are not comparable.
 
 ### 6.4 Tier 1 Detection — PANW VM-Series
@@ -221,7 +224,9 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 | US-07 | P0 | As an OPS, I want the same capture and ruleset snapshot to yield identical labels, so that I can verify the pipeline is behaving deterministically. | Goal 2; `--offline` |
 | US-08 | P1 | As an OPS, I want an `--offline` mode that runs without the NGFW, so that I can process captures and test the pipeline when the lab is unavailable. | Marked reduced coverage |
 | US-09 | P1 | As a DME, I want pcapng and gzipped captures accepted directly, so that I can use files as they come off Wireshark or a sensor without pre-processing. | Normalization |
-| US-10 | P1 | As a DME, I want JA4 fingerprints recorded on TLS flows, so that I can use them as model features and pivot on them during analysis. | Enrichment, not verdicts |
+| US-10 | P1 | As a DME, I want JA4 fingerprints recorded on TLS flows, so that I can use them as model features and pivot on them during analysis. | The enrichment half — Zeek-computed attributes, no verdict |
+| US-14 | P0 | As a DME, I want a JA4 fingerprint matching an admitted rule to produce a Tier 2 label, so that encrypted-traffic detections are labelled by the same machinery as every other detection and need no rework when JA4 rule content becomes available. | The labeling half. Capability ships in v1; content arrives later |
+| US-15 | P1 | As an OPS, I want the run to record how many JA4 rules were admitted, so that I can tell "no JA4 content published yet" apart from "the JA4 path is broken". | Guards against the capability silently rotting |
 | US-11 | P1 | As an OPS, I want the ruleset admission filter and its results recorded per run, so that I can see exactly which rules were live and how many were excluded. | Ties to issue #11 |
 | US-12 | P2 | As an OPS, I want a documented environment diagram in draw.io and mermaid form, so that the lab can be rebuilt or handed over. | From the brief |
 | US-13 | P2 | As a DME, I want `labels.json` to carry a schema version, so that a shape change breaks loudly rather than silently. | Forward compatibility |
@@ -309,7 +314,18 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 ### US-10: Fingerprint enrichment
 
 - Given a capture containing TLS connections, when the run completes, then JA4 values are present on those flows in the Zeek output.
-- Given a JA4 value matching no rule, when labels are written, then no label is produced from the fingerprint alone.
+- Given a JA4 value that matches no admitted rule, when labels are written, then no label is produced from that fingerprint — a computed fingerprint alone is never a verdict.
+
+### US-14: JA4 labeling capability
+
+- Given an admitted ruleset containing a `ja4.hash` rule, when a capture contains a TLS flow whose JA4 matches it, then a Tier 2 label is produced carrying that rule's identity, ruleset snapshot, and confidence — structurally identical to any other Tier 2 label.
+- Given JA4 rules are present in an admitted source, when the run executes, then Suricata JA4 fingerprinting is active rather than silently skipped.
+- Given a JA4-matched label, when it is inspected, then it is indistinguishable in shape from a JA3- or content-matched Tier 2 label, requiring no special handling by consumers.
+
+### US-15: JA4 content visibility
+
+- Given no admitted source publishes JA4 rules, when the run completes, then run metadata records the JA4 rule path as active with an admitted JA4 rule count of zero.
+- Given an admitted source begins publishing JA4 rules, when the next run executes, then those rules are admitted and counted with no change to flabel's code or configuration.
 
 ## 10. Technical Considerations
 
@@ -355,7 +371,7 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 | Replay integrity | Packets sent equal packets seen, or the discrepancy is reported | Per-run reconciliation; failure surfaced, never suppressed | TBD |
 | Unmatched detection rate | Tracked and reported; no target set for v1 | Per-run `unmatched_count`; trend reviewed as capture volume grows | TBD |
 | Supported-format success rate | 100% of pcap, pcapng, and gzipped inputs process or fail with a clear reason | Test matrix across format variants | TBD |
-| Tier 2 admitted-rule count | Recorded per source; adequacy assessed once known | Measured at build time (issue #11) | TBD |
+| Tier 2 admitted-rule count | Recorded per source, **including a separate JA4 rule count** | Measured at build time (issue #11); JA4 count surfaced in run metadata every run | TBD |
 
 **Note:** these metrics measure *pipeline integrity*, not *label accuracy*. Under trust-by-construction there is no measurement of false-positive rate — see Risks.
 
@@ -368,6 +384,7 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 | Trust-by-construction is unfalsifiable — no false-positive rate can be quoted if a label consumer asks | High | High | Ruleset snapshots recorded per run so labels are reproducible and auditable even if unmeasured; fail-closed admission filter; flagged for eng-review reconsideration |
 | Tier 1 detections cannot be correlated to capture flows (port reuse, NAT, tunnelling) | Med | Med | Tuple-driven matching with time only scoping the query; uncorrelated detections emitted in `unmatched_detections[]` rather than dropped or guessed |
 | Fingerprint verdicts drift as benign software adopts a fingerprint, silently invalidating a verdict | Med | Med | Fingerprint verdicts sourced through ET rules rather than raw feeds, so vendor revisions carry the aging burden; ruleset snapshot dates recorded |
+| The JA4 labeling path ships with no rule content, so it appears functional while producing nothing — and may quietly rot untested | Med | Med | Admitted JA4 rule count surfaced in run metadata every run, so zero content is visible rather than assumed; the path is tested against a synthetic JA4 rule so the capability is proven independent of content availability; sourcing tracked as a live issue rather than a future phase |
 | Admission filter proves too strict, leaving Tier 2 coverage too thin to be useful | Med | Med | Admitted-rule counts measured per source (issue #11); untagged-rule policy revisitable (issue #10); paid high-fidelity rulesets remain a costed fallback |
 | JA4+ licensing (FoxIO 1.1, non-commercial) conflicts with output feeding product models | Med | High | Legal engaged as an approver; plain JA4 is BSD 3-Clause and available as an unrestricted fallback |
 | Capture data or credentials leak into the public repository | Low | High | `.gitignore` coverage for captures, logs, and `.env`; no real capture data in fixtures; pre-commit secret checks |
@@ -389,6 +406,7 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 | 8 | What fixture strategy provides test captures without committing real traffic? | TBD | At scaffold | Open |
 | 9 | Should `pawpatrules` remain admitted without an FP review, being the least-vetted admitted source? | Craig | At spec | Open |
 | 10 | What are the review dates for the success metrics? | Craig | TBD | Open |
+| 11 | Where does JA4 rule content come from — wait for ET to publish, evaluate a commercial feed, or derive our own from malware captures? The capability ships in v1 regardless; this decides when it starts producing labels. | Craig | Post-v1 | Open — tracked as a live issue |
 
 15. Basic Test Cases
 
@@ -410,6 +428,8 @@ Personas: **DME** = DeepTempo detection-model engineer (primary consumer of labe
 | 13 | Default run with lab unreachable | Fails naming the Tier 1 dependency; no partial label file | | |
 | 14 | Replay with packet-count mismatch | Discrepancy reported; run not presented as full coverage | | |
 | 15 | TLS capture | JA4 present on TLS flows in Zeek output; no label from fingerprint alone | | |
+| 17 | Synthetic `ja4.hash` rule matching a capture's TLS flow | Tier 2 label produced, structurally identical to a JA3 or content match, carrying rule identity and snapshot | | |
+| 18 | No admitted source publishes JA4 rules | Run metadata records JA4 path active with admitted JA4 rule count of zero | | |
 | 16 | Every emitted label | Complete provenance block; `flow.uid` resolves to exactly one `conn.log` record | | |
 
 ## 14. References & Related Documents

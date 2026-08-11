@@ -231,6 +231,8 @@ The `--offline` flag runs the Tier 2 path alone, with the output clearly marked 
 | **2** | Suricata — ET Open (metadata-filtered, **including `emerging-ja3.rules`**) plus the CC0/MIT IOC feeds | Per-rule `confidence: High` is a vendor-declared low-FP assertion for signature rules; upstream curation plus snapshot provenance for IOC feeds |
 | *Enrichment* | JA4 / JA4+ via Zeek | Recorded as an attribute, not a verdict — no free verdict source yet. Promote into Tier 2 when ET ships `ja4.hash` rules. |
 
+> **Superseded by the PRD (2026-08-11).** This section recommended deferring the JA4 *labeling* path until rule content existed. `docs/prd.md` v0.3 instead moves the **capability** into phase one — `ja4.hash` matching is built, enabled, and tested in v1, with only the rule *content* remaining unavailable. The finding above (no free JA4 verdict source exists) is unchanged and still accurate; what changed is that the capability is no longer deferred behind it.
+
 ---
 
 ## Tools and maintenance status
