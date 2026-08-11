@@ -1,0 +1,20 @@
+{
+  "_comment": "Adjust commands to the project's stack (these defaults are Python: ruff + pytest). Delete '_disabled' from a key to enable it.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "jq -r '.tool_input.file_path' | { read f; case \"$f\" in *.py) ruff format \"$f\" && ruff check --fix \"$f\";; esac; }" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "pytest -q" }
+        ]
+      }
+    ]
+  }
+}
