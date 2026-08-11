@@ -5,12 +5,12 @@ created: "2026-08-11"
 github_repo: "DeepTempo/flabel"
 notion_url: "https://app.notion.com/p/3b92a84a5230812aa64aef638e389725"
 prd_gdoc_url: ""       # Google Doc PRD (set by /project:prd); "" = not created yet
-current_stage: research
+current_stage: prd
 # NOTE: issue numbers are not in stage order. Two creates hit a transient TLS
 # error and were retried, and GitHub never reuses issue numbers. This mapping is
 # authoritative — trust it over the numeric order in the GitHub issue list.
 stages:
-  research:   { status: pending, issue: 1, artifact: docs/research.md,   completed: null }
+  research:   { status: completed, issue: 1, artifact: docs/research.md, completed: "2026-08-11" }
   prd:        { status: pending, issue: 2, artifact: docs/prd.md,        completed: null }
   eng_review: { status: pending, issue: 6, artifact: docs/eng-review.md, completed: null }
   plan:       { status: pending, issue: 3, artifact: PLAN.md,            completed: null }
@@ -20,3 +20,4 @@ stages:
 log:
   - "2026-08-11 init — repo scaffolded, 7 stage issues filed, Notion row created"
   - "2026-08-11 init — repo recreated so main is the default branch; old repo renamed to DeepTempo/flabel-old and archived"
+  - "2026-08-11 stage(research) completed — recommends Suricata over Snort, replay only for PANW, and JA4-as-enrichment instead of JA3/JA4 labelling"
