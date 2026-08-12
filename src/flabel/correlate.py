@@ -148,8 +148,11 @@ def correlate(
     matched_flows: dict[str, Flow] = {}
     unmatched: list[UnmatchedDetection] = []
 
+    # Indexed once for the whole run, not rebuilt per detection (#56).
+    index = index_flows(flows)
+
     for detection, entry in entries:
-        flow, reason = _place(detection, flows)
+        flow, reason = _place(detection, index)
         if flow is None or reason is not None:
             # `UnmatchedDetection` rejects a reason outside the Literal, so a placement that
             # returned neither a flow nor a reason fails loudly here rather than silently
@@ -171,12 +174,92 @@ def correlate(
     return result
 
 
+# --- finding the candidates --------------------------------------------------------------------
+#
+# The flows are indexed once per run rather than scanned once per detection (#56). The scan was
+# O(detections x flows): at 500k flows and 20k detections — a size `docs/prd.md` explicitly
+# anticipates when it speaks of multi-GB captures — that is 10^10 comparisons, tens of minutes in
+# a stage the PRD assumes is free next to Zeek. Nothing in the suite would have noticed, because
+# the largest case here is a few hundred detections against a handful of flows.
+#
+# The index is keyed by the whole tuple, and each flow is inserted under **both orientations**,
+# which is what `_same_tuple` used to establish by comparing. A detection is then looked up by
+# its own tuple: matching forward finds the flow's forward key, and matching reversed finds the
+# reversed key. No behaviour changes — `test_the_index_agrees_with_the_predicate_it_replaced`
+# asserts the two produce identical candidate sets, and `_same_tuple` is kept as the reference
+# it is checked against rather than deleted.
+
+#: Flow lookup key: protocol, then the initiator and responder halves in order.
+TupleKey = tuple[str, str, int, str, int]
+TupleIndex = Mapping[TupleKey, list[Flow]]
+
+
+def _tuple_key(proto: str, src_ip: str, src_port: int, dst_ip: str, dst_port: int) -> TupleKey:
+    return (proto, src_ip, src_port, dst_ip, dst_port)
+
+
+def index_flows(flows: Mapping[str, Flow]) -> dict[TupleKey, list[Flow]]:
+    """Every flow under both orientations of its 5-tuple.
+
+    A flow whose two orientations coincide — same address and port on both sides — lands in one
+    bucket twice; `_candidates` de-duplicates by `uid`, so that costs a wasted slot rather than a
+    doubled candidate.
+    """
+    index: dict[TupleKey, list[Flow]] = {}
+    for flow in flows.values():
+        forward = _tuple_key(flow.proto, flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port)
+        reverse = _tuple_key(flow.proto, flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port)
+        index.setdefault(forward, []).append(flow)
+        index.setdefault(reverse, []).append(flow)
+    return index
+
+
+def _candidates(detection: Detection, index: TupleIndex) -> list[Flow]:
+    """The flows this detection could belong to, by lookup rather than by scan.
+
+    Two keys at most, and the second only for ICMP: the counterpart type Zeek may have written
+    in the responder column is a function of the detection's own type and address family, so it
+    is computable here without a second index. That is why the relaxation costs one extra dict
+    lookup rather than a scan.
+
+    De-duplicated by `uid` because a flow can be reachable under more than one key — both
+    orientations of a symmetric tuple, or the exact and counterpart keys when a detection's code
+    happens to equal its counterpart type.
+    """
+    keys = [
+        _tuple_key(
+            detection.proto,
+            detection.src_ip,
+            detection.src_port,
+            detection.dst_ip,
+            detection.dst_port,
+        )
+    ]
+
+    if detection.proto == ICMP:
+        counterpart = _counterparts(detection.src_ip).get(detection.src_port)
+        if counterpart is not None and counterpart != detection.dst_port:
+            keys.append(
+                _tuple_key(
+                    detection.proto,
+                    detection.src_ip,
+                    detection.src_port,
+                    detection.dst_ip,
+                    counterpart,
+                )
+            )
+
+    found: dict[str, Flow] = {}
+    for key in keys:
+        for flow in index.get(key, ()):
+            found.setdefault(flow.uid, flow)
+    return list(found.values())
+
+
 # --- placing one detection -------------------------------------------------------------------
 
 
-def _place(
-    detection: Detection, flows: Mapping[str, Flow]
-) -> tuple[Flow | None, UnmatchedReason | None]:
+def _place(detection: Detection, index: TupleIndex) -> tuple[Flow | None, UnmatchedReason | None]:
     """The flow this detection belongs to, or `None` and the reason it could not be decided.
 
     Spec §9's four steps, in order. The order is load-bearing: a *lone* candidate is matched
@@ -184,7 +267,7 @@ def _place(
     window is bounded by the packets it attributed to the connection, and those disagree at the
     edges often enough that requiring containment unconditionally would lose real detections.
     """
-    candidates = [flow for flow in flows.values() if _same_tuple(detection, flow)]
+    candidates = _candidates(detection, index)
 
     if not candidates:
         return None, "no_flow_match"
