@@ -748,6 +748,18 @@ Reproducibility depends entirely on this being exact.
 - Timestamps: ISO-8601 UTC with microsecond precision and a `Z` suffix. One format everywhere.
 - Floats never emitted where a string is expected; no locale-dependent formatting.
 
+**"One format everywhere" governs every timestamp in the document, not only the run block's**
+(Craig, 2026-08-12). So `Flow.ts_first` / `ts_last` and `Detection.ts` — which Zeek and Suricata
+both produce as epoch floats — serialise as ISO-8601 strings like every other timestamp. Ratified
+here because the sentence sat in a section about the run block and could be read as scoped to it,
+and the two readings produce different data for every consumer that joins on time.
+
+Zeek writes microsecond precision, so nothing is lost at the resolution the tools actually report.
+A consumer wanting epoch converts on read, against a fixed documented format. The rejected
+alternative was epoch floats for flow and detection times with ISO for wall-clock fields, which is
+two formats in one document — exactly what this line exists to prevent — and the rejected
+compromise was emitting both, which is two fields that must agree.
+
 ### Reproducibility is over records, after canonicalisation — not bytes
 
 **This section originally claimed byte-identity, excluding `run.started_at`,
@@ -819,7 +831,7 @@ or normalise**: the same capture labelled from two directories would otherwise d
   "ruleset": {"snapshot_id": str, "sources": [...SourceAdmission...],
               "total_admitted": int, "total_ja4_admitted": int},
   "tools": {"zeek": str, "zeek_flags": ["-C", "-D"], "suricata": str,
-            "editcap": str, "ja4_zeek_package": str | None,
+            "editcap": str | None, "ja4_zeek_package": str | None,
             "ja4_status": "present|not-installed|probe-failed" | None,
             "suricata_config_sha256": str},
   "counts": {"flows": int, "detections": int, "labels": int,
@@ -837,6 +849,22 @@ had nowhere to surface: `tools.ja4_status` and `tools.suricata_config_sha256`, a
 `counts.rules_loaded` / `rules_failed` / `rules_skipped`. `tools.ja4_zeek_package` is now nullable —
 it holds a real package version read from the toolchain manifest, or nothing, and never a status
 string standing in for one (§8).
+
+**`tools.editcap` became nullable in step 8**, for the same reason and from the same source.
+Nothing records an editcap version at run time — `ingest.py` invokes the binary without capturing
+one, and a labelling run may not shell out to ask (§2.2) — so a non-nullable `str` was a field with
+no way to be filled. It is read from the toolchain manifest's `wireshark` entry, or is `null`.
+A null here means the manifest was absent, which is the ordinary laptop case; it never means
+`editcap` did not run, because a run that needed it and could not use it fails.
+
+**`loss_conditions` is derived, never stored.** This section names the key while §11 puts each
+condition's authoritative field elsewhere in the block — `input.*`, `counts.*`, `tools.ja4_status`,
+`tool_failures[]`. It is computed from those on the way out, so the two cannot disagree; storing it
+would create nine pairs of fields that must agree and one place for them to drift. Each flag is
+`null` rather than `false` when the stage that would know never ran, because "JA4 was fine" and
+"nothing ever probed JA4" are different facts and `false` asserts the first. §13 forbids reporting
+full coverage when a loss condition fired, and this is the field that makes that answerable in one
+lookup rather than by reconstructing §11's rules from six scattered numbers.
 
 ### `run.json` — the run block when there are no labels to carry it
 
