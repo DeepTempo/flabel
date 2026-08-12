@@ -16,11 +16,18 @@ written against the plausible-but-wrong result rather than against the implement
 * `flows_total` counted over flows that produced no label;
 * an ICMP relaxation wide enough to merge two one-way flows.
 
-The ICMP counterpart tables were **measured** against Zeek 8.0.4, not recalled — see
-`test_icmpv4_counterparts_are_what_zeek_writes`.
+The ICMP counterpart tables are **measured, and re-measured on every CI run** — see
+`test_the_icmp_tables_are_what_zeek_actually_writes`, the one test here that invokes Zeek. The
+parametrized table tests around it prove only that the matcher reads the tables: they build
+their fixtures from the constant they iterate, so they cannot say anything about Zeek, and a
+comment claiming otherwise is how a remembered measurement passes for a real one.
 """
 
 from __future__ import annotations
+
+import struct
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -428,13 +435,13 @@ def test_an_icmpv6_reply_detection_matches_through_the_reversed_flow():
 
 
 @pytest.mark.parametrize(("kind", "counterpart"), sorted(ICMPV4_COUNTERPART.items()))
-def test_icmpv4_counterparts_are_what_zeek_writes(kind, counterpart):
-    """The table is measured, not recalled.
+def test_the_matching_reads_the_icmpv4_table(kind, counterpart):
+    """Every table entry is honoured by the matcher.
 
-    Swept on Zeek 8.0.4 by sending one packet of every ICMP type with code 7 and reading back
-    `id.resp_p`: types `{0,8, 9,10, 13,14, 15,16, 17,18}` come back paired with each other and
-    every other type comes back as the code. So these are exactly the types where step 6's
-    mirroring lands one field out; the rest already match exactly.
+    This asserts the *code reads the table*, and deliberately nothing more: it builds its
+    fixture from the same constant it iterates, so it would pass against a table of nonsense.
+    What the table says about Zeek is proved against Zeek itself, by
+    `test_the_icmp_tables_are_what_zeek_actually_writes` below.
     """
     flow = make_flow(src_port=kind, dst_port=counterpart, proto="icmp")
     detection = make_detection(src_port=kind, dst_port=0, proto="icmp")
@@ -443,13 +450,8 @@ def test_icmpv4_counterparts_are_what_zeek_writes(kind, counterpart):
 
 
 @pytest.mark.parametrize(("kind", "counterpart"), sorted(ICMPV6_COUNTERPART.items()))
-def test_icmpv6_counterparts_are_what_zeek_writes(kind, counterpart):
-    """The ICMPv6 half of the same sweep: `{128,129, 130,131, 133,134, 135,136, 139,140, 144,145}`.
-
-    Neighbour solicitation/advertisement (135/136) matters as much as echo here — it is the
-    most common ICMPv6 traffic on a real capture, and handling echo alone would leave it
-    uncorrelatable while looking like the spec's residual had been closed.
-    """
+def test_the_matching_reads_the_icmpv6_table(kind, counterpart):
+    """The ICMPv6 half of the same limited claim — the matcher honours every entry."""
     flow = make_flow(
         src_ip="fd00::a1", src_port=kind, dst_ip="fd00::b2", dst_port=counterpart, proto="icmp"
     )
@@ -458,6 +460,91 @@ def test_icmpv6_counterparts_are_what_zeek_writes(kind, counterpart):
     )
 
     assert len(correlate([detection], by_uid(flow), make_manifest()).labels) == 1
+
+
+# --- the tables against the tool that produces them -------------------------------------------
+
+#: A code no counterpart type takes, so a responder column echoing the code can never be
+#: mistaken for one holding a paired type. Zero would be ambiguous against ICMPv4 type 0.
+SWEEP_CODE = 7
+
+ETHERNET = b"\x02" * 6 + b"\x02" * 5 + b"\x01"
+IPV4_SRC, IPV4_DST = bytes([192, 0, 2, 1]), bytes([192, 0, 2, 2])
+IPV6_SRC = bytes.fromhex("fd000000000000000000000000000001")
+IPV6_DST = bytes.fromhex("fd000000000000000000000000000002")
+
+
+def _icmp4_packet(icmp_type: int, code: int) -> bytes:
+    """One Ethernet/IPv4/ICMP packet. Checksums are left zero — Zeek is invoked with `-C`."""
+    icmp = struct.pack("!BBHHH", icmp_type, code, 0, 0x1234, 1) + b"payload!"
+    header = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0, 20 + len(icmp), 1, 0, 64, 1, 0, IPV4_SRC, IPV4_DST
+    )
+    return ETHERNET + b"\x08\x00" + header + icmp
+
+
+def _icmp6_packet(icmp_type: int, code: int) -> bytes:
+    """One Ethernet/IPv6/ICMPv6 packet, likewise unchecksummed."""
+    icmp = struct.pack("!BBHI", icmp_type, code, 0, 0) + b"\x00" * 16
+    header = struct.pack("!IHBB", 0x60000000, len(icmp), 58, 64) + IPV6_SRC + IPV6_DST
+    return ETHERNET + b"\x86\xdd" + header + icmp
+
+
+def _write_pcap(path: Path, packets: list[bytes]) -> None:
+    out = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+    for index, packet in enumerate(packets):
+        out += struct.pack("<IIII", 1_700_000_000 + index * 10, 0, len(packet), len(packet))
+        out += packet
+    path.write_bytes(out)
+
+
+def _sweep(tmp_path: Path, build, types: range) -> dict[int, int]:
+    """Send one packet of each type at `SWEEP_CODE` and read back what Zeek put in `id.resp_p`.
+
+    The code is deliberately not 0: it is a value no counterpart type takes, so a responder
+    column echoing the code can never be mistaken for one holding a paired type.
+    """
+    capture = tmp_path / "icmp.pcap"
+    _write_pcap(capture, [build(kind, SWEEP_CODE) for kind in types])
+    outdir = tmp_path / "zeek"
+    outdir.mkdir()
+    subprocess.run(
+        ["zeek", "-C", "-D", "-r", str(capture)], cwd=outdir, check=True, capture_output=True
+    )
+
+    paired: dict[int, int] = {}
+    for line in (outdir / "conn.log").read_text(encoding="utf-8").splitlines():
+        if line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        orig_p, resp_p = int(fields[3]), int(fields[5])
+        if resp_p != SWEEP_CODE:
+            paired[orig_p] = resp_p
+    return paired
+
+
+@pytest.mark.requires_tools
+def test_the_icmp_tables_are_what_zeek_actually_writes(tmp_path: Path):
+    """The tables are measured facts about Zeek, so Zeek is what checks them (spec §8).
+
+    Correlation's ICMP special case exists because Zeek writes a *counterpart type* in
+    `id.resp_p` for some ICMP types and the *code* for all the others, while a Suricata alert
+    can only ever yield `(type, code)`. Which types those are is not a design choice — it is
+    behaviour of the pinned Zeek build, and spec §8 now states it as fact.
+
+    The tests above prove the matcher reads the tables. Only this one proves the tables are
+    true, and it is the difference between a measurement and a remembered measurement: without
+    it, a Zeek upgrade that changed this behaviour would silently make every affected ICMP
+    detection uncorrelatable, and the 1% gate would fail good runs while blaming correlation.
+
+    Exhaustive over the ranges that contain every pairing, rather than over the table's own
+    keys — iterating the keys could only ever confirm what the table already says, and would
+    never reveal a pair the table is *missing*.
+    """
+    assert _sweep(tmp_path, _icmp4_packet, range(0, 46)) == ICMPV4_COUNTERPART
+    v6 = tmp_path / "v6"
+    v6.mkdir()
+    assert _sweep(v6, _icmp6_packet, range(0, 161)) == ICMPV6_COUNTERPART
 
 
 def test_the_icmp_relaxation_does_not_merge_two_one_way_flows():

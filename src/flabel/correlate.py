@@ -60,15 +60,18 @@ ICMP = "icmp"
 #
 # ICMP has no ports. Zeek writes the ICMP *type* in `id.orig_p`, and in `id.resp_p` either the
 # type it pairs that type with (a request/reply pair) or, for every other type, the ICMP code.
-# A single Suricata alert record carries only the type and code of its own packet, so step 8's
+# A single Suricata alert record carries only the type and code of its own packet, so step 6's
 # mirroring produces `(type, code)` — exact whenever Zeek wrote the code, and one field out
 # whenever Zeek wrote a counterpart type. Closing that gap is spec §8's residual, and it is
 # closed here rather than in `suricata.py` because only correlation has both records in hand.
 #
-# **Measured, not recalled.** Swept on Zeek 8.0.4 by sending one packet of every ICMP type with
-# code 7 and reading back `id.resp_p` from `conn.log`: the types below came back paired with
-# each other, and every other type came back as 7. Two corrections to spec §8 fall out of that
-# sweep, both of which would otherwise have left detections uncorrelatable:
+# **Measured, and re-measured on every CI run.** Swept exhaustively — ICMPv4 types 0-45 and
+# ICMPv6 types 0-160, one packet each at code 7 — reading `id.resp_p` back from `conn.log`: the
+# types below came back paired with each other, and every other type came back as 7.
+# `test_the_icmp_tables_are_what_zeek_actually_writes` is that sweep, run against the pinned
+# Zeek, so an upgrade that changed this behaviour fails the build instead of silently making
+# every affected ICMP detection uncorrelatable. Two corrections to spec §8 fall out of it, both
+# of which would otherwise have left detections uncorrelatable:
 #
 #   * §8 says mirroring is "exact for ICMPv4". It is exact for the echo *request* only —
 #     type 8 pairs with 0, which is also its code — while an alert on the echo *reply* yields
@@ -78,9 +81,19 @@ ICMP = "icmp"
 #     and is far more common on a real capture, so handling echo alone would look like the
 #     residual had been closed while leaving the ordinary case broken.
 #
-# An entry that Zeek turns out not to pair costs nothing: it only permits a responder value
-# Zeek would then never write. A missing entry costs an unmatched detection — reported, and
-# never a wrong flow.
+# **The two error directions are not symmetric, and not in the direction intuition suggests.**
+# A *missing* entry is safe: the detection goes unmatched, which is reported, and is never a
+# wrong flow. A *spurious* entry — claiming Zeek pairs a type it does not — is not. For an
+# unpaired type Zeek writes the code in the responder column, so `(A, X, B, Y)` is a real,
+# distinct one-way flow; an entry saying X pairs with Y makes a detection of type X match that
+# flow as well as the one it belongs to, and two one-way flows merge. That is precisely what
+# `test_the_icmp_relaxation_does_not_merge_two_one_way_flows` exists to prevent, reached from
+# the other side.
+#
+# So these tables are extended only from a fresh sweep against the pinned Zeek — never from an
+# RFC, a specification, or memory. The margin is thinner than it looks, because flabel's inputs
+# are malicious captures, where non-standard type/code combinations are a technique rather than
+# an accident.
 ICMPV4_COUNTERPART = {0: 8, 8: 0, 9: 10, 10: 9, 13: 14, 14: 13, 15: 16, 16: 15, 17: 18, 18: 17}
 ICMPV6_COUNTERPART = {
     128: 129,

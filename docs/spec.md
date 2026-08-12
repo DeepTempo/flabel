@@ -629,7 +629,7 @@ was measured against real Zeek output, not inferred:
 | Disagreement | Normalisation | Why |
 | :-- | :-- | :-- |
 | Protocol case | lowercase both sides | Zeek writes `tcp`, Suricata writes `TCP`. One side has to normalise or **no** detection would ever match. |
-| ICMP ports | mirror `icmp_type`/`icmp_code` into the port columns | Suricata omits ports for ICMP; Zeek writes the ICMP type in `id.orig_p` and a counterpart type in `id.resp_p`. Recording `(0, 0)` would make every ICMP detection unmatchable, and ET Open ships plenty of ICMP rules — 3 such alerts in 150 detections is enough to trip §9's 1% gate and fail a good run, with the run block blaming correlation. |
+| ICMP ports | mirror `icmp_type`/`icmp_code` into the port columns | Suricata omits ports for ICMP; Zeek writes the ICMP type in `id.orig_p` and, in `id.resp_p`, either a counterpart type or — for most types — the code (see the residual below). Recording `(0, 0)` would make every ICMP detection unmatchable, and ET Open ships plenty of ICMP rules — 3 such alerts in 150 detections is enough to trip §9's 1% gate and fail a good run, with the run block blaming correlation. |
 | `IPv6-ICMP` | maps to `icmp` | Zeek's `transport_proto` holds only tcp/udp/icmp/unknown_transport, so it writes `icmp` for ICMPv6 too. Lowercasing alone would leave `ipv6-icmp` against `icmp`. The IP version is still readable from the addresses, so nothing is lost. |
 | IPv6 address form | canonicalise (compressed) | Suricata expands (`fd00:0000:...:00a1`), Zeek compresses (`fd00::a1`). Correlation compares strings, so without this every IPv6 detection is uncorrelatable. |
 
@@ -641,8 +641,11 @@ its code, and one field out everywhere else. Closing it needs correlation to tre
 matching on the type column and accepting either the code or the counterpart in the responder
 column — not a different value in `suricata.py`.
 
-**Measured on Zeek 8.0.4** by sending one packet of every ICMP type with `code 7`, so a code could
-never be mistaken for a counterpart, and reading `id.resp_p` back from `conn.log`:
+**Measured on Zeek 8.0.4, exhaustively** — every ICMPv4 type 0–45 and every ICMPv6 type 0–160,
+one packet each at `code 7` so a code can never be mistaken for a counterpart, reading `id.resp_p`
+back from `conn.log`. The sweep is `test_the_icmp_tables_are_what_zeek_actually_writes`, a
+`requires_tools` test, so this table is re-measured against the pinned Zeek on every CI run rather
+than being a fact recorded once and trusted thereafter:
 
 | Family | Types Zeek pairs | Every other type |
 | :-- | :-- | :-- |
