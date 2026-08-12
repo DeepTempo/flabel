@@ -34,7 +34,8 @@ from flabel.rules.snapshot import load_sid_index, load_snapshot, write_snapshot
 
 COLUMNS = (
     f"{'source':26} {'basis':16} {'fetched':>8} {'admitted':>9} {'%':>6} {'no-conf':>8} "
-    f"{'low-conf':>9} {'low-sev':>8} {'#alert':>7} {'ja3':>4} {'ja4':>4} {'data':>5}"
+    f"{'low-conf':>9} {'low-sev':>8} {'unload':>7} {'#alert':>7} {'ja3':>4} {'ja4':>4} "
+    f"{'data':>5}"
 )
 
 
@@ -98,8 +99,8 @@ def main() -> int:
             f"{counts.name:26} {counts.admission_basis:16} {counts.rules_fetched:8} "
             f"{counts.rules_admitted:9} {share:5.1f}% {counts.rules_excluded_no_confidence:8} "
             f"{counts.rules_excluded_low_confidence:9} {counts.rules_excluded_low_severity:8} "
-            f"{counts.rules_excluded_commented:7} {counts.ja3_rules_admitted:4} "
-            f"{counts.ja4_rules_admitted:4} {len(files):5}"
+            f"{counts.rules_excluded_unloadable:7} {counts.rules_excluded_commented:7} "
+            f"{counts.ja3_rules_admitted:4} {counts.ja4_rules_admitted:4} {len(files):5}"
         )
 
     if not admissions:
@@ -116,6 +117,7 @@ def main() -> int:
             + admission.rules_excluded_no_confidence
             + admission.rules_excluded_low_confidence
             + admission.rules_excluded_low_severity
+            + admission.rules_excluded_unloadable
         )
         assert accounted == admission.rules_fetched, f"{admission.name} does not balance"
     print("spec §6 identity holds for every source: fetched == admitted + sum(excluded)")
@@ -141,6 +143,7 @@ def _totals(admissions: list) -> str:
         f"{sum(a.rules_excluded_no_confidence for a in admissions):8} "
         f"{sum(a.rules_excluded_low_confidence for a in admissions):9} "
         f"{sum(a.rules_excluded_low_severity for a in admissions):8} "
+        f"{sum(a.rules_excluded_unloadable for a in admissions):7} "
         f"{sum(a.rules_excluded_commented for a in admissions):7} "
         f"{sum(a.ja3_rules_admitted for a in admissions):4} "
         f"{sum(a.ja4_rules_admitted for a in admissions):4}"

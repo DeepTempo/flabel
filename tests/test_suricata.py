@@ -37,6 +37,7 @@ import pytest
 from flabel import suricata
 from flabel.errors import SnapshotError, ToolError
 from flabel.models import SourceAdmission
+from flabel.rules.admit import negates_home_net
 from flabel.rules.snapshot import snapshot_id_for, write_snapshot
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -52,6 +53,7 @@ HOME_NET_SID = 9000005
 DNS_SID = 9000006
 ICMP_SID = 9000007
 ICMP6_SID = 9000008
+HOME_NET_NEGATED_SID = 9000009
 
 #: A well-formed id that is not the hash of anything, for injecting an inconsistent snapshot.
 WRONG_SNAPSHOT_ID = "0123456789abcdef"
@@ -868,6 +870,31 @@ def test_a_partial_rule_load_is_a_failure_not_a_thinner_run(tmp_path):
     message = info.tool_failures[0].message
     assert "loaded 1 of the snapshot's 2 rules" in message
     assert "1 failed" in message
+
+
+@pytest.mark.requires_tools
+def test_the_engine_really_does_reject_a_rule_that_negates_home_net(tmp_path):
+    """The measurement `rules/admit.py` rests on, taken against the real engine.
+
+    `negates_home_net` excludes rules written `... -> ![...,$HOME_NET] ...` at admission, and its
+    whole justification is that flabel's `HOME_NET: any` makes them unloadable. If that were ever
+    untrue — a Suricata release resolving the negation differently, a change to flabel's config —
+    the exclusion would be deleting rules for no reason, and only a real invocation can say.
+
+    Asserted through the run's own failure path rather than by grepping `suricata.log`, because
+    that is the consequence that matters: one such rule in a snapshot costs *every* label in the
+    run, not one rule's worth.
+    """
+    snapshot = make_snapshot(tmp_path, {"pawpatrules": [HTTP_SID, HOME_NET_NEGATED_SID]})
+
+    detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+    assert detections == [], "one unloadable rule costs the whole run — hence the exclusion"
+    assert len(info.tool_failures) == 1
+    assert "loaded 1 of the snapshot's 2 rules" in info.tool_failures[0].message
+    # And the other half: admission would never have handed this rule over in the first place.
+    assert negates_home_net(RULES[HOME_NET_NEGATED_SID])
+    assert not negates_home_net(RULES[HTTP_SID])
 
 
 def test_a_run_whose_rule_count_cannot_be_determined_fails(tmp_path):

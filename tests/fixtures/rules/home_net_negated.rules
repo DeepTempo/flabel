@@ -1,0 +1,37 @@
+# flabel test fixture — rules whose address specification negates $HOME_NET, and the
+# near-misses that must NOT be mistaken for one.
+#
+# Synthetic. The sid block (7200000) and every address is invented, but the *shapes* are the
+# ones pawpatrules ships: sids 3300158, 3300159 and 3321393 are all written
+# `alert udp $HOME_NET any -> ![...,$HOME_NET] <port>`. With flabel's `HOME_NET: any`, Suricata
+# 8.0.6 refuses to load them:
+#
+#     Complete IP space negated. Rule address range is NIL.
+#
+# Negating a HOME_NET of `any` is the empty set. Nothing can make `$HOME_NET` mean everything
+# and `!$HOME_NET` mean something, so these are excluded at admission rather than handed to the
+# engine to reject — see `flabel.rules.admit.negates_home_net`.
+
+# --- excluded: unloadable -------------------------------------------------------------------
+
+# A bare negated variable.
+alert udp $HOME_NET any -> !$HOME_NET 53 (msg:"FLABEL TEST negated bare home_net"; classtype:command-and-control; sid:7200001; rev:1;)
+# The shape the real feed ships: a negated list that contains $HOME_NET among literals.
+alert udp $HOME_NET any -> ![10.0.0.0/8,192.168.0.0/16,$HOME_NET] 123 (msg:"FLABEL TEST negated list containing home_net"; classtype:command-and-control; sid:7200002; rev:1;)
+# Nested lists: the negation applies to the whole outer list, so stopping at the first `]`
+# would read only part of it and miss the $HOME_NET inside.
+alert udp $HOME_NET any -> ![10.0.0.0/8,[172.16.0.0/12,$HOME_NET]] 5353 (msg:"FLABEL TEST negated nested list containing home_net"; classtype:command-and-control; sid:7200003; rev:1;)
+# The source side is an address specification too.
+alert tcp !$HOME_NET any -> $HOME_NET 445 (msg:"FLABEL TEST negated home_net as source"; classtype:command-and-control; sid:7200004; rev:1;)
+
+# --- admitted: near-misses ------------------------------------------------------------------
+
+# A negation of something else entirely. `$EXTERNAL_NET` is `!$HOME_NET` in flabel's config,
+# which under `HOME_NET: any` is empty — but that is Suricata's business to resolve, and it
+# loads the rule, which is the only test that matters here.
+alert tcp $HOME_NET any -> !$EXTERNAL_NET 445 (msg:"FLABEL TEST negated other variable"; classtype:command-and-control; sid:7200005; rev:1;)
+# $HOME_NET inside a list that is not negated.
+alert tcp [$HOME_NET,10.0.0.0/8] any -> any 445 (msg:"FLABEL TEST unnegated list containing home_net"; classtype:command-and-control; sid:7200006; rev:1;)
+# A `!` in the options block, not in an address specification. `isdataat:!1,relative` is
+# ordinary in real feeds, and the quoted content here is the hostile version of the same thing.
+alert tcp $HOME_NET any -> any any (msg:"FLABEL TEST bang inside the options block"; content:"![$HOME_NET]"; isdataat:!1,relative; classtype:command-and-control; sid:7200007; rev:1;)
