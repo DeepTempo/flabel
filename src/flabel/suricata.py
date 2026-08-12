@@ -54,11 +54,10 @@ import json
 import re
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import fields
 from datetime import datetime
 from importlib import resources
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any
 
 from flabel.errors import SnapshotError, ToolError
 from flabel.models import (
@@ -69,6 +68,7 @@ from flabel.models import (
     SuricataRunInfo,
     ToolFailure,
 )
+from flabel.rules.snapshot import DATA_DIR, RULES_NAME, load_sid_index, load_snapshot
 
 #: Suricata is Tier 2 for every label it produces. Phase 2's PANW device is Tier 1; a lower
 #: tier is a higher-trust observation (`Label.best_tier` is the minimum).
@@ -78,23 +78,13 @@ TIER = 2
 #: work and a test can inject "the binary is not there" by emptying ``PATH``.
 BINARY = "suricata"
 
-RULES_FILE = "rules.rules"
-MANIFEST_FILE = "manifest.json"
-#: Step 4 writes this: ``{"schema": 1, "sources": {"<name>": [<sid>, ...]}}``. It is the only
-#: place a SID's originating source is recorded — eve.json carries none — and it is hashed into
-#: `snapshot_id`, which is what makes the attribution as tamper-evident as the rules themselves.
-SID_INDEX_FILE = "sid_index.json"
-#: The one `sid_index.json` shape this code understands. A different schema is a hard failure,
-#: never a best-effort read: attribution decides whether a source may label at all.
-SID_INDEX_SCHEMA = 1
 EVE_FILE = "eve.json"
 LOG_FILE = "suricata.log"
 
-#: flabel's own Suricata config, shipped as package data. See the file's own header for the six
+#: flabel's own Suricata config, shipped as package data. See the file's own header for the
 #: label-affecting things the operator's `/etc/suricata/suricata.yaml` would otherwise decide.
 CONFIG_FILE = "suricata.yaml"
 CLASSIFICATION_FILE = "classification.config"
-REFERENCE_FILE = "reference.config"
 
 #: Timeouts, so a wedged Suricata becomes the `ToolFailure` spec §11 promises instead of a
 #: hung pipeline and a hung CI job. Generous rather than tuned: a real capture against a full
@@ -112,8 +102,14 @@ SID = re.compile(r"\bsid\s*:\s*(\d+)\s*;")
 #: to SID 1 — and every label from it would name the wrong rule.
 QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
 
-#: Length of `snapshot_id`: spec §7 defines it as sha256(rules.rules bytes) truncated here.
-SNAPSHOT_ID_LENGTH = 16
+#: The rule's own `classtype:`. Read from the rule text rather than taken from `eve.json`'s
+#: `alert.category` — see `rule_classtypes` for why that matters to a label.
+CLASSTYPE = re.compile(r"\bclasstype\s*:\s*([A-Za-z0-9._-]+)\s*;")
+
+#: A `dataset:` companion file a rule loads, e.g. `dataset:isset,tor,type string,load
+#: pawpatrules_tor.lst`. Suricata resolves that name against the rule path, which is why
+#: `default-rule-path` has to point at the directory the file is actually in (`rule_path`).
+DATASET_LOAD = re.compile(r"\bdataset\s*:[^;]*?\bload\s+([^\s,;]+)")
 
 #: Suricata's own load report in ``suricata.log``, used when the eve stats event is absent.
 #: All three counts come off one line: "N rules successfully loaded, M rules failed, K rules
@@ -151,23 +147,30 @@ def config_files() -> tuple[Path, ...]:
     """Every config file the invocation depends on, in a fixed order.
 
     Fixed because `config_sha256` hashes them in this order: the digest identifies the whole
-    configuration, not one file of it. `classification.config` is in here because it supplies
-    the `classtype` text recorded on every label.
+    configuration, not one file of it.
+
+    Two files, not three. `reference.config` was dropped after measuring: it only maps a
+    `reference:` keyword's prefix to a URL, nothing reads those URLs, and against a real
+    85,545-rule snapshot its absence changes the load by **0 rules** (the engine warns once per
+    unknown prefix). `classification.config` stays because without it Suricata warns once per
+    unknown classtype and its `alert.severity` defaults — neither fatal, but noise in a log an
+    operator reads.
     """
     directory = data_dir()
-    return tuple(directory / name for name in (CONFIG_FILE, CLASSIFICATION_FILE, REFERENCE_FILE))
+    return tuple(directory / name for name in (CONFIG_FILE, CLASSIFICATION_FILE))
 
 
 def config_sha256() -> str:
     """One digest over flabel's Suricata configuration, for the run block.
 
-    A run is only reproducible against a *known* configuration: `HOME_NET`, the classtype
-    descriptions and the eve output selection all change what a label says. Recording the
-    digest is what lets two runs be compared without trusting that the config was the same.
+    A run is only reproducible against a *known* configuration: `HOME_NET` decides whether a
+    whole class of rule can fire at all, and the eve output selection decides what is recorded.
+    Recording the digest is what lets two runs be compared without trusting they used the same
+    config.
 
     Returned rather than stored on `SuricataRunInfo`, which has no field for it — `provenance`
-    can call this. A `config_sha256` field on `SuricataRunInfo` would be the better home; that
-    is a `models.py` change and is flagged rather than made here.
+    can call this. TODO(step 9): read this into a `config_sha256` field on `SuricataRunInfo`
+    once the coordinator adds one; it belongs in the run block's `tools` section.
     """
     digest = hashlib.sha256()
     for path in config_files():
@@ -178,7 +181,66 @@ def config_sha256() -> str:
     return digest.hexdigest()
 
 
-def build_argv(capture: Path, snapshot: Path, outdir: Path) -> list[str]:
+def rule_path(snapshot: Path, rules: str) -> Path:
+    """The directory Suricata must resolve a rule's ``dataset:`` file against.
+
+    Measured, and not what one would guess. Suricata resolves ``dataset: ... load
+    pawpatrules_tor.lst`` against the *rule path*, so with ``default-rule-path=<snapshot>`` the
+    18 pawpatrules dataset rules fail to load — 26 failures against the live feeds. Pointing it
+    at ``<snapshot>/data/pawpatrules`` loads all 85,545 with 0 failures.
+
+    Which directory that is comes from the rules themselves: every ``load`` target is looked up
+    under ``data/``, so the answer is derived per snapshot rather than hardcoded to the one feed
+    that ships datasets today.
+
+    **``default-rule-path`` takes a single path, and that is a real ceiling.** If a second
+    dataset-bearing feed is ever admitted, its files will sit in a different per-source directory
+    and one of the two sets cannot resolve — so this raises rather than picking a winner and
+    letting the other feed's rules quietly fail. The per-source layout itself is not negotiable:
+    `et/open` and `stamus/lateral` both ship a file called `LICENSE`, so a flat directory would
+    have them overwrite each other. When that day comes the fix is upstream of here — a symlink
+    farm or a single merged data directory built at snapshot time, which is step 4's to own.
+    """
+    targets = sorted(set(DATASET_LOAD.findall(rules)))
+    if not targets:
+        return snapshot
+
+    data_root = snapshot / DATA_DIR
+    homes: dict[str, set[Path]] = {}
+    for target in targets:
+        name = Path(target).name
+        if name != target:
+            # A path rather than a bare name resolves relative to the rule path itself, so the
+            # directory this function has to return is no longer inferable from where the file is.
+            raise SnapshotError(
+                f"{snapshot / RULES_NAME} loads dataset {target!r}, which contains a path "
+                f"separator. flabel can only resolve bare file names against a snapshot's "
+                f"data directory."
+            )
+        found = sorted(path.parent for path in data_root.rglob(name) if path.is_file())
+        if not found:
+            raise SnapshotError(
+                f"{snapshot / RULES_NAME} loads dataset {target!r}, which is not in "
+                f"{data_root}. The rules that need it could not match, so the snapshot is "
+                f"incomplete rather than merely unusual."
+            )
+        homes.setdefault(target, set()).update(found)
+
+    directories = sorted({directory for found in homes.values() for directory in found})
+    if len(directories) > 1:
+        raise SnapshotError(
+            f"snapshot {snapshot.name} needs dataset files from more than one directory "
+            f"({[str(directory) for directory in directories]}), and Suricata's "
+            f"`default-rule-path` accepts exactly one. Every rule pointing at the directories "
+            f"not chosen would fail to load, so this fails here instead of silently losing "
+            f"coverage. Merging the data directories is step 4's to do."
+        )
+    return directories[0]
+
+
+def build_argv(
+    capture: Path, snapshot: Path, outdir: Path, rules_path: Path | None = None
+) -> list[str]:
     """The exact invocation of spec §8, with flabel's own config.
 
     Separated from `run_suricata` so the flags are testable without running anything. Three
@@ -188,10 +250,10 @@ def build_argv(capture: Path, snapshot: Path, outdir: Path) -> list[str]:
       ``$HOME_NET -> $EXTERNAL_NET`` C2 rule fires at all depends on the operator's
       `suricata.yaml` (proved by a test: on the stock config that rule matches *nothing* in the
       benign canary; with flabel's, it matches).
-    * ``--set default-rule-path`` — where a rule's own relative paths (``dataset:``,
-      ``filemagic:``) resolve. Pointed at the snapshot so rule-referenced files can only come
-      from inside it. It does *not* affect ``-S``: measured on 8.0.6, a relative ``-S`` resolves
-      against the working directory and ignores this setting.
+    * ``--set default-rule-path`` — where a rule's own ``dataset:`` files resolve. See
+      `rule_path`: it is the per-source data directory, not the snapshot root, and the difference
+      is 26 rules that fail to load against the live feeds. It does *not* affect ``-S``: measured
+      on 8.0.6, a relative ``-S`` resolves against the working directory and ignores this.
     * absolute paths throughout — `Path.resolve()` on all three, so the argv means the same
       thing from any working directory. Spec §12's default ``--rules-dir`` is relative.
     """
@@ -204,18 +266,15 @@ def build_argv(capture: Path, snapshot: Path, outdir: Path) -> list[str]:
         "-c",
         str(directory / CONFIG_FILE),
         "-S",
-        str(snapshot / RULES_FILE),
+        str(snapshot / RULES_NAME),
         "-l",
         str(outdir),
-        # The two config files `suricata.yaml` names relatively. Set absolutely here rather
-        # than written as absolute paths in the YAML, because the package's location is not
-        # knowable when the YAML is written.
+        # `classification.config` is named relatively in the YAML and set absolutely here,
+        # because the package's location is not knowable when the YAML is written.
         "--set",
         f"classification-file={directory / CLASSIFICATION_FILE}",
         "--set",
-        f"reference-config-file={directory / REFERENCE_FILE}",
-        "--set",
-        f"default-rule-path={snapshot}",
+        f"default-rule-path={(rules_path or snapshot).resolve()}",
         "--set",
         "app-layer.protocols.tls.ja3-fingerprints=yes",
         "--set",
@@ -232,14 +291,21 @@ def run_suricata(
 
     Detections are returned in eve.json order, which is capture order. Ordering of the final
     output is `labels.py`'s job (spec §10), so nothing is re-sorted here.
+
+    The snapshot is loaded through `rules/snapshot.py` rather than read here: `load_snapshot`
+    re-hashes the content against the id, checks the manifest describes it, and `load_sid_index`
+    parses the attribution — all of which this module used to duplicate. `snapshot` is a
+    directory because spec §8 says so, and a snapshot directory is always named by its id, so
+    the loader is called with the pair it wants.
     """
-    manifest = load_manifest(snapshot)
-    verify_snapshot_id(snapshot, manifest)
+    directory, manifest = load_snapshot(snapshot.parent, snapshot.name)
     sources = {admission.name: admission for admission in manifest.sources}
-    index = sid_source_index(snapshot, manifest)
+    index = load_sid_index(directory)
+    rules_text = _rules_text(directory)
+    classtypes = rule_classtypes(rules_text, index, directory)
     _prepare_outdir(outdir)
 
-    argv = build_argv(capture, snapshot, outdir)
+    argv = build_argv(capture, directory, outdir, rule_path(directory, rules_text))
     version, failure = _version()
     if failure is not None:
         return [], _failed(manifest, failure)
@@ -294,7 +360,7 @@ def run_suricata(
             version=version,
         )
 
-    detections, alerts_total, suppressed, counts = _read_eve(eve, index, sources)
+    detections, alerts_total, suppressed, counts = _read_eve(eve, index, classtypes, sources)
     if counts is None:
         counts = _rules_loaded_from_log(outdir / LOG_FILE)
 
@@ -309,6 +375,9 @@ def run_suricata(
         rules_loaded=counts[0] if counts else 0,
         alerts_total=alerts_total,
         identify_alerts_suppressed=suppressed,
+        # TODO(coordinator): `rules_failed=counts[1]` and `rules_skipped=counts[2]` once the
+        # fields land on `SuricataRunInfo`, and the shortfall in `_check_ruleset_loaded` becomes
+        # a `warnings` entry below a threshold rather than an unconditional failure.
     )
 
 
@@ -364,308 +433,105 @@ def _check_ruleset_loaded(
 
 
 # --- the snapshot -------------------------------------------------------------------------
+#
+# Reading and verifying a snapshot is `rules/snapshot.py`'s job, not this module's: it re-hashes
+# the content against the id and checks the manifest describes it. What is left here is the one
+# thing only the Suricata pass needs — the classtype each sid declares — plus the cross-check
+# that the attribution covers exactly the rules that can fire.
 
 
-def load_manifest(snapshot: Path) -> SnapshotManifest:
-    """Read and validate `snapshot`'s manifest.
+def _rules_text(directory: Path) -> str:
+    """`rules.rules` as text, decoded leniently.
 
-    Strict about missing and unknown keys: the manifest is where `source_class` comes from,
-    and `source_class` is what decides whether a source may label at all. A manifest we can
-    only partly read is not a basis for that decision, and never falls back to another
-    snapshot (spec §7).
+    Lenient because the bytes are third-party rule text and the snapshot id already proves they
+    are the bytes that were admitted: a stray non-UTF-8 byte in one rule's `msg` must not stop a
+    run, and the sid and classtype this module reads are ASCII either way.
     """
-    path = snapshot / MANIFEST_FILE
-    if not snapshot.is_dir():
-        raise SnapshotError(f"ruleset snapshot directory not found: {snapshot}")
-    document = _load_json(path, snapshot)
-
-    raw_sources = document.get("sources")
-    if not isinstance(raw_sources, list) or not raw_sources:
-        raise SnapshotError(f"{path} lists no sources, so no alert could be attributed")
-
-    admissions = tuple(_build(SourceAdmission, entry, path) for entry in raw_sources)
-
-    # Duplicates rejected the way `config.py` rejects them in the registry: with two entries
-    # of the same name, which `source_class` applies — and therefore whether that source may
-    # label at all — would depend on manifest order. `may_label` is the one thing spec §13
-    # calls absolute, so it may not rest on a dict update winning.
-    seen: set[str] = set()
-    for admission in admissions:
-        key = admission.name.casefold()
-        if key in seen:
-            raise SnapshotError(
-                f"{path}: source {admission.name!r} appears more than once. Which "
-                f"source_class applies would depend on the order of the file."
-            )
-        seen.add(key)
-
-    return _build(SnapshotManifest, {**document, "sources": admissions}, path)
-
-
-def verify_snapshot_id(snapshot: Path, manifest: SnapshotManifest) -> None:
-    """Check that `snapshot_id` really is the hash of the rules and the attribution.
-
-    Spec §7 calls the id self-verifying — "rewriting the file changes the id" — but nothing
-    verified it, and the parts come from different files: `snapshot_id` is read from
-    `manifest.json`, the rules that alert from `rules.rules`, and the source each SID belongs
-    to from `sid_index.json`. Edit either and every label would still claim the original id: a
-    label whose origin cannot be traced (spec §13) while looking perfectly traceable.
-
-    Two compositions are accepted, and this is temporary: `rules.rules` alone, which is what
-    spec §7 says today, and `rules.rules` followed by `sid_index.json`, which is what step 4
-    now writes. Both are exact content hashes, so tampering still fails either way — the only
-    slack is that an id computed the old way leaves `sid_index.json` unprotected. **Spec §7
-    should pin one**, and this check should move into `rules/snapshot.load_snapshot`, which
-    will own the definition.
-    """
-    if len(manifest.snapshot_id) < SNAPSHOT_ID_LENGTH:
-        raise SnapshotError(
-            f"snapshot id {manifest.snapshot_id!r} is shorter than {SNAPSHOT_ID_LENGTH} "
-            f"characters, which is too little of a sha256 to identify a ruleset"
-        )
-
-    rules = _read_bytes(snapshot / RULES_FILE, snapshot)
-    index = _read_bytes(snapshot / SID_INDEX_FILE, snapshot)
-    candidates = {
-        f"sha256({RULES_FILE} + {SID_INDEX_FILE})": hashlib.sha256(rules + index).hexdigest(),
-        f"sha256({RULES_FILE})": hashlib.sha256(rules).hexdigest(),
-    }
-
-    if not any(digest.startswith(manifest.snapshot_id) for digest in candidates.values()):
-        detail = ", ".join(
-            f"{name} begins {digest[: len(manifest.snapshot_id)]!r}"
-            for name, digest in candidates.items()
-        )
-        raise SnapshotError(
-            f"snapshot {snapshot} is not internally consistent: {MANIFEST_FILE} says "
-            f"snapshot_id {manifest.snapshot_id!r}, but {detail}. The rules that would run are "
-            f"not the rules this id names, so every label from this run would misstate its "
-            f"origin."
-        )
-
-
-def _read_bytes(path: Path, snapshot: Path) -> bytes:
-    """Read a required snapshot file, or fail the run saying which one is missing."""
     try:
-        return path.read_bytes()
-    except FileNotFoundError as exc:
-        raise SnapshotError(f"snapshot {snapshot} has no {path.name}") from exc
+        return (directory / RULES_NAME).read_bytes().decode("utf-8", errors="replace")
     except OSError as exc:
-        raise SnapshotError(f"{path} could not be read: {exc}") from exc
+        raise SnapshotError(f"could not read {directory / RULES_NAME}: {exc}") from exc
 
 
-def sid_source_index(snapshot: Path, manifest: SnapshotManifest) -> dict[int, str]:
-    """Map every SID that can fire to the source it came from, from `sid_index.json`.
+def rule_classtypes(rules: str, index: Mapping[int, str], directory: Path) -> dict[int, str]:
+    """Each sid's `classtype:`, read from the rule text, and the sid cross-check.
 
-    `eve.json` carries no source, so attribution has to come from the snapshot. Step 4 writes
-    it explicitly::
+    **Why not `eve.json`'s `alert.category`, which spec §8 names.** `category` is not the
+    classtype: it is the *description* Suricata looks up in `classification.config`, so the text
+    a label carried depended on a file outside the rule — different wording on two machines for
+    one rule (a Goal 2 break), an empty string for any classtype the file omits, and, once that
+    file became flabel's own, wording flabel would be inventing on the feed's behalf. The rule
+    itself says `classtype:trojan-activity`, that text is inside the hashed snapshot, and it is
+    what the feed actually asserted. So a label now records `trojan-activity` rather than
+    "A Network Trojan was detected".
 
-        {"schema": 1, "sources": {"et/open": [2000001, ...], "pawpatrules": [3300303]}}
+    A rule with no `classtype:` maps to nothing and its detections carry `classtype=None`. That
+    is common, not exceptional: 10,949 of the 85,545 admitted rules in the measured snapshot have
+    none.
 
-    Read rather than re-derived. The previous version of this function reconstructed the map by
-    globbing ``raw/<source>.rules`` and deriving the source name from the file path — which
-    invented an unwritten contract about the layout of multi-file feeds (ET Open is a tarball of
-    many `.rules` files), re-read tens of megabytes of rule text on every run, and rested on
-    `raw/`, which is not covered by `snapshot_id` and so could be edited without detection.
-
-    The file is still cross-checked against the two things that must agree with it, because a
-    label carrying the wrong source is worse than a run that refuses to start:
-
-    * every source it names must be in the manifest — the manifest is where `source_class`,
-      hence `may_label`, comes from;
-    * every SID in `rules.rules` must appear in it exactly once. A SID claimed twice is
-      ambiguous and is never resolved by picking one; a SID claimed by nobody is a rule that
-      can fire and cannot be traced.
+    The cross-check rides along because the scan is already happening. `rules.rules` is what
+    Suricata reads, so it decides what can fire; `sid_index.json` decides what a firing rule can
+    be attributed to. A sid in one and not the other means a label with no traceable origin, or
+    an attribution for a rule that is not there — either way the two files describe different
+    rulesets and neither can be trusted (spec §13).
     """
-    path = snapshot / SID_INDEX_FILE
-    document = _load_json(path, snapshot)
+    classtypes: dict[int, str] = {}
+    admitted: set[int] = set()
 
-    schema = document.get("schema")
-    if schema != SID_INDEX_SCHEMA:
-        raise SnapshotError(
-            f"{path} declares schema {schema!r}, but this flabel understands only "
-            f"{SID_INDEX_SCHEMA}. Attribution decides whether a source may label at all, so it "
-            f"is never read on a best-effort basis."
-        )
-
-    sources = document.get("sources")
-    if not isinstance(sources, dict) or not sources:
-        raise SnapshotError(f"{path} maps no sources to SIDs, so no alert could be attributed")
-
-    known = {admission.name for admission in manifest.sources}
-    index: dict[int, str] = {}
-    ambiguous: dict[int, set[str]] = {}
-
-    for name in sorted(sources):
-        if name not in known:
+    for line in rules.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        # Quoted arguments are blanked first, so a `content:"sid:1;"` cannot be read as the
+        # rule's own sid, and the last remaining match wins: `sid` is conventionally the final
+        # option, so anything that survived the blanking is more likely to precede it.
+        bare = QUOTED.sub('""', stripped)
+        found = SID.findall(bare)
+        if not found:
             raise SnapshotError(
-                f"{path} attributes SIDs to source {name!r}, which {MANIFEST_FILE} does not "
-                f"list. The manifest is the authority on which sources a snapshot contains and "
-                f"on whether each may label."
+                f"{directory / RULES_NAME} has an active rule with no sid, which cannot be "
+                f"attributed to a source: {stripped[:120]}"
             )
-        sids = sources[name]
-        if not isinstance(sids, list):
-            raise SnapshotError(
-                f"{path}: source {name!r} maps to {type(sids).__name__}, expected a list of SIDs"
-            )
-        for sid in sids:
-            if not isinstance(sid, int) or isinstance(sid, bool):
-                raise SnapshotError(f"{path}: source {name!r} lists a non-integer SID {sid!r}")
-            owner = index.get(sid)
-            if owner is not None and owner != name:
-                ambiguous.setdefault(sid, {owner}).add(name)
-            index[sid] = name
-
-    if ambiguous:
-        detail = ", ".join(
-            f"{sid} ({', '.join(sorted(names))})" for sid, names in sorted(ambiguous.items())
-        )
-        raise SnapshotError(
-            f"{path} claims the same SID from more than one source: {detail}. A detection is "
-            f"never attributed by guess, so the snapshot must be rebuilt without the collision. "
-            f"Step 4 owns detecting this at write time, where dropping one of the two is an "
-            f"option the operator actually has."
-        )
-
-    _cross_check_rules(snapshot, index)
-    return index
-
-
-def _cross_check_rules(snapshot: Path, index: Mapping[int, str]) -> None:
-    """Assert `sid_index.json` describes the rules that will actually run.
-
-    `rules.rules` is the file Suricata reads, so it — not the index — decides what can fire.
-    The scan costs one pass over bytes already read for the snapshot-id check, and it catches
-    the two ways the two files can disagree: a rule with no attribution, and an attribution
-    for a rule that is not there.
-    """
-    rules = snapshot / RULES_FILE
-    text = _read_bytes(rules, snapshot).decode("utf-8", errors="replace")
-    admitted = _sids(text.splitlines(), strict=True, origin=rules)
+        sid = int(found[-1])
+        admitted.add(sid)
+        classtype = CLASSTYPE.search(bare)
+        if classtype is not None:
+            classtypes[sid] = classtype.group(1)
 
     if not admitted:
         raise SnapshotError(
-            f"{rules} contains no rules. Suricata treats that as a warning and exits 0 with "
-            f"an empty alert set, which is indistinguishable from a capture that contained "
-            f"nothing — so it fails here instead."
+            f"{directory / RULES_NAME} contains no rules. Suricata treats that as a warning and "
+            f"exits 0 with an empty alert set, which is indistinguishable from a capture that "
+            f"contained nothing — so it fails here instead."
         )
 
     unattributed = sorted(admitted - set(index))
     if unattributed:
         raise SnapshotError(
-            f"{rules} admits SIDs that {SID_INDEX_FILE} does not attribute: {unattributed[:20]} "
-            f"({len(unattributed)} total). Each could fire and could not be traced to a source, "
-            f"which also means we cannot tell whether it may label (spec §2.8)."
+            f"{directory / RULES_NAME} admits sids that sid_index.json does not attribute: "
+            f"{unattributed[:20]} ({len(unattributed)} total). Each could fire and could not be "
+            f"traced to a source, which also means we cannot tell whether it may label "
+            f"(spec §2.8)."
         )
 
     phantom = sorted(set(index) - admitted)
     if phantom:
         raise SnapshotError(
-            f"{SID_INDEX_FILE} attributes SIDs that are not in {RULES_FILE}: {phantom[:20]} "
+            f"sid_index.json attributes sids that are not in {RULES_NAME}: {phantom[:20]} "
             f"({len(phantom)} total). The two files describe different rulesets, so neither can "
             f"be trusted to say what ran."
         )
-
-
-def _load_json(path: Path, snapshot: Path) -> Mapping[str, Any]:
-    """Read a required snapshot JSON object, with every failure a `SnapshotError`."""
-    try:
-        document = json.loads(_read_bytes(path, snapshot).decode("utf-8"))
-    except UnicodeDecodeError as exc:
-        raise SnapshotError(f"{path} is not valid UTF-8: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise SnapshotError(f"{path} is not valid JSON: {exc}") from exc
-    if not isinstance(document, dict):
-        raise SnapshotError(f"{path} must contain a JSON object, got {type(document).__name__}")
-    return document
-
-
-def _sids(lines: Iterable[str], *, strict: bool = False, origin: Path | None = None) -> set[int]:
-    """The SIDs of the active rules in `lines`.
-
-    Blank lines and comments are skipped: a snapshot may carry a header comment, and a disabled
-    ``#alert`` rule can never fire (ET Open ships 19,479 of them). `strict` is for
-    ``rules.rules``, where an active rule without a SID is a broken snapshot rather than noise
-    to skip — it is a rule that can alert and cannot be attributed.
-    """
-    found: set[int] = set()
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        # Quoted arguments are blanked first, so a `content:"sid:1;"` cannot be mistaken for
-        # the rule's own SID, and the *last* remaining match wins: `sid` is conventionally the
-        # final option, and anything that survived the blanking is more likely to precede it.
-        matches = SID.findall(QUOTED.sub('""', stripped))
-        if not matches:
-            if strict:
-                raise SnapshotError(
-                    f"{origin} has an active rule with no sid, which cannot be attributed to "
-                    f"a source: {stripped[:120]}"
-                )
-            continue
-        found.add(int(matches[-1]))
-    return found
-
-
-def _build(kind: type, values: Mapping[str, Any], path: Path) -> Any:
-    """Construct a frozen dataclass from `values`, requiring every field it declares.
-
-    A *missing* key is fatal: the manifest is where `source_class` comes from, and a field we
-    cannot read is a decision we would be guessing at. An *unknown* key is ignored, which is
-    the opposite of `config.py`'s rule about the registry, for a reason — a human writes the
-    registry, where a typo'd key that reads as a setting is the hazard, while this file is
-    written by flabel itself. Rejecting unknown keys would mean a later version that adds a
-    field makes every snapshot already on disk unreadable, and spec §2.7 requires Phase 2 to
-    be additive. A renamed field still fails loudly, as a missing one.
-    """
-    if not isinstance(values, Mapping):
-        raise SnapshotError(
-            f"{path}: expected a JSON object for {kind.__name__}, got {type(values).__name__}"
-        )
-
-    expected = {field.name for field in fields(kind)}
-    missing = sorted(expected - set(values))
-    if missing:
-        raise SnapshotError(f"{path}: {kind.__name__} is missing {', '.join(missing)}")
-
-    # Types are checked, not just presence. JSON has no schema, so `"snapshot_id": 12345` or
-    # `"name": 5` would otherwise construct a dataclass whose `str` field holds an int, and the
-    # failure would surface pages later as a bare `TypeError` or `AttributeError` — not a
-    # `FlabelError`, so `cli.py` could only report it as a traceback. Only the scalar fields are
-    # checked; `sources` is validated by this same function one level down.
-    hints = get_type_hints(kind)
-    for name in sorted(expected):
-        wanted = hints.get(name)
-        if wanted in (str, int) and not _is_instance(values[name], wanted):
-            raise SnapshotError(
-                f"{path}: {kind.__name__}.{name} must be {wanted.__name__}, got "
-                f"{type(values[name]).__name__} ({values[name]!r})"
-            )
-
-    try:
-        return kind(**{name: values[name] for name in expected})
-    except (TypeError, ValueError) as exc:
-        # ValueError covers the models' own Literal checks — an unknown `source_class` lands
-        # here, and getting that wrong changes whether a source may label.
-        raise SnapshotError(f"{path}: invalid {kind.__name__}: {exc}") from exc
-
-
-def _is_instance(value: object, wanted: type) -> bool:
-    """`isinstance`, except that a bool is not an acceptable int.
-
-    `True` would otherwise pass as `rules_admitted`, and arithmetic on it would quietly work.
-    """
-    if isinstance(value, bool) and wanted is int:
-        return False
-    return isinstance(value, wanted)
+    return classtypes
 
 
 # --- eve.json ------------------------------------------------------------------------------
 
 
 def _read_eve(
-    path: Path, index: Mapping[int, str], sources: Mapping[str, SourceAdmission]
+    path: Path,
+    index: Mapping[int, str],
+    classtypes: Mapping[int, str],
+    sources: Mapping[str, SourceAdmission],
 ) -> tuple[list[Detection], int, int, tuple[int, int, int] | None]:
     """Parse `path` in one pass.
 
@@ -702,7 +568,7 @@ def _read_eve(
                 continue
 
             alerts_total += 1
-            detection = _detection(record, index, sources, path, number)
+            detection = _detection(record, index, classtypes, sources, path, number)
             if detection is None:
                 suppressed += 1
             else:
@@ -734,6 +600,7 @@ def _lines(handle: Iterable[str], path: Path) -> Iterable[str]:
 def _detection(
     record: Mapping[str, Any],
     index: Mapping[int, str],
+    classtypes: Mapping[int, str],
     sources: Mapping[str, SourceAdmission],
     path: Path,
     number: int,
@@ -784,7 +651,10 @@ def _detection(
     if not spec.may_label:
         return None
 
-    category = alert.get("category") or None
+    # From the rule text in the hashed snapshot, not from `alert.category`: see
+    # `rule_classtypes`. A rule with no `classtype:` yields None, which is ordinary — 10,949 of
+    # the 85,545 rules in the measured snapshot declare none.
+    classtype = classtypes.get(sid)
     src_port, dst_port = _ports(record)
     return Detection(
         source=source,
@@ -794,7 +664,7 @@ def _detection(
         # written without one — the default matches the tool's own semantics rather than
         # inventing a version.
         rev=int(alert.get("rev", 0)),
-        classtype=category,
+        classtype=classtype,
         app_proto=record.get("app_proto"),
         threat=str(alert["signature"]),
         ts=_epoch(record.get("timestamp"), path, number),

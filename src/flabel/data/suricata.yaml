@@ -41,6 +41,20 @@
 # which is right for labelling an arbitrary capture where flabel cannot know which side is
 # "home", but it also removes directionality as a false-positive filter. The benign canary is
 # the standing check on that (PRD §6.3).
+#
+# MEASURED COST, against a real 85,545-rule snapshot: exactly **3 rules cannot load** —
+# pawpatrules sids 3300158, 3300159 and 3321393, all "P2P direct calling via STUN"
+# (policy-violation / attempted-user). Each is written `-> ![... ,$HOME_NET]`, and negating a
+# HOME_NET of `any` leaves the empty set, so Suricata refuses them: "Complete IP space negated.
+# Rule address range is NIL." No configuration can have both `$HOME_NET` meaning everything and
+# `!$HOME_NET` meaning something.
+#
+# The alternative, if those three ever matter more than the coverage: `HOME_NET` back to the
+# RFC 1918 ranges with `EXTERNAL_NET: "any"` (rather than the stock `!$HOME_NET`). That loads all
+# 85,545 *and* still lets an abuse.ch `$HOME_NET -> $EXTERNAL_NET` rule fire on internal-to-
+# internal traffic — at the cost that a capture whose own hosts are not RFC 1918 stops matching
+# any `$HOME_NET`-anchored rule at all. Left as decided, not quietly changed, since the choice
+# between "every capture, minus 3 rules" and "85,545 rules, on RFC 1918 captures" is Craig's.
 vars:
   address-groups:
     HOME_NET: "any"
@@ -79,12 +93,17 @@ vars:
 
 # --- rules ---------------------------------------------------------------------------------
 #
-# No `rule-files` key: the ruleset comes from `-S <snapshot>/rules.rules`, which *replaces*
-# any list here. `default-rule-path` is set per run to the snapshot directory (`--set`), so
-# `dataset:` and `filemagic:` paths resolve inside the snapshot and nowhere else.
+# No `rule-files` key: the ruleset comes from `-S <snapshot>/rules.rules`, which *replaces* any
+# list here. `default-rule-path` is set per run (`--set`) to the snapshot's **per-source data
+# directory**, because that is where Suricata resolves a rule's `dataset: ... load <file>`
+# against — measured: pointing it at the snapshot root instead costs 26 failed rules. The value
+# here is deliberately a path that cannot exist, so a run that forgot to set it fails loudly
+# rather than resolving rule-referenced files against something real.
 default-rule-path: /nonexistent
 classification-file: classification.config
-reference-config-file: reference.config
+# No `reference-config-file`. It only maps a `reference:` prefix to a URL, nothing in flabel reads
+# those URLs, and measured against a real 85,545-rule snapshot its absence changes the load by
+# **0 rules** — the engine warns once per unknown prefix. One fewer file to own.
 
 # --- outputs -------------------------------------------------------------------------------
 #
