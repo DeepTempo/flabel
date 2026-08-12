@@ -4,8 +4,15 @@ project: "flabel"
 created: "2026-08-11"
 github_repo: "DeepTempo/flabel"
 notion_url: "https://app.notion.com/p/3b92a84a5230812aa64aef638e389725"
-prd_gdoc_url: "https://docs.google.com/document/d/1WwKukQ71L6JQWkSpKvoR4lgwB96w3x1WHAHzZ30ul2E/edit"   # v0.2; supersedes v0.1 doc 1q_muS6Am... (delete manually — Drive MCP has no delete)
+prd_gdoc_url: "https://docs.google.com/document/d/1WwKukQ71L6JQWkSpKvoR4lgwB96w3x1WHAHzZ30ul2E/edit"
+# STALE: the Doc above is PRD v0.2; docs/prd.md is v0.4. Regenerate it (Drive MCP cannot edit in
+# place, so it means creating a new Doc and updating this URL). Also: the superseded v0.1 Doc
+# 1q_muS6AmCuvcNva4C1WtRE3_KXArJPxnapttsU6UQIE needs deleting by hand — no delete tool exists.
 current_stage: scaffold
+next_action: "Merge PR #25, then run /project:build — it does the scaffold check first, then Step 1 (#15, toolchain+CI), which blocks every other step."
+blocked_on:
+  - "Malicious canary capture must be sourced (origin + licence recorded) — needed by Step 10 (#24) only; steps 1-9 are unblocked."
+  - "PRD Q1/Q2/Q10: stakeholders, target release, success-metric review dates. Left TBD deliberately, not invented."
 # NOTE: issue numbers are not in stage order. Two creates hit a transient TLS
 # error and were retried, and GitHub never reuses issue numbers. This mapping is
 # authoritative — trust it over the numeric order in the GitHub issue list.
@@ -24,3 +31,4 @@ log:
   - "2026-08-11 stage(prd) completed — labels.json schema settled (one entry per flow, sources[], Zeek uid join, malicious-only); timestamped run dirs; 13 user stories"
   - "2026-08-11 stage(eng-review) completed — 3 Critical / 9 High findings; PRD v0.4 splits delivery: Phase 1 = Tier 2 only, Tier 1 to Phase 2; NGFW default stubbed, --offline retained"
   - "2026-08-11 stage(plan) completed — docs/spec.md + PLAN.md; 10 Phase 1 steps (#15-#24), parallel groups {3,4,5,6} and {7,8}; toolchain CI is step 1 because tests invoke Zeek/Suricata for real"
+  - "2026-08-12 session handoff — CLAUDE.md architecture filled in from the plan; PR #25 open and unmerged; local branches stage/{research,prd,eng-review} are merged and prunable"
