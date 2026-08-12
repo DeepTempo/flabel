@@ -1,0 +1,13 @@
+# flabel test fixture — an IOC feed in the shape the wholesale sources publish
+# (abuse.ch, malsilo, pawpatrules): no ET `confidence` taxonomy anywhere, so a metadata
+# filter would admit nothing. Spec §6 admits every active `alert` line from these.
+#
+# Synthetic. The sid block (7100000) and the indicator values are invented.
+
+alert tcp $HOME_NET any -> 198.51.100.7 443 (msg:"FLABEL TEST feodo-style c2 destination"; flow:established,to_server; reference:url,example.invalid/flabel; classtype:command-and-control; sid:7100001; rev:1;)
+alert dns $HOME_NET any -> any 53 (msg:"FLABEL TEST urlhaus-style name lookup"; dns.query; content:"flabel-indicator.invalid"; nocase; isdataat:!1,relative; classtype:command-and-control; sid:7100002; rev:1;)
+alert tls any any -> any any (msg:"FLABEL TEST wholesale ja3 hash"; ja3.hash; content:"c1f2a3b4d5e6f708192a3b4c5d6e7f80"; classtype:command-and-control; sid:7100003; rev:1;)
+alert tls any any -> any any (msg:"FLABEL TEST wholesale ja4 hash"; ja4.hash; content:"t13d1516h2_8daaf6152771_02713d6af862"; classtype:command-and-control; sid:7100004; rev:1;)
+
+# A disabled rule: wholesale admission still never enables a rule the feed shipped off.
+#alert tcp $HOME_NET any -> 198.51.100.8 443 (msg:"FLABEL TEST disabled wholesale rule"; flow:established,to_server; classtype:command-and-control; sid:7100005; rev:1;)
