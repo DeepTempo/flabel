@@ -115,6 +115,8 @@ def serialise(document: Mapping[str, Any]) -> str:
     * `allow_nan=False` — the default emits bare `NaN`/`Infinity`, which Python reads back and
       no strict JSON parser accepts, so a non-finite ratio would ship a file that only looks
       valid from inside this project.
+
+    **This returns text. Write it with `serialise_bytes`, not `Path.write_text`** — see there.
     """
     return (
         json.dumps(
@@ -126,6 +128,24 @@ def serialise(document: Mapping[str, Any]) -> str:
         )
         + "\n"
     )
+
+
+def serialise_bytes(document: Mapping[str, Any]) -> bytes:
+    """`document` as canonical UTF-8 bytes — what a caller writes to disk.
+
+    The encoding is not the caller's choice to make. `ensure_ascii=False` (spec §10) means the
+    output carries whatever non-ASCII characters a third-party rule's `msg:` text contains, and
+    `Path.write_text` encodes with the **locale** encoding, not UTF-8. Under `LANG=C` or
+    `LC_ALL=POSIX` — the default in many container images, cron environments and CI runners —
+    that is ASCII, so writing a label whose threat text contains one accented character raises
+    `UnicodeEncodeError` *after the entire pipeline has succeeded*. Under a cp1252 locale it
+    does not raise at all; it writes mojibake into the ground-truth file.
+
+    Neither failure can be caught by a test that inspects the returned string, which is why the
+    encoding is bound here rather than documented and hoped for. `labels.json` and `run.json`
+    are UTF-8 by definition — JSON has no other interchange encoding.
+    """
+    return serialise(document).encode("utf-8")
 
 
 # --- ordering (spec §10) --------------------------------------------------------------------

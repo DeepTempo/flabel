@@ -23,7 +23,13 @@ import pytest
 
 from flabel import labels as labels_module
 from flabel import notice as notice_module
-from flabel.labels import SCHEMA_VERSION, build_document, iso_from_epoch, serialise
+from flabel.labels import (
+    SCHEMA_VERSION,
+    build_document,
+    iso_from_epoch,
+    serialise,
+    serialise_bytes,
+)
 from flabel.models import (
     Detection,
     Flow,
@@ -722,3 +728,136 @@ def test_an_identify_source_never_reaches_a_serialised_label():
     )
     with pytest.raises(ValueError, match="identify"):
         build_source_entry(make_detection(source="oisf/trafficid"), admission, SNAPSHOT_ID)
+
+
+# --- the bytes that reach the disk ----------------------------------------------------------
+#
+# `ensure_ascii=False` (spec §10) means the output carries whatever non-ASCII characters a
+# third-party rule's `msg:` text contains. Every test above inspects a `str`, and a `str` cannot
+# show the defect: `Path.write_text` encodes with the *locale* encoding, so the same correct
+# string becomes `UnicodeEncodeError` under `LANG=C` and mojibake under cp1252 — both after the
+# pipeline has already succeeded. These tests are about the encode step, so they assert bytes.
+
+#: A rule msg with characters outside ASCII. Real feeds carry these: rule authors write in the
+#: language they think in, and malware family names are not all Latin-1.
+NON_ASCII_THREAT = "ET MALWARE Trojan.Крипт — beaconing to café.example"
+
+
+def test_the_document_round_trips_through_utf8_bytes():
+    """The encoding is bound in the library, not left to the caller's locale."""
+    document = build_document(
+        run={"flabel_version": "0.1.0"},
+        labels=[make_label(None, make_entry(threat=NON_ASCII_THREAT))],
+        unmatched=[],
+    )
+
+    raw = serialise_bytes(document)
+
+    assert isinstance(raw, bytes)
+    assert json.loads(raw.decode("utf-8"))["labels"][0]["sources"][0]["threat"] == NON_ASCII_THREAT
+
+
+def test_non_ascii_threat_text_survives_as_characters_not_escapes():
+    """`ensure_ascii=False` is the spec's choice; this proves it reaches the bytes intact.
+
+    If `ensure_ascii` were ever flipped back on, the file would still parse to the same string —
+    so a `json.loads` round-trip cannot catch it. The bytes can.
+    """
+    document = build_document(
+        run={}, labels=[make_label(None, make_entry(threat=NON_ASCII_THREAT))], unmatched=[]
+    )
+
+    raw = serialise_bytes(document)
+
+    assert "café".encode() in raw
+    # The escape `ensure_ascii=True` would emit instead, spelled without a non-ASCII
+    # literal in a bytes context.
+    assert b"caf\\u00e9" not in raw
+
+
+def test_the_bytes_are_writable_where_the_locale_cannot_encode_them(tmp_path):
+    """The failure this helper exists to prevent, reproduced against the filesystem.
+
+    `write_bytes` is unaffected by locale; `write_text` is not. Under `LANG=C` the second form
+    raises `UnicodeEncodeError` — after a successful run, on the file that is the product.
+    """
+    document = build_document(
+        run={}, labels=[make_label(None, make_entry(threat=NON_ASCII_THREAT))], unmatched=[]
+    )
+    path = tmp_path / "labels.json"
+
+    path.write_bytes(serialise_bytes(document))
+
+    assert json.loads(path.read_text(encoding="utf-8"))["labels"][0]["sources"][0]["threat"] == (
+        NON_ASCII_THREAT
+    )
+
+
+# --- attribution follows the text, not the verdict ------------------------------------------
+#
+# Craig's decision, 2026-08-12. `unmatched_detections[].detection.threat` is verbatim rule
+# `msg:` text from sources that asserted no label, and several admitted feeds are CC-BY,
+# share-alike or copyleft. Scoping NOTICE to `labels[].sources` would make a licence obligation
+# depend on whether a detection happened to correlate.
+
+
+def test_a_source_reaching_only_an_unmatched_detection_is_still_attributed():
+    """Its rule text is in labels.json just the same; only the verdict is absent."""
+    manifest = make_manifest(
+        make_admission(name="et/open", licence="MIT"),
+        make_admission(name="pawpatrules", licence="CC-BY-SA-4.0"),
+    )
+    label = make_label(None, make_entry(source="et/open", licence="MIT"))
+    stray = make_unmatched(source="pawpatrules", threat="PAW Suspicious TLS SNI")
+
+    text = notice_module.render_notice((label,), manifest, (stray,))
+
+    assert "pawpatrules" in text
+    assert "share-alike" in text
+
+
+def test_a_source_that_asserted_nothing_at_all_is_still_omitted():
+    """The widening is to text that appears, not to the whole snapshot.
+
+    NOTICE describes what was used; the snapshot describes what was available. Listing every
+    feed would read as a claim that each contributed to this run.
+    """
+    manifest = make_manifest(
+        make_admission(name="et/open", licence="MIT"),
+        make_admission(name="abuse.ch/urlhaus", licence="CC0-1.0"),
+    )
+    label = make_label(None, make_entry(source="et/open", licence="MIT"))
+
+    text = notice_module.render_notice((label,), manifest)
+
+    assert "abuse.ch/urlhaus" not in text
+
+
+def test_the_unmatched_licence_comes_from_the_snapshot_not_the_registry():
+    """An unmatched detection carries no SourceEntry, so the manifest is the authority.
+
+    Same rule as everywhere else: terms are frozen with the rules that fired, never read from
+    data/sources.toml as it is today.
+    """
+    manifest = make_manifest(make_admission(name="stamus/lateral", licence="GPL-3.0-only"))
+    stray = make_unmatched(source="stamus/lateral")
+
+    licences = notice_module.labelling_sources((), (stray,), manifest)
+
+    assert licences == {"stamus/lateral": "GPL-3.0-only"}
+
+
+def test_every_licence_in_the_shipped_registry_has_attribution_text():
+    """A new feed under an unlisted licence must fail the build, not degrade quietly.
+
+    Without this, adding a tenth source under, say, Apache-2.0 makes NOTICE print "Licence
+    terms not recorded in flabel" for a shipping feed — legally safe, operationally useless,
+    and silent. NOTICE is the artifact with legal weight, so the gap should be loud.
+    """
+    from flabel.config import load_sources
+
+    missing = sorted({spec.licence for spec in load_sources()} - set(notice_module.ATTRIBUTION))
+    assert not missing, (
+        f"sources.toml ships licences with no ATTRIBUTION entry: {missing}. "
+        f"Add the obligation text rather than letting NOTICE fall back to UNRECORDED."
+    )

@@ -536,6 +536,9 @@ def full_run(tmp_path: Path, **overrides) -> dict:
         "zeek": make_zeek_info(tmp_path),
         "suricata": make_suricata_info(),
         "correlation": make_correlation(),
+        # A completed run resolved its snapshot. Stated rather than inferred from `manifest`
+        # being present, for the same reason the run block itself does not infer it.
+        "snapshot_resolved": True,
         "toolchain_path": tmp_path / "absent-toolchain.json",
     }
     return build_run_block(**{**arguments, **overrides})
@@ -746,6 +749,40 @@ def test_a_malformed_manifest_warns_rather_than_failing_or_going_quiet(tmp_path)
 
     assert values == {}
     assert warnings and any("toolchain" in warning for warning in warnings)
+
+
+def test_a_manifest_that_is_not_utf8_warns_rather_than_crashing_the_run_block(tmp_path):
+    """The malformed case above is valid UTF-8, so it never reached this branch.
+
+    `read_text(encoding="utf-8")` raises `UnicodeDecodeError` on undecodable bytes, and that is
+    a `ValueError`, **not** an `OSError` — so it escaped the read's exception clause entirely.
+    One bad byte in a truncated `/etc/flabel-toolchain.json` would then crash `build_run_block`
+    on every run, including the failure path where step 9 is writing `run.json` to explain why
+    the run died. Spec §10 says `run.json` is written by every run; this is the test that keeps
+    an unrelated provenance file from making that untrue.
+    """
+    path = tmp_path / "flabel-toolchain.json"
+    path.write_bytes(b'{"zeek": "8.0.4\xff\xfe"}')
+
+    values, warnings = read_toolchain(path)
+
+    assert values == {}
+    assert warnings and any("UTF-8" in warning for warning in warnings)
+
+
+def test_a_run_block_still_builds_when_the_toolchain_manifest_is_undecodable(tmp_path):
+    """The whole point of the branch above: the report survives the unreadable file."""
+    path = tmp_path / "flabel-toolchain.json"
+    path.write_bytes(b"\xff\xfe\x00broken")
+
+    block = full_run(tmp_path, toolchain_path=path)
+
+    # The two fields the manifest is the only source for. `tools.zeek` and `tools.suricata`
+    # come from their stages' run info and are unaffected — which is the point: an unreadable
+    # provenance file costs the facts it held, not the report.
+    assert block["tools"]["editcap"] is None
+    assert block["tools"]["ja4_zeek_package"] is None
+    assert any("UTF-8" in warning for warning in block["warnings"])
 
 
 def test_a_non_string_version_is_rejected_rather_than_serialised_as_a_number(tmp_path):
@@ -1023,7 +1060,11 @@ def test_the_loss_condition_summary_covers_every_row_of_the_spec_table(tmp_path)
             },
             id="tool-failure",
         ),
-        pytest.param("snapshot_missing", lambda tmp_path: {"manifest": None}, id="snapshot"),
+        pytest.param(
+            "snapshot_missing",
+            lambda tmp_path: {"snapshot_resolved": False, "manifest": None},
+            id="snapshot",
+        ),
         pytest.param(
             "identify_alert_suppressed",
             lambda tmp_path: {"suricata": make_suricata_info(identify_alerts_suppressed=3)},
@@ -1054,6 +1095,28 @@ def test_each_loss_condition_flag_is_false_until_its_fault_is_injected(
 
     injected = full_run(tmp_path, **overrides(tmp_path))["loss_conditions"]
     assert injected[condition] is True, f"{condition} did not fire when its fault was injected"
+
+
+def test_a_crash_before_the_snapshot_loads_does_not_claim_the_ruleset_was_missing(tmp_path):
+    """The two runs `manifest is None` used to conflate, told apart.
+
+    Zeek is OOM-killed, step 9 catches `ToolError` and writes `run.json` — and at that point
+    the snapshot has not been loaded, because it is loaded for correlation, after Zeek. Deriving
+    `snapshot_missing` from the absent manifest would blame a missing ruleset for a crash that
+    had nothing to do with the ruleset, in the one file whose job is saying honestly what the
+    run did and did not see. §11 defines that row as a specific operator error —
+    `--ruleset-snapshot nonexistent` — not as "we never got there".
+    """
+    crashed = build_run_block(
+        started_at=STARTED,
+        finished_at=FINISHED,
+        capture=make_capture(tmp_path),
+        tool_failures=(ToolFailure(tool="zeek", argv=("zeek",), exit_code=-9, message="killed"),),
+        toolchain_path=tmp_path / "absent-toolchain.json",
+    )
+
+    assert crashed["loss_conditions"]["snapshot_missing"] is None
+    assert crashed["loss_conditions"]["tool_failure"] is True
 
 
 def test_an_unknown_loss_condition_is_null_rather_than_false(tmp_path):

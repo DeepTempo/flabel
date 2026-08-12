@@ -844,6 +844,12 @@ or normalise**: the same capture labelled from two directories would otherwise d
 }
 ```
 
+**The types above describe a completed run.** In the `run.json` of a run that failed part-way,
+every field of `input`, `ruleset`, `tools` and `counts` whose stage did not run is `null` — not
+zero, not an empty list, and never a dropped key, so a reader can tell "not measured" from
+"measured as none". A consumer written from the literal above must expect `null` in place of any
+of them, including where a list is declared.
+
 **Five keys were added to the run block in steps 5 and 6**, each because the model field behind it
 had nowhere to surface: `tools.ja4_status` and `tools.suricata_config_sha256`, and
 `counts.rules_loaded` / `rules_failed` / `rules_skipped`. `tools.ja4_zeek_package` is now nullable —
@@ -857,7 +863,9 @@ no way to be filled. It is read from the toolchain manifest's `wireshark` entry,
 A null here means the manifest was absent, which is the ordinary laptop case; it never means
 `editcap` did not run, because a run that needed it and could not use it fails.
 
-**`loss_conditions` is derived, never stored.** This section names the key while §11 puts each
+**`loss_conditions` is derived, never stored** — an implementer's decision taken in step 8,
+recorded here with its reasoning rather than attributed to a product call, because §10 named the
+key and never defined it. This section names the key while §11 puts each
 condition's authoritative field elsewhere in the block — `input.*`, `counts.*`, `tools.ja4_status`,
 `tool_failures[]`. It is computed from those on the way out, so the two cannot disagree; storing it
 would create nine pairs of fields that must agree and one place for them to drift. Each flag is
@@ -897,7 +905,11 @@ reproducibility comparison must skip label-free run directories rather than fail
 
 ### `NOTICE` — `notice.py`
 
-Lists every source that asserted at least one label in this run, with its licence and required attribution. Sources present in the snapshot but which asserted nothing are not listed.
+Lists every source **whose rule text appears anywhere in this run's output**, with its licence and required attribution. Sources present in the snapshot but absent from the output are not listed: the snapshot describes what was *available*, NOTICE describes what was *used*.
+
+**Widened from "every source that asserted a label" in step 8** (Craig, 2026-08-12). `unmatched_detections[].detection.threat` is verbatim rule `msg:` text, copied into `labels.json` from sources that asserted nothing — and several admitted feeds are CC-BY-4.0, CC-BY-SA-4.0 or GPL-3.0-only, whose terms ask for attribution wherever their text is redistributed. Under the narrow reading a licence obligation would depend on whether a detection happened to *correlate*, which is an accident of the capture rather than anything about the source. Over-attributing costs a longer file; under-attributing is a breach in the one artifact carrying legal weight, in a public repo.
+
+A source reached only through an unmatched detection has no `SourceEntry`, so its licence is resolved through the snapshot manifest — the same authority, one step less direct. A source appearing under two different licences in one run raises rather than picking one.
 
 ---
 

@@ -2,11 +2,16 @@
 
 Pure: no `subprocess`, no `urllib`, no `socket`. Enforced by `tests/test_architecture.py`.
 
-It lists **every source that asserted at least one label in this run**, with its licence and
-what that licence requires of whoever redistributes the output. Sources present in the snapshot
-that asserted nothing are not listed: the snapshot describes what was *available*, and NOTICE
-describes what was *used*. Printing the whole snapshot would be the shorter implementation and
-would read as a claim that every feed contributed to these verdicts.
+It lists **every source whose rule text appears anywhere in this run's output**, with its
+licence and what that licence requires of whoever redistributes it. That is a wider set than the
+sources that asserted a label (Craig, 2026-08-12): `unmatched_detections[].detection.threat` is
+verbatim rule `msg:` text from sources that asserted nothing, and several admitted feeds are
+CC-BY, share-alike or copyleft. Attribution must not depend on whether a detection happened to
+correlate, which is an accident of the capture rather than anything about the source.
+
+Sources present in the snapshot but absent from the output are still not listed: the snapshot
+describes what was *available*, and NOTICE describes what was *used*. Printing the whole snapshot
+would be the shorter implementation and would read as a claim that every feed contributed.
 
 **The terms come from the snapshot, never from `data/sources.toml` as it reads now** — the same
 authority `build_source_entry` uses above, and for the same reason: between `flabel rules
@@ -24,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from flabel.models import Label, SnapshotManifest
+from flabel.models import Label, SnapshotManifest, UnmatchedDetection
 
 #: What each licence actually asks of someone redistributing labels derived from its rules.
 #: Keyed by the SPDX id the registry records (spec §5). Deliberately a statement of the
@@ -66,41 +71,75 @@ UNRECORDED = (
     "Licence terms not recorded in flabel. Consult the source's own licence before redistributing."
 )
 
-HEADER = "flabel — attribution for the rule sources that asserted labels in this run"
+HEADER = "flabel — attribution for the rule sources whose content appears in this run's output"
 
 
-def labelling_sources(labels: Sequence[Label]) -> dict[str, str]:
-    """Source name -> licence, for every source that asserted at least one label.
+def labelling_sources(
+    labels: Sequence[Label],
+    unmatched: Sequence[UnmatchedDetection] = (),
+    manifest: SnapshotManifest | None = None,
+) -> dict[str, str]:
+    """Source name -> licence, for every source whose rule text appears in this run's output.
 
-    The licence is read off the `SourceEntry`, which froze it at snapshot time. A source
-    appears once however many labels or entries it asserted.
+    **Not only the sources that asserted a label** (Craig, 2026-08-12). Spec §10 originally
+    scoped `NOTICE` to `labels[].sources`, but `unmatched_detections[].detection.threat` is
+    verbatim rule `msg:` text copied into `labels.json` from sources that asserted nothing — and
+    several admitted feeds are CC-BY-4.0, CC-BY-SA-4.0 or GPL-3.0-only, whose terms ask for
+    attribution wherever their text is redistributed. Scoping attribution to whether a detection
+    happened to *correlate* would make a licence obligation depend on an accident of the capture.
 
-    A source asserting two different licences within one run is a corrupted snapshot rather
-    than a formatting problem, so it raises: printing either one would be a coin toss.
+    Over-attributing costs a longer file; under-attributing is a licence breach in the one
+    artifact that carries legal weight, in a public repo.
+
+    The licence comes off the `SourceEntry` where there is one, because that froze it at
+    snapshot time. An unmatched detection carries no entry, so its source is resolved through
+    `manifest` — the same authority, one step less direct.
+
+    A source appearing under two different licences within one run is a corrupted snapshot
+    rather than a formatting problem, so it raises: printing either would be a coin toss.
     """
     licences: dict[str, str] = {}
+
+    def record(source: str, licence: str) -> None:
+        existing = licences.setdefault(source, licence)
+        if existing != licence:
+            raise ValueError(
+                f"{source} appears under two licences, {existing!r} and {licence!r}: "
+                f"attribution cannot be stated for either"
+            )
+
     for label in labels:
         for entry in label.sources:
-            existing = licences.setdefault(entry.source, entry.licence)
-            if existing != entry.licence:
-                raise ValueError(
-                    f"{entry.source} asserted labels under two licences, {existing!r} and "
-                    f"{entry.licence!r}: attribution cannot be stated for either"
-                )
+            record(entry.source, entry.licence)
+
+    # Sources reached only through an unmatched detection. Their text is in the output just the
+    # same; only the verdict is absent.
+    if unmatched and manifest is not None:
+        admissions = manifest.sources_by_name
+        for item in unmatched:
+            admission = admissions.get(item.detection.source)
+            if admission is not None:
+                record(admission.name, admission.licence)
+
     return licences
 
 
-def render_notice(labels: Sequence[Label], manifest: SnapshotManifest) -> str:
+def render_notice(
+    labels: Sequence[Label],
+    manifest: SnapshotManifest,
+    unmatched: Sequence[UnmatchedDetection] = (),
+) -> str:
     """The `NOTICE` text for this run.
 
-    `manifest` supplies each source's URL and is the authority the labels are checked against;
-    `labels` decides who is listed at all.
+    `manifest` supplies each source's URL and is the authority the labels are checked against.
+    `labels` and `unmatched` together decide who is listed — every source whose text reached the
+    output, not only those that reached a verdict.
     """
     # The manifest's own index, not a fourth copy of the same comprehension (#49): uniqueness
     # is guaranteed on the type, so this cannot silently drop an entry the way a local
     # dict-comprehension over a tuple with a repeated name would.
     admissions = manifest.sources_by_name
-    licences = labelling_sources(labels)
+    licences = labelling_sources(labels, unmatched, manifest)
 
     lines = [
         HEADER,
@@ -125,8 +164,8 @@ def render_notice(labels: Sequence[Label], manifest: SnapshotManifest) -> str:
             # already refuses a detection whose source is absent from the manifest, so
             # reaching here means a label was built against a different snapshot.
             raise ValueError(
-                f"{name} asserted a label but is absent from snapshot {manifest.snapshot_id}: "
-                f"its attribution cannot be established"
+                f"{name} appears in this run's output but is absent from snapshot "
+                f"{manifest.snapshot_id}: its attribution cannot be established"
             )
         licence = licences[name]
         if admission.licence != licence:
@@ -147,3 +186,18 @@ def render_notice(labels: Sequence[Label], manifest: SnapshotManifest) -> str:
         )
 
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def render_notice_bytes(
+    labels: Sequence[Label],
+    manifest: SnapshotManifest,
+    unmatched: Sequence[UnmatchedDetection] = (),
+) -> bytes:
+    """The `NOTICE` text as UTF-8 bytes — what a caller writes to disk.
+
+    Same reasoning as `labels.serialise_bytes`: `Path.write_text` encodes with the locale
+    encoding, which is ASCII under `LANG=C`, so a source name or licence string carrying a
+    non-ASCII character would raise after a successful run or silently write mojibake. NOTICE is
+    the artifact with legal weight, so garbling it is worse here than almost anywhere else.
+    """
+    return render_notice(labels, manifest, unmatched).encode("utf-8")

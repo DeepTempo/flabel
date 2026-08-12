@@ -211,6 +211,7 @@ from flabel.models import (  # noqa: E402
     SnapshotManifest,
     SuricataRunInfo,
     ToolFailure,
+    UnmatchedReason,
     ZeekRunInfo,
 )
 
@@ -269,6 +270,15 @@ def read_toolchain(path: Path = TOOLCHAIN_MANIFEST) -> tuple[dict[str, str], tup
         return {}, ()
     except OSError as exc:
         return {}, (f"toolchain manifest {path} could not be read: {exc}",)
+    except UnicodeDecodeError as exc:
+        # Caught separately because it is **not** an `OSError` — it subclasses `ValueError`, so
+        # it escapes the clause above and takes `build_run_block` down with it. A truncated or
+        # half-written `/etc/flabel-toolchain.json` in a broken image would then crash the run
+        # block on every run, including the failure path where step 9 is trying to write
+        # `run.json` to explain why the run died. Losing the whole report over an unreadable
+        # byte in an unrelated provenance file is exactly the trade this function's three
+        # outcomes exist to avoid.
+        return {}, (f"toolchain manifest {path} is not valid UTF-8: {exc}",)
 
     try:
         document = json.loads(raw)
@@ -303,6 +313,7 @@ def build_run_block(
     zeek: ZeekRunInfo | None = None,
     suricata: SuricataRunInfo | None = None,
     correlation: CorrelationResult | None = None,
+    snapshot_resolved: bool | None = None,
     tool_failures: Sequence[ToolFailure] = (),
     warnings: Sequence[str] = (),
     toolchain_path: Path = TOOLCHAIN_MANIFEST,
@@ -338,7 +349,7 @@ def build_run_block(
         "tools": _tools_section(zeek, suricata, versions, ja4_version),
         "counts": _counts_section(correlation, suricata),
         "loss_conditions": _loss_conditions(
-            capture, zeek, suricata, correlation, manifest, failures
+            capture, zeek, suricata, correlation, snapshot_resolved, failures
         ),
         "tool_failures": [_failure(failure) for failure in failures],
         "warnings": [
@@ -544,7 +555,7 @@ def _loss_conditions(
     zeek: ZeekRunInfo | None,
     suricata: SuricataRunInfo | None,
     correlation: CorrelationResult | None,
-    manifest: SnapshotManifest | None,
+    snapshot_resolved: bool | None,
     failures: tuple[ToolFailure, ...],
 ) -> dict[str, bool | None]:
     """One flag per row of spec §11: did this loss condition fire?
@@ -564,6 +575,16 @@ def _loss_conditions(
     unmatched_reasons = (
         {entry.reason for entry in correlation.unmatched} if correlation is not None else None
     )
+    # Checked against the Literal rather than against string constants spelled here. A rename in
+    # `models.UnmatchedReason` would leave a comparison that simply never matches — reporting
+    # "no ambiguous matches occurred" on a run that had them, which is spec §13's never-do
+    # reached by a refactor. `_JA4_STATUS_VALUES` above uses `get_args` for the same reason;
+    # this asserts the names still exist rather than trusting two spellings to stay in step.
+    known_reasons = set(get_args(UnmatchedReason))
+    assert {"no_flow_match", "ambiguous_flow_match"} <= known_reasons, (
+        f"UnmatchedReason changed to {sorted(known_reasons)}; the loss_conditions rows below "
+        f"name reasons that no longer exist and would silently report no loss"
+    )
     return {
         "input_truncated": None if capture is None else capture.truncated_at_offset is not None,
         "multi_datalink_discard": None if capture is None else bool(capture.discarded_link_types),
@@ -576,9 +597,16 @@ def _loss_conditions(
         # Known on every run: the caller passes what it caught, and no stage having failed is
         # itself an observation rather than an absence.
         "tool_failure": bool(failures),
-        # Spec §11 gives this row no field, because it is a hard failure before a manifest
-        # exists. In `run.json` that is exactly what an unresolved snapshot looks like.
-        "snapshot_missing": manifest is None,
+        # Told, not inferred. `manifest is None` conflates two different runs: one where
+        # `--ruleset-snapshot` named a snapshot that does not exist — the §11 row, a specific
+        # and diagnosable operator error — and one where Zeek was OOM-killed before the
+        # snapshot was ever loaded. Inferring the first from the second would blame a missing
+        # ruleset for every mid-pipeline crash, which is a false statement in the one file whose
+        # job is saying honestly what the run did and did not see. Only the caller knows which
+        # happened, so only the caller can say.
+        "snapshot_missing": snapshot_resolved
+        if snapshot_resolved is None
+        else not snapshot_resolved,
         "identify_alert_suppressed": (
             None if suricata is None else suricata.identify_alerts_suppressed > 0
         ),
