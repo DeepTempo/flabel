@@ -36,9 +36,15 @@ FIXTURES = Path(__file__).parent / "fixtures"
 BENIGN = FIXTURES / "benign.pcap"
 
 #: The two flows `make_canary.py` synthesizes, as (src_ip, src_port, dst_ip, dst_port, proto).
+#:
+#: Both are cleartext HTTP to port **80**. Flow 2 used port 443 until pawpatrules sid 3300303
+#: ("Suspicious HTTP traffic on unusual HTTP port") was found firing on it — correctly, and on
+#: the one fixture whose entire value is that zero labels is known-correct by construction. The
+#: two flows differ by endpoint and timing, not by port; port 443 belongs to a capture that
+#: carries a real TLS handshake (`TLS_TUPLE` below, generated at test time).
 BENIGN_TUPLES = {
     ("10.0.0.5", 49152, "10.0.0.200", 80, "tcp"),
-    ("10.0.0.6", 49153, "10.0.0.201", 443, "tcp"),
+    ("10.0.0.6", 49153, "10.0.0.201", 80, "tcp"),
 }
 
 #: Fixed timestamps from the canary generator, so a wrong `ts` cannot pass unnoticed.

@@ -40,7 +40,25 @@ python tests/fixtures/make_canary.py benign.pcap
 
 Output is byte-deterministic — fixed timestamps, IP IDs, and sequence numbers — so it can
 be regenerated and byte-compared. 14 packets, two complete TCP flows (handshake, HTTP
-exchange, teardown), RFC 1918 addresses, correct IP and TCP checksums.
+exchange, teardown), **both to port 80**, RFC 1918 addresses, correct IP and TCP checksums.
+
+### Why port 80 matters
+
+Flow 2 used to be the same cleartext HTTP exchange sent to port **443**. pawpatrules sid
+3300303 — "Suspicious HTTP traffic on unusual HTTP port" — fires on that, and it is right
+to: cleartext HTTP on the TLS port is exactly the anomaly it is looking for.
+
+That single alert made Goal 5's gate unpassable. The canary is synthesized so that *zero
+labels is known-correct by construction*; a canary that contains traffic a reasonable rule
+would flag has no such property, and its failure would be ambiguous in the worst way —
+indistinguishable from the specificity regression the gate exists to catch. **The fixture
+was at fault, not the feed.**
+
+So the two flows differ by endpoint and timing, not by port. Anything added here has to
+clear the same bar: not merely benign, but *unremarkable* — traffic no admitted rule could
+reasonably alert on. Port 443 belongs to a capture carrying a real TLS handshake, and those
+are generated at test time (`test_zeek.py::tls_capture`,
+`test_suricata.py::write_tls_capture`) rather than committed.
 
 ## Note on Zeek determinism
 

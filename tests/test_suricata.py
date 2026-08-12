@@ -61,12 +61,17 @@ WRONG_SNAPSHOT_ID = "0123456789abcdef"
 #: Step 4's SID→source attribution file, which step 6 reads instead of re-deriving from `raw/`.
 SID_INDEX = "sid_index.json"
 
-#: The alert timestamp the HTTP rule must carry: ``make_canary.BASE_TS`` + 0.05s. The canary's
-#: first flow runs one packet every 0.01s and the request is its 4th; Suricata raises the alert
-#: on the 6th (``pcap_cnt`` 6), when the stream has been reassembled — i.e. on the packet
-#: Suricata was looking at, not the one carrying the bytes. Asserted as an absolute epoch value
-#: because correlation joins it against Zeek's epoch ``ts`` (spec §9).
+#: The alert timestamps the HTTP rule must carry, one per canary flow: ``make_canary.BASE_TS``
+#: + 0.05s, and the same 10s later. Each flow runs one packet every 0.01s and the request is its
+#: 4th; Suricata raises the alert on the 6th (``pcap_cnt`` 6), when the stream has been
+#: reassembled — i.e. on the packet Suricata was looking at, not the one carrying the bytes.
+#: Asserted as absolute epoch values because correlation joins them against Zeek's epoch ``ts``
+#: (spec §9).
+#:
+#: Two of them because **both** canary flows are cleartext HTTP to port 80. Flow 2 used to go to
+#: 443, which made the fixture itself anomalous — see `make_canary.py`'s `FLOWS`.
 HTTP_ALERT_TS = 1700000000.05
+HTTP_ALERT_TS_2 = 1700000010.05
 
 SEMVER = re.compile(r"\d+\.\d+\.\d+")
 
@@ -451,15 +456,15 @@ def test_the_vendored_config_makes_a_home_net_rule_fire(tmp_path):
     `synthetic.rules` sid 9000005 is written the way the abuse.ch feeds write their C2 rules —
     ``$HOME_NET any -> $EXTERNAL_NET $HTTP_PORTS``. The benign canary is RFC 1918 on both ends,
     so under Suricata's stock config (`EXTERNAL_NET: "!$HOME_NET"`) that rule can match nothing
-    at all. Measured: stock config → 0 alerts, flabel's config → 1. Every abuse.ch label on an
-    internal capture depends on this.
+    at all. Measured: stock config → 0 alerts, flabel's config → 2, one per canary flow. Every
+    abuse.ch label on an internal capture depends on this.
     """
     snapshot = make_snapshot(tmp_path, {"abuse.ch/feodotracker": [HOME_NET_SID]})
 
     detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
     assert info.tool_failures == ()
-    assert [detection.sid for detection in detections] == [HOME_NET_SID], (
+    assert [detection.sid for detection in detections] == [HOME_NET_SID, HOME_NET_SID], (
         "a $HOME_NET -> $EXTERNAL_NET rule did not fire on an internal-to-internal capture, "
         "which is what HOME_NET: any in flabel's own suricata.yaml exists to prevent"
     )
@@ -490,14 +495,18 @@ def test_the_engine_accepts_flabels_config_files_without_complaint(tmp_path):
 
 
 @pytest.mark.requires_tools
-def test_synthetic_rule_yields_exactly_one_detection(tmp_path):
-    """A rule matching the benign canary parses into one fully-populated `Detection`."""
+def test_synthetic_rule_yields_one_fully_populated_detection_per_flow(tmp_path):
+    """A rule matching the benign canary parses into a fully-populated `Detection` per flow.
+
+    Two, not one: both canary flows are cleartext HTTP to port 80, so a port-80 rule fires on
+    each. Returned in eve.json order, which is capture order — flow 1 then flow 2.
+    """
     snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
 
     detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
     assert info.tool_failures == ()
-    assert len(detections) == 1
+    assert len(detections) == 2
     detection = detections[0]
 
     assert detection.source == "et/open"
@@ -522,8 +531,16 @@ def test_synthetic_rule_yields_exactly_one_detection(tmp_path):
         "signature_severity Major",
     )
 
+    # The second flow's detection differs only in endpoint and timing — same rule, same
+    # provenance — which is what makes it a second *label* rather than a duplicate.
+    second = detections[1]
+    assert (second.sid, second.source, second.classtype) == (HTTP_SID, "et/open", "trojan-activity")
+    assert (second.src_ip, second.src_port) == ("10.0.0.6", 49153)
+    assert (second.dst_ip, second.dst_port) == ("10.0.0.201", 80)
+    assert second.ts == pytest.approx(HTTP_ALERT_TS_2)
+
     assert info.snapshot_id == snapshot.name, "the id is the directory name"
-    assert info.alerts_total == 1
+    assert info.alerts_total == 2
     assert info.identify_alerts_suppressed == 0
     assert info.rules_loaded == 1, "only the snapshot's one rule may load — no ambient ruleset"
     assert (info.rules_failed, info.rules_skipped) == (0, 0)
@@ -696,8 +713,8 @@ def test_identify_source_alert_is_suppressed(tmp_path):
 
     assert info.tool_failures == ()
     assert detections == [], "an identify-class source may never produce a label"
-    assert info.alerts_total == 1, "the rule must genuinely have fired for this to prove anything"
-    assert info.identify_alerts_suppressed == 1
+    assert info.alerts_total == 2, "the rule must genuinely have fired for this to prove anything"
+    assert info.identify_alerts_suppressed == 2, "one per canary flow, and none of them a label"
 
 
 @pytest.mark.requires_tools
@@ -717,10 +734,11 @@ def test_suppression_is_per_source_not_per_run(tmp_path):
     detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
     assert info.tool_failures == ()
-    assert [(d.source, d.sid) for d in detections] == [("et/open", HTTP_SID)]
+    assert [(d.source, d.sid) for d in detections] == [("et/open", HTTP_SID)] * 2
     assert info.rules_loaded == 2
-    assert info.alerts_total == 2
-    assert info.identify_alerts_suppressed == 1
+    # Two rules × two canary flows: four alerts, of which the identify source's two are dropped.
+    assert info.alerts_total == 4
+    assert info.identify_alerts_suppressed == 2
     assert len(detections) == info.alerts_total - info.identify_alerts_suppressed
 
 
@@ -759,7 +777,7 @@ def test_attribution_comes_from_the_sid_index_not_from_raw_rule_text(tmp_path):
 
     detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
-    assert [(d.source, d.sid) for d in detections] == [("et/open", HTTP_SID)]
+    assert [(d.source, d.sid) for d in detections] == [("et/open", HTTP_SID)] * 2
     assert info.rules_loaded == 1, "only the admitted rule may load, never stray raw text"
 
 
@@ -1105,7 +1123,7 @@ def test_classtype_does_not_depend_on_the_classification_config(tmp_path):
     detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
     assert info.tool_failures == (), "an unknown classtype only warns; it must not fail the run"
-    assert [detection.classtype for detection in detections] == ["flabel-invented"]
+    assert [detection.classtype for detection in detections] == ["flabel-invented"] * 2
     eve = (tmp_path / "out" / "eve.json").read_text().replace(" ", "")
     assert '"category":""' in eve, (
         "eve.json reported an empty category, which is why classtype is not taken from it"

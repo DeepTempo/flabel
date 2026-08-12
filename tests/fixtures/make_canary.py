@@ -33,9 +33,20 @@ SRC_MAC = b"\x02\x00\x00\x00\x00\x01"
 DST_MAC = b"\x02\x00\x00\x00\x00\x02"
 
 # (client port, server port, client IP, server IP)
+#
+# **Both flows are cleartext HTTP, and both must therefore go to port 80.** Flow 2 used to use
+# port 443, which made the canary's own traffic anomalous: pawpatrules sid 3300303, "Suspicious
+# HTTP traffic on unusual HTTP port", fires on cleartext HTTP to 443 and is entirely right to.
+# A canary whose whole value is that *zero labels is known-correct by construction* cannot
+# contain traffic a reasonable rule would flag — the fixture was at fault, not the feed, and
+# Goal 5's gate ("any label on the benign canary fails the build") could not pass while it was.
+#
+# So the two flows differ by endpoint and timing, not by port. If a future flow needs port 443,
+# it has to carry a real TLS handshake; `test_suricata.py::write_tls_capture` is where that
+# lives, generated at test time rather than committed.
 FLOWS = [
     (49152, 80, "10.0.0.5", "10.0.0.200"),
-    (49153, 443, "10.0.0.6", "10.0.0.201"),
+    (49153, 80, "10.0.0.6", "10.0.0.201"),
 ]
 
 
