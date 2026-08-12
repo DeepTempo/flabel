@@ -629,14 +629,42 @@ was measured against real Zeek output, not inferred:
 | Disagreement | Normalisation | Why |
 | :-- | :-- | :-- |
 | Protocol case | lowercase both sides | Zeek writes `tcp`, Suricata writes `TCP`. One side has to normalise or **no** detection would ever match. |
-| ICMP ports | mirror `icmp_type`/`icmp_code` into the port columns | Suricata omits ports for ICMP; Zeek writes the ICMP type in `id.orig_p` and a counterpart type in `id.resp_p`. Recording `(0, 0)` would make every ICMP detection unmatchable, and ET Open ships plenty of ICMP rules — 3 such alerts in 150 detections is enough to trip §9's 1% gate and fail a good run, with the run block blaming correlation. |
+| ICMP ports | mirror `icmp_type`/`icmp_code` into the port columns | Suricata omits ports for ICMP; Zeek writes the ICMP type in `id.orig_p` and, in `id.resp_p`, either a counterpart type or — for most types — the code (see the residual below). Recording `(0, 0)` would make every ICMP detection unmatchable, and ET Open ships plenty of ICMP rules — 3 such alerts in 150 detections is enough to trip §9's 1% gate and fail a good run, with the run block blaming correlation. |
 | `IPv6-ICMP` | maps to `icmp` | Zeek's `transport_proto` holds only tcp/udp/icmp/unknown_transport, so it writes `icmp` for ICMPv6 too. Lowercasing alone would leave `ipv6-icmp` against `icmp`. The IP version is still readable from the addresses, so nothing is lost. |
 | IPv6 address form | canonicalise (compressed) | Suricata expands (`fd00:0000:...:00a1`), Zeek compresses (`fd00::a1`). Correlation compares strings, so without this every IPv6 detection is uncorrelatable. |
 
-**Residual, owned by step 7:** for an ICMPv6 echo, Zeek writes the counterpart *type* in
-`id.resp_p` (`128, 129`) where mirroring yields `128, 0`. A single alert record does not carry the
-counterpart type, so mirroring is exact for ICMPv4 and one field out for ICMPv6 echo. Closing it
-needs correlation to treat ICMP specially, not a different value here.
+**Residual, owned by step 7 — and wider than this section first said.** A single alert record
+carries only its own packet's type and code, so mirroring produces `(type, code)`. Zeek writes the
+type in `id.orig_p` and, in `id.resp_p`, either the type it *pairs* that type with or, for every
+other type, the code. Mirroring is therefore exact only where a type's counterpart happens to equal
+its code, and one field out everywhere else. Closing it needs correlation to treat ICMP specially —
+matching on the type column and accepting either the code or the counterpart in the responder
+column — not a different value in `suricata.py`.
+
+**Measured on Zeek 8.0.4, exhaustively** — every ICMPv4 type 0–45 and every ICMPv6 type 0–160,
+one packet each at `code 7` so a code can never be mistaken for a counterpart, reading `id.resp_p`
+back from `conn.log`. The sweep is `test_the_icmp_tables_are_what_zeek_actually_writes`, a
+`requires_tools` test, so this table is re-measured against the pinned Zeek on every CI run rather
+than being a fact recorded once and trusted thereafter:
+
+| Family | Types Zeek pairs | Every other type |
+| :-- | :-- | :-- |
+| ICMPv4 | `0↔8`, `9↔10`, `13↔14`, `15↔16`, `17↔18` | writes the code |
+| ICMPv6 | `128↔129`, `130↔131`, `133↔134`, `135↔136`, `139↔140`, `144↔145` | writes the code |
+
+This section previously said mirroring is *"exact for ICMPv4 and one field out for ICMPv6 echo"*.
+Both halves were wrong, and each would have left detections silently uncorrelatable:
+
+- **ICMPv4 is exact for the echo *request* only** — type 8 pairs with 0, which is also its code, so
+  the family looked exact because of a coincidence in the one case anybody checks by hand. An alert
+  on the echo *reply* yields `(0, 0)` against a flow whose responder column holds `8`. Timestamp,
+  information and address-mask exchanges are out by the same field.
+- **ICMPv6 is not only echo.** Neighbour discovery (`135↔136`) pairs identically and appears on
+  essentially every real IPv6 capture, where echo may not. Handling echo alone would have looked
+  like the residual was closed while leaving the ordinary case broken.
+
+The family is selected by the address, not the protocol: Zeek's `transport_proto` writes `icmp` for
+both, so the protocol field cannot distinguish them.
 
 **A partial rule load is a reported loss, not a silent one.** Suricata exits 0 whether it loaded
 every rule or none, so `rules_loaded`, `rules_failed` and `rules_skipped` are read from the eve
