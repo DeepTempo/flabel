@@ -1,0 +1,42 @@
+# flabel test fixture — ET-shaped rules, one per admission branch (docs/spec.md §6).
+#
+# Synthetic. Every sid is in the 2000000 block but none is a real Emerging Threats
+# signature, and no rule is intended to match real traffic. Tests assert on these sids,
+# so do not renumber them; add new cases with new sids instead.
+#
+# Shape copied from the live ET Open 8.0 set: a `metadata:` option carrying comma-separated
+# `key value` pairs, of which only `confidence` and `signature_severity` gate admission.
+
+# --- admitted: confidence High AND signature_severity Major|Critical -----------------------
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST admitted high/major"; flow:established,to_server; http.uri; content:"/flabel-admit-major"; metadata:attack_target Client_Endpoint, created_at 2024_01_01, deployment Perimeter, former_category MALWARE, confidence High, signature_severity Major, updated_at 2024_01_02; classtype:trojan-activity; sid:2000001; rev:2;)
+alert tcp $HOME_NET any -> $EXTERNAL_NET 4444 (msg:"FLABEL TEST admitted high/critical"; flow:established,to_server; content:"flabel-admit-critical"; metadata:attack_target Client_Endpoint, created_at 2024_01_01, deployment Perimeter, confidence High, signature_severity Critical, updated_at 2024_01_02; classtype:command-and-control; sid:2000002; rev:1;)
+
+# --- excluded, low severity: confidence High but severity below Major ----------------------
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST high confidence minor severity"; flow:established,to_server; http.uri; content:"/flabel-minor"; metadata:created_at 2024_01_01, confidence High, signature_severity Minor, updated_at 2024_01_02; classtype:policy-violation; sid:2000003; rev:1;)
+
+# --- excluded, low severity: confidence High and no signature_severity key at all ----------
+# A missing severity key is a severity that does not meet the bar, not a separate counter:
+# spec §6 admits only where BOTH conditions hold.
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST high confidence no severity key"; flow:established,to_server; http.uri; content:"/flabel-no-severity"; metadata:created_at 2024_01_01, confidence High, updated_at 2024_01_02; classtype:misc-activity; sid:2000004; rev:1;)
+
+# --- excluded, low confidence: the key is present but is not High --------------------------
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST low confidence critical severity"; flow:established,to_server; content:"flabel-low-conf"; metadata:created_at 2024_01_01, confidence Low, signature_severity Critical, updated_at 2024_01_02; classtype:trojan-activity; sid:2000005; rev:1;)
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST medium confidence major severity"; flow:established,to_server; content:"flabel-medium-conf"; metadata:created_at 2024_01_01, confidence Medium, signature_severity Major, updated_at 2024_01_02; classtype:trojan-activity; sid:2000006; rev:1;)
+
+# --- excluded, no confidence key: a different population from `confidence Low` (issue #10) --
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST no metadata option"; flow:established,to_server; content:"flabel-no-metadata"; classtype:trojan-activity; sid:2000007; rev:1;)
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST metadata without confidence"; flow:established,to_server; content:"flabel-untagged"; metadata:created_at 2013_05_06, signature_severity Major, updated_at 2019_07_26; classtype:trojan-activity; sid:2000008; rev:4;)
+
+# --- never admitted: a disabled rule, even though its metadata would pass ------------------
+#alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST disabled rule"; flow:established,to_server; content:"flabel-disabled"; metadata:created_at 2024_01_01, confidence High, signature_severity Critical, updated_at 2024_01_02; classtype:trojan-activity; sid:2000009; rev:1;)
+
+# --- fingerprint rules: counted separately, and only when admitted ------------------------
+alert tls any any -> any any (msg:"FLABEL TEST ja3 hash admitted"; ja3.hash; content:"a0e9f5d64349fb13191bc781f81f42e1"; metadata:created_at 2024_01_01, confidence High, signature_severity Major, updated_at 2024_01_02; classtype:trojan-activity; sid:2000010; rev:1;)
+alert tls any any -> any any (msg:"FLABEL TEST ja4 hash admitted"; ja4.hash; content:"t13d1516h2_8daaf6152771_02713d6af862"; metadata:created_at 2024_01_01, confidence High, signature_severity Critical, updated_at 2024_01_02; classtype:trojan-activity; sid:2000011; rev:1;)
+alert tls any any -> any any (msg:"FLABEL TEST ja3 hash excluded"; ja3.hash; content:"b1f0a6e75450fc24202cd892f92f53f2"; metadata:created_at 2024_01_01, confidence Low, signature_severity Critical, updated_at 2024_01_02; classtype:trojan-activity; sid:2000014; rev:1;)
+
+# --- parser edges that must not change a verdict -------------------------------------------
+# Lowercase metadata values: a case change upstream must not silently drop the whole feed.
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST lowercase metadata values"; flow:established,to_server; content:"flabel-lowercase"; metadata:created_at 2024_01_01, confidence high, signature_severity critical, updated_at 2024_01_02; classtype:trojan-activity; sid:2000012; rev:1;)
+# Two `metadata:` options on one rule: Suricata allows it, so the keys are merged.
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST split metadata options"; flow:established,to_server; content:"flabel-split-metadata"; metadata:created_at 2024_01_01, confidence High; metadata:signature_severity Major, updated_at 2024_01_02; classtype:trojan-activity; sid:2000013; rev:1;)
