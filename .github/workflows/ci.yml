@@ -25,6 +25,20 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
+      # spec §3 warns that package data can silently miss the wheel — hatchling honours
+      # .gitignore, which carries broad *.log and zeek/ rules. Tests only prove resolution
+      # from a checkout, which was never the failing mode.
+      - name: Package data reaches the wheel
+        run: |
+          uv build --wheel -o dist
+          python -c "
+          import sys, zipfile, glob
+          wheel = glob.glob('dist/*.whl')[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          missing = [p for p in ['flabel/data/sources.toml'] if p not in names]
+          sys.exit(f'missing from {wheel}: {missing}') if missing else print('package data present')
+          "
+
   test:
     runs-on: ubuntu-latest
     container:

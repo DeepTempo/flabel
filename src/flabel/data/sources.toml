@@ -1,0 +1,113 @@
+# flabel source registry — the ten admitted rule feeds (spec §5).
+#
+# `source_class` decides what a label from this feed *means*, and whether it may label at all.
+# `admission_basis` decides how its rules are selected. Both are validated at load time; see
+# config.py. Overridable with `--sources`.
+#
+# URLs and licences are taken from the OISF suricata-intel-index, which is the authoritative
+# catalogue for these community feeds:
+#   https://github.com/OISF/suricata-intel-index/blob/master/index.yaml
+#
+# Feeds deliberately absent, per spec §5 — do not re-add without revisiting the research:
+#   tgreen/hunting, etnetera/aggressive, ptresearch/attackdetection, ptrules/open,
+#   sslbl/ja3-fingerprints, and every commercial ruleset.
+#
+# sslbl/ja3-fingerprints is excluded even though it is free and available: a computed
+# fingerprint is never a verdict (spec §2.6), and JA3 is trivially forgeable.
+#
+# abuse.ch/sslbl-c2 (sslipblacklist) was removed in step 2 after verification: the OISF index
+# marks it `deprecated: Deprecated by source on 2025-01-03`, and the live artifact is 335 bytes
+# containing a header and "ATTENTION: This list has been deprecated" — zero rules. A source
+# that cannot ever contribute implies coverage it does not deliver, and its zero count would
+# read as "matched nothing this run". Nine live sources remain.
+
+# --- signature feeds: a rule matched traffic content -> the flow is malicious --------------
+
+[[source]]
+name             = "et/open"
+# suricata-8.0 to match the pinned engine (8.0.6). ET compiles per engine version, so the
+# 7.0 set would omit rules using 8.0-era keywords. Spec §5's example URL says 7.0; corrected
+# there in the same change as this file.
+url              = "https://rules.emergingthreats.net/open/suricata-8.0/emerging.rules.tar.gz"
+licence          = "MIT"
+source_class     = "signature"
+# The only feed carrying ET-style metadata, so the only one that can be metadata-filtered.
+admission_basis  = "metadata-filter"
+
+[[source]]
+name             = "stamus/lateral"
+url              = "https://ti.stamus-networks.io/open/stamus-lateral-rules.tar.gz"
+licence          = "GPL-3.0-only"
+source_class     = "signature"
+admission_basis  = "wholesale"
+
+[[source]]
+name             = "malsilo/win-malware"
+# RISK ACCEPTED (Craig, 2026-08-12). The OISF index flags this feed `obsolete: unmaintained`;
+# the live artifact is 1,089 bytes with 14 alert rules across three files, last modified
+# 2022-12-01. Kept deliberately, on the same terms as pawpatrules: the benign canary is its
+# standing review. Note the inconsistency this accepts — docs/research.md §B1 excluded
+# sslbl/ja3-fingerprints partly for being abandoned. Revisit if it produces a false positive.
+url              = "https://malsilo.gitlab.io/feeds/dumps/malsilo.rules.tar.gz"
+licence          = "MIT"
+source_class     = "signature"
+admission_basis  = "wholesale"
+
+[[source]]
+name             = "the-hunters-ledger/open"
+url              = "https://the-hunters-ledger.com/feeds/suricata/hunters-ledger.rules"
+licence          = "CC-BY-4.0"
+source_class     = "signature"
+admission_basis  = "wholesale"
+
+[[source]]
+name             = "pawpatrules"
+url              = "https://rules.pawpatrules.fr/suricata/paw-patrules.tar.gz"
+licence          = "CC-BY-SA-4.0"
+source_class     = "signature"
+# Admitted wholesale with its false-positive risk accepted; the benign canary is its standing
+# review and runs on every build (docs/prd.md §6.3).
+admission_basis  = "wholesale"
+
+# --- ioc-dest: a rule matched a known-bad endpoint -> the flow is malicious ----------------
+
+[[source]]
+name             = "abuse.ch/feodotracker"
+url              = "https://feodotracker.abuse.ch/downloads/feodotracker.tar.gz"
+licence          = "CC0-1.0"
+source_class     = "ioc-dest"
+admission_basis  = "wholesale"
+
+[[source]]
+name             = "abuse.ch/sslbl-blacklist"
+# Renamed from `sslbl/ssl-fp-blacklist`, which the OISF index marks deprecated in favour of
+# this name (same URL). Changed in step 2, before any label carried the stale alias.
+# TLS certificate fingerprints of known C2 — an observed certificate, not a computed
+# client fingerprint, which is why this is admitted where ja3-fingerprints is not.
+url              = "https://sslbl.abuse.ch/blacklist/sslblacklist_tls_cert.tar.gz"
+licence          = "CC0-1.0"
+source_class     = "ioc-dest"
+admission_basis  = "wholesale"
+
+# --- ioc-name: a rule matched a looked-up name -> the flow REFERENCED an indicator ---------
+
+[[source]]
+name             = "abuse.ch/urlhaus"
+# Labels from this feed carry label_basis = "indicator-reference", not "direct": a matched
+# URL or host means the flow referred to the indicator, not that the traffic itself was
+# observed to be malicious.
+url              = "https://urlhaus.abuse.ch/downloads/urlhaus_suricata.tar.gz"
+licence          = "CC0-1.0"
+source_class     = "ioc-name"
+admission_basis  = "wholesale"
+
+# --- identify: describes benign software -> may NEVER label --------------------------------
+
+[[source]]
+name             = "oisf/trafficid"
+# Loaded so its detections can be counted and suppressed (counts.identify_alerts_suppressed),
+# never so they can label. may_label is False for this class, enforced in code and in a test.
+url              = "https://openinfosecfoundation.org/rules/trafficid/trafficid.rules"
+licence          = "MIT"
+source_class     = "identify"
+admission_basis  = "wholesale"

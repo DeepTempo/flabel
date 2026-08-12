@@ -79,10 +79,16 @@ src/flabel/
   provenance.py     assemble the run block (pure)
   notice.py         emit NOTICE attribution (pure)
   cli.py            argument parsing, orchestration, exit codes
-data/
-  sources.toml      the source registry (shipped with the package)
-  json-logs.zeek    Zeek script adding JSON filters
+  data/
+    sources.toml    the source registry (shipped with the package)
+    json-logs.zeek  Zeek script adding JSON filters
 ```
+
+**Package data lives inside the package**, not at the repo root. Root-level `data/` can only
+reach a wheel via a hatch `force-include`, which is absent from an editable install — the mode
+`uv sync` uses — so `importlib.resources` would resolve in a built wheel and fail in the tests.
+Under `src/flabel/data/` it resolves identically from a checkout, an editable install and a
+wheel. Corrected in step 2; the original diagram placed `data/` alongside `src/`.
 
 **`models.py` is a refinement of the approved layout.** Every module codes against shared dataclasses rather than each owning its own, which is what allows steps 4–7 to be built in parallel without importing one another.
 
@@ -191,6 +197,25 @@ class UnmatchedDetection:
     reason: Literal["no_flow_match", "ambiguous_flow_match"]
 ```
 
+**Added in step 2**, because §8 and §9 name them as return types but this section did not define
+them: `NormalizedCapture`, `ZeekRunInfo`, `SuricataRunInfo`, `CorrelationResult`, and
+`ToolFailure` (carried by the two RunInfo types). Fields are derived from the run block in §10.
+They live here rather than in steps 3/5/6/7 so those steps only *read* `models.py`; a step that
+has to create a shared type collides with its siblings in the file meant to prevent that.
+
+**Three fields added in step 2**, each with its reason in the code:
+
+| Field | Why |
+| :-- | :-- |
+| `Detection.metadata` | §8 says to parse `alert.metadata`; there was nowhere to put it. Issue #10 is answered from it. |
+| `SourceAdmission.url` | Otherwise a label's origin traces only to a source *name* in a TOML file that can change between runs. |
+| `SourceAdmission.rules_excluded_commented` | ET Open 8.0 ships 19,479 `#alert` lines against 51,778 active rules. Without this counter §6's `fetched == admitted + sum(excluded)` identity cannot describe the feed. `rules_fetched` therefore counts active `alert` lines only. |
+
+**The `Literal` types are enforced at runtime**, not merely annotated: `Label(verdict="benign")`
+would otherwise construct happily, and §13's first never-do is asserting a flow is benign. A
+`Label` also rejects empty `sources` (a label with no assertion has no provenance) and a
+`best_tier` disagreeing with `min(sources.tier)`.
+
 ### `labels.json` document
 
 ```json
@@ -213,14 +238,14 @@ class UnmatchedDetection:
 ```toml
 [[source]]
 name             = "et/open"
-url              = "https://rules.emergingthreats.net/open/suricata-7.0/emerging.rules.tar.gz"
+url              = "https://rules.emergingthreats.net/open/suricata-8.0/emerging.rules.tar.gz"
 licence          = "MIT"
 source_class     = "signature"
 admission_basis  = "metadata-filter"
 
 [[source]]
 name             = "abuse.ch/feodotracker"
-url              = "https://sslbl.abuse.ch/blacklist/..."
+url              = "https://feodotracker.abuse.ch/downloads/feodotracker.tar.gz"
 licence          = "CC0-1.0"
 source_class     = "ioc-dest"        # matches a C2 destination -> the flow IS malicious
 admission_basis  = "wholesale"
@@ -244,18 +269,33 @@ admission_basis  = "wholesale"
 | :-- | :-- | :-- | :-- | :-: |
 | `et/open` | MIT | `signature` | metadata-filter | direct |
 | `stamus/lateral` | GPL-3.0-only | `signature` | wholesale | direct |
-| `malsilo/win-malware` | MIT | `signature` | wholesale | direct |
+| `malsilo/win-malware` | MIT | `signature` | wholesale | direct (unmaintained — risk accepted) |
 | `the-hunters-ledger/open` | CC-BY-4.0 | `signature` | wholesale | direct |
 | `pawpatrules` | CC-BY-SA-4.0 | `signature` | wholesale | direct |
 | `abuse.ch/feodotracker` | CC0-1.0 | `ioc-dest` | wholesale | direct |
-| `abuse.ch/sslbl-c2` | CC0-1.0 | `ioc-dest` | wholesale | direct |
-| `sslbl/ssl-fp-blacklist` | CC0-1.0 | `ioc-dest` | wholesale | direct |
+| `abuse.ch/sslbl-blacklist` | CC0-1.0 | `ioc-dest` | wholesale | direct |
 | `abuse.ch/urlhaus` | CC0-1.0 | `ioc-name` | wholesale | **indicator-reference** |
 | `oisf/trafficid` | MIT | `identify` | wholesale | **never** |
 
 Excluded entirely and absent from the registry: `tgreen/hunting`, `etnetera/aggressive`, `ptresearch/attackdetection`, `ptrules/open`, `sslbl/ja3-fingerprints`, and all commercial sources.
 
-Validation on load: unknown `source_class` or `admission_basis` is a hard failure; `metadata-filter` is permitted only where ET-style metadata exists.
+**`sslbl/ssl-fp-blacklist` was renamed to `abuse.ch/sslbl-blacklist` in step 2.** The OISF index marks the old name `deprecated: Renamed to abuse.ch/sslbl-blacklist` (same URL). Since the source name is recorded on every label as provenance, the canonical name was adopted before any label could carry the stale alias. The exclusion list above likewise cites `sslbl/ja3-fingerprints` by its old name; upstream now calls it `abuse.ch/sslbl-ja3`, and both are excluded.
+
+**`malsilo/win-malware` is upstream-unmaintained, and that risk is accepted** (Craig, 2026-08-12). The OISF index flags it `obsolete: unmaintained`; the live artifact is 1,089 bytes with 14 alert rules across three files, last modified 2022-12-01. Kept on the same terms as `pawpatrules`: no per-rule gate, with the benign canary as its standing review. This knowingly accepts an inconsistency — `docs/research.md` §B1 excluded `sslbl/ja3-fingerprints` partly for being abandoned. Revisit if it ever produces a false positive.
+
+**`abuse.ch/sslbl-c2` was removed in step 2** after verification against the live feed, leaving nine sources. The OISF index marks it `deprecated: Deprecated by source on 2025-01-03`, and the artifact is 335 bytes: a header plus "ATTENTION: This list has been deprecated". It ships zero rules. Shipping it would imply coverage that cannot exist, and its zero count would be indistinguishable from a feed that matched nothing that run.
+
+Validation on load, as originally specified: unknown `source_class` or `admission_basis` is a hard failure; `metadata-filter` is permitted only where ET-style metadata exists.
+
+**The following were added in step 2 as a design decision, not carried over from an earlier draft** — recorded here so the code and this document agree, but they are the implementer's judgment rather than a pre-existing requirement. Reasoning: a registry that loads with a setting silently ignored is worse than one that refuses to load, because it reads as working.
+
+- An unknown or misspelled field, a missing required field, a duplicate name (compared case-insensitively, since step 4 writes `raw/<source>.rules`), an empty registry, a non-boolean `enabled`, and a non-string or empty `name`/`url`/`licence`.
+- **A non-HTTPS `url`.** Rules are the trust root of every label: over `http://` they are forgeable in transit, and `file://` would make an arbitrary local file into label evidence.
+- **A `name` outside `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)?$`.** The name becomes a path component in a snapshot (§7), so `--sources` with `name = "../../.ssh/authorized_keys"` would otherwise write fetched rule text outside the snapshot directory.
+
+A `licence` of `"unstated"` remains legal per §4, but no shipped source uses it and a test asserts so.
+
+The ET Open URL pins `suricata-8.0` to match the pinned engine (8.0.6). ET compiles per engine version, so the 7.0 set omits rules using 8.0-era keywords; this originally read `suricata-7.0`, corrected in step 2.
 
 ---
 
