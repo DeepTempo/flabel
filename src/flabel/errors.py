@@ -7,9 +7,15 @@ Note what is deliberately *not* here: a distinct code for partial input. A trunc
 still produces labels and still exits 0, with `run.input.input_status` reporting the
 truncation. Anything else would make every ordinary `set -e` script treat a successful run
 over a slightly-short capture as a failure.
+
+`models.py` is the one package import this module makes, and it cannot introduce a cycle:
+models is the base of the dependency graph and imports nothing itself. `ToolError` needs it
+because a tool failure is only reportable if the structured record travels with the exception.
 """
 
 from __future__ import annotations
+
+from flabel.models import ToolFailure
 
 #: Labels were written. Covers complete and partial input alike.
 EXIT_SUCCESS = 0
@@ -59,8 +65,32 @@ class ToolError(FlabelError):
     """Zeek, Suricata or editcap failed, exited non-zero, or was killed.
 
     The failure is recorded in `tool_failures[]` as well as raised, so the run reports what
-    was lost rather than merely dying.
+    was lost rather than merely dying — which means the structured record has to travel *with*
+    the exception. Two attributes carry it, and both are always present:
+
+    * `failures` — the `ToolFailure` records for the run block's `tool_failures[]`. A tuple
+      rather than a single record because one stage can lose more than one tool.
+    * `run_info` — the stage's own run info (`ZeekRunInfo`, `SuricataRunInfo`, …) when the
+      stage got far enough to build one, so a caller that catches the failure can still report
+      the version, flags and log directory of the pass that failed. Typed `object` on purpose:
+      `errors.py` sits below the stages and must not know which of them raised.
+
+    This is one convention, not three. Steps 3, 5 and 6 each invented their own — a
+    `ConversionError` subclass carrying `.failure`, a bare `error.run_info = info` assignment
+    after construction, and a plain message — because `errors.py` was read-only while they were
+    built in parallel. A caller cannot write one `except ToolError` clause against three
+    shapes, so the shape lives here.
     """
+
+    def __init__(
+        self,
+        message: str,
+        failures: tuple[ToolFailure, ...] = (),
+        run_info: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failures = failures
+        self.run_info = run_info
 
 
 class UsageError(FlabelError):

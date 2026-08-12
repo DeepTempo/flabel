@@ -144,19 +144,20 @@ SELECTED_NAME = "selected.pcapng"
 CHUNK_BYTES = 1024 * 1024
 
 
-class ConversionError(ToolError):
-    """`editcap` or `tshark` failed, carrying the structured record for the run block.
+def _conversion_error(failure: ToolFailure) -> ToolError:
+    """`editcap` or `tshark` failed — a hard failure carrying the record for the run block.
 
-    Spec §11 wants a tool failure in `tool_failures[]` *and* a hard failure. `ToolError` alone
-    carries only a message, and `NormalizedCapture` has no field for a failure because a
-    normalize that fails returns nothing at all — so the record travels on the exception.
-    `cli.py` (step 9) reads `.failure` to populate the run block; anything catching plain
-    `ToolError` still gets the right exit code.
+    Spec §11 wants a tool failure in `tool_failures[]` *and* a hard failure. A `normalize` that
+    fails returns nothing at all, so the record has to travel on the exception; `ToolError`'s
+    `failures` tuple is where it travels. The message is the failure's own, so an operator who
+    only sees the exception still sees which tool did what.
+
+    This used to be a local `ConversionError(ToolError)` subclass with a singular `.failure`
+    attribute, invented here because `errors.py` was read-only during the parallel build. A
+    caller cannot write one `except ToolError` clause against three stages' three conventions,
+    so the convention moved into `errors.py` and the subclass is gone.
     """
-
-    def __init__(self, failure: ToolFailure) -> None:
-        super().__init__(failure.message)
-        self.failure = failure
+    return ToolError(failure.message, failures=(failure,))
 
 
 @dataclass(frozen=True)
@@ -450,7 +451,7 @@ def _editcap_encapsulation(link_type: int, subject: str) -> str:
 
 
 def _run_tool(tool: str, argv: list[str]) -> None:
-    """Invoke a conversion tool, turning any failure into `ConversionError`.
+    """Invoke a conversion tool, turning any failure into a `ToolError`.
 
     A missing binary and a non-zero exit are the same event to a caller — the conversion did
     not happen — so both arrive as one exception type, with `exit_code` (`None` for "could not
@@ -459,7 +460,7 @@ def _run_tool(tool: str, argv: list[str]) -> None:
     try:
         result = subprocess.run(argv, capture_output=True, text=True, check=False)
     except OSError as error:
-        raise ConversionError(
+        raise _conversion_error(
             ToolFailure(
                 tool=tool,
                 argv=tuple(argv),
@@ -469,7 +470,7 @@ def _run_tool(tool: str, argv: list[str]) -> None:
         ) from error
 
     if result.returncode != 0:
-        raise ConversionError(
+        raise _conversion_error(
             ToolFailure(
                 tool=tool,
                 argv=tuple(argv),
@@ -495,7 +496,7 @@ def _verify_converted(path: Path, expected_packets: int, tool: str, argv: list[s
     try:
         produced = _walk_pcap(path, f"the pcap {tool} produced")
     except CaptureError as error:
-        raise ConversionError(
+        raise _conversion_error(
             ToolFailure(
                 tool=tool,
                 argv=tuple(argv),
@@ -505,7 +506,7 @@ def _verify_converted(path: Path, expected_packets: int, tool: str, argv: list[s
         ) from error
 
     if produced.packets != expected_packets or produced.truncated_at_offset is not None:
-        raise ConversionError(
+        raise _conversion_error(
             ToolFailure(
                 tool=tool,
                 argv=tuple(argv),
@@ -627,10 +628,38 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
             discarded_link_types=discarded_link_types,
             discarded_packets=discarded_packets,
             normalization=tuple(normalization),
+            warnings=_partial_input_warnings(walked, discarded_link_types, discarded_packets),
         )
     except BaseException:
         _discard_output(workdir, created_dirs, intermediates)
         raise
+
+
+def _partial_input_warnings(
+    walked: _Walk, discarded_link_types: tuple[str, ...], discarded_packets: int
+) -> tuple[str, ...]:
+    """The two ways this stage succeeds while losing something, said in sentences.
+
+    Both are already counted — `truncated_at_offset`, `discarded_link_types`,
+    `discarded_packets` — and both still exit 0 (spec §12). The counters are for a consumer
+    reading `run.input`; these are for the reader who sees only `run.warnings[]`, which spec
+    §10 puts in the same document. Nothing here is a new fact, and nothing here is *only*
+    here: a warning that were the sole record of a loss would be a loss reported in prose.
+    """
+    warnings: list[str] = []
+    if walked.truncated_at_offset is not None:
+        warnings.append(
+            f"capture is truncated at offset {walked.truncated_at_offset}: the incomplete final "
+            f"record was dropped and {walked.packets} complete records were read. Input status "
+            f"is partial; labels describe what was readable."
+        )
+    if discarded_packets:
+        warnings.append(
+            f"capture mixes link types, which a pcap cannot express: {discarded_packets} "
+            f"packet(s) of link type(s) {', '.join(discarded_link_types)} were discarded and "
+            f"nothing in them was analysed. Input status is partial."
+        )
+    return tuple(warnings)
 
 
 def _decompress(capture: Path, destination: Path) -> None:

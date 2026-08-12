@@ -23,12 +23,15 @@ from flabel.models import (
     CorrelationResult,
     Detection,
     Flow,
+    Ja4Status,
     Label,
     NormalizedCapture,
     SourceClass,
     SourceEntry,
     SourceSpec,
+    SuricataRunInfo,
     UnmatchedDetection,
+    ZeekRunInfo,
 )
 
 #: Derived from the type, not restated. A hardcoded list would keep passing while silently
@@ -273,3 +276,83 @@ def test_unmatched_detection_records_why_it_could_not_be_placed():
 
     assert unmatched.reason == "no_flow_match"
     assert unmatched.detection.sid == 2000001
+
+
+# --- the stage run infos --------------------------------------------------------------------
+
+
+def test_ja4_status_is_a_status_and_ja4_package_version_is_a_version():
+    """Two fields because they answer two questions, and one used to answer both.
+
+    `zeek.py` stored `absent:not-installed` in `ja4_package_version` while `models.py` was
+    shared by three parallel steps. Anything printing that field printed nonsense, so the status
+    now has its own typed field and the version field holds a version or nothing.
+    """
+    info = ZeekRunInfo(
+        version="8.0.4",
+        flags=("-C", "-D"),
+        log_dir=pathlib.Path("/run/zeek"),
+        ja4_status="not-installed",
+    )
+
+    assert info.ja4_status == "not-installed"
+    assert info.ja4_package_version is None
+    assert info.warnings == ()
+
+
+@pytest.mark.parametrize("status", get_args(Ja4Status))
+def test_every_ja4_status_is_accepted(status):
+    """Three values, and all three reachable: `probe-failed` is a defect worth distinguishing."""
+    info = ZeekRunInfo(
+        version="8.0.4", flags=("-D",), log_dir=pathlib.Path("/run/zeek"), ja4_status=status
+    )
+    assert info.ja4_status == status
+
+
+def test_an_unknown_ja4_status_is_rejected():
+    """A Literal that reaches the run block is enforced, like every other one here."""
+    with pytest.raises(ValueError, match="ja4_status"):
+        ZeekRunInfo(
+            version="8.0.4",
+            flags=("-D",),
+            log_dir=pathlib.Path("/run/zeek"),
+            ja4_status="maybe",
+        )
+
+
+def test_no_ja4_status_at_all_is_allowed():
+    """None means nothing probed it — distinct from `probe-failed`, which means something did."""
+    info = ZeekRunInfo(version="8.0.4", flags=("-D",), log_dir=pathlib.Path("/run/zeek"))
+    assert info.ja4_status is None
+
+
+def test_the_suricata_run_info_counts_rules_the_engine_rejected():
+    """A rule that never loaded never examined the capture, so the number is not optional.
+
+    Defaulting to zero rather than None on purpose: these come off one line of Suricata's own
+    output alongside the loaded count, so a run that has a loaded count has all three.
+    """
+    info = SuricataRunInfo(
+        version="8.0.6",
+        snapshot_id="deadbeef",
+        rules_loaded=85_542,
+        alerts_total=0,
+        rules_failed=3,
+        rules_skipped=1,
+        config_sha256="0" * 64,
+        warnings=("coverage unverified",),
+    )
+
+    assert (info.rules_failed, info.rules_skipped) == (3, 1)
+    assert info.config_sha256 == "0" * 64
+    assert info.warnings == ("coverage unverified",)
+    assert info.tool_failures == ()
+
+
+def test_the_suricata_run_info_defaults_the_new_fields():
+    """Every field added for the run block has a default, so no existing call site breaks."""
+    info = SuricataRunInfo(version="8.0.6", snapshot_id="x", rules_loaded=1, alerts_total=0)
+
+    assert (info.rules_failed, info.rules_skipped) == (0, 0)
+    assert info.config_sha256 is None
+    assert info.warnings == ()

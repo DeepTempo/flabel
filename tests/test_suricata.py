@@ -524,6 +524,11 @@ def test_synthetic_rule_yields_exactly_one_detection(tmp_path):
     assert info.alerts_total == 1
     assert info.identify_alerts_suppressed == 0
     assert info.rules_loaded == 1, "only the snapshot's one rule may load — no ambient ruleset"
+    assert (info.rules_failed, info.rules_skipped) == (0, 0)
+    assert info.warnings == (), "a ruleset that loaded in full has nothing to warn about"
+    # The configuration is part of what makes a run reproducible: `HOME_NET` decides whether a
+    # whole class of rule can fire at all, so the run block records which config was in force.
+    assert info.config_sha256 == suricata.config_sha256()
     assert SEMVER.fullmatch(info.version), f"unparsed version {info.version!r}"
 
     # eve.json is a mixed stream — flow, http, fileinfo and stats records share it with
@@ -848,9 +853,11 @@ def test_a_partial_rule_load_is_a_failure_not_a_thinner_run(tmp_path):
     this is the ordinary case, not the exotic one.
 
     Hard failure by decision (Craig, 2026-08-12: record, warn above zero, fail above a
-    threshold). The threshold half needs `rules_failed` on `SuricataRunInfo`, which does not
-    exist yet, so for now any shortfall fails — the conservative half. **This will fail real runs
-    until step 4 stops admitting rules this engine cannot load**, which is the intended alarm.
+    threshold). Recording now happens — `rules_failed` and `rules_skipped` are on
+    `SuricataRunInfo` — and the failure stays unconditional, because a threshold is a number of
+    labels one is willing to lose in silence and nobody has justified one. **This fails a real
+    run whose feeds contain a rule the engine rejects**, which is the intended alarm; the fix is
+    in admission, not here.
     """
     snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID, UNLOADABLE_SID]})
 
@@ -878,6 +885,45 @@ def test_a_run_whose_rule_count_cannot_be_determined_fails(tmp_path):
 
     agreed = suricata._check_ruleset_loaded((3, 0, 0), expected=3, argv=["suricata"], exit_code=0)
     assert agreed is None, "a ruleset that loaded in full is not a failure"
+
+
+def test_rejected_rules_alongside_a_reconciling_load_are_a_warning():
+    """The engine says it loaded everything *and* that it rejected rules. Both cannot be whole.
+
+    `_check_ruleset_loaded` has already failed the run for any shortfall, so this is the one
+    remaining shape: loaded matches the snapshot, yet `failed` or `skipped` is non-zero. Not
+    fatal — every admitted rule is accounted for by the count that reconciles — but not silent
+    either (spec §2.5), because the run's rule coverage is then unverified.
+
+    Tested directly because no engine produces the contradiction on demand, and the alternative
+    to testing it here is not testing it.
+    """
+    assert suricata._load_warnings(0, 0) == ()
+
+    (warning,) = suricata._load_warnings(2, 1)
+    assert "2 rules failed" in warning and "1 rules skipped" in warning
+    assert "unverified" in warning
+
+    assert suricata._load_warnings(0, 4) != (), "skipped alone is still a contradiction"
+
+
+def test_a_failed_run_still_reports_the_config_it_attempted(tmp_path, monkeypatch):
+    """A failure is only diagnosable against the configuration that produced it.
+
+    `HOME_NET` and the eve output selection decide what *could* have fired, so a run that dies
+    without saying which config was in force leaves the reader unable to tell a tool fault from
+    a configuration that made the rules inert. Injected through the environment — an empty PATH,
+    so the real binary is genuinely absent (spec §11's fault injection).
+    """
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+
+    detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+    assert detections == []
+    assert len(info.tool_failures) == 1
+    assert info.config_sha256 == suricata.config_sha256()
+    assert info.snapshot_id == snapshot.name, "and which ruleset it attempted"
 
 
 # --- eve.json parsing, unit-level -----------------------------------------------------------
