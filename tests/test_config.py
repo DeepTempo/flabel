@@ -24,15 +24,60 @@ from flabel.errors import ConfigError
 SourceRow = namedtuple("SourceRow", "licence source_class admission_basis url")
 
 AUTHORITATIVE = {
-    "et/open": SourceRow("MIT", "signature", "metadata-filter", "https://rules.emergingthreats.net/open/suricata-8.0/emerging.rules.tar.gz"),
-    "stamus/lateral": SourceRow("GPL-3.0-only", "signature", "wholesale", "https://ti.stamus-networks.io/open/stamus-lateral-rules.tar.gz"),
-    "malsilo/win-malware": SourceRow("MIT", "signature", "wholesale", "https://malsilo.gitlab.io/feeds/dumps/malsilo.rules.tar.gz"),
-    "the-hunters-ledger/open": SourceRow("CC-BY-4.0", "signature", "wholesale", "https://the-hunters-ledger.com/feeds/suricata/hunters-ledger.rules"),
-    "pawpatrules": SourceRow("CC-BY-SA-4.0", "signature", "wholesale", "https://rules.pawpatrules.fr/suricata/paw-patrules.tar.gz"),
-    "abuse.ch/feodotracker": SourceRow("CC0-1.0", "ioc-dest", "wholesale", "https://feodotracker.abuse.ch/downloads/feodotracker.tar.gz"),
-    "abuse.ch/sslbl-blacklist": SourceRow("CC0-1.0", "ioc-dest", "wholesale", "https://sslbl.abuse.ch/blacklist/sslblacklist_tls_cert.tar.gz"),
-    "abuse.ch/urlhaus": SourceRow("CC0-1.0", "ioc-name", "wholesale", "https://urlhaus.abuse.ch/downloads/urlhaus_suricata.tar.gz"),
-    "oisf/trafficid": SourceRow("MIT", "identify", "wholesale", "https://openinfosecfoundation.org/rules/trafficid/trafficid.rules"),
+    "et/open": SourceRow(
+        "MIT",
+        "signature",
+        "metadata-filter",
+        "https://rules.emergingthreats.net/open/suricata-8.0/emerging.rules.tar.gz",
+    ),
+    "stamus/lateral": SourceRow(
+        "GPL-3.0-only",
+        "signature",
+        "wholesale",
+        "https://ti.stamus-networks.io/open/stamus-lateral-rules.tar.gz",
+    ),
+    "malsilo/win-malware": SourceRow(
+        "MIT",
+        "signature",
+        "wholesale",
+        "https://malsilo.gitlab.io/feeds/dumps/malsilo.rules.tar.gz",
+    ),
+    "the-hunters-ledger/open": SourceRow(
+        "CC-BY-4.0",
+        "signature",
+        "wholesale",
+        "https://the-hunters-ledger.com/feeds/suricata/hunters-ledger.rules",
+    ),
+    "pawpatrules": SourceRow(
+        "CC-BY-SA-4.0",
+        "signature",
+        "wholesale",
+        "https://rules.pawpatrules.fr/suricata/paw-patrules.tar.gz",
+    ),
+    "abuse.ch/feodotracker": SourceRow(
+        "CC0-1.0",
+        "ioc-dest",
+        "wholesale",
+        "https://feodotracker.abuse.ch/downloads/feodotracker.tar.gz",
+    ),
+    "abuse.ch/sslbl-blacklist": SourceRow(
+        "CC0-1.0",
+        "ioc-dest",
+        "wholesale",
+        "https://sslbl.abuse.ch/blacklist/sslblacklist_tls_cert.tar.gz",
+    ),
+    "abuse.ch/urlhaus": SourceRow(
+        "CC0-1.0",
+        "ioc-name",
+        "wholesale",
+        "https://urlhaus.abuse.ch/downloads/urlhaus_suricata.tar.gz",
+    ),
+    "oisf/trafficid": SourceRow(
+        "MIT",
+        "identify",
+        "wholesale",
+        "https://openinfosecfoundation.org/rules/trafficid/trafficid.rules",
+    ),
 }
 
 #: Spec §5: "Excluded entirely and absent from the registry".
