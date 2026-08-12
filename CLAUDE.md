@@ -39,6 +39,11 @@ managing content-addressed ruleset snapshots. Full contracts in `docs/spec.md` �
   reproducibility is impossible. Step 5 has a regression test that fails if it's dropped.
 - Config via environment, never hardcoded. Copy `.env.example` → `.env` (gitignored) for the GCP
   project ID and device endpoints; refer to them as `${GCP_PROJECT}` etc. in committed files.
+- **`docs/spec.md` is load-bearing for the tests.** Step 8's tests parse it at run time: the run
+  block's key set must equal §10's literal, and every §11 loss-condition field must resolve in the
+  output. Editing those sections can fail the build — which is the point, since the spec cannot
+  gain a row the code ignores — but it means the spec is not inert prose. Run the tests after
+  editing it.
 
 ## Guardrails
 - **Label trustworthiness is the top quality bar.** Every verdict carries its source and provenance;
