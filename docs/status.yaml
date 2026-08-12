@@ -5,7 +5,7 @@ created: "2026-08-11"
 github_repo: "DeepTempo/flabel"
 notion_url: "https://app.notion.com/p/3b92a84a5230812aa64aef638e389725"
 prd_gdoc_url: "https://docs.google.com/document/d/1WwKukQ71L6JQWkSpKvoR4lgwB96w3x1WHAHzZ30ul2E/edit"   # v0.2; supersedes v0.1 doc 1q_muS6Am... (delete manually — Drive MCP has no delete)
-current_stage: plan
+current_stage: scaffold
 # NOTE: issue numbers are not in stage order. Two creates hit a transient TLS
 # error and were retried, and GitHub never reuses issue numbers. This mapping is
 # authoritative — trust it over the numeric order in the GitHub issue list.
@@ -13,9 +13,9 @@ stages:
   research:   { status: completed, issue: 1, artifact: docs/research.md, completed: "2026-08-11" }
   prd:        { status: completed, issue: 2, artifact: docs/prd.md, completed: "2026-08-11" }
   eng_review: { status: completed, issue: 6, artifact: docs/eng-review.md, completed: "2026-08-11" }
-  plan:       { status: pending, issue: 3, artifact: PLAN.md,            completed: null }
+  plan:       { status: completed, issue: 3, artifact: PLAN.md, completed: "2026-08-11" }
   scaffold:   { status: pending, issue: 4, artifact: .github/workflows/ci.yml, completed: null }
-  build:      { status: pending, issue: 7, artifact: null, completed: null, steps_done: 0, steps_total: 0 }
+  build:      { status: pending, issue: 7, artifact: null, completed: null, steps_done: 0, steps_total: 10 }
   verify:     { status: pending, issue: 5, artifact: null, completed: null }
 log:
   - "2026-08-11 init — repo scaffolded, 7 stage issues filed, Notion row created"
@@ -23,3 +23,4 @@ log:
   - "2026-08-11 stage(research) completed — recommends Suricata over Snort, replay only for PANW, and JA4-as-enrichment instead of JA3/JA4 labelling"
   - "2026-08-11 stage(prd) completed — labels.json schema settled (one entry per flow, sources[], Zeek uid join, malicious-only); timestamped run dirs; 13 user stories"
   - "2026-08-11 stage(eng-review) completed — 3 Critical / 9 High findings; PRD v0.4 splits delivery: Phase 1 = Tier 2 only, Tier 1 to Phase 2; NGFW default stubbed, --offline retained"
+  - "2026-08-11 stage(plan) completed — docs/spec.md + PLAN.md; 10 Phase 1 steps (#15-#24), parallel groups {3,4,5,6} and {7,8}; toolchain CI is step 1 because tests invoke Zeek/Suricata for real"
