@@ -728,6 +728,13 @@ Then consolidate: one `Label` per flow, `sources` sorted, `best_tier = min(tier)
 
 **Gate:** zero unmatched is silent; any unmatched warns; unmatched / total detections above `threshold` (default `0.01`) fails the run. Phase 2 configures its own, looser threshold rather than relaxing this default.
 
+**Failing raises `CorrelationError`, carrying the `CorrelationResult`.** The gate fires *because*
+detections went unplaced, so the `UnmatchedDetection` records — each with the reason it could not
+be matched — are the whole content of the failure, and a bare message would discard them at the
+moment they became the point. §11 requires them reported, and §10's `run.json` is where they go on
+a failed run. Same convention as `ToolError` carrying `failures` and `run_info` (§4), so a caller
+writes one shape of `except` clause across the pipeline rather than one per stage.
+
 ---
 
 ## 10. Canonical output — `labels.py`
