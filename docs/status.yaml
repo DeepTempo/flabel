@@ -8,11 +8,14 @@ prd_gdoc_url: "https://docs.google.com/document/d/1WwKukQ71L6JQWkSpKvoR4lgwB96w3
 # STALE: the Doc above is PRD v0.2; docs/prd.md is v0.4. Regenerate it (Drive MCP cannot edit in
 # place, so it means creating a new Doc and updating this URL). Also: the superseded v0.1 Doc
 # 1q_muS6AmCuvcNva4C1WtRE3_KXArJPxnapttsU6UQIE needs deleting by hand — no delete tool exists.
-current_stage: scaffold
-next_action: "Merge PR #25, then run /project:build — it does the scaffold check first, then Step 1 (#15, toolchain+CI), which blocks every other step."
+current_stage: build
+next_action: "Run /project:build for Step 2 (#16, models/errors/config), which unblocks the parallel group {3,4,5,6}."
 blocked_on:
   - "Malicious canary capture must be sourced (origin + licence recorded) — needed by Step 10 (#24) only; steps 1-9 are unblocked."
   - "PRD Q1/Q2/Q10: stakeholders, target release, success-metric review dates. Left TBD deliberately, not invented."
+known_gaps:
+  - "No LICENSE file. Deliberate (Craig's call, 2026-08-12) while JA4+ licensing is with Legal — the repo is public but unlicensed. Not a scaffold defect; do not re-flag."
+  - "README §Status and §Output layout are stale: they say 'Pre-research', call labels.json 'unsettled', and describe replay-based detection, which is Phase 2. Its Develop section is current."
 # NOTE: issue numbers are not in stage order. Two creates hit a transient TLS
 # error and were retried, and GitHub never reuses issue numbers. This mapping is
 # authoritative — trust it over the numeric order in the GitHub issue list.
@@ -21,8 +24,8 @@ stages:
   prd:        { status: completed, issue: 2, artifact: docs/prd.md, completed: "2026-08-11" }
   eng_review: { status: completed, issue: 6, artifact: docs/eng-review.md, completed: "2026-08-11" }
   plan:       { status: completed, issue: 3, artifact: PLAN.md, completed: "2026-08-11" }
-  scaffold:   { status: pending, issue: 4, artifact: .github/workflows/ci.yml, completed: null }
-  build:      { status: pending, issue: 7, artifact: null, completed: null, steps_done: 0, steps_total: 10 }
+  scaffold:   { status: completed, issue: 4, artifact: .github/workflows/ci.yml, completed: "2026-08-12" }
+  build:      { status: in_progress, issue: 7, artifact: null, completed: null, steps_done: 1, steps_total: 10 }
   verify:     { status: pending, issue: 5, artifact: null, completed: null }
 log:
   - "2026-08-11 init — repo scaffolded, 7 stage issues filed, Notion row created"
@@ -32,3 +35,5 @@ log:
   - "2026-08-11 stage(eng-review) completed — 3 Critical / 9 High findings; PRD v0.4 splits delivery: Phase 1 = Tier 2 only, Tier 1 to Phase 2; NGFW default stubbed, --offline retained"
   - "2026-08-11 stage(plan) completed — docs/spec.md + PLAN.md; 10 Phase 1 steps (#15-#24), parallel groups {3,4,5,6} and {7,8}; toolchain CI is step 1 because tests invoke Zeek/Suricata for real"
   - "2026-08-12 session handoff — CLAUDE.md architecture filled in from the plan; PR #25 open and unmerged; local branches stage/{research,prd,eng-review} are merged and prunable"
+  - "2026-08-12 PR #25 merged (spec.md + PLAN.md on main); stage/* branches pruned"
+  - "2026-08-12 stage(scaffold)+step 1 (#15, PR #26) — toolchain container pinned by digest (zeek 8.0.9, suricata 8.0.6, wireshark 4.6.6, ja4 v0.18.8); --require-tool-tests makes a skipped integration suite fail; --strict-toolchain asserts exact versions in CI. Found: `suricata --version` exits 1 (use -V), and the OBS Zeek repo has no arm64 build, so the image is amd64-only"

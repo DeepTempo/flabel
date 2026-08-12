@@ -29,7 +29,7 @@ dev = [
 # CI adds --strict-toolchain to assert these exact strings. Bump them with the image.
 zeek = "8.0.9"
 suricata = "8.0.6"
-wireshark = "4.6.7"  # supplies both editcap and capinfos
+wireshark = "4.6.6"  # supplies both editcap and capinfos
 ja4_zeek_package = "v0.18.8"  # git tag of zeek/foxio/ja4; JA4+ under FoxIO License 1.1
 
 [tool.ruff]

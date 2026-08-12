@@ -108,29 +108,21 @@ def test_zeek_loads_ja4_package(strict_toolchain):
 
     Skipped when the package is absent (a laptop with a broken ``zkg``); fatal under
     ``--strict-toolchain``, so the CI container can never silently ship without it.
+
+    Asks Zeek to load the package rather than looking for its directory: that tests the
+    capability step 5 actually needs and stays correct wherever ``zkg`` chose to install it.
     """
-    installed = _installed_zeek_packages()
-
-    if "ja4" not in installed and not strict_toolchain:
-        pytest.skip("zeek/foxio/ja4 is not installed — see docs/dev-setup.md")
-
-    assert "ja4" in installed, (
-        "zeek/foxio/ja4 is not installed. JA4 is computed by Zeek and carried on every "
-        f"label (docs/prd.md §9), so the container must ship it. Found: {sorted(installed)}"
-    )
-
     parse = subprocess.run(
-        ["zeek", "--parse-only", "-e", "@load packages"],
+        ["zeek", "--parse-only", "-e", "@load ja4"],
         capture_output=True,
         text=True,
     )
-    assert parse.returncode == 0, f"Zeek could not load its packages: {parse.stderr}"
 
+    if parse.returncode != 0 and not strict_toolchain:
+        pytest.skip("zeek/foxio/ja4 is not installed — see docs/dev-setup.md")
 
-def _installed_zeek_packages() -> set[str]:
-    """Package directory names under Zeek's site packages dir."""
-    site = subprocess.run(["zeek-config", "--site_dir"], capture_output=True, text=True, check=True)
-    packages = pathlib.Path(site.stdout.strip()) / "packages"
-    if not packages.is_dir():
-        return set()
-    return {entry.name for entry in packages.iterdir() if entry.is_dir()}
+    assert parse.returncode == 0, (
+        "Zeek cannot load the ja4 package. JA4 is computed by Zeek and is the single "
+        f"authority for the value carried on a label (docs/prd.md §9), so the container "
+        f"must ship it. Zeek said:\n{parse.stderr}"
+    )
