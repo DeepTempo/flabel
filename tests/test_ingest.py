@@ -6,16 +6,18 @@ Every awkward input gets the outcome spec §8 names, and the two loss conditions
 Fixtures are **generated, never committed**: `tests/fixtures/make_awkward.py` writes them into
 `tmp_path`. Committed capture bytes cannot be reviewed, and this repository is public.
 
-`editcap` and `capinfos` run for real (spec §2, "tools real, network stubbed"), and `capinfos`
-is deliberately used as an *independent* oracle for packet counts and encapsulation: flabel's
-own record-header walk is the thing under test, so checking it against flabel's own reader
-would prove only that the code agrees with itself. Nothing here touches the network.
+`editcap`, `tshark` and `capinfos` run for real (spec §2, "tools real, network stubbed"), and
+`capinfos` is deliberately used as an *independent* oracle for packet counts and
+encapsulation: flabel's own record-header walk is the thing under test, so checking it against
+flabel's own reader would prove only that the code agrees with itself. Nothing here touches
+the network.
 """
 
 from __future__ import annotations
 
 import gzip
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -25,9 +27,11 @@ import pytest
 
 from flabel.errors import CaptureError, ToolError
 from flabel.ingest import (
+    DECOMPRESSED_NAME,
     LINK_TYPES,
+    MAX_PACKET_BYTES,
     NORMALIZED_NAME,
-    EditcapError,
+    ConversionError,
     link_type_name,
     normalize,
     sniff,
@@ -45,6 +49,14 @@ BENIGN = FIXTURE_DIR / "benign.pcap"
 #: The canary capture's shape, asserted directly rather than derived, so a change to the
 #: generator that silently altered the fixture would fail here instead of passing quietly.
 CANARY_PACKETS = 14
+
+#: Discarding link types needs `tshark`, which is being added to the CI toolchain container.
+#: A separate marker from `requires_tools` so its absence skips only the tests that need it,
+#: with a reason that says why — rather than reading as a broken toolchain.
+needs_tshark = pytest.mark.skipif(
+    shutil.which("tshark") is None,
+    reason="tshark is not installed — it is the multi-datalink selection tool (see PR #31)",
+)
 
 
 # --- helpers -------------------------------------------------------------------------------
@@ -131,8 +143,12 @@ def test_every_generated_fixture_is_what_it_claims(tmp_path):
         "truncated_record_header.pcap": "pcap",
         "truncated.pcapng": "pcapng",
         "multi_datalink.pcapng": "pcapng",
+        "interleaved_multi_datalink.pcapng": "pcapng",
+        "big_endian.pcapng": "pcapng",
+        "short_header.pcap": "pcap",
         "plain.pcap.gz": "gzip",
         "plain.pcapng.gz": "gzip",
+        "truncated.pcapng.gz": "gzip",
     }
     assert {name: sniff(written[name]) for name in expected} == expected
 
@@ -374,6 +390,31 @@ def test_truncated_pcapng_fails_and_names_editcap(tmp_path):
     assert not workdir.exists(), "a hard failure must leave no output directory (spec §13)"
 
 
+def test_a_truncated_pcapng_inside_gzip_names_the_file_the_operator_has(tmp_path):
+    """The repair instruction has to point at a file that exists.
+
+    After decompression the file being *read* is a temporary one that cleanup deletes, so a
+    message naming it would send the operator to run `editcap` on a path that is already gone.
+    `editcap` reads gzipped captures directly, so the original is also the right file to
+    repair — no intermediate step for the operator either.
+    """
+    plain = tmp_path / "truncated.pcapng"
+    offset = awkward.write_truncated_pcapng(plain, keep=10, missing=8)
+    capture = awkward.write_gzipped(plain, tmp_path / "truncated.pcapng.gz")
+    workdir = tmp_path / "out"
+
+    with pytest.raises(CaptureError) as raised:
+        normalize(capture, workdir)
+
+    message = str(raised.value)
+    assert f"editcap -F pcapng {capture}" in message, message
+    assert DECOMPRESSED_NAME not in message, (
+        f"the repair command names the deleted temporary file, not the operator's: {message}"
+    )
+    assert f"offset {offset}" in message
+    assert not workdir.exists()
+
+
 def test_bad_header_fails_and_leaves_no_output(tmp_path):
     """Spec §8 step 4, for a file that is not a capture at all."""
     capture = awkward.write_bad_header(tmp_path / "bad_header.pcap")
@@ -382,6 +423,143 @@ def test_bad_header_fails_and_leaves_no_output(tmp_path):
     with pytest.raises(CaptureError):
         normalize(capture, workdir)
     assert not workdir.exists()
+
+
+def test_a_pcap_header_cut_short_is_a_capture_error(tmp_path):
+    """Real magic, no header behind it. Sniffing passes, so the walk has to catch it.
+
+    Twelve bytes cannot describe a capture, and unpacking 24 bytes of fields out of them would
+    raise `struct.error` — not a `FlabelError`, so the operator would get a traceback and an
+    unmapped exit code instead of a diagnosis.
+    """
+    capture = awkward.write_short_pcap_header(tmp_path / "short_header.pcap", kept=12)
+    workdir = tmp_path / "out"
+
+    assert sniff(capture) == "pcap"
+    with pytest.raises(CaptureError, match="pcap file header is 12 bytes"):
+        normalize(capture, workdir)
+    assert not workdir.exists()
+
+
+# --- structurally corrupt pcapng: a diagnosis, never a traceback ----------------------------
+#
+# Each of these is a file that is *not* truncated — it ends where it says it does — but whose
+# internal structure contradicts itself. The distinction matters to an operator: truncation is
+# repairable and has a documented recovery, corruption is not.
+
+
+def test_a_block_declaring_an_impossible_length_is_corrupt(tmp_path):
+    capture, offset = awkward.write_pcapng_bad_block_length(tmp_path / "bad_length.pcapng")
+    workdir = tmp_path / "out"
+
+    with pytest.raises(CaptureError) as raised:
+        normalize(capture, workdir)
+
+    message = str(raised.value)
+    assert f"offset {offset}" in message
+    assert "corrupt" in message
+    assert not workdir.exists()
+
+
+def test_a_packet_block_larger_than_any_frame_is_corrupt(tmp_path):
+    """The sanity bound that separates "a header we misread" from "a big packet".
+
+    Forged rather than materialised: the point is that the *declared* length is impossible, so
+    there is no need to write 20 MiB to prove it.
+    """
+    capture, offset = awkward.write_pcapng_bad_block_length(
+        tmp_path / "huge_packet.pcapng", length=20 * 1024 * 1024
+    )
+
+    with pytest.raises(CaptureError) as raised:
+        normalize(capture, tmp_path / "out")
+
+    message = str(raised.value)
+    assert f"offset {offset}" in message
+    assert str(MAX_PACKET_BYTES) in message
+
+
+def test_a_block_whose_two_lengths_disagree_is_corrupt(tmp_path):
+    """pcapng writes its block length twice; disagreement is the format's own alarm."""
+    capture, offset = awkward.write_pcapng_trailer_mismatch(tmp_path / "trailer.pcapng")
+    workdir = tmp_path / "out"
+
+    with pytest.raises(CaptureError, match="trailing length") as raised:
+        normalize(capture, workdir)
+
+    assert f"offset {offset}" in str(raised.value)
+    assert not workdir.exists()
+
+
+def test_a_packet_on_an_undefined_interface_is_corrupt(tmp_path):
+    """An interface with no description block has no knowable link type.
+
+    Link type decides whether conversion is possible at all, so this is one of the places
+    where a sensible-looking default — "probably Ethernet" — would silently misdescribe the
+    capture instead of failing.
+    """
+    capture = awkward.write_pcapng_undefined_interface(tmp_path / "undefined.pcapng")
+    workdir = tmp_path / "out"
+
+    with pytest.raises(CaptureError, match="references interface 5"):
+        normalize(capture, workdir)
+    assert not workdir.exists()
+
+
+def test_a_block_too_short_for_its_own_fields_is_corrupt(tmp_path):
+    """A structurally valid block length that still cannot hold the block's contents.
+
+    12 is a legal pcapng block length, so the length checks pass; the body is then empty and
+    the link type it should contain is not there. Without a body-length check this is where
+    `struct.error` escapes as a traceback.
+    """
+    capture = awkward.write_pcapng_short_block_body(tmp_path / "short_body.pcapng")
+    workdir = tmp_path / "out"
+
+    with pytest.raises(CaptureError, match="too short"):
+        normalize(capture, workdir)
+    assert not workdir.exists()
+
+
+@pytest.mark.requires_tools
+def test_a_large_decryption_secrets_block_is_not_corruption(tmp_path):
+    """The counter-case to the bound above: big *non-packet* blocks are legal and common.
+
+    Wireshark embeds TLS key logs in a decryption secrets block, so a capture can carry many
+    megabytes of them. A size bound applied to every block type — rather than to packets only —
+    would reject a perfectly good capture, and the toolchain accepting the same file is the
+    independent evidence that it is good.
+    """
+    capture = awkward.write_pcapng_with_large_secrets_block(tmp_path / "secrets.pcapng")
+    assert capture.stat().st_size > MAX_PACKET_BYTES
+    assert capinfos_packet_count(capture) == CANARY_PACKETS
+
+    result = normalize(capture, tmp_path / "out")
+
+    assert result.input_status == "complete"
+    assert result.packets_read == CANARY_PACKETS
+    assert capinfos_packet_count(result.path) == CANARY_PACKETS
+
+
+@pytest.mark.requires_tools
+def test_a_big_endian_pcapng_walks_correctly(tmp_path):
+    """pcapng carries no endianness in its magic — the block type is a palindrome.
+
+    The byte order comes from the byte-order magic inside the section header block, so a reader
+    that assumes little-endian survives the first four bytes and then reads absurd block
+    lengths. All four pcap byte orders have fixtures; this is the pcapng equivalent.
+    """
+    capture = awkward.write_big_endian_pcapng(tmp_path / "big_endian.pcapng")
+
+    assert sniff(capture) == "pcapng"
+    assert capinfos_packet_count(capture) == CANARY_PACKETS
+
+    result = normalize(capture, tmp_path / "out")
+
+    assert result.capture_format == "pcapng"
+    assert result.packets_read == CANARY_PACKETS
+    assert result.input_status == "complete"
+    assert pcap_frames(result.path) == [frame for _, frame in canary.build_packets()]
 
 
 def test_gzipped_bad_header_leaves_no_output_and_no_temporary_file(tmp_path):
@@ -516,6 +694,7 @@ def test_conversion_is_reproducible(tmp_path):
 # --- multi-datalink: dominant kept, discards recorded ---------------------------------------
 
 
+@needs_tshark
 @pytest.mark.requires_tools
 def test_multi_datalink_keeps_the_dominant_type_and_records_the_discards(tmp_path):
     """Spec §8 step 7 and §11's second loss condition.
@@ -523,6 +702,9 @@ def test_multi_datalink_keeps_the_dominant_type_and_records_the_discards(tmp_pat
     pcap cannot express two link types, so something has to go. What must not happen is
     losing it silently: `discarded_link_types`, `discarded_packets` and `partial` together are
     what stop this from looking like a complete capture downstream.
+
+    `packets_read` stays at 14 — it counts what the *input* held — so the normalized file holds
+    `packets_read - discarded_packets`.
     """
     capture = awkward.write_multi_datalink_pcapng(tmp_path / "multi.pcapng")
     result = normalize(capture, tmp_path / "out")
@@ -533,16 +715,19 @@ def test_multi_datalink_keeps_the_dominant_type_and_records_the_discards(tmp_pat
     assert result.discarded_packets == 4
     assert result.truncated_at_offset is None
     assert result.normalization == (
-        "convert: editcap -F pcap",
-        "split: kept link type EN10MB (10 packets); discarded 4 packets of link type(s) LINUX_SLL",
+        "select: tshark kept interface(s) 0 carrying link type EN10MB (10 packets)",
+        "convert: editcap -F pcap -T ether",
+        "split: discarded 4 packets of link type(s) LINUX_SLL",
     )
 
     assert capinfos_packet_count(result.path) == 10
     assert capinfos_encapsulation(result.path) == "Ethernet"
     # The kept packets are the Ethernet ones, not merely ten of the fourteen.
     assert pcap_frames(result.path) == [frame for _, frame in canary.build_packets()[:10]]
+    assert list(result.path.parent.iterdir()) == [result.path], "no intermediate left behind"
 
 
+@needs_tshark
 @pytest.mark.requires_tools
 def test_dominance_is_by_packet_count_not_by_ethernet_preference(tmp_path):
     """Flip the majority and the kept type flips with it.
@@ -561,6 +746,7 @@ def test_dominance_is_by_packet_count_not_by_ethernet_preference(tmp_path):
     assert capinfos_encapsulation(result.path) == "Linux cooked-mode capture v1"
 
 
+@needs_tshark
 @pytest.mark.requires_tools
 def test_a_tie_resolves_the_same_way_every_time(tmp_path):
     """Equal counts have no meaningful winner, so the rule only has to be *stable*.
@@ -576,6 +762,36 @@ def test_a_tie_resolves_the_same_way_every_time(tmp_path):
     assert first.discarded_link_types == second.discarded_link_types == ("LINUX_SLL",)
     assert first.discarded_packets == second.discarded_packets == 7
     assert first.path.read_bytes() == second.path.read_bytes()
+
+
+@needs_tshark
+@pytest.mark.requires_tools
+def test_interleaved_link_types_across_several_interfaces_are_kept_whole(tmp_path):
+    """What a real `dumpcap -i eth0 -i lo` capture looks like, and it breaks two shortcuts.
+
+    Link types arrive packet by packet rather than in runs, so selecting the kept packets by
+    *number* — ranges on an `editcap` command line — would produce roughly one range per packet
+    and grow the argument list with the capture until it could not be passed at all. A display
+    filter on the interface is one argument regardless.
+
+    And one link type spans two interfaces here, so a filter naming a single `interface_id`
+    would silently drop four Ethernet packets it was supposed to keep. Comparing the frames,
+    not just the count, is what catches that.
+    """
+    capture = awkward.write_interleaved_multi_datalink_pcapng(tmp_path / "interleaved.pcapng")
+    expected = awkward.interleaved_ethernet_frames()
+
+    result = normalize(capture, tmp_path / "out")
+
+    assert result.input_status == "partial"
+    assert result.packets_read == CANARY_PACKETS
+    assert result.discarded_link_types == ("LINUX_SLL",)
+    assert result.discarded_packets == CANARY_PACKETS - len(expected)
+    assert result.normalization[0] == (
+        f"select: tshark kept interface(s) 0, 2 carrying link type EN10MB ({len(expected)} packets)"
+    )
+    assert capinfos_encapsulation(result.path) == "Ethernet"
+    assert pcap_frames(result.path) == expected
 
 
 def test_an_unnameable_dominant_link_type_fails_loudly(tmp_path):
@@ -612,51 +828,120 @@ def test_link_type_names_cover_the_generators_types():
 # --- tool failure ---------------------------------------------------------------------------
 
 
-def test_missing_editcap_raises_a_tool_error_carrying_the_failure(tmp_path, monkeypatch):
-    """Spec §11's "point at a non-existent binary" fault injection.
+@pytest.mark.parametrize(
+    ("fixture", "tool"),
+    [("plain.pcapng", "editcap"), ("multi_datalink.pcapng", "tshark")],
+)
+def test_a_missing_conversion_tool_is_reported_by_name(tmp_path, monkeypatch, fixture, tool):
+    """Spec §11's "point at a non-existent binary" fault injection, for both tools.
 
     PATH is emptied rather than `subprocess` patched: the failure being injected is an
-    environment fault, and patching the call would test our mock of `editcap` instead of our
-    handling of its absence. `EditcapError` is a `ToolError`, so `cli.py` gets exit 1 whether
-    or not it knows to read `.failure`.
+    environment fault, and patching the call would test our imitation of the tool instead of
+    our handling of its absence. `ConversionError` is a `ToolError`, so `cli.py` gets exit 1
+    whether or not it knows to read `.failure` — and the recorded `tool` has to name the one
+    that was actually missing, since that is what an operator installs.
     """
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-    capture = awkward.write_plain_pcapng(tmp_path / "plain.pcapng")
+    if tool == "tshark":
+        capture = awkward.write_multi_datalink_pcapng(tmp_path / fixture)
+    else:
+        capture = awkward.write_plain_pcapng(tmp_path / fixture)
     workdir = tmp_path / "out"
 
     with pytest.raises(ToolError) as raised:
         normalize(capture, workdir)
 
     error = raised.value
-    assert isinstance(error, EditcapError)
-    assert error.failure.tool == "editcap"
-    assert error.failure.exit_code is None
-    assert error.failure.argv[0] == "editcap"
-    assert "-F" in error.failure.argv and "pcap" in error.failure.argv
+    assert isinstance(error, ConversionError)
+    assert error.failure.tool == tool
+    assert error.failure.exit_code is None, "None means could not be run at all"
+    assert error.failure.argv[0] == tool
     assert not workdir.exists(), "a failed conversion must leave no output"
 
 
 @pytest.mark.requires_tools
-def test_a_real_non_zero_editcap_exit_is_reported(tmp_path):
+def test_a_real_non_zero_tool_exit_is_reported_with_its_command(tmp_path):
     """The other half of spec §11's tool-failure row: a genuine non-zero exit and its stderr.
 
     Injected through the environment — the output path is occupied by a directory, so the real
     `editcap` fails to open it — rather than by patching `subprocess`, which would test our
     imitation of the tool instead of our handling of it. Deliberately not a permissions trick:
     CI runs as root in the toolchain container, where permissions are advisory.
+
+    The recorded `argv` is asserted because a `ToolFailure` renders straight into the run
+    block: "a tool failed" with no command and no code is not a report anyone can act on.
     """
     capture = awkward.write_plain_pcapng(tmp_path / "plain.pcapng")
     workdir = tmp_path / "out"
     (workdir / NORMALIZED_NAME).mkdir(parents=True)
 
-    with pytest.raises(EditcapError) as raised:
+    with pytest.raises(ConversionError) as raised:
         normalize(capture, workdir)
 
     failure = raised.value.failure
+    assert failure.tool == "editcap"
     assert failure.exit_code not in (0, None), "the tool's own exit code, not a stand-in"
+    assert failure.argv[0] == "editcap"
+    assert str(capture) in failure.argv, "argv must be the command that actually ran"
     assert failure.message.strip()
     assert (workdir / NORMALIZED_NAME).is_dir(), "cleanup must not delete what it did not write"
     assert list((workdir / NORMALIZED_NAME).iterdir()) == []
+
+
+# --- atomicity: either a complete run directory or none (spec §13) ---------------------------
+
+
+def test_a_failure_after_the_output_is_written_still_leaves_nothing(tmp_path, monkeypatch):
+    """The window between writing `normalized.pcap` and returning is not exception-free.
+
+    Hashing and sizing the input happen after the output exists, and they read a file on
+    someone else's filesystem — one that can be unlinked, unmounted or revoked in between.
+    Injected by making the hash raise, because the real race cannot be scheduled: what is being
+    tested is that *any* late failure takes the output with it rather than leaving a capture
+    behind for a run that returned nothing.
+    """
+
+    def unreadable(_path):
+        raise OSError("input vanished while it was being hashed")
+
+    monkeypatch.setattr("flabel.ingest._sha256", unreadable)
+    workdir = tmp_path / "out"
+
+    with pytest.raises(OSError, match="vanished"):
+        normalize(BENIGN, workdir)
+
+    assert not workdir.exists(), "output survived a failed run (spec §13)"
+
+
+def test_parent_directories_created_for_the_workdir_are_removed_too(tmp_path):
+    """`mkdir(parents=True)` can create a chain, and all of it is this call's to clean up.
+
+    Removing only the leaf would leave empty directories behind as debris from a run that
+    produced nothing — and a caller who sees `runs/2026/08/` appear reasonably concludes a run
+    happened there.
+    """
+    capture = awkward.write_bad_header(tmp_path / "bad_header.pcap")
+    root = tmp_path / "runs"
+    workdir = root / "2026" / "08" / "capture_1200"
+
+    with pytest.raises(CaptureError):
+        normalize(capture, workdir)
+
+    assert not root.exists(), "intermediate directories survived a failed run"
+
+
+def test_an_existing_ancestor_is_left_alone(tmp_path):
+    """Cleanup stops where flabel's own creations stop."""
+    capture = awkward.write_bad_header(tmp_path / "bad_header.pcap")
+    existing = tmp_path / "runs"
+    existing.mkdir()
+    workdir = existing / "capture_1200"
+
+    with pytest.raises(CaptureError):
+        normalize(capture, workdir)
+
+    assert existing.is_dir()
+    assert not workdir.exists()
 
 
 # --- structural guards ---------------------------------------------------------------------

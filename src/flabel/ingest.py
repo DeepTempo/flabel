@@ -18,7 +18,18 @@ correct file. A pcapng block is not: a partial block can leave `editcap` guessin
 structure of what follows, and a guess about the input is exactly what this module must never
 make. So pcap proceeds as partial and pcapng fails with repair instructions.
 
-This module is impure by design (`subprocess` for `editcap`) and performs no network I/O.
+Three properties hold throughout, because a capture is the largest and least trustworthy
+thing flabel touches:
+
+* **Nothing is read into memory whole.** Hashing, copying and decompression stream; the walks
+  seek past payloads and large blocks instead of reading them.
+* **A malformed file is a `CaptureError`, never a traceback.** Header fields are bounds-checked
+  before they are unpacked, and the walk has an outer guard for anything that slips through.
+* **A failure leaves no output.** Spec §13 allows a complete run directory or none, so every
+  path that has already written something cleans up before the exception escapes — including
+  any directory this call created.
+
+This module is impure by design (`subprocess`) and performs no network I/O.
 """
 
 from __future__ import annotations
@@ -64,11 +75,42 @@ BLOCK_PACKET_OBSOLETE = 0x00000002
 BLOCK_SIMPLE_PACKET = 0x00000003
 BLOCK_ENHANCED_PACKET = 0x00000006
 
-#: A record or block longer than this is not a large packet, it is a header we misread. 16 MiB
-#: is three orders of magnitude above a jumbo frame, so the bound only fires on corruption.
-#: Checked *before* the end-of-file bound so corruption is reported as corruption rather than
-#: as truncation, which would tell the operator to look in the wrong place.
-MAX_RECORD_BYTES = 16 * 1024 * 1024
+PACKET_BLOCKS = frozenset({BLOCK_ENHANCED_PACKET, BLOCK_PACKET_OBSOLETE, BLOCK_SIMPLE_PACKET})
+
+BLOCK_NAMES = {
+    BLOCK_SECTION_HEADER: "section header",
+    BLOCK_INTERFACE_DESCRIPTION: "interface description",
+    BLOCK_PACKET_OBSOLETE: "packet",
+    BLOCK_SIMPLE_PACKET: "simple packet",
+    BLOCK_ENHANCED_PACKET: "enhanced packet",
+}
+
+#: Smallest body (block length minus the 12 bytes of framing) that can hold the mandatory
+#: fields of each block type this module reads fields from. Checked before unpacking: a block
+#: whose declared length is structurally valid can still be too short for its own contents,
+#: and unpacking that raises `struct.error` — not a `FlabelError`, so it would reach the
+#: operator as a traceback instead of "this file is corrupt".
+MIN_BODY_BYTES = {
+    BLOCK_SECTION_HEADER: 16,
+    BLOCK_INTERFACE_DESCRIPTION: 8,
+    BLOCK_ENHANCED_PACKET: 20,
+    BLOCK_PACKET_OBSOLETE: 20,
+    BLOCK_SIMPLE_PACKET: 4,
+}
+
+#: How much of a block body to read. Every field this module needs is in the first few bytes,
+#: and a pcapng may legitimately carry a very large block — Wireshark embeds TLS key logs in
+#: decryption secrets blocks, and name resolution blocks grow with the capture — so bodies are
+#: peeked at and skipped rather than read.
+PCAPNG_PEEK_BYTES = 32
+
+#: A *packet* longer than this is not a large frame, it is a header we misread. 16 MiB is three
+#: orders of magnitude above a jumbo frame, so the bound only fires on corruption. It is
+#: deliberately **not** applied to other block types, where large is normal and legal — a
+#: capture carrying a decryption secrets block is not a corrupt capture. Checked before the
+#: end-of-file bound so corruption is reported as corruption rather than as truncation, which
+#: would send the operator looking in the wrong place.
+MAX_PACKET_BYTES = 16 * 1024 * 1024
 
 #: libpcap link type -> (name recorded in provenance, `editcap -T` name). The names on the
 #: right are `editcap`'s own, verified against `editcap -T` on Wireshark 4.6; the ones on the
@@ -92,23 +134,22 @@ LINK_TYPES: dict[int, tuple[str, str]] = {
 #: Name of the single file every downstream stage reads.
 NORMALIZED_NAME = "normalized.pcap"
 
-#: `editcap`'s packet selection is passed as command-line arguments, so a capture whose link
-#: types interleave into a pathological number of runs would overflow the argument list. The
-#: bound is generous — real mixed captures come from a handful of interfaces in long runs —
-#: and failing with an explanation beats an `OSError` from the kernel.
-MAX_SELECTION_RUNS = 20_000
+#: Intermediates, deleted before `normalize` returns. Named rather than randomised so a crashed
+#: process leaves something recognisable behind instead of a mystery temp file.
+DECOMPRESSED_NAME = "decompressed.capture"
+SELECTED_NAME = "selected.pcapng"
 
 #: Read size for hashing and copying. Captures are routinely gigabytes; nothing here loads a
 #: whole file into memory.
 CHUNK_BYTES = 1024 * 1024
 
 
-class EditcapError(ToolError):
-    """`editcap` failed, carrying the structured record for the run block.
+class ConversionError(ToolError):
+    """`editcap` or `tshark` failed, carrying the structured record for the run block.
 
-    Spec §11 wants a tool failure in `tool_failures[]` *and* a hard failure. `ToolError`
-    alone carries only a message, and `NormalizedCapture` has no field for a failure because
-    a normalize that fails returns nothing at all — so the record travels on the exception.
+    Spec §11 wants a tool failure in `tool_failures[]` *and* a hard failure. `ToolError` alone
+    carries only a message, and `NormalizedCapture` has no field for a failure because a
+    normalize that fails returns nothing at all — so the record travels on the exception.
     `cli.py` (step 9) reads `.failure` to populate the run block; anything catching plain
     `ToolError` still gets the right exit code.
     """
@@ -131,6 +172,10 @@ class _Walk:
     truncated_at_offset: int | None
     #: Packet count per link type, in ascending link-type order. Single-entry for pcap.
     packets_by_link_type: tuple[tuple[int, int], ...] = ()
+    #: Link type of each interface, in the order the interfaces appear in the file — the
+    #: numbering `tshark`'s `frame.interface_id` uses, so it is what a selection filter is
+    #: built from. Several interfaces may share one link type.
+    interface_link_types: tuple[int, ...] = ()
 
     @property
     def link_types(self) -> tuple[int, ...]:
@@ -140,11 +185,15 @@ class _Walk:
 # --- sniffing ------------------------------------------------------------------------------
 
 
-def sniff(path: Path) -> str:
+def sniff(path: Path, subject: str | None = None) -> str:
     """Container format of `path` by magic bytes: `gzip`, `pcap` or `pcapng`.
 
     Raises `CaptureError` for anything else, which is spec §8 step 4's unreadable header: we
     will not hand an unidentified file to a tool to find out what happens.
+
+    `subject` is what an error message should name. It differs from `path` once a temporary
+    decompressed file is what is being read — naming that file would point the operator at
+    something cleanup has already deleted.
     """
     with path.open("rb") as handle:
         magic = handle.read(4)
@@ -156,16 +205,37 @@ def sniff(path: Path) -> str:
     if magic == PCAPNG_MAGIC:
         return "pcapng"
     raise CaptureError(
-        f"{path}: unrecognised capture format — first bytes are {magic.hex(' ') or '(empty)'}. "
-        f"Expected gzip (1f 8b), pcap (a1 b2 c3 d4 or its byte-swapped and nanosecond "
-        f"variants) or pcapng (0a 0d 0d 0a). The file extension is never consulted."
+        f"{subject or path}: unrecognised capture format — first bytes are "
+        f"{magic.hex(' ') or '(empty)'}. Expected gzip (1f 8b), pcap (a1 b2 c3 d4 or its "
+        f"byte-swapped and nanosecond variants) or pcapng (0a 0d 0d 0a). The file extension "
+        f"is never consulted."
     )
 
 
 # --- validation: the record-header walk ----------------------------------------------------
 
 
-def _walk_pcap(path: Path) -> _Walk:
+def walk(path: Path, container: str, subject: str | None = None) -> _Walk:
+    """Validate `path` by reading every record header. `container` comes from `sniff`.
+
+    The `struct.error` guard is the outer net for the whole walk. The bounds checks below aim
+    to catch every malformed field before it is unpacked; this makes sure a case they miss
+    still reaches the operator as `CaptureError` — a diagnosis and an exit code — rather than
+    as a traceback from the middle of a struct call.
+    """
+    subject = subject or str(path)
+    try:
+        if container == "pcap":
+            return _walk_pcap(path, subject)
+        return _walk_pcapng(path, subject)
+    except struct.error as error:
+        raise CaptureError(
+            f"{subject}: a header field could not be read ({error}). The file is corrupt: "
+            f"flabel walks record headers itself, so a malformed one surfaces here."
+        ) from error
+
+
+def _walk_pcap(path: Path, subject: str) -> _Walk:
     """Count records and locate the first short one.
 
     Driven by seeks and 16-byte header reads rather than by reading payloads, so the cost is
@@ -176,7 +246,7 @@ def _walk_pcap(path: Path) -> _Walk:
         header = handle.read(PCAP_FILE_HEADER_BYTES)
         if len(header) < PCAP_FILE_HEADER_BYTES:
             raise CaptureError(
-                f"{path}: pcap file header is {len(header)} bytes, needs "
+                f"{subject}: pcap file header is {len(header)} bytes, needs "
                 f"{PCAP_FILE_HEADER_BYTES}. The header itself is incomplete, so there is no "
                 f"capture to read — this is not recoverable truncation."
             )
@@ -186,7 +256,7 @@ def _walk_pcap(path: Path) -> _Walk:
         )
         if version_major != 2:
             raise CaptureError(
-                f"{path}: pcap version {version_major} is not 2 — the header does not "
+                f"{subject}: pcap version {version_major} is not 2 — the header does not "
                 f"describe a readable pcap file."
             )
 
@@ -195,24 +265,24 @@ def _walk_pcap(path: Path) -> _Walk:
         while offset < size:
             record_header = handle.read(PCAP_RECORD_HEADER_BYTES)
             if len(record_header) < PCAP_RECORD_HEADER_BYTES:
-                return _Walk(packets, offset, ((link_type, packets),))
+                return _Walk(packets, offset, ((link_type, packets),), (link_type,))
             _, _, captured_length, _ = struct.unpack(order + "IIII", record_header)
-            if captured_length > MAX_RECORD_BYTES:
+            if captured_length > MAX_PACKET_BYTES:
                 raise CaptureError(
-                    f"{path}: record header at offset {offset} claims {captured_length} "
-                    f"captured bytes, above the {MAX_RECORD_BYTES}-byte sanity bound. The "
+                    f"{subject}: record header at offset {offset} claims {captured_length} "
+                    f"captured bytes, above the {MAX_PACKET_BYTES}-byte sanity bound. The "
                     f"header is not readable — the file is corrupt rather than truncated."
                 )
             if offset + PCAP_RECORD_HEADER_BYTES + captured_length > size:
-                return _Walk(packets, offset, ((link_type, packets),))
+                return _Walk(packets, offset, ((link_type, packets),), (link_type,))
             offset += PCAP_RECORD_HEADER_BYTES + captured_length
             handle.seek(offset)
             packets += 1
 
-    return _Walk(packets, None, ((link_type, packets),))
+    return _Walk(packets, None, ((link_type, packets),), (link_type,))
 
 
-def _walk_pcapng(path: Path) -> _Walk:
+def _walk_pcapng(path: Path, subject: str) -> _Walk:
     """Count packet blocks per interface link type and locate the first short block.
 
     Interface link types are collected as well as counted because pcap cannot express more
@@ -221,7 +291,8 @@ def _walk_pcapng(path: Path) -> _Walk:
     """
     size = path.stat().st_size
     order = "<"
-    link_type_of_interface: list[int] = []
+    interface_link_types: list[int] = []
+    section_base = 0
     counts: dict[int, int] = {}
     packets = 0
     offset = 0
@@ -232,63 +303,77 @@ def _walk_pcapng(path: Path) -> _Walk:
             if len(head) < PCAPNG_BLOCK_HEADER_BYTES:
                 if offset == 0:
                     raise CaptureError(
-                        f"{path}: file is {size} bytes — too short to hold a pcapng section "
-                        f"header block."
+                        f"{subject}: file is {size} bytes — too short to hold a pcapng "
+                        f"section header block."
                     )
-                return _Walk(packets, offset, _by_link_type(counts))
+                return _Walk(packets, offset, _by_link_type(counts), tuple(interface_link_types))
 
             block_type = struct.unpack(order + "I", head[:4])[0]
             if offset == 0 or block_type == BLOCK_SECTION_HEADER:
-                order = _section_byte_order(handle, path, offset)
+                order = _section_byte_order(handle, subject, offset)
                 block_type = BLOCK_SECTION_HEADER
-                # A new section redefines the interfaces; carrying the old ones over would
-                # attribute packets to link types from a different section.
-                link_type_of_interface = []
+                # A new section restarts interface *numbering*, but Wireshark — and therefore
+                # `frame.interface_id` — numbers interfaces continuously across the whole
+                # file. One list plus a per-section base preserves both readings.
+                section_base = len(interface_link_types)
 
             total_length = struct.unpack(order + "I", head[4:8])[0]
-            if (
-                total_length < PCAPNG_MIN_BLOCK_BYTES
-                or total_length % 4
-                or total_length > MAX_RECORD_BYTES
-            ):
+            body_length = total_length - PCAPNG_MIN_BLOCK_BYTES
+            is_packet = block_type in PACKET_BLOCKS
+            name = BLOCK_NAMES.get(block_type, f"type 0x{block_type:08x}")
+
+            if total_length < PCAPNG_MIN_BLOCK_BYTES or total_length % 4:
                 raise CaptureError(
-                    f"{path}: block at offset {offset} declares a total length of "
-                    f"{total_length}, which is not a valid pcapng block length. The file is "
+                    f"{subject}: {name} block at offset {offset} declares a total length of "
+                    f"{total_length}, which is not a valid pcapng block length (at least "
+                    f"{PCAPNG_MIN_BLOCK_BYTES} bytes, and a multiple of 4). The file is "
                     f"corrupt rather than truncated."
                 )
+            if is_packet and total_length > MAX_PACKET_BYTES:
+                raise CaptureError(
+                    f"{subject}: {name} block at offset {offset} declares {total_length} "
+                    f"bytes, above the {MAX_PACKET_BYTES}-byte sanity bound for a packet. The "
+                    f"header is not readable — the file is corrupt rather than truncated."
+                )
             if offset + total_length > size:
-                return _Walk(packets, offset, _by_link_type(counts))
+                return _Walk(packets, offset, _by_link_type(counts), tuple(interface_link_types))
+            if body_length < MIN_BODY_BYTES.get(block_type, 0):
+                raise CaptureError(
+                    f"{subject}: {name} block at offset {offset} has a {body_length}-byte "
+                    f"body, too short for the {MIN_BODY_BYTES[block_type]} bytes of fields "
+                    f"its type defines. The file is corrupt."
+                )
 
-            body = handle.read(total_length - PCAPNG_MIN_BLOCK_BYTES)
+            body = handle.read(min(body_length, PCAPNG_PEEK_BYTES))
+            handle.seek(offset + total_length - 4)
             trailer = struct.unpack(order + "I", handle.read(4))[0]
             if trailer != total_length:
                 raise CaptureError(
-                    f"{path}: block at offset {offset} declares length {total_length} but "
-                    f"its trailing length is {trailer}. pcapng writes the length twice so a "
-                    f"reader can detect exactly this; the file is corrupt."
+                    f"{subject}: {name} block at offset {offset} declares length "
+                    f"{total_length} but its trailing length is {trailer}. pcapng writes the "
+                    f"length twice so a reader can detect exactly this; the file is corrupt."
                 )
 
             if block_type == BLOCK_INTERFACE_DESCRIPTION:
-                link_type_of_interface.append(struct.unpack(order + "H", body[:2])[0])
-            elif block_type in (BLOCK_ENHANCED_PACKET, BLOCK_PACKET_OBSOLETE, BLOCK_SIMPLE_PACKET):
-                interface = _packet_interface(block_type, body, order)
-                if interface >= len(link_type_of_interface):
+                interface_link_types.append(struct.unpack(order + "H", body[:2])[0])
+            elif is_packet:
+                index = section_base + _packet_interface(block_type, body, order)
+                if index >= len(interface_link_types):
                     raise CaptureError(
-                        f"{path}: packet block at offset {offset} references interface "
-                        f"{interface}, which no interface description block defines. Its link "
+                        f"{subject}: {name} block at offset {offset} references interface "
+                        f"{index}, which no interface description block defines. Its link "
                         f"type is unknowable, and guessing one would misdescribe the capture."
                     )
-                counts[link_type_of_interface[interface]] = (
-                    counts.get(link_type_of_interface[interface], 0) + 1
-                )
+                counts[interface_link_types[index]] = counts.get(interface_link_types[index], 0) + 1
                 packets += 1
 
             offset += total_length
+            handle.seek(offset)
 
-    return _Walk(packets, None, _by_link_type(counts))
+    return _Walk(packets, None, _by_link_type(counts), tuple(interface_link_types))
 
 
-def _section_byte_order(handle, path: Path, offset: int) -> str:
+def _section_byte_order(handle, subject: str, offset: int) -> str:
     """Byte order declared by the section header block whose header was just read.
 
     The SHB's own `total_length` field cannot be read until this is known, so the byte-order
@@ -298,20 +383,20 @@ def _section_byte_order(handle, path: Path, offset: int) -> str:
     handle.seek(offset + PCAPNG_BLOCK_HEADER_BYTES)
     if len(magic) < 4:
         raise CaptureError(
-            f"{path}: pcapng section header block at offset {offset} is incomplete — its "
+            f"{subject}: pcapng section header block at offset {offset} is incomplete — its "
             f"byte-order magic is missing, so the file cannot be read at all."
         )
     for order in ("<", ">"):
         if struct.unpack(order + "I", magic)[0] == PCAPNG_BYTE_ORDER_MAGIC:
             return order
     raise CaptureError(
-        f"{path}: pcapng section header block at offset {offset} has byte-order magic "
+        f"{subject}: pcapng section header block at offset {offset} has byte-order magic "
         f"{magic.hex(' ')}, expected 1a 2b 3c 4d in either order."
     )
 
 
 def _packet_interface(block_type: int, body: bytes, order: str) -> int:
-    """Interface index a packet block belongs to.
+    """Interface index a packet block belongs to, relative to its section.
 
     A simple packet block carries no interface field: the format defines it as belonging to
     the first interface, which is the only reading that is not a guess.
@@ -328,11 +413,6 @@ def _by_link_type(counts: dict[int, int]) -> tuple[tuple[int, int], ...]:
     return tuple(sorted(counts.items()))
 
 
-def walk(path: Path, container: str) -> _Walk:
-    """Validate `path` by reading every record header. `container` comes from `sniff`."""
-    return _walk_pcap(path) if container == "pcap" else _walk_pcapng(path)
-
-
 # --- link types ----------------------------------------------------------------------------
 
 
@@ -342,13 +422,14 @@ def link_type_name(link_type: int) -> str:
     return known[0] if known else f"LINKTYPE_{link_type}"
 
 
-def _editcap_encapsulation(link_type: int, path: Path) -> str:
+def _editcap_encapsulation(link_type: int, subject: str) -> str:
     """`editcap -T` name for `link_type`, or a `CaptureError` explaining the dead end.
 
     `-T` is unavoidable when discarding link types: `editcap` decides the output
     encapsulation from the *interface description blocks*, not from the packets that survive
-    selection, so a pcapng that ever declared two link types still refuses to become a pcap
-    even once the minority packets are dropped. Verified on Wireshark 4.6.7.
+    filtering, so a pcapng that ever declared two link types still refuses to become a pcap
+    even once the minority packets are gone. Verified on Wireshark 4.6.7 — for `tshark` as
+    well as `editcap`, and whether the filtering happens in one step or two.
 
     That makes `-T` a claim about the kept packets, so it is only ever passed with a name for
     the type those packets actually carry. Without one, the operator gets an explanation
@@ -357,114 +438,89 @@ def _editcap_encapsulation(link_type: int, path: Path) -> str:
     known = LINK_TYPES.get(link_type)
     if known is None:
         raise CaptureError(
-            f"{path}: the dominant link type is {link_type_name(link_type)}, which flabel has "
-            f"no `editcap -T` name for, and the capture mixes link types so a plain "
+            f"{subject}: the dominant link type is {link_type_name(link_type)}, which flabel "
+            f"has no `editcap -T` name for, and the capture mixes link types so a plain "
             f"conversion is impossible. Split it by link type manually (see `editcap -T` for "
             f"the available names) and pass the resulting single-link-type capture instead."
         )
     return known[1]
 
 
-# --- editcap -------------------------------------------------------------------------------
+# --- running the tools ---------------------------------------------------------------------
 
 
-def _run_editcap(argv: list[str]) -> None:
-    """Invoke `editcap`, turning any failure into `EditcapError`.
+def _run_tool(tool: str, argv: list[str]) -> None:
+    """Invoke a conversion tool, turning any failure into `ConversionError`.
 
     A missing binary and a non-zero exit are the same event to a caller — the conversion did
-    not happen — so both arrive as one exception type with `exit_code` distinguishing them.
+    not happen — so both arrive as one exception type, with `exit_code` (`None` for "could not
+    be run at all") telling them apart in the run block.
     """
     try:
         result = subprocess.run(argv, capture_output=True, text=True, check=False)
     except OSError as error:
-        raise EditcapError(
+        raise ConversionError(
             ToolFailure(
-                tool="editcap",
+                tool=tool,
                 argv=tuple(argv),
                 exit_code=None,
-                message=f"editcap could not be run: {error}",
+                message=f"{tool} could not be run: {error}",
             )
         ) from error
 
     if result.returncode != 0:
-        raise EditcapError(
+        raise ConversionError(
             ToolFailure(
-                tool="editcap",
+                tool=tool,
                 argv=tuple(argv),
                 exit_code=result.returncode,
                 message=(
-                    f"editcap exited {result.returncode}: "
-                    f"{(result.stderr or result.stdout).strip()}"
+                    f"{tool} exited {result.returncode}: {(result.stderr or result.stdout).strip()}"
                 ),
             )
         )
 
 
-def _selection_ranges(path: Path, keep_link_type: int, walked: _Walk) -> list[str]:
-    """1-based packet-number ranges for every packet on `keep_link_type`.
+def _verify_converted(path: Path, expected_packets: int, tool: str, argv: list[str]) -> None:
+    """Re-walk the conversion output and check the packet count is the one we asked for.
 
-    A second walk rather than a per-packet list from the first: the ranges compress runs, so
-    memory stays proportional to the number of interleavings instead of to the packet count,
-    which matters on the multi-gigabyte captures this is aimed at.
+    Exiting zero is not evidence that a tool wrote what was requested, and a silently short
+    conversion would surface downstream as flows that never existed rather than as an ingest
+    failure. The walk already exists, so the check is nearly free.
+
+    Reported as a tool failure rather than a capture error: the input was fine — we walked it —
+    so what went wrong is the tool, which is what `tool_failures[]` is for. `exit_code` is
+    `None` because the process did exit zero; the message carries the contradiction.
     """
-    runs: list[tuple[int, int]] = []
-    for number in _packet_numbers(path, keep_link_type):
-        if runs and runs[-1][1] == number - 1:
-            runs[-1] = (runs[-1][0], number)
-        else:
-            runs.append((number, number))
-        if len(runs) > MAX_SELECTION_RUNS:
-            raise CaptureError(
-                f"{path}: packets of the kept link type fall into more than "
-                f"{MAX_SELECTION_RUNS} separate runs. flabel selects them by passing ranges "
-                f"to `editcap`, and a list this long exceeds what a command line can carry. "
-                f"Split the capture by link type before running flabel."
+    try:
+        produced = _walk_pcap(path, f"the pcap {tool} produced")
+    except CaptureError as error:
+        raise ConversionError(
+            ToolFailure(
+                tool=tool,
+                argv=tuple(argv),
+                exit_code=None,
+                message=f"{tool} exited 0 but its output is not a readable pcap: {error}",
             )
-    if not runs:
-        raise CaptureError(
-            f"{path}: no packets carry link type {link_type_name(keep_link_type)}, though the "
-            f"header walk counted {walked.packets}. This is a flabel bug, not a bad file."
+        ) from error
+
+    if produced.packets != expected_packets or produced.truncated_at_offset is not None:
+        raise ConversionError(
+            ToolFailure(
+                tool=tool,
+                argv=tuple(argv),
+                exit_code=None,
+                message=(
+                    f"{tool} exited 0 but its output holds {produced.packets} packets where "
+                    f"{expected_packets} were expected"
+                    + (
+                        f", and is itself truncated at offset {produced.truncated_at_offset}"
+                        if produced.truncated_at_offset is not None
+                        else ""
+                    )
+                ),
+            )
         )
-    return [f"{first}-{last}" if first != last else str(first) for first, last in runs]
-
-
-def _packet_numbers(path: Path, keep_link_type: int):
-    """1-based numbers of the packet blocks whose interface carries `keep_link_type`.
-
-    Yields rather than collects. Only reached for a capture already known to be a
-    structurally valid pcapng, so the error paths of `_walk_pcapng` are not repeated here.
-    """
-    size = path.stat().st_size
-    order = "<"
-    link_type_of_interface: list[int] = []
-    number = 0
-    offset = 0
-
-    with path.open("rb") as handle:
-        while offset < size:
-            head = handle.read(PCAPNG_BLOCK_HEADER_BYTES)
-            if len(head) < PCAPNG_BLOCK_HEADER_BYTES:
-                return
-            block_type = struct.unpack(order + "I", head[:4])[0]
-            if offset == 0 or block_type == BLOCK_SECTION_HEADER:
-                order = _section_byte_order(handle, path, offset)
-                block_type = BLOCK_SECTION_HEADER
-                link_type_of_interface = []
-            total_length = struct.unpack(order + "I", head[4:8])[0]
-            if offset + total_length > size:
-                return
-            body = handle.read(total_length - PCAPNG_MIN_BLOCK_BYTES)
-
-            if block_type == BLOCK_INTERFACE_DESCRIPTION:
-                link_type_of_interface.append(struct.unpack(order + "H", body[:2])[0])
-            elif block_type in (BLOCK_ENHANCED_PACKET, BLOCK_PACKET_OBSOLETE, BLOCK_SIMPLE_PACKET):
-                number += 1
-                interface = _packet_interface(block_type, body, order)
-                if link_type_of_interface[interface] == keep_link_type:
-                    yield number
-
-            offset += total_length
-            handle.seek(offset)
 
 
 # --- output --------------------------------------------------------------------------------
@@ -490,33 +546,6 @@ def _copy_prefix(source: Path, destination: Path, length: int) -> None:
             remaining -= len(chunk)
 
 
-def _verify_converted(path: Path, expected_packets: int) -> None:
-    """Re-walk `editcap`'s output and check the packet count is the one we asked for.
-
-    `editcap` exiting zero is not evidence that it wrote what was requested, and a silently
-    short conversion would show up downstream as flows that never existed rather than as an
-    ingest failure. The walk already exists, so the check is nearly free.
-    """
-    produced = _walk_pcap(path)
-    if produced.packets != expected_packets or produced.truncated_at_offset is not None:
-        raise EditcapError(
-            ToolFailure(
-                tool="editcap",
-                argv=(),
-                exit_code=0,
-                message=(
-                    f"editcap exited 0 but its output holds {produced.packets} packets where "
-                    f"{expected_packets} were expected"
-                    + (
-                        f", and is itself truncated at offset {produced.truncated_at_offset}"
-                        if produced.truncated_at_offset is not None
-                        else ""
-                    )
-                ),
-            )
-        )
-
-
 # --- the entry point -----------------------------------------------------------------------
 
 
@@ -524,16 +553,22 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
     """Produce the single normalized capture every downstream stage reads.
 
     `workdir` receives exactly one file on success, `normalized.pcap`. On failure it receives
-    none, and is not created if it did not already exist: spec §13 forbids a partial run
-    directory, so a capture that cannot be normalized must leave nothing resembling output.
+    none, and neither it nor any parent directory this call created survives: spec §13 allows
+    a complete run directory or none, with nothing in between.
 
     `sha256` and `bytes_total` describe `capture` **as it was handed to us** — a compressed
     input hashes as the compressed file. They identify the operator's input, which is what
     `capture_format` also describes; the normalized file is identified by being derived from
     them through the recorded `normalization` steps.
 
-    Offsets in `truncated_at_offset` are offsets into the *uncompressed* capture, since that
-    is the only place a record boundary exists.
+    Two counting conventions, reported to the run block exactly as stated here:
+
+    * `packets_read` counts the **complete** records in the input. An incomplete tail record
+      is not counted and is *not* in `discarded_packets` either — `truncated_at_offset` is
+      what reports it. `discarded_packets` counts link-type discards only, so the normalized
+      file holds `packets_read - discarded_packets` packets.
+    * `truncated_at_offset` is an offset into the **uncompressed** capture, since a gzip
+      member has no record boundaries for an offset to refer to.
     """
     capture = Path(capture)
     if not capture.is_file():
@@ -541,7 +576,8 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
 
     container = sniff(capture)
     compressed = container == "gzip"
-    created_workdir = not workdir.exists()
+    subject = str(capture)
+    created_dirs = _missing_directories(workdir)
     intermediates: list[Path] = []
     normalization: list[str] = []
 
@@ -549,17 +585,18 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
         workdir.mkdir(parents=True, exist_ok=True)
         source = capture
         if compressed:
-            source = workdir / "decompressed.capture"
+            source = workdir / DECOMPRESSED_NAME
             intermediates.append(source)
             _decompress(capture, source)
             normalization.append("decompress: gzip")
-            # Sniffed again: gzip says nothing about what it wraps, and the name says nothing
-            # about anything. A `.pcap.gz` holding a pcapng is the reason this is a second
-            # sniff rather than an assumption.
-            container = sniff(source)
+            # Sniffed again, and renamed for reporting: gzip says nothing about what it wraps,
+            # and from here on the file being read is a temporary one that cleanup deletes, so
+            # every message must still name the operator's file.
+            subject = f"{capture} (decompressed)"
+            container = sniff(source, subject)
         capture_format: CaptureFormat = _format_name(container, compressed)
 
-        walked = walk(source, container)
+        walked = walk(source, container, subject)
         output = workdir / NORMALIZED_NAME
         if container == "pcap":
             discarded_link_types: tuple[str, ...] = ()
@@ -567,29 +604,33 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
             _emit_pcap(source, output, walked, normalization, intermediates)
         else:
             discarded_link_types, discarded_packets = _emit_pcapng(
-                source, output, walked, normalization
+                source, output, walked, normalization, workdir, subject, capture, intermediates
             )
+
+        for intermediate in intermediates:
+            intermediate.unlink(missing_ok=True)
+        intermediates.clear()
+
+        # Hashing and sizing are inside the try on purpose: `capture` is a file on someone
+        # else's filesystem, and if it vanishes or turns unreadable in this window the failure
+        # must take `normalized.pcap` with it rather than leave output behind for a failed run.
+        partial = walked.truncated_at_offset is not None or discarded_packets > 0
+        return NormalizedCapture(
+            path=output,
+            original_path=capture,
+            sha256=_sha256(capture),
+            capture_format=capture_format,
+            bytes_total=capture.stat().st_size,
+            input_status="partial" if partial else "complete",
+            packets_read=walked.packets,
+            truncated_at_offset=walked.truncated_at_offset,
+            discarded_link_types=discarded_link_types,
+            discarded_packets=discarded_packets,
+            normalization=tuple(normalization),
+        )
     except BaseException:
-        _discard_output(workdir, created_workdir, intermediates)
+        _discard_output(workdir, created_dirs, intermediates)
         raise
-
-    for intermediate in intermediates:
-        intermediate.unlink(missing_ok=True)
-
-    partial = walked.truncated_at_offset is not None or discarded_packets > 0
-    return NormalizedCapture(
-        path=output,
-        original_path=capture,
-        sha256=_sha256(capture),
-        capture_format=capture_format,
-        bytes_total=capture.stat().st_size,
-        input_status="partial" if partial else "complete",
-        packets_read=walked.packets,
-        truncated_at_offset=walked.truncated_at_offset,
-        discarded_link_types=discarded_link_types,
-        discarded_packets=discarded_packets,
-        normalization=tuple(normalization),
-    )
 
 
 def _decompress(capture: Path, destination: Path) -> None:
@@ -647,6 +688,10 @@ def _emit_pcapng(
     output: Path,
     walked: _Walk,
     normalization: list[str],
+    workdir: Path,
+    subject: str,
+    origin: Path,
+    intermediates: list[Path],
 ) -> tuple[tuple[str, ...], int]:
     """Convert a pcapng to pcap, discarding minority link types if there is more than one.
 
@@ -654,33 +699,59 @@ def _emit_pcapng(
     """
     if walked.truncated_at_offset is not None:
         raise CaptureError(
-            f"{source}: pcapng is truncated at offset {walked.truncated_at_offset} after "
+            f"{subject}: pcapng is truncated at offset {walked.truncated_at_offset} after "
             f"{walked.packets} packets. Unlike a pcap record, a partial pcapng block cannot "
             f"be dropped safely, so flabel will not convert it. Repair it first — "
-            f"`editcap -F pcapng {source} repaired.pcapng` rewrites the readable blocks — "
-            f"then re-run flabel against the repaired file."
+            f"`editcap -F pcapng {origin} repaired.pcapng` rewrites the readable blocks, and "
+            f"reads a gzipped capture directly — then re-run flabel on the repaired file."
         )
 
     if len(walked.link_types) <= 1:
-        _run_editcap(["editcap", "-F", "pcap", str(source), str(output)])
+        argv = ["editcap", "-F", "pcap", str(source), str(output)]
+        _run_tool("editcap", argv)
         normalization.append("convert: editcap -F pcap")
-        _verify_converted(output, walked.packets)
+        _verify_converted(output, walked.packets, "editcap", argv)
         return (), 0
 
     # Dominant by packet count, ties broken by the lowest link type. A tie has no meaningful
-    # winner, so the rule is chosen to be *stable* — reproducibility (Goal 2) needs two runs
+    # winner, so the rule is chosen to be *stable*: reproducibility (Goal 2) needs two runs
     # over one capture to keep the same packets, which a dict-order or first-seen rule would
     # not guarantee.
     kept_link_type, kept_packets = max(
         walked.packets_by_link_type, key=lambda item: (item[1], -item[0])
     )
-    encapsulation = _editcap_encapsulation(kept_link_type, source)
-    ranges = _selection_ranges(source, kept_link_type, walked)
+    encapsulation = _editcap_encapsulation(kept_link_type, subject)
+    kept_interfaces = [
+        index
+        for index, link_type in enumerate(walked.interface_link_types)
+        if link_type == kept_link_type
+    ]
 
-    _run_editcap(
-        ["editcap", "-F", "pcap", "-T", encapsulation, "-r", str(source), str(output), *ranges]
-    )
-    _verify_converted(output, kept_packets)
+    # Selection by *interface*, with a display filter. The obvious alternative — passing the
+    # kept packet numbers to `editcap` as ranges — only stays small while link types arrive in
+    # long runs, and a real `dumpcap -i eth0 -i lo` capture interleaves them per packet, so
+    # the argument list would grow with the capture until it exceeded what a command line can
+    # carry. A filter is one argument whatever the interleaving. Several interfaces can share
+    # the kept link type, hence the disjunction.
+    selected = workdir / SELECTED_NAME
+    intermediates.append(selected)
+    expression = " || ".join(f"frame.interface_id=={index}" for index in kept_interfaces)
+    select_argv = [
+        "tshark",
+        "-r",
+        str(source),
+        "-Y",
+        expression,
+        "-F",
+        "pcapng",
+        "-w",
+        str(selected),
+    ]
+    _run_tool("tshark", select_argv)
+
+    convert_argv = ["editcap", "-F", "pcap", "-T", encapsulation, str(selected), str(output)]
+    _run_tool("editcap", convert_argv)
+    _verify_converted(output, kept_packets, "editcap", convert_argv)
 
     discarded = tuple(
         link_type_name(link_type)
@@ -688,20 +759,44 @@ def _emit_pcapng(
         if link_type != kept_link_type
     )
     discarded_packets = walked.packets - kept_packets
-    normalization.append("convert: editcap -F pcap")
     normalization.append(
-        f"split: kept link type {link_type_name(kept_link_type)} ({kept_packets} packets); "
-        f"discarded {discarded_packets} packets of link type(s) {', '.join(discarded)}"
+        f"select: tshark kept interface(s) "
+        f"{', '.join(str(index) for index in kept_interfaces)} carrying link type "
+        f"{link_type_name(kept_link_type)} ({kept_packets} packets)"
+    )
+    normalization.append(f"convert: editcap -F pcap -T {encapsulation}")
+    normalization.append(
+        f"split: discarded {discarded_packets} packets of link type(s) {', '.join(discarded)}"
     )
     return discarded, discarded_packets
 
 
-def _discard_output(workdir: Path, created_workdir: bool, intermediates: list[Path]) -> None:
+# --- cleanup -------------------------------------------------------------------------------
+
+
+def _missing_directories(workdir: Path) -> list[Path]:
+    """`workdir` and every ancestor of it that does not exist yet, deepest first.
+
+    `mkdir(parents=True)` can create a whole chain of directories, and a cleanup that removed
+    only the leaf would leave the rest behind as debris from a run that produced nothing.
+    """
+    missing: list[Path] = []
+    current = workdir
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    return missing
+
+
+def _discard_output(workdir: Path, created_dirs: list[Path], intermediates: list[Path]) -> None:
     """Leave nothing behind after a failure — spec §13: no partial run directory.
 
     The normalized file is removed too: a caller that catches the error and carries on must
-    not find a half-written capture waiting for it. An existing `workdir` is left in place
-    (it was not ours to delete) but emptied of what this call put there.
+    not find a half-written capture waiting for it. Directories go only if this call created
+    them, so a pre-existing `workdir` survives — it was not ours to delete — emptied of
+    whatever this call put in it.
 
     Every removal is best-effort. This runs while an exception is in flight, and a cleanup
     that raised — an unwritable directory, an output path that turned out to be something
@@ -710,8 +805,8 @@ def _discard_output(workdir: Path, created_workdir: bool, intermediates: list[Pa
     for path in [*intermediates, workdir / NORMALIZED_NAME]:
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
-    if created_workdir and workdir.is_dir():
-        # Only if something else wrote here meanwhile — in which case the directory is not
-        # ours to remove after all.
+    for directory in created_dirs:
+        # `rmdir` refuses a non-empty directory, which is the behaviour we want: if something
+        # else wrote here meanwhile, the directory is not ours to remove after all.
         with contextlib.suppress(OSError):
-            workdir.rmdir()
+            directory.rmdir()
