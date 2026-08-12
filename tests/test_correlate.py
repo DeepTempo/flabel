@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 
 from flabel.correlate import ICMPV4_COUNTERPART, ICMPV6_COUNTERPART, correlate
-from flabel.errors import FlabelError, SnapshotError, exit_code_for
+from flabel.errors import CorrelationError, SnapshotError, exit_code_for
 from flabel.models import (
     Detection,
     Flow,
@@ -831,7 +831,7 @@ def test_one_unmatched_in_two_hundred_passes():
 
 def test_one_unmatched_in_fifty_fails_the_run():
     """2% is above the default: at that rate the labels no longer describe the capture."""
-    with pytest.raises(FlabelError, match="unmatched"):
+    with pytest.raises(CorrelationError, match="unmatched"):
         correlate(many_detections(50, 1), by_uid(make_flow()), make_manifest())
 
 
@@ -852,7 +852,7 @@ def test_the_gate_fires_above_the_threshold_not_at_it(unmatched, total, fails):
     flows = by_uid(make_flow())
 
     if fails:
-        with pytest.raises(FlabelError):
+        with pytest.raises(CorrelationError):
             correlate(detections, flows, make_manifest())
     else:
         assert len(correlate(detections, flows, make_manifest()).unmatched) == unmatched
@@ -865,16 +865,34 @@ def test_the_threshold_is_configurable():
 
     assert len(correlate(detections, flows, make_manifest(), threshold=0.05).unmatched) == 1
 
-    with pytest.raises(FlabelError):
+    with pytest.raises(CorrelationError):
         correlate(detections, flows, make_manifest(), threshold=0.001)
 
 
 def test_the_gate_failure_exits_one():
     """Spec §12/§13: a hard failure is exit 1, and nothing may claim a verdict afterwards."""
-    with pytest.raises(FlabelError) as raised:
+    with pytest.raises(CorrelationError) as raised:
         correlate(many_detections(50, 1), by_uid(make_flow()), make_manifest())
 
     assert exit_code_for(raised.value) == 1
+
+
+def test_the_gate_failure_carries_the_unmatched_records():
+    """The records are the content of the failure, and the raise must not discard them.
+
+    Spec §11 requires every unmatched detection reported, and spec §10 puts them in `run.json`
+    on a failed run — but step 9 can only write what the exception hands it. Before
+    `CorrelationError` this raise carried a message and nothing else, so the one failure that
+    is *about* lost detections was the one that lost them.
+    """
+    with pytest.raises(CorrelationError) as raised:
+        correlate(many_detections(50, 1), by_uid(make_flow()), make_manifest())
+
+    result = raised.value.result
+    assert result is not None, "the gate raised without the result step 9 has to report"
+    assert len(result.unmatched) == 1
+    assert result.unmatched[0].reason == "no_flow_match"
+    assert result.detections_total == 50
 
 
 def test_zero_unmatched_is_silent(capsys):
@@ -923,7 +941,7 @@ def test_a_threshold_that_would_disable_the_gate_is_refused(threshold):
 
 def test_a_threshold_of_zero_means_any_loss_fails():
     """The strictest useful setting, and it must not be mistaken for "unset"."""
-    with pytest.raises(FlabelError):
+    with pytest.raises(CorrelationError):
         correlate(many_detections(200, 1), by_uid(make_flow()), make_manifest(), threshold=0.0)
 
 
@@ -939,7 +957,7 @@ def test_the_gate_measures_detections_not_flows():
     )
     flows = by_uid(make_flow(), *quiet)
 
-    with pytest.raises(FlabelError, match="1 of 20"):
+    with pytest.raises(CorrelationError, match="1 of 20"):
         correlate(many_detections(20, 1), flows, make_manifest())
 
 

@@ -32,7 +32,7 @@ import math
 import sys
 from collections.abc import Mapping, Sequence
 
-from flabel.errors import FlabelError, SnapshotError
+from flabel.errors import CorrelationError, SnapshotError
 from flabel.models import (
     CorrelationResult,
     Detection,
@@ -112,7 +112,7 @@ def correlate(
 
     Raises `SnapshotError` for a detection from a source the snapshot does not describe,
     `ValueError` for anything `build_source_entry` refuses (an `identify` source, an
-    unresolvable snapshot id, a tier outside `{1, 2}`), and `FlabelError` when more than
+    unresolvable snapshot id, a tier outside `{1, 2}`), and `CorrelationError` when more than
     `threshold` of the detections could not be placed.
     """
     _check_threshold(threshold)
@@ -333,8 +333,9 @@ def _gate(result: CorrelationResult, threshold: float) -> None:
     """Spec §9: silent at zero unmatched, a warning above zero, a failed run above `threshold`.
 
     Silence at zero is what makes the warning worth reading — it always means something was
-    lost. The failure is a `FlabelError` (exit 1, no `labels.json`), because past the threshold
-    the labels no longer describe the capture and a file that says otherwise is worse than none.
+    lost. The failure is a `CorrelationError` (exit 1, no `labels.json`), because past the
+    threshold the labels no longer describe the capture and a file that says otherwise is worse
+    than none.
     """
     if not result.unmatched:
         return
@@ -344,14 +345,15 @@ def _gate(result: CorrelationResult, threshold: float) -> None:
         f"({result.unmatched_ratio:.2%}) could not be attached to exactly one flow"
     )
     if result.unmatched_ratio > threshold:
-        # Warned before raising, so an operator watching the run sees the count even though the
-        # `UnmatchedDetection` records go no further: a raise carries no result, and there is no
-        # `labels.json` on a hard failure to record them in.
+        # Warned as well as raised. The exception carries the result, so the caller can write
+        # `unmatched_detections[]` into `run.json` (spec §10) — but the warning reaches an
+        # operator watching the run, who is not reading a file that does not exist yet.
         _warn(f"{summary}; above the {threshold:.2%} threshold, so this run has failed")
-        raise FlabelError(
+        raise CorrelationError(
             f"{summary}, above the unmatched threshold of {threshold}: the labels would not "
             f"describe this capture. Raise --unmatched-threshold to accept the loss, or check "
-            f"that Zeek and Suricata read the same capture."
+            f"that Zeek and Suricata read the same capture.",
+            result=result,
         )
 
     _warn(f"{summary}; they are reported in unmatched_detections[] and carry no label")
