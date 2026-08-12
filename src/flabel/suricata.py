@@ -24,12 +24,18 @@ Failure handling splits along a deliberate line:
   and exits 0 with an empty alert set (verified on 8.0.6), which is indistinguishable from a
   capture that contained nothing.
 * **Suricata failed to run, or ran and failed** → a `ToolFailure` in the returned
-  `SuricataRunInfo`, with no exception escaping. The caller fails the run (spec §8) but the
-  run block still reports what was lost rather than merely dying (spec §2.5).
+  `SuricataRunInfo`. The caller fails the run (spec §8) but the run block still reports what
+  was lost rather than merely dying (spec §2.5).
+* **`eve.json` says something we cannot read** → `ToolError`, raised. Stated plainly because
+  it is the one case that raises *after* the tool has written its output directory: a
+  corrupt, undecodable or structurally impossible record is not a loss we can quantify, and
+  attaching a count to it would be inventing one. The caller must therefore treat a raised
+  failure as "the output directory may exist and must not be published" (spec §13).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -66,6 +72,14 @@ LOG_FILE = "suricata.log"
 #: `sid:` in a rule line. Suricata itself accepts whitespace around the colon, so this does
 #: too — a rule we failed to see the SID of would be a rule we could not attribute.
 SID = re.compile(r"\bsid\s*:\s*(\d+)\s*;")
+
+#: A double-quoted rule argument. Stripped before the SID is read, because a rule whose
+#: `content:` or `pcre:` happens to contain the text ``sid:1;`` would otherwise be attributed
+#: to SID 1 — and every label from it would name the wrong rule.
+QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+#: Length of `snapshot_id`: spec §7 defines it as sha256(rules.rules bytes) truncated here.
+SNAPSHOT_ID_LENGTH = 16
 
 #: Suricata's own load report in ``suricata.log``, used when the eve stats event is absent.
 RULES_LOADED = re.compile(r"(\d+) rules successfully loaded")
@@ -106,6 +120,7 @@ def run_suricata(
     output is `labels.py`'s job (spec §10), so nothing is re-sorted here.
     """
     manifest = load_manifest(snapshot)
+    verify_snapshot_id(snapshot, manifest)
     sources = {admission.name: admission for admission in manifest.sources}
     index = sid_source_index(snapshot, manifest)
     _prepare_outdir(outdir)
@@ -209,7 +224,62 @@ def load_manifest(snapshot: Path) -> SnapshotManifest:
         raise SnapshotError(f"{path} lists no sources, so no alert could be attributed")
 
     admissions = tuple(_build(SourceAdmission, entry, path) for entry in raw_sources)
+
+    # Duplicates rejected the way `config.py` rejects them in the registry: with two entries
+    # of the same name, which `source_class` applies — and therefore whether that source may
+    # label at all — would depend on manifest order. `may_label` is the one thing spec §13
+    # calls absolute, so it may not rest on a dict update winning.
+    seen: set[str] = set()
+    for admission in admissions:
+        key = admission.name.casefold()
+        if key in seen:
+            raise SnapshotError(
+                f"{path}: source {admission.name!r} appears more than once. Which "
+                f"source_class applies would depend on the order of the file."
+            )
+        seen.add(key)
+
     return _build(SnapshotManifest, {**document, "sources": admissions}, path)
+
+
+def verify_snapshot_id(snapshot: Path, manifest: SnapshotManifest) -> None:
+    """Check that `snapshot_id` really is the hash of the rules that are about to run.
+
+    Spec §7 calls the id self-verifying — "rewriting the file changes the id" — but nothing
+    verifies it, and the two halves come from different files: `snapshot_id` is read from
+    `manifest.json` while the rules that produce the alerts are read from `rules.rules`. Edit
+    `rules.rules` and every label would still claim the original id, which is a label whose
+    origin cannot be traced (spec §13) while looking perfectly traceable.
+
+    The id is checked as a *prefix* of the digest rather than at one exact length, so this
+    does not silently pin step 4 to a particular truncation — only to hashing the file spec §7
+    says it hashes. This check belongs in `rules/snapshot.load_snapshot` once step 4 lands;
+    it lives here because that function does not exist yet.
+
+    What this does **not** cover, and should be recorded as accepted risk: `manifest.json`
+    itself is unprotected, and it is where `source_class` — hence `may_label` — comes from.
+    """
+    if len(manifest.snapshot_id) < SNAPSHOT_ID_LENGTH:
+        raise SnapshotError(
+            f"snapshot id {manifest.snapshot_id!r} is shorter than {SNAPSHOT_ID_LENGTH} "
+            f"characters, which is too little of a sha256 to identify a ruleset"
+        )
+
+    rules = snapshot / RULES_FILE
+    try:
+        digest = hashlib.sha256(rules.read_bytes()).hexdigest()
+    except FileNotFoundError as exc:
+        raise SnapshotError(f"snapshot {snapshot} has no {RULES_FILE}") from exc
+    except OSError as exc:
+        raise SnapshotError(f"{rules} could not be read: {exc}") from exc
+
+    if not digest.startswith(manifest.snapshot_id):
+        raise SnapshotError(
+            f"snapshot {snapshot} is not internally consistent: {MANIFEST_FILE} says "
+            f"snapshot_id {manifest.snapshot_id!r}, but sha256({RULES_FILE}) begins "
+            f"{digest[: len(manifest.snapshot_id)]!r}. The rules that would run are not the "
+            f"rules this id names, so every label from this run would misstate its origin."
+        )
 
 
 def sid_source_index(snapshot: Path, manifest: SnapshotManifest) -> dict[int, str]:
@@ -303,37 +373,38 @@ def _sids(lines: Iterable[str], *, strict: bool = False, origin: Path | None = N
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        match = SID.search(stripped)
-        if match is None:
+        # Quoted arguments are blanked first, so a `content:"sid:1;"` cannot be mistaken for
+        # the rule's own SID, and the *last* remaining match wins: `sid` is conventionally the
+        # final option, and anything that survived the blanking is more likely to precede it.
+        matches = SID.findall(QUOTED.sub('""', stripped))
+        if not matches:
             if strict:
                 raise SnapshotError(
                     f"{origin} has an active rule with no sid, which cannot be attributed to "
                     f"a source: {stripped[:120]}"
                 )
             continue
-        found.add(int(match.group(1)))
+        found.add(int(matches[-1]))
     return found
 
 
 def _build(kind: type, values: Mapping[str, Any], path: Path) -> Any:
-    """Construct a frozen dataclass from `values`, rejecting missing and unknown keys.
+    """Construct a frozen dataclass from `values`, requiring every field it declares.
 
-    Unknown keys are rejected rather than ignored: a manifest key we do not understand means
-    the writer and the reader disagree about the format, and continuing would mean reading a
-    document whose meaning we have guessed at.
+    A *missing* key is fatal: the manifest is where `source_class` comes from, and a field we
+    cannot read is a decision we would be guessing at. An *unknown* key is ignored, which is
+    the opposite of `config.py`'s rule about the registry, for a reason — a human writes the
+    registry, where a typo'd key that reads as a setting is the hazard, while this file is
+    written by flabel itself. Rejecting unknown keys would mean a later version that adds a
+    field makes every snapshot already on disk unreadable, and spec §2.7 requires Phase 2 to
+    be additive. A renamed field still fails loudly, as a missing one.
     """
     expected = {field.name for field in fields(kind)}
     missing = sorted(expected - set(values))
-    unknown = sorted(set(values) - expected)
-    if missing or unknown:
-        problems = []
-        if missing:
-            problems.append(f"missing {', '.join(missing)}")
-        if unknown:
-            problems.append(f"unknown field(s) {unknown}")
-        raise SnapshotError(f"{path}: {kind.__name__} has {'; '.join(problems)}")
+    if missing:
+        raise SnapshotError(f"{path}: {kind.__name__} is missing {', '.join(missing)}")
     try:
-        return kind(**values)
+        return kind(**{name: values[name] for name in expected})
     except (TypeError, ValueError) as exc:
         # ValueError covers the models' own Literal checks — an unknown `source_class` lands
         # here, and getting that wrong changes whether a source may label.
@@ -358,7 +429,7 @@ def _read_eve(
     loaded: int | None = None
 
     with path.open(encoding="utf-8") as handle:
-        for number, line in enumerate(handle, start=1):
+        for number, line in enumerate(_lines(handle, path), start=1):
             stripped = line.strip()
             if not stripped:
                 continue
@@ -390,6 +461,26 @@ def _read_eve(
     return detections, alerts_total, suppressed, loaded
 
 
+def _lines(handle: Iterable[str], path: Path) -> Iterable[str]:
+    """Yield `handle`'s lines, turning undecodable bytes into a `FlabelError`.
+
+    eve.json carries attacker-influenced strings — SNI, HTTP hosts, filenames — so a byte that
+    is not valid UTF-8 is a thing a capture can genuinely contain. Without this, one such byte
+    anywhere in the file, including in a record no alert refers to, ends the run with a bare
+    `UnicodeDecodeError`: not a `FlabelError`, so `cli.py` cannot map it to an exit code and
+    the operator gets a traceback instead of a reason. Decoded strictly rather than with
+    ``errors="replace"`` because a silently mangled `threat` or hostname would travel into
+    `labels.json` as provenance.
+    """
+    try:
+        yield from handle
+    except UnicodeDecodeError as exc:
+        raise ToolError(
+            f"{path} is not valid UTF-8 ({exc}). Suricata writes capture-derived strings into "
+            f"eve.json, so this may be the capture's content rather than a broken tool."
+        ) from exc
+
+
 def _detection(
     record: Mapping[str, Any],
     index: Mapping[int, str],
@@ -403,8 +494,14 @@ def _detection(
     later stage could accidentally read past (spec §2.8).
     """
     alert = record.get("alert")
-    if not isinstance(alert, dict) or "signature_id" not in alert:
-        raise ToolError(f"{path} line {number} is an alert with no alert.signature_id")
+    if not isinstance(alert, dict):
+        raise ToolError(f"{path} line {number} is an alert record with no alert object")
+    # `signature` is required alongside `signature_id` because it becomes `SourceEntry.threat`,
+    # one of the fields spec §4 demands on every label with no "where applicable" escape. A
+    # default of "" would be a label that names no threat while looking complete.
+    for key in ("signature_id", "signature"):
+        if key not in alert:
+            raise ToolError(f"{path} line {number} is an alert with no alert.{key}")
 
     sid = int(alert["signature_id"])
     source = index.get(sid)
@@ -433,10 +530,13 @@ def _detection(
         source=source,
         tier=TIER,
         sid=sid,
+        # `rev` defaults to 0 only because that is what Suricata itself reports for a rule
+        # written without one — the default matches the tool's own semantics rather than
+        # inventing a version.
         rev=int(alert.get("rev", 0)),
         classtype=category,
         app_proto=record.get("app_proto"),
-        threat=str(alert.get("signature", "")),
+        threat=str(alert["signature"]),
         ts=_epoch(record.get("timestamp"), path, number),
         src_ip=str(record.get("src_ip", "")),
         src_port=int(record.get("src_port", 0)),
@@ -456,15 +556,27 @@ def _epoch(timestamp: Any, path: Path, number: int) -> float:
     Suricata writes local time with an offset (``2023-11-14T14:13:20.050000-0800``); Zeek
     writes epoch seconds. Converting here means correlation compares two numbers on one
     timeline instead of reconciling two formats (spec §9).
+
+    A timestamp with **no** offset is rejected rather than assumed. `datetime.timestamp()`
+    reads a naive value as *local* time, so an offset-less record would silently shift by the
+    machine's UTC offset — no error, an epoch value hours out, and a correlation that quietly
+    matches the wrong flow or none at all. Different machines would disagree, which is a
+    reproducibility break of exactly the kind Goal 2 rules out.
     """
     if not isinstance(timestamp, str):
         raise ToolError(f"{path} line {number}: alert has no timestamp")
     try:
-        return datetime.fromisoformat(timestamp).timestamp()
+        parsed = datetime.fromisoformat(timestamp)
     except ValueError as exc:
         raise ToolError(
             f"{path} line {number}: unparseable timestamp {timestamp!r}: {exc}"
         ) from exc
+    if parsed.tzinfo is None:
+        raise ToolError(
+            f"{path} line {number}: timestamp {timestamp!r} carries no UTC offset, so it "
+            f"cannot be placed on the capture timeline without guessing a timezone"
+        )
+    return parsed.timestamp()
 
 
 def _metadata(raw: Any) -> tuple[str, ...]:
