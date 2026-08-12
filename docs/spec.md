@@ -392,6 +392,47 @@ Pure. Given a source and its fetched rule text, return the admitted rules plus c
 - Commented-out rules (`#alert`) are never admitted.
 - Every exclusion increments exactly one counter; `fetched == admitted + sum(excluded)` is asserted.
 
+### Measured yield — 2026-08-12 (closes issue #11)
+
+Reproduced offline from a saved mirror of the nine live feeds, so these are repeatable without
+network access: `tests/fixtures/rules/measure_feeds.py --mirror <dir>`.
+
+| Source | Basis | Fetched | Admitted | % | no-conf | low-conf | low-sev | unloadable |
+| :-- | :-- | --: | --: | --: | --: | --: | --: | --: |
+| `abuse.ch/feodotracker` | wholesale | 5 | 5 | 100.0% | | | | |
+| `abuse.ch/sslbl-blacklist` | wholesale | 10,369 | 10,369 | 100.0% | | | | |
+| `abuse.ch/urlhaus` | wholesale | 31,682 | 31,682 | 100.0% | | | | |
+| `et/open` | metadata-filter | 51,778 | 21,221 | **41.0%** | 5,836 | 11,425 | 13,296 | |
+| `malsilo/win-malware` | wholesale | 14 | 14 | 100.0% | | | | |
+| `oisf/trafficid` | wholesale | 34 | 34 | 100.0% | | | | |
+| `pawpatrules` | wholesale | 21,467 | 21,464 | 100.0% | | | | 3 |
+| `stamus/lateral` | wholesale | 546 | 546 | 100.0% | | | | |
+| `the-hunters-ledger/open` | wholesale | 96 | 96 | 100.0% | | | | |
+| **Total** | | **115,991** | **85,431** | **73.7%** | 5,836 | 11,425 | 13,296 | 3 |
+
+The `fetched == admitted + sum(excluded)` identity holds for every source. `rules_fetched` counts
+active `alert` lines only; the 19,495 `#alert` lines (19,479 of them ET Open's) are counted in
+`rules_excluded_commented`.
+
+**41.0% is not the coverage figure, and reading it as one would be the wrong conclusion.** The
+metadata filter applies to exactly one source. ET Open is 24.8% of admitted volume, so Tier 2
+coverage is **85,431 rules across nine sources, 73.7% of everything fetched** — the per-source
+policy working as designed rather than a filter discarding most of the ruleset.
+
+**What this gives issue #10.** ET Open's exclusions split 5,836 with no `confidence` key, 11,425
+`confidence` too low, 13,296 severity too low. So untagged rules are 11.3% of ET Open's active
+rules and 19.4% of what the filter drops; admitting them would move ET Open from 41.0% to 52.3%
+yield with no per-rule evidence behind any of them. That is the trade #10 has to decide, now with a
+denominator.
+
+**Zero `ja4.hash` rules exist across all nine feeds** (199 `ja3.hash`: 193 `pawpatrules`, 5
+`et/open`, 1 `the-hunters-ledger/open`), confirming issue #13 — the capability ships, the content
+does not exist upstream.
+
+**These counts describe one mirror, not a constant.** `abuse.ch/urlhaus` and two of `pawpatrules`'
+companion lists (`openphish`, `nrd_phishing_14day`) refresh upstream daily, which is why companion
+data is inside the `snapshot_id` hash (§7). A later fetch is a different measurement.
+
 ---
 
 ## 7. Ruleset snapshots — `rules/snapshot.py`
@@ -790,6 +831,35 @@ had nowhere to surface: `tools.ja4_status` and `tools.suricata_config_sha256`, a
 it holds a real package version read from the toolchain manifest, or nothing, and never a status
 string standing in for one (§8).
 
+### `run.json` — the run block when there are no labels to carry it
+
+**On a hard tool failure the run directory contains `run.json` and no `labels.json`** (Craig,
+2026-08-12 — issue #23). `run.json` holds the same run block defined above, including
+`tool_failures[]` with each failure's argv, exit code, and whether the tool was killed rather than
+exited.
+
+This resolves a genuine tension between two requirements rather than working around either. §11
+requires a tool failure recorded in `tool_failures[]`; §13 forbids writing a partial `labels.json`
+on a hard failure. The array therefore belongs to a document that must not exist — so it moves to
+one that may.
+
+Two alternatives were rejected, and why matters more than the choice:
+
+| Rejected | Why |
+| :-- | :-- |
+| stderr only, nothing on disk | A calling script would have to parse prose to learn what was lost. That is exactly the structured-record loss `ToolError.failures` exists to prevent (§4) — the argv, the exit code and the kill status would survive only as text. |
+| A complete `labels.json` with empty `labels[]` | It reads as "nothing malicious was found" when the pipeline in fact died. A consumer training on the output cannot distinguish it from a clean capture, which is §2.5's failure mode in its purest form. |
+
+**The absence of `labels.json` is the signal, and it is unambiguous**: no verdict was ever claimed.
+A consumer tests for the file, not for a status field inside it — a status field would have to be
+read and understood, whereas a missing file cannot be misread as a verdict.
+
+Consequently `run.json` is written by **every** run, successful or not, so that a consumer has one
+place to find the run block regardless of outcome and never has to infer which file to open. Two
+consequences follow for later steps: it is a name in the output contract (§12), and §10's
+reproducibility comparison must skip label-free run directories rather than fail on the missing
+`labels.json`.
+
 ### `NOTICE` — `notice.py`
 
 Lists every source that asserted at least one label in this run, with its licence and required attribution. Sources present in the snapshot but which asserted nothing are not listed.
@@ -815,14 +885,34 @@ Each has a field and exactly one fault-injection test. This closed list is what 
 **Two rows added in steps 5 and 6.** Both are losses the tools report and then exit 0 over, which
 is the shape §2.5 exists to catch.
 
-**Rules failed or skipped at load: record always, warn above zero, fail above a threshold** (Craig,
-2026-08-12). Suricata loads what it can and exits 0, so a snapshot of 85,545 rules loading as
-85,519 is a run that looks complete and never examined the capture with 26 of its rules. Any
-shortfall is worth saying out loud, and a large one means the snapshot and the engine disagree about
-what a rule is — but a hard failure on *any* shortfall would fail real runs over a handful of rules
-using a keyword this build lacks, which is why the threshold exists. Rules the engine is known in
-advance to reject are excluded at admission instead (§5), so the counters describe surprises rather
-than known incompatibilities.
+**Rules failed or skipped at load: record always, warn on any shortfall, and let the operator
+decide** (Craig, 2026-08-12 — issue #46). Suricata loads what it can and exits 0, so a snapshot of
+85,545 rules loading as 85,519 is a run that looks complete and never examined the capture with 26
+of its rules. Any shortfall is worth saying out loud, and a large one means the snapshot and the
+engine disagree about what a rule is. Rules the engine is known in advance to reject are excluded
+at admission instead (§5), so these counters describe *surprises* rather than known
+incompatibilities.
+
+**This replaces the earlier "fail above a threshold".** A threshold is a number of labels you are
+willing to lose in silence, and the measurement gives no evidence for any particular value.
+Measured 2026-08-12 against a snapshot built from all nine feeds (`8c9e8d58af0a8d64`, 85,431
+rules): **85,431 loaded, 0 failed, 0 skipped** — `rules_loaded` equals `total_admitted` exactly.
+Zero is the only value ever observed, so any threshold would be invented rather than derived.
+
+So the run reports the shortfall — the count **and** the percentage of the ruleset it represents —
+and asks whether to continue (`Y/n`, default yes). The operator decides in the moment, with the
+loss quantified in front of them, rather than a constant deciding in advance on their behalf.
+
+**The prompt appears only when stdin is a TTY.** flabel runs in CI, cron and `set -e` scripts,
+where a prompt either hangs the pipeline or blocks §10's own reproducibility gates. Without a TTY
+the run proceeds — that is what "default yes" means — and the warning is recorded in the run block
+either way, so a non-interactive run never loses the fact that rules went missing. No flag controls
+this: the CLI contract in §12 is closed, and a flag would be a second way to express something the
+default already answers.
+
+A run that cannot obtain the counts at all still fails (§8): an alert set whose ruleset cannot be
+attested is not evidence, and that is a different condition from a ruleset that is attestably
+incomplete.
 
 **JA4 unavailable: `tools.ja4_status`, so a null `ja4` cannot be mistaken for "no TLS in this
 capture".** Those are different facts about a flow, and with no field to hold the difference a
@@ -850,7 +940,7 @@ flabel rules list  [--rules-dir <d>]
 | Code | Meaning |
 | :-: | :-- |
 | 0 | Success. Labels written. Covers both complete and partial input — `run.input.input_status` distinguishes them. |
-| 1 | Failure. No labels written. |
+| 1 | Failure. **No `labels.json`** — but the run directory exists and holds `run.json` with `tool_failures[]` (§10), unless the failure occurred before a run directory could be created (a missing snapshot, an unreadable capture). |
 | 2 | Usage error (argparse). |
 | 3 | Not implemented — the Phase 1 default path only. |
 
@@ -885,7 +975,9 @@ Not blocking the plan; each has an owner.
 | Item | Where |
 | :-- | :-- |
 | Malicious canary capture must be sourced (origin + licence recorded) | `tests/fixtures/README.md`, PRD Q8 |
-| Exact ET Open admitted-rule counts | issue #11, measured by step 4 |
-| Untagged-ET-rule policy | issue #10 |
-| JA4 rule content | issue #13 |
+| ~~Exact ET Open admitted-rule counts~~ | **Closed 2026-08-12 — §6 records the measured per-source yield (issue #11)** |
+| Untagged-ET-rule policy | issue #10 — §6 now supplies the denominator it was waiting on |
+| JA4 rule content | issue #13 — confirmed zero `ja4.hash` rules across all nine feeds (§6) |
 | Stakeholders, target release, metric review dates | PRD Q1, Q2, Q10 |
+| `manifest.json` is not covered by `snapshot_id`, so a label's terms are stored with the rules but not sealed with them | issue #48 |
+| `_read_manifest` accepts duplicate source names; the last silently wins | issue #49 |

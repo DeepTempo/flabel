@@ -26,6 +26,8 @@ from flabel.models import (
     Ja4Status,
     Label,
     NormalizedCapture,
+    SnapshotManifest,
+    SourceAdmission,
     SourceClass,
     SourceEntry,
     SourceSpec,
@@ -356,3 +358,106 @@ def test_the_suricata_run_info_defaults_the_new_fields():
     assert (info.rules_failed, info.rules_skipped) == (0, 0)
     assert info.config_sha256 is None
     assert info.warnings == ()
+
+
+# --- the snapshot manifest names each source exactly once ----------------------------------
+#
+# Issue #49. The duplicate is rejected on the type rather than by whichever reader notices,
+# because the failure is silent: every consumer resolves a source by name, and a name appearing
+# twice with different terms means `licence`, `admission_basis` and `label_basis` on every label
+# from that source describe whichever entry the lookup happened to keep. Both entries are
+# well-formed, so nothing downstream can detect it.
+
+
+def make_admission(**overrides) -> SourceAdmission:
+    fields = {
+        "name": "et/open",
+        "url": "https://example.invalid/emerging.rules.tar.gz",
+        "licence": "MIT",
+        "source_class": "signature",
+        "admission_basis": "metadata-filter",
+        "rules_fetched": 10,
+        "rules_admitted": 10,
+        "rules_excluded_no_confidence": 0,
+        "rules_excluded_low_confidence": 0,
+        "rules_excluded_low_severity": 0,
+        "rules_excluded_commented": 0,
+        "ja4_rules_admitted": 0,
+        "ja3_rules_admitted": 0,
+        "fetched_at": "2026-08-12T00:00:00.000000Z",
+    }
+    return SourceAdmission(**{**fields, **overrides})
+
+
+def make_manifest(*admissions: SourceAdmission) -> SnapshotManifest:
+    sources = admissions or (make_admission(),)
+    return SnapshotManifest(
+        snapshot_id="8a39182c18a3c9d3",
+        created_at="2026-08-12T00:00:00.000000Z",
+        flabel_version="0.1.0",
+        sources=sources,
+        total_admitted=sum(a.rules_admitted for a in sources),
+        total_ja4_admitted=0,
+    )
+
+
+def test_a_manifest_naming_one_source_twice_is_refused():
+    """The wrong-terms defect, caught where it starts instead of where it shows up.
+
+    Two entries for `et/open` with different classes would give every label from it whichever
+    `label_basis` the lookup kept — `direct` or `indicator-reference`, the difference between
+    "this flow is the attack" and "this flow referenced an indicator".
+    """
+    with pytest.raises(ValueError, match="once"):
+        make_manifest(
+            make_admission(name="et/open", source_class="signature"),
+            make_admission(name="et/open", source_class="ioc-name"),
+        )
+
+
+def test_a_manifest_naming_one_source_twice_is_refused_even_when_identical():
+    """Identical duplicates are still refused.
+
+    Not because they would resolve wrongly today, but because `total_admitted` and the
+    per-source counts double-count them, and a reader cannot tell an intentional repeat from a
+    writer bug. There is no case where the same source belongs in a snapshot twice.
+    """
+    with pytest.raises(ValueError, match="once"):
+        make_manifest(make_admission(), make_admission())
+
+
+def test_distinct_source_names_are_accepted():
+    """The ordinary case: nine sources, nine names."""
+    manifest = make_manifest(
+        make_admission(name="et/open"),
+        make_admission(name="abuse.ch/urlhaus", source_class="ioc-name"),
+    )
+    assert len(manifest.sources) == 2
+
+
+def test_sources_by_name_indexes_every_source():
+    """The lookup every consumer needs, defined once (issue #49).
+
+    `suricata.py` resolves a SID's originating source through it and correlation resolves a
+    detection's terms through it. Written separately in each, they are two places that can
+    disagree about the same tuple — the argument that pre-placed `build_source_entry`.
+    """
+    urlhaus = make_admission(name="abuse.ch/urlhaus", source_class="ioc-name")
+    manifest = make_manifest(make_admission(name="et/open"), urlhaus)
+
+    assert set(manifest.sources_by_name) == {"et/open", "abuse.ch/urlhaus"}
+    assert manifest.sources_by_name["abuse.ch/urlhaus"] is urlhaus
+
+
+def test_sources_by_name_cannot_silently_drop_an_entry():
+    """The index is total, because uniqueness is enforced at construction.
+
+    A dict comprehension over a tuple that may repeat a key is exactly how the defect in #49
+    stayed invisible: the lookup keeps the last and reports nothing.
+    """
+    manifest = make_manifest(
+        make_admission(name="et/open"),
+        make_admission(name="pawpatrules", source_class="signature"),
+        make_admission(name="oisf/trafficid", source_class="identify"),
+    )
+    assert len(manifest.sources_by_name) == len(manifest.sources)

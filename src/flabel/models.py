@@ -11,6 +11,7 @@ and a claim that can be edited after the fact is not provenance.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, get_args
@@ -213,6 +214,45 @@ class SnapshotManifest:
     sources: tuple[SourceAdmission, ...]
     total_admitted: int
     total_ja4_admitted: int
+
+    def __post_init__(self) -> None:
+        # A duplicate name is rejected here rather than by whichever reader happens to notice,
+        # because every consumer resolves a source by name and the failure is silent: a name
+        # that appears twice with different terms yields whichever entry the lookup kept, and
+        # `label_basis`, `licence` and `admission_basis` on every label from that source then
+        # describe the wrong entry. Nothing downstream can detect it — both entries are
+        # well-formed. Enforcing it on the type means no manifest with duplicates can exist as
+        # an object at all, however it was built: read from disk, constructed in a test, or
+        # assembled by a future writer.
+        #
+        # `_read_manifest` already converts a ValueError from this constructor into a
+        # `SnapshotError`, so the operator gets a reason and exit 1 rather than a traceback.
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for admission in self.sources:
+            if admission.name in seen:
+                duplicates.add(admission.name)
+            seen.add(admission.name)
+        if duplicates:
+            raise ValueError(
+                f"SnapshotManifest.sources names each source once; some appear more "
+                f"than once, and a label resolving through them would cite one entry's terms "
+                f"while another's rules fired: {sorted(duplicates)}"
+            )
+
+    @property
+    def sources_by_name(self) -> Mapping[str, SourceAdmission]:
+        """The admissions indexed by source name — the lookup every consumer needs.
+
+        A property rather than a line each caller writes. `suricata.py` resolves a SID's
+        originating source through it and correlation resolves a detection's terms through it,
+        so without this both build the same comprehension over a tuple, and the duplicate-name
+        hazard above lives in each copy. Same argument as `build_source_entry`: a lookup
+        written in more than one place is a lookup that can disagree with itself.
+
+        Uniqueness is guaranteed by `__post_init__`, so this cannot silently drop an entry.
+        """
+        return {admission.name: admission for admission in self.sources}
 
 
 # --- pipeline -----------------------------------------------------------------------------
