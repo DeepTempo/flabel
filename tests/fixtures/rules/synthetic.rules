@@ -1,0 +1,75 @@
+# Synthetic Suricata rules for the step 6 tests (PLAN.md step 6, docs/spec.md §8).
+#
+# These are TEST FIXTURES, never a rule source: no feed ships them, `data/sources.toml`
+# does not list them, and their SIDs (9000001+) sit outside every admitted feed's range
+# so they can never collide with a real snapshot.
+#
+# Two deliberate choices:
+#
+# 1. Every rule is `any any -> any any` (or `-> any 80`) and uses **no `$HOME_NET` /
+#    `$EXTERNAL_NET` variable**. The abuse.ch feeds do use them, and in a file-read run
+#    those variables come from the system `suricata.yaml`, where `EXTERNAL_NET` defaults to
+#    `!$HOME_NET`. A rule written `$HOME_NET -> $EXTERNAL_NET` therefore never matches a
+#    capture whose endpoints are both RFC 1918 — which the benign canary's are. A fixture
+#    rule that silently never matches would make these tests prove nothing, so the address
+#    variables are avoided entirely rather than depended on.
+#
+# 2. `classtype:` is set so `alert.category` in eve.json is non-empty and the parsed
+#    `Detection.classtype` is asserted against a known value. eve.json reports the
+#    classtype's *description* from Suricata's `classification.config`, not the shortname.
+#
+# Verified against Suricata 8.0.6 (HAVE_JA3, HAVE_JA4): all three load with 0 failed.
+
+# sid 9000001 — matches the benign canary's HTTP request (tests/fixtures/benign.pcap,
+# flow 10.0.0.5:49152 -> 10.0.0.200:80). Fires exactly once. Carries ET-style metadata so
+# `alert.metadata` parsing is covered by a real run rather than a hand-written record.
+alert tcp any any -> any 80 (msg:"FLABEL TEST synthetic HTTP request"; content:"GET / HTTP/1.0"; classtype:trojan-activity; metadata:confidence High, signature_severity Major, created_at 2026_08_12; sid:9000001; rev:3;)
+
+# sid 9000002 — the JA4 capability rule (US-14). ET Open 8.0 was measured to contain zero
+# `ja4.hash` rules, so this is the only evidence that a JA4 rule can produce a label at all.
+# `t13d0405h2_` is the JA4_a segment of the ClientHello the test synthesizes: TCP, TLS 1.3,
+# SNI present, 4 ciphers, 5 extensions, ALPN `h2`. JA4_a is defined by the JA4 spec as a
+# readable summary of the handshake, so it stays stable where the two truncated SHA-256
+# segments after it need not; matching the prefix asserts the capability without pinning the
+# test to one hash implementation. Full value on Suricata 8.0.6:
+# t13d0405h2_77f0cd3447db_beb9f91c6f80
+alert tls any any -> any any (msg:"FLABEL TEST synthetic JA4 client fingerprint"; ja4.hash; content:"t13d0405h2_"; startswith; classtype:trojan-activity; sid:9000002; rev:1;)
+
+# sid 9000003 — stands in for a rule from an `identify`-class source (spec §2.8, US-16).
+# It matches the benign canary exactly like 9000001 does; the point is that a detection from
+# an `identify` source is dropped before correlation no matter how well the rule fired.
+alert tcp any any -> any 80 (msg:"FLABEL TEST synthetic identify"; content:"GET"; classtype:not-suspicious; sid:9000003; rev:1;)
+
+# sid 9000004 — DELIBERATELY UNLOADABLE: `not_a_real_keyword` is not a Suricata keyword, so
+# the engine rejects the rule. Verified on 8.0.6: it then loads zero rules, warns, and
+# **exits 0 with an empty alert set** — the quietest possible failure, since zero labels
+# looks exactly like a clean run over an uninteresting capture. Used to prove that "the
+# engine loaded nothing" is treated as a tool failure. Never repair this into a valid rule.
+alert tcp any any -> any any (msg:"FLABEL TEST unloadable rule"; not_a_real_keyword:1; classtype:trojan-activity; sid:9000004; rev:1;)
+
+# sid 9000005 — the ONE rule here that deliberately DOES use the address variables, written the
+# way the abuse.ch feeds write their C2 rules. It is the test of flabel's own `suricata.yaml`:
+# the benign canary is RFC 1918 on both ends, so under Suricata's stock config — where
+# `EXTERNAL_NET` is `!$HOME_NET` — this rule can match nothing at all. Measured on 8.0.6: stock
+# config 0 alerts, flabel's config 1 alert. Three of the nine real sources use these variables,
+# so this rule stands in for every abuse.ch label on an internal capture.
+alert http $HOME_NET any -> $EXTERNAL_NET $HTTP_PORTS (msg:"FLABEL TEST synthetic C2 callout"; content:"GET"; http_method; classtype:trojan-activity; sid:9000005; rev:1;)
+
+# sid 9000006 — UDP, because the benign canary has no UDP flow and ET Open's DNS rules are a
+# large share of the ruleset. Proves the parsed tuple and `proto` for UDP, which correlation
+# joins against Zeek's `conn.log` (measured: Zeek writes `proto=udp`, ports 53124 -> 53 for the
+# same fixture, so the two agree field for field).
+alert udp any any -> any 53 (msg:"FLABEL TEST synthetic DNS query"; content:"flabel-test"; classtype:trojan-activity; sid:9000006; rev:1;)
+
+# sid 9000007 — ICMPv4 echo request. There are no ports in an ICMP alert record, and Zeek does
+# not leave `conn.log`'s port columns empty: it writes the ICMP type in `id.orig_p` and the
+# counterpart type in `id.resp_p`. Measured on the same fixture — Zeek: `icmp 8 -> 0`;
+# Suricata: `icmp_type 8, icmp_code 0`. Without mirroring those into the port columns every
+# ICMP detection is uncorrelatable, and spec §9's 1% unmatched gate fails the whole run.
+alert icmp any any -> any any (msg:"FLABEL TEST synthetic ICMP echo"; itype:8; classtype:trojan-activity; sid:9000007; rev:1;)
+
+# sid 9000008 — ICMPv6 echo request, which is where the two tools disagree hardest. Measured:
+# Suricata reports `proto: "IPv6-ICMP"`, Zeek reports `proto=icmp` — its `transport_proto` has
+# only tcp/udp/icmp/unknown_transport. Lowercasing alone would leave `ipv6-icmp` against Zeek's
+# `icmp` and no ICMPv6 detection could ever match a flow.
+alert icmp any any -> any any (msg:"FLABEL TEST synthetic ICMPv6 echo"; itype:128; classtype:trojan-activity; sid:9000008; rev:1;)

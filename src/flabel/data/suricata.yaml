@@ -1,0 +1,216 @@
+%YAML 1.1
+---
+# flabel's own Suricata configuration. Passed with `-c` on every run.
+#
+# WHY THIS FILE EXISTS
+#
+# Without `-c`, Suricata reads the operator's `/etc/suricata/suricata.yaml`, and that file
+# decides at least six things that change what flabel labels or what it writes to disk:
+#
+#   1. `HOME_NET` / `EXTERNAL_NET` — whether an abuse.ch C2 rule written
+#      `$HOME_NET -> $EXTERNAL_NET` fires at all. On the stock config EXTERNAL_NET is
+#      `!$HOME_NET`, so such a rule can never match a capture whose endpoints are both
+#      RFC 1918 — internal traffic would be silently unlabelled.
+#   2. `classification-file` — supplies the `classtype` description that eve.json reports as
+#      `alert.category` and that flabel records on every label as provenance.
+#   3. `outputs.eve-log.types` — whether alerts are written at all. An operator whose eve
+#      config omits `alert` would get a clean-looking run with zero labels.
+#   4. `alert.metadata` — whether `alert.metadata` reaches us, which issue #10 is answered from.
+#   5. `stats` — whether the rule-load counts flabel checks the ruleset against are emitted.
+#   6. Data handling — whether payloads, HTTP bodies and carved files are written into the run
+#      directory. flabel processes other people's captures; that must never depend on a
+#      setting nobody reviewed.
+#
+# Reproducibility (Goal 2) cannot hold while an unrecorded file on one machine decides which
+# rules match and what text lands in provenance. So the config is version-controlled, its
+# sha256 is recorded in the run block, and the run is identical on a laptop and in CI.
+#
+# This is deliberately a *small* config rather than a copy of Suricata's 2,400-line default:
+# everything that affects a label is stated here explicitly, and anything absent takes the
+# engine's own documented default. Verified against Suricata 8.0.6 with `suricata -T`.
+
+# --- address and port variables -----------------------------------------------------------
+#
+# HOME_NET is `any` by decision (Craig, 2026-08-12), and EXTERNAL_NET must be `any` with it.
+# This is the corollary that makes the decision work: with `EXTERNAL_NET: "!$HOME_NET"` — the
+# stock value — `HOME_NET: any` would make EXTERNAL_NET the empty set, and every
+# `$HOME_NET -> $EXTERNAL_NET` rule would match nothing at all. That is the opposite of what
+# setting HOME_NET to `any` is for.
+#
+# The trade-off, stated plainly: `any -> any` maximises the traffic a rule is tested against,
+# which is right for labelling an arbitrary capture where flabel cannot know which side is
+# "home", but it also removes directionality as a false-positive filter. The benign canary is
+# the standing check on that (PRD §6.3).
+#
+# MEASURED COST, against a real 85,545-rule snapshot: exactly **3 rules cannot load** —
+# pawpatrules sids 3300158, 3300159 and 3321393, all "P2P direct calling via STUN"
+# (policy-violation / attempted-user). Each is written `-> ![... ,$HOME_NET]`, and negating a
+# HOME_NET of `any` leaves the empty set, so Suricata refuses them: "Complete IP space negated.
+# Rule address range is NIL." No configuration can have both `$HOME_NET` meaning everything and
+# `!$HOME_NET` meaning something.
+#
+# The alternative, if those three ever matter more than the coverage: `HOME_NET` back to the
+# RFC 1918 ranges with `EXTERNAL_NET: "any"` (rather than the stock `!$HOME_NET`). That loads all
+# 85,545 *and* still lets an abuse.ch `$HOME_NET -> $EXTERNAL_NET` rule fire on internal-to-
+# internal traffic — at the cost that a capture whose own hosts are not RFC 1918 stops matching
+# any `$HOME_NET`-anchored rule at all. Left as decided, not quietly changed, since the choice
+# between "every capture, minus 3 rules" and "85,545 rules, on RFC 1918 captures" is Craig's.
+vars:
+  address-groups:
+    HOME_NET: "any"
+    EXTERNAL_NET: "any"
+    # The remaining groups keep the names ET Open and the abuse.ch feeds reference. A rule
+    # naming a variable this file does not define fails to load, and a rule that failed to
+    # load is coverage flabel silently does not have — so the full set is listed even though
+    # every one of them resolves to `any` here.
+    HTTP_SERVERS: "$HOME_NET"
+    SMTP_SERVERS: "$HOME_NET"
+    SQL_SERVERS: "$HOME_NET"
+    DNS_SERVERS: "$HOME_NET"
+    TELNET_SERVERS: "$HOME_NET"
+    AIM_SERVERS: "$EXTERNAL_NET"
+    DC_SERVERS: "$HOME_NET"
+    DNP3_SERVER: "$HOME_NET"
+    DNP3_CLIENT: "$HOME_NET"
+    MODBUS_CLIENT: "$HOME_NET"
+    MODBUS_SERVER: "$HOME_NET"
+    ENIP_CLIENT: "$HOME_NET"
+    ENIP_SERVER: "$HOME_NET"
+
+  port-groups:
+    HTTP_PORTS: "80"
+    SHELLCODE_PORTS: "!80"
+    ORACLE_PORTS: 1521
+    SSH_PORTS: 22
+    DNP3_PORTS: 20000
+    MODBUS_PORTS: 502
+    FILE_DATA_PORTS: "[$HTTP_PORTS,110,143]"
+    FTP_PORTS: 21
+    GENEVE_PORTS: 6081
+    VXLAN_PORTS: 4789
+    TEREDO_PORTS: 3544
+    SIP_PORTS: "[5060, 5061]"
+
+# --- rules ---------------------------------------------------------------------------------
+#
+# No `rule-files` key: the ruleset comes from `-S <snapshot>/rules.rules`, which *replaces* any
+# list here. `default-rule-path` is set per run (`--set`) to the snapshot's **per-source data
+# directory**, because that is where Suricata resolves a rule's `dataset: ... load <file>`
+# against — measured: pointing it at the snapshot root instead costs 26 failed rules. The value
+# here is deliberately a path that cannot exist, so a run that forgot to set it fails loudly
+# rather than resolving rule-referenced files against something real.
+default-rule-path: /nonexistent
+classification-file: classification.config
+# No `reference-config-file`. It only maps a `reference:` prefix to a URL, nothing in flabel reads
+# those URLs, and measured against a real 85,545-rule snapshot its absence changes the load by
+# **0 rules** — the engine warns once per unknown prefix. One fewer file to own.
+
+# --- outputs -------------------------------------------------------------------------------
+#
+# eve.json is the only machine-read output. `-l` decides where it goes.
+default-log-dir: /tmp/flabel-suricata
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      # Not appended to: flabel refuses to reuse an output directory (spec §13), and this
+      # makes a stale file impossible rather than merely refused.
+      append: no
+      types:
+        - alert:
+            # `metadata` carries the rule's own `metadata:` keys, which is where the answer to
+            # issue #10 (should untagged ET rules be admitted?) comes from.
+            metadata: yes
+            # No payload, no printable payload, no HTTP body: flabel handles other people's
+            # captures, and capture content must not be copied into the run directory beyond
+            # the tool logs (spec §13). This also keeps eve.json a size we can parse per line.
+            payload: no
+            payload-printable: no
+            packet: no
+            http-body: no
+            http-body-printable: no
+            tagged-packets: no
+        # Flow records are kept: no payload, and they make the alert stream auditable against
+        # the connections Suricata actually saw.
+        - flow
+        # Stats records carry the engine's own rule-load counts, which flabel checks the
+        # snapshot against. Their `timestamp` and `uptime` are wall-clock and are therefore
+        # excluded from any reproducibility comparison.
+        - stats:
+            totals: yes
+            threads: no
+            deltas: no
+
+# Deliberately absent, and each absence is a decision: `fast` (redundant with eve alerts),
+# `stats` (the .log form; the eve form is machine-read), `http-log`/`tls-log`/`dns-log`
+# (Zeek owns protocol logs), `pcap-log` (would copy the capture into the run directory),
+# `file-store` (would carve files out of someone else's traffic onto disk).
+
+# --- stats ---------------------------------------------------------------------------------
+stats:
+  enabled: yes
+  # One stats record at exit is what flabel needs; a short interval would add wall-clock
+  # records to eve.json for no benefit. File-read runs are short.
+  interval: 3600
+
+# `suricata.log` is the human-readable log of what the engine did, and carries the rule-load
+# line flabel falls back to when eve stats are unavailable. Every line is wall-clock stamped,
+# so the file is never reproducible: it is retained for the operator, never for comparison.
+# The console output stays on so a run's warnings reach stderr, where spec §12 puts them.
+logging:
+  default-log-level: info
+  outputs:
+    - console:
+        enabled: yes
+    - file:
+        enabled: yes
+        level: info
+        filename: suricata.log
+
+# --- app layer -----------------------------------------------------------------------------
+#
+# JA3 and JA4 on: JA4 is the capability US-14 rests on, and a `ja4.hash` rule cannot match
+# without it. Also set on the command line, so the two cannot silently disagree.
+app-layer:
+  protocols:
+    tls:
+      enabled: yes
+      detection-ports:
+        dp: 443
+      ja3-fingerprints: yes
+      ja4-fingerprints: yes
+    http:
+      enabled: yes
+    dns:
+      tcp:
+        enabled: yes
+      udp:
+        enabled: yes
+
+# --- decode and reassembly -----------------------------------------------------------------
+#
+# Checksums are NOT validated. A capture taken on a host with TX checksum offload has
+# structurally invalid checksums for locally-originated packets; validating them would make
+# Suricata skip flows Zeek (`-C`) inspected, and those flows would be reported as clean
+# rather than as unexamined. Parity between the two tools matters more than checksum rigour
+# on a file we are only reading.
+stream:
+  checksum-validation: no
+  inline: no
+  reassembly:
+    memcap: 256mb
+    depth: 1mb
+flow:
+  memcap: 128mb
+defrag:
+  memcap: 32mb
+
+# --- host os policy ------------------------------------------------------------------------
+host-os-policy:
+  bsd: []
+  old-linux: []
+  linux: []
+  windows: []
+  vista: []
+  windows2k3: []
