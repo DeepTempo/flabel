@@ -79,10 +79,16 @@ src/flabel/
   provenance.py     assemble the run block (pure)
   notice.py         emit NOTICE attribution (pure)
   cli.py            argument parsing, orchestration, exit codes
-data/
-  sources.toml      the source registry (shipped with the package)
-  json-logs.zeek    Zeek script adding JSON filters
+  data/
+    sources.toml    the source registry (shipped with the package)
+    json-logs.zeek  Zeek script adding JSON filters
 ```
+
+**Package data lives inside the package**, not at the repo root. Root-level `data/` can only
+reach a wheel via a hatch `force-include`, which is absent from an editable install — the mode
+`uv sync` uses — so `importlib.resources` would resolve in a built wheel and fail in the tests.
+Under `src/flabel/data/` it resolves identically from a checkout, an editable install and a
+wheel. Corrected in step 2; the original diagram placed `data/` alongside `src/`.
 
 **`models.py` is a refinement of the approved layout.** Every module codes against shared dataclasses rather than each owning its own, which is what allows steps 4–7 to be built in parallel without importing one another.
 
@@ -213,7 +219,7 @@ class UnmatchedDetection:
 ```toml
 [[source]]
 name             = "et/open"
-url              = "https://rules.emergingthreats.net/open/suricata-7.0/emerging.rules.tar.gz"
+url              = "https://rules.emergingthreats.net/open/suricata-8.0/emerging.rules.tar.gz"
 licence          = "MIT"
 source_class     = "signature"
 admission_basis  = "metadata-filter"
@@ -255,7 +261,9 @@ admission_basis  = "wholesale"
 
 Excluded entirely and absent from the registry: `tgreen/hunting`, `etnetera/aggressive`, `ptresearch/attackdetection`, `ptrules/open`, `sslbl/ja3-fingerprints`, and all commercial sources.
 
-Validation on load: unknown `source_class` or `admission_basis` is a hard failure; `metadata-filter` is permitted only where ET-style metadata exists.
+Validation on load: unknown `source_class` or `admission_basis` is a hard failure; `metadata-filter` is permitted only where ET-style metadata exists. Also hard failures, added in step 2 for the same reason — a registry that loads with a setting silently ignored is worse than one that refuses to load: an unknown or misspelled field, a missing required field, a duplicate source name, an empty registry, and a non-boolean `enabled`.
+
+The ET Open URL pins `suricata-8.0` to match the pinned engine (8.0.6). ET compiles per engine version, so the 7.0 set omits rules using 8.0-era keywords; this originally read `suricata-7.0`, corrected in step 2.
 
 ---
 
