@@ -1,17 +1,30 @@
 """Invoke Suricata over the normalized capture and parse `eve.json` (spec §8).
 
-Three things in here carry the weight:
+Five things in here carry the weight:
 
-**The invocation is exact.** ``-S`` *replaces* the ruleset with the snapshot's, so no
-ambient system ruleset can contribute a SID that appears in no snapshot; ``--runmode single``
-makes the alert set deterministic, which Goal 2 rests on. Both are asserted by a test on
-`build_argv`, not left to a comment.
+**The invocation is exact, and self-contained.** ``-S`` *replaces* the ruleset with the
+snapshot's, so no ambient system ruleset can contribute a SID that appears in no snapshot;
+``--runmode single`` makes the alert set deterministic, which Goal 2 rests on; and ``-c``
+points at flabel's own `data/suricata.yaml`, so the operator's ``/etc/suricata/suricata.yaml``
+cannot decide what gets labelled, what provenance text a label carries, or whether capture
+payloads are written to disk. All asserted by a test on `build_argv`, not left to a comment.
+
+**Every path handed to the tool is absolute.** Measured on 8.0.6: a relative ``-S`` resolves
+against the process's working directory. Spec §12's default ``--rules-dir`` is relative, so
+this is the ordinary case — and a recorded argv that only works from one directory is not a
+reproducible failure report.
 
 **Every alert is attributed to a source before it can become a label.** `eve.json` records a
-SID and nothing about where the rule came from, so attribution is rebuilt from the snapshot.
-An alert that cannot be attributed is never emitted with a guess: spec §13 forbids a label
-whose origin cannot be traced, and the source is also what decides whether the alert may
-label at all.
+SID and nothing about where the rule came from, so attribution comes from the snapshot's
+`sid_index.json`. An alert that cannot be attributed is never emitted with a guess: spec §13
+forbids a label whose origin cannot be traced, and the source is also what decides whether
+the alert may label at all.
+
+**The tuple is translated into Zeek's spelling, not Suricata's.** Correlation joins the two
+tools' 5-tuples field by field (spec §9), and they disagree on three things: protocol case and
+naming, IPv6 address formatting, and what to put in the port columns for ICMP. Each is
+normalised here, against measured Zeek output rather than assumption — see `_proto`, `_address`
+and `_ports`.
 
 **Detections from `identify`-class sources are dropped here**, at the earliest point they
 exist, and counted in `identify_alerts_suppressed` (spec §2.8). Dropping them further
@@ -36,14 +49,16 @@ Failure handling splits along a deliberate line:
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import fields
 from datetime import datetime
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, get_type_hints
 
 from flabel.errors import SnapshotError, ToolError
 from flabel.models import (
@@ -65,9 +80,28 @@ BINARY = "suricata"
 
 RULES_FILE = "rules.rules"
 MANIFEST_FILE = "manifest.json"
-RAW_DIR = "raw"
+#: Step 4 writes this: ``{"schema": 1, "sources": {"<name>": [<sid>, ...]}}``. It is the only
+#: place a SID's originating source is recorded — eve.json carries none — and it is hashed into
+#: `snapshot_id`, which is what makes the attribution as tamper-evident as the rules themselves.
+SID_INDEX_FILE = "sid_index.json"
+#: The one `sid_index.json` shape this code understands. A different schema is a hard failure,
+#: never a best-effort read: attribution decides whether a source may label at all.
+SID_INDEX_SCHEMA = 1
 EVE_FILE = "eve.json"
 LOG_FILE = "suricata.log"
+
+#: flabel's own Suricata config, shipped as package data. See the file's own header for the six
+#: label-affecting things the operator's `/etc/suricata/suricata.yaml` would otherwise decide.
+CONFIG_FILE = "suricata.yaml"
+CLASSIFICATION_FILE = "classification.config"
+REFERENCE_FILE = "reference.config"
+
+#: Timeouts, so a wedged Suricata becomes the `ToolFailure` spec §11 promises instead of a
+#: hung pipeline and a hung CI job. Generous rather than tuned: a real capture against a full
+#: ET Open snapshot is minutes of work, and killing a healthy run would be worse than waiting.
+#: Step 9 should make the run timeout an option rather than leaving it a constant here.
+RUN_TIMEOUT_SECONDS = 3600
+VERSION_TIMEOUT_SECONDS = 60
 
 #: `sid:` in a rule line. Suricata itself accepts whitespace around the colon, so this does
 #: too — a rule we failed to see the SID of would be a rule we could not attribute.
@@ -82,26 +116,106 @@ QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
 SNAPSHOT_ID_LENGTH = 16
 
 #: Suricata's own load report in ``suricata.log``, used when the eve stats event is absent.
-RULES_LOADED = re.compile(r"(\d+) rules successfully loaded")
+#: All three counts come off one line: "N rules successfully loaded, M rules failed, K rules
+#: skipped". Reading only the first would leave the interesting number on the floor.
+RULES_LOADED = re.compile(
+    r"(\d+) rules successfully loaded, (\d+) rules failed, (\d+) rules skipped"
+)
 
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 
+#: Protocol names Suricata spells differently from Zeek's `conn.log`. Measured, not assumed:
+#: Zeek writes `icmp` for ICMPv6 too — its `transport_proto` has only tcp/udp/icmp/
+#: unknown_transport — while Suricata writes `IPv6-ICMP`. Lowercasing alone would leave
+#: `ipv6-icmp` against Zeek's `icmp` and every ICMPv6 detection would be uncorrelatable, which
+#: is the failure this table exists to prevent. The IP version is still distinguishable from
+#: the addresses, so nothing is lost by agreeing with Zeek here.
+#:
+#: Not covered, and reported rather than guessed: Zeek writes `unknown_transport` for GRE, ESP
+#: and anything else that is not TCP/UDP/ICMP, where Suricata writes the protocol name. Those
+#: are left as Suricata reports them (lowercased) until Zeek's side is measured on a fixture
+#: that has them.
+PROTO_ALIASES = {"ipv6-icmp": "icmp"}
+
+
+def data_dir() -> Path:
+    """Where flabel's own Suricata config lives.
+
+    Under `src/flabel/data/` for the same reason the source registry is (spec §3): it resolves
+    identically from a checkout, an editable install and a built wheel.
+    """
+    return Path(str(resources.files("flabel") / "data"))
+
+
+def config_files() -> tuple[Path, ...]:
+    """Every config file the invocation depends on, in a fixed order.
+
+    Fixed because `config_sha256` hashes them in this order: the digest identifies the whole
+    configuration, not one file of it. `classification.config` is in here because it supplies
+    the `classtype` text recorded on every label.
+    """
+    directory = data_dir()
+    return tuple(directory / name for name in (CONFIG_FILE, CLASSIFICATION_FILE, REFERENCE_FILE))
+
+
+def config_sha256() -> str:
+    """One digest over flabel's Suricata configuration, for the run block.
+
+    A run is only reproducible against a *known* configuration: `HOME_NET`, the classtype
+    descriptions and the eve output selection all change what a label says. Recording the
+    digest is what lets two runs be compared without trusting that the config was the same.
+
+    Returned rather than stored on `SuricataRunInfo`, which has no field for it — `provenance`
+    can call this. A `config_sha256` field on `SuricataRunInfo` would be the better home; that
+    is a `models.py` change and is flagged rather than made here.
+    """
+    digest = hashlib.sha256()
+    for path in config_files():
+        try:
+            digest.update(path.read_bytes())
+        except OSError as exc:
+            raise ToolError(f"flabel's Suricata config {path} could not be read: {exc}") from exc
+    return digest.hexdigest()
+
 
 def build_argv(capture: Path, snapshot: Path, outdir: Path) -> list[str]:
-    """The exact invocation of spec §8.
+    """The exact invocation of spec §8, with flabel's own config.
 
-    Separated from `run_suricata` so the flags are testable without running anything. `-S`
-    (replace the ruleset) rather than `-s` (add to it) is the whole reason a label's SID can
-    be traced to a snapshot.
+    Separated from `run_suricata` so the flags are testable without running anything. Three
+    things here are load-bearing beyond the flags spec §8 lists:
+
+    * ``-c`` — flabel's config rather than the machine's. Without it, whether an abuse.ch
+      ``$HOME_NET -> $EXTERNAL_NET`` C2 rule fires at all depends on the operator's
+      `suricata.yaml` (proved by a test: on the stock config that rule matches *nothing* in the
+      benign canary; with flabel's, it matches).
+    * ``--set default-rule-path`` — where a rule's own relative paths (``dataset:``,
+      ``filemagic:``) resolve. Pointed at the snapshot so rule-referenced files can only come
+      from inside it. It does *not* affect ``-S``: measured on 8.0.6, a relative ``-S`` resolves
+      against the working directory and ignores this setting.
+    * absolute paths throughout — `Path.resolve()` on all three, so the argv means the same
+      thing from any working directory. Spec §12's default ``--rules-dir`` is relative.
     """
+    capture, snapshot, outdir = capture.resolve(), snapshot.resolve(), outdir.resolve()
+    directory = data_dir()
     return [
         BINARY,
         "-r",
         str(capture),
+        "-c",
+        str(directory / CONFIG_FILE),
         "-S",
         str(snapshot / RULES_FILE),
         "-l",
         str(outdir),
+        # The two config files `suricata.yaml` names relatively. Set absolutely here rather
+        # than written as absolute paths in the YAML, because the package's location is not
+        # knowable when the YAML is written.
+        "--set",
+        f"classification-file={directory / CLASSIFICATION_FILE}",
+        "--set",
+        f"reference-config-file={directory / REFERENCE_FILE}",
+        "--set",
+        f"default-rule-path={snapshot}",
         "--set",
         "app-layer.protocols.tls.ja3-fingerprints=yes",
         "--set",
@@ -131,7 +245,21 @@ def run_suricata(
         return [], _failed(manifest, failure)
 
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, check=False)
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=RUN_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        # A wedged tool is a loss condition like any other (spec §11). Without this the run
+        # hangs, and a hung CI job reports nothing at all.
+        return [], _failed(
+            manifest,
+            _failure(
+                argv,
+                None,
+                f"suricata did not finish within {RUN_TIMEOUT_SECONDS}s and was killed",
+            ),
+            version=version,
+        )
     except OSError as exc:
         return [], _failed(
             manifest,
@@ -166,31 +294,73 @@ def run_suricata(
             version=version,
         )
 
-    detections, alerts_total, suppressed, loaded = _read_eve(eve, index, sources)
-    if loaded is None:
-        loaded = _rules_loaded_from_log(outdir / LOG_FILE)
+    detections, alerts_total, suppressed, counts = _read_eve(eve, index, sources)
+    if counts is None:
+        counts = _rules_loaded_from_log(outdir / LOG_FILE)
 
-    if not loaded:
-        # The snapshot was checked to hold rules before we started, so zero loaded means the
-        # engine rejected every one of them — an empty alert set that means nothing.
-        return [], _failed(
-            manifest,
-            _failure(
-                argv,
-                completed.returncode,
-                "suricata loaded no rules from the snapshot, so an empty alert set proves "
-                "nothing about the capture",
-            ),
-            version=version,
-        )
+    failure = _check_ruleset_loaded(counts, expected=len(index), argv=argv, exit_code=0)
+    if failure is not None:
+        return [], _failed(manifest, failure, version=version)
 
     return detections, SuricataRunInfo(
         version=version,
         snapshot_id=manifest.snapshot_id,
-        rules_loaded=loaded,
+        # `counts` is not None here: `_check_ruleset_loaded` returns a failure when it is.
+        rules_loaded=counts[0] if counts else 0,
         alerts_total=alerts_total,
         identify_alerts_suppressed=suppressed,
     )
+
+
+def _check_ruleset_loaded(
+    counts: tuple[int, int, int] | None, *, expected: int, argv: Sequence[str], exit_code: int
+) -> ToolFailure | None:
+    """Decide whether the engine loaded the ruleset flabel thought it handed over.
+
+    Three distinct outcomes, deliberately not collapsed into one truthiness test:
+
+    * **Unknown** — neither the eve stats record nor `suricata.log` reported a count. Both are
+      config-owned, so "we could not tell" is a real state and it is not the same as zero. It
+      fails the run: an alert set we cannot attest the ruleset for is not evidence.
+    * **Zero loaded** — the engine rejected every rule. The snapshot was checked to hold rules
+      before the tool started, and Suricata exits 0 in this case, so nothing else would say so.
+    * **Fewer loaded than admitted** — the case that actually happens with real feeds: some
+      rules use a keyword this build lacks, or name a classtype the config does not define. The
+      run reported success and the labels those rules would have produced are simply absent.
+
+    The third is a hard failure by decision (Craig, 2026-08-12): "record it, warn above zero,
+    fail above a threshold". Recording needs a `rules_failed` field on `SuricataRunInfo` that
+    does not exist yet, and a *threshold* is only meaningful once the count is recorded — so
+    until then any shortfall fails, which is the conservative half of that decision. **Note the
+    consequence:** with today's feeds this will fail real runs (26 pawpatrules rules were
+    measured as failing to load), which is the intended alarm, not a surprise — the fix belongs
+    in step 4's admission, which should not admit a rule this engine cannot load.
+    """
+    if counts is None:
+        return _failure(
+            argv,
+            exit_code,
+            "suricata reported no rule-load count in either eve stats or suricata.log, so the "
+            "alert set cannot be attested against the snapshot",
+        )
+
+    loaded, failed, skipped = counts
+    if loaded == 0:
+        return _failure(
+            argv,
+            exit_code,
+            f"suricata loaded none of the snapshot's {expected} rules ({failed} failed, "
+            f"{skipped} skipped), so an empty alert set proves nothing about the capture",
+        )
+    if loaded != expected:
+        return _failure(
+            argv,
+            exit_code,
+            f"suricata loaded {loaded} of the snapshot's {expected} rules ({failed} failed, "
+            f"{skipped} skipped). The missing rules never examined the capture, so any label "
+            f"they would have produced is absent from a run that otherwise looks complete",
+        )
+    return None
 
 
 # --- the snapshot -------------------------------------------------------------------------
@@ -207,17 +377,7 @@ def load_manifest(snapshot: Path) -> SnapshotManifest:
     path = snapshot / MANIFEST_FILE
     if not snapshot.is_dir():
         raise SnapshotError(f"ruleset snapshot directory not found: {snapshot}")
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise SnapshotError(f"snapshot {snapshot} has no {MANIFEST_FILE}") from exc
-    except OSError as exc:
-        raise SnapshotError(f"{path} could not be read: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise SnapshotError(f"{path} is not valid JSON: {exc}") from exc
-
-    if not isinstance(document, dict):
-        raise SnapshotError(f"{path} must contain a JSON object, got {type(document).__name__}")
+    document = _load_json(path, snapshot)
 
     raw_sources = document.get("sources")
     if not isinstance(raw_sources, list) or not raw_sources:
@@ -243,21 +403,20 @@ def load_manifest(snapshot: Path) -> SnapshotManifest:
 
 
 def verify_snapshot_id(snapshot: Path, manifest: SnapshotManifest) -> None:
-    """Check that `snapshot_id` really is the hash of the rules that are about to run.
+    """Check that `snapshot_id` really is the hash of the rules and the attribution.
 
     Spec §7 calls the id self-verifying — "rewriting the file changes the id" — but nothing
-    verifies it, and the two halves come from different files: `snapshot_id` is read from
-    `manifest.json` while the rules that produce the alerts are read from `rules.rules`. Edit
-    `rules.rules` and every label would still claim the original id, which is a label whose
-    origin cannot be traced (spec §13) while looking perfectly traceable.
+    verified it, and the parts come from different files: `snapshot_id` is read from
+    `manifest.json`, the rules that alert from `rules.rules`, and the source each SID belongs
+    to from `sid_index.json`. Edit either and every label would still claim the original id: a
+    label whose origin cannot be traced (spec §13) while looking perfectly traceable.
 
-    The id is checked as a *prefix* of the digest rather than at one exact length, so this
-    does not silently pin step 4 to a particular truncation — only to hashing the file spec §7
-    says it hashes. This check belongs in `rules/snapshot.load_snapshot` once step 4 lands;
-    it lives here because that function does not exist yet.
-
-    What this does **not** cover, and should be recorded as accepted risk: `manifest.json`
-    itself is unprotected, and it is where `source_class` — hence `may_label` — comes from.
+    Two compositions are accepted, and this is temporary: `rules.rules` alone, which is what
+    spec §7 says today, and `rules.rules` followed by `sid_index.json`, which is what step 4
+    now writes. Both are exact content hashes, so tampering still fails either way — the only
+    slack is that an id computed the old way leaves `sid_index.json` unprotected. **Spec §7
+    should pin one**, and this check should move into `rules/snapshot.load_snapshot`, which
+    will own the definition.
     """
     if len(manifest.snapshot_id) < SNAPSHOT_ID_LENGTH:
         raise SnapshotError(
@@ -265,76 +424,93 @@ def verify_snapshot_id(snapshot: Path, manifest: SnapshotManifest) -> None:
             f"characters, which is too little of a sha256 to identify a ruleset"
         )
 
-    rules = snapshot / RULES_FILE
-    try:
-        digest = hashlib.sha256(rules.read_bytes()).hexdigest()
-    except FileNotFoundError as exc:
-        raise SnapshotError(f"snapshot {snapshot} has no {RULES_FILE}") from exc
-    except OSError as exc:
-        raise SnapshotError(f"{rules} could not be read: {exc}") from exc
+    rules = _read_bytes(snapshot / RULES_FILE, snapshot)
+    index = _read_bytes(snapshot / SID_INDEX_FILE, snapshot)
+    candidates = {
+        f"sha256({RULES_FILE} + {SID_INDEX_FILE})": hashlib.sha256(rules + index).hexdigest(),
+        f"sha256({RULES_FILE})": hashlib.sha256(rules).hexdigest(),
+    }
 
-    if not digest.startswith(manifest.snapshot_id):
+    if not any(digest.startswith(manifest.snapshot_id) for digest in candidates.values()):
+        detail = ", ".join(
+            f"{name} begins {digest[: len(manifest.snapshot_id)]!r}"
+            for name, digest in candidates.items()
+        )
         raise SnapshotError(
             f"snapshot {snapshot} is not internally consistent: {MANIFEST_FILE} says "
-            f"snapshot_id {manifest.snapshot_id!r}, but sha256({RULES_FILE}) begins "
-            f"{digest[: len(manifest.snapshot_id)]!r}. The rules that would run are not the "
-            f"rules this id names, so every label from this run would misstate its origin."
+            f"snapshot_id {manifest.snapshot_id!r}, but {detail}. The rules that would run are "
+            f"not the rules this id names, so every label from this run would misstate its "
+            f"origin."
         )
+
+
+def _read_bytes(path: Path, snapshot: Path) -> bytes:
+    """Read a required snapshot file, or fail the run saying which one is missing."""
+    try:
+        return path.read_bytes()
+    except FileNotFoundError as exc:
+        raise SnapshotError(f"snapshot {snapshot} has no {path.name}") from exc
+    except OSError as exc:
+        raise SnapshotError(f"{path} could not be read: {exc}") from exc
 
 
 def sid_source_index(snapshot: Path, manifest: SnapshotManifest) -> dict[int, str]:
-    """Map every SID that can fire to the source it came from.
+    """Map every SID that can fire to the source it came from, from `sid_index.json`.
 
-    `eve.json` carries no source, so this is rebuilt from the snapshot: the SIDs in
-    ``rules.rules`` are the ones that can fire, and ``raw/<source>.rules`` says which source
-    each came from (spec §7). Intersecting the two is deliberate — ``raw/`` is the text *as
-    fetched*, so it also holds rules admission rejected, and those can never alert.
+    `eve.json` carries no source, so attribution has to come from the snapshot. Step 4 writes
+    it explicitly::
 
-    Every failure here is hard, because each one would otherwise surface as a label carrying
-    the wrong source or no source at all:
+        {"schema": 1, "sources": {"et/open": [2000001, ...], "pawpatrules": [3300303]}}
 
-    * no ``raw/`` files → nothing to attribute *from*;
-    * a ``raw/`` source the manifest does not list → the two disagree about the snapshot;
-    * one SID claimed by two sources → ambiguous, and never resolved by picking one;
-    * an admitted SID no source claims → a rule that can fire and cannot be traced.
+    Read rather than re-derived. The previous version of this function reconstructed the map by
+    globbing ``raw/<source>.rules`` and deriving the source name from the file path — which
+    invented an unwritten contract about the layout of multi-file feeds (ET Open is a tarball of
+    many `.rules` files), re-read tens of megabytes of rule text on every run, and rested on
+    `raw/`, which is not covered by `snapshot_id` and so could be edited without detection.
+
+    The file is still cross-checked against the two things that must agree with it, because a
+    label carrying the wrong source is worse than a run that refuses to start:
+
+    * every source it names must be in the manifest — the manifest is where `source_class`,
+      hence `may_label`, comes from;
+    * every SID in `rules.rules` must appear in it exactly once. A SID claimed twice is
+      ambiguous and is never resolved by picking one; a SID claimed by nobody is a rule that
+      can fire and cannot be traced.
     """
-    rules = snapshot / RULES_FILE
-    try:
-        admitted = _sids(rules.read_text(encoding="utf-8").splitlines(), strict=True, origin=rules)
-    except FileNotFoundError as exc:
-        raise SnapshotError(f"snapshot {snapshot} has no {RULES_FILE}") from exc
-    except OSError as exc:
-        raise SnapshotError(f"{rules} could not be read: {exc}") from exc
+    path = snapshot / SID_INDEX_FILE
+    document = _load_json(path, snapshot)
 
-    if not admitted:
+    schema = document.get("schema")
+    if schema != SID_INDEX_SCHEMA:
         raise SnapshotError(
-            f"{rules} contains no rules. Suricata treats that as a warning and exits 0 with "
-            f"an empty alert set, which is indistinguishable from a capture that contained "
-            f"nothing — so it fails here instead."
+            f"{path} declares schema {schema!r}, but this flabel understands only "
+            f"{SID_INDEX_SCHEMA}. Attribution decides whether a source may label at all, so it "
+            f"is never read on a best-effort basis."
         )
+
+    sources = document.get("sources")
+    if not isinstance(sources, dict) or not sources:
+        raise SnapshotError(f"{path} maps no sources to SIDs, so no alert could be attributed")
 
     known = {admission.name for admission in manifest.sources}
     index: dict[int, str] = {}
     ambiguous: dict[int, set[str]] = {}
 
-    raw_root = snapshot / RAW_DIR
-    raw_files = sorted(raw_root.rglob("*.rules")) if raw_root.is_dir() else []
-    if not raw_files:
-        raise SnapshotError(
-            f"snapshot {snapshot} has no {RAW_DIR}/<source>.rules files, so no alert could be "
-            f"attributed to a source. eve.json does not carry the source, and a label whose "
-            f"origin cannot be traced must never be emitted (spec §13)."
-        )
-
-    for path in raw_files:
-        name = path.relative_to(raw_root).with_suffix("").as_posix()
+    for name in sorted(sources):
         if name not in known:
             raise SnapshotError(
-                f"{path} holds rules for source {name!r}, which {MANIFEST_FILE} does not "
-                f"list. The manifest is the authority on which sources a snapshot contains "
-                f"and on whether each may label."
+                f"{path} attributes SIDs to source {name!r}, which {MANIFEST_FILE} does not "
+                f"list. The manifest is the authority on which sources a snapshot contains and "
+                f"on whether each may label."
             )
-        for sid in _sids(path.read_text(encoding="utf-8").splitlines()) & admitted:
+        sids = sources[name]
+        if not isinstance(sids, list):
+            raise SnapshotError(
+                f"{path}: source {name!r} maps to {type(sids).__name__}, expected a list of SIDs"
+            )
+        for sid in sids:
+            if not isinstance(sid, int) or isinstance(sid, bool):
+                raise SnapshotError(f"{path}: source {name!r} lists a non-integer SID {sid!r}")
             owner = index.get(sid)
             if owner is not None and owner != name:
                 ambiguous.setdefault(sid, {owner}).add(name)
@@ -345,28 +521,72 @@ def sid_source_index(snapshot: Path, manifest: SnapshotManifest) -> dict[int, st
             f"{sid} ({', '.join(sorted(names))})" for sid, names in sorted(ambiguous.items())
         )
         raise SnapshotError(
-            f"snapshot {snapshot} claims the same SID from more than one source: {detail}. "
-            f"A detection is never attributed by guess, so the snapshot must be rebuilt "
-            f"without the collision."
+            f"{path} claims the same SID from more than one source: {detail}. A detection is "
+            f"never attributed by guess, so the snapshot must be rebuilt without the collision. "
+            f"Step 4 owns detecting this at write time, where dropping one of the two is an "
+            f"option the operator actually has."
+        )
+
+    _cross_check_rules(snapshot, index)
+    return index
+
+
+def _cross_check_rules(snapshot: Path, index: Mapping[int, str]) -> None:
+    """Assert `sid_index.json` describes the rules that will actually run.
+
+    `rules.rules` is the file Suricata reads, so it — not the index — decides what can fire.
+    The scan costs one pass over bytes already read for the snapshot-id check, and it catches
+    the two ways the two files can disagree: a rule with no attribution, and an attribution
+    for a rule that is not there.
+    """
+    rules = snapshot / RULES_FILE
+    text = _read_bytes(rules, snapshot).decode("utf-8", errors="replace")
+    admitted = _sids(text.splitlines(), strict=True, origin=rules)
+
+    if not admitted:
+        raise SnapshotError(
+            f"{rules} contains no rules. Suricata treats that as a warning and exits 0 with "
+            f"an empty alert set, which is indistinguishable from a capture that contained "
+            f"nothing — so it fails here instead."
         )
 
     unattributed = sorted(admitted - set(index))
     if unattributed:
         raise SnapshotError(
-            f"snapshot {snapshot} admits SIDs no source claims: {unattributed}. Each could "
-            f"fire and could not be traced to a source, which also means we cannot tell "
-            f"whether it may label (spec §2.8)."
+            f"{rules} admits SIDs that {SID_INDEX_FILE} does not attribute: {unattributed[:20]} "
+            f"({len(unattributed)} total). Each could fire and could not be traced to a source, "
+            f"which also means we cannot tell whether it may label (spec §2.8)."
         )
-    return index
+
+    phantom = sorted(set(index) - admitted)
+    if phantom:
+        raise SnapshotError(
+            f"{SID_INDEX_FILE} attributes SIDs that are not in {RULES_FILE}: {phantom[:20]} "
+            f"({len(phantom)} total). The two files describe different rulesets, so neither can "
+            f"be trusted to say what ran."
+        )
+
+
+def _load_json(path: Path, snapshot: Path) -> Mapping[str, Any]:
+    """Read a required snapshot JSON object, with every failure a `SnapshotError`."""
+    try:
+        document = json.loads(_read_bytes(path, snapshot).decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise SnapshotError(f"{path} is not valid UTF-8: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SnapshotError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise SnapshotError(f"{path} must contain a JSON object, got {type(document).__name__}")
+    return document
 
 
 def _sids(lines: Iterable[str], *, strict: bool = False, origin: Path | None = None) -> set[int]:
     """The SIDs of the active rules in `lines`.
 
-    Blank lines and comments are skipped — ``raw/`` text is as fetched, and real feeds ship
-    both, as well as disabled ``#alert`` rules that were never admitted. `strict` is for
-    ``rules.rules``, where an active rule without a SID is a broken snapshot rather than
-    noise to skip.
+    Blank lines and comments are skipped: a snapshot may carry a header comment, and a disabled
+    ``#alert`` rule can never fire (ET Open ships 19,479 of them). `strict` is for
+    ``rules.rules``, where an active rule without a SID is a broken snapshot rather than noise
+    to skip — it is a rule that can alert and cannot be attributed.
     """
     found: set[int] = set()
     for line in lines:
@@ -399,10 +619,30 @@ def _build(kind: type, values: Mapping[str, Any], path: Path) -> Any:
     field makes every snapshot already on disk unreadable, and spec §2.7 requires Phase 2 to
     be additive. A renamed field still fails loudly, as a missing one.
     """
+    if not isinstance(values, Mapping):
+        raise SnapshotError(
+            f"{path}: expected a JSON object for {kind.__name__}, got {type(values).__name__}"
+        )
+
     expected = {field.name for field in fields(kind)}
     missing = sorted(expected - set(values))
     if missing:
         raise SnapshotError(f"{path}: {kind.__name__} is missing {', '.join(missing)}")
+
+    # Types are checked, not just presence. JSON has no schema, so `"snapshot_id": 12345` or
+    # `"name": 5` would otherwise construct a dataclass whose `str` field holds an int, and the
+    # failure would surface pages later as a bare `TypeError` or `AttributeError` — not a
+    # `FlabelError`, so `cli.py` could only report it as a traceback. Only the scalar fields are
+    # checked; `sources` is validated by this same function one level down.
+    hints = get_type_hints(kind)
+    for name in sorted(expected):
+        wanted = hints.get(name)
+        if wanted in (str, int) and not _is_instance(values[name], wanted):
+            raise SnapshotError(
+                f"{path}: {kind.__name__}.{name} must be {wanted.__name__}, got "
+                f"{type(values[name]).__name__} ({values[name]!r})"
+            )
+
     try:
         return kind(**{name: values[name] for name in expected})
     except (TypeError, ValueError) as exc:
@@ -411,22 +651,32 @@ def _build(kind: type, values: Mapping[str, Any], path: Path) -> Any:
         raise SnapshotError(f"{path}: invalid {kind.__name__}: {exc}") from exc
 
 
+def _is_instance(value: object, wanted: type) -> bool:
+    """`isinstance`, except that a bool is not an acceptable int.
+
+    `True` would otherwise pass as `rules_admitted`, and arithmetic on it would quietly work.
+    """
+    if isinstance(value, bool) and wanted is int:
+        return False
+    return isinstance(value, wanted)
+
+
 # --- eve.json ------------------------------------------------------------------------------
 
 
 def _read_eve(
     path: Path, index: Mapping[int, str], sources: Mapping[str, SourceAdmission]
-) -> tuple[list[Detection], int, int, int | None]:
+) -> tuple[list[Detection], int, int, tuple[int, int, int] | None]:
     """Parse `path` in one pass.
 
-    Returns the detections that may label, the total alert count, how many were suppressed,
-    and the engine's rule-load count if the stats event reported one. One pass because
-    eve.json also holds every flow, http and tls record of the run and can be large.
+    Returns the detections that may label, the total alert count, how many were suppressed, and
+    the engine's ``(loaded, failed, skipped)`` rule counts if the stats record carried them.
+    One pass because eve.json also holds every flow record of the run and can be large.
     """
     detections: list[Detection] = []
     alerts_total = 0
     suppressed = 0
-    loaded: int | None = None
+    loaded: tuple[int, int, int] | None = None
 
     with path.open(encoding="utf-8") as handle:
         for number, line in enumerate(_lines(handle, path), start=1):
@@ -503,7 +753,16 @@ def _detection(
         if key not in alert:
             raise ToolError(f"{path} line {number} is an alert with no alert.{key}")
 
-    sid = int(alert["signature_id"])
+    # Checked rather than coerced: `int(None)` and `int("x")` raise TypeError/ValueError, which
+    # are not `FlabelError`s, so `cli.py` could only report them as a traceback.
+    raw_sid = alert["signature_id"]
+    if not isinstance(raw_sid, int) or isinstance(raw_sid, bool):
+        raise ToolError(
+            f"{path} line {number}: alert.signature_id is {raw_sid!r}, not an integer, so the "
+            f"alert cannot be attributed to a rule"
+        )
+
+    sid = raw_sid
     source = index.get(sid)
     if source is None:
         # Cannot happen with `-S`: only snapshot rules are loaded and every admitted SID was
@@ -526,6 +785,7 @@ def _detection(
         return None
 
     category = alert.get("category") or None
+    src_port, dst_port = _ports(record)
     return Detection(
         source=source,
         tier=TIER,
@@ -538,16 +798,62 @@ def _detection(
         app_proto=record.get("app_proto"),
         threat=str(alert["signature"]),
         ts=_epoch(record.get("timestamp"), path, number),
-        src_ip=str(record.get("src_ip", "")),
-        src_port=int(record.get("src_port", 0)),
-        dst_ip=str(record.get("dest_ip", "")),
-        dst_port=int(record.get("dest_port", 0)),
-        # Lowercased: Suricata writes `TCP`, Zeek's conn.log writes `tcp`, and correlation
-        # matches the two 5-tuples field by field (spec §9). Zeek's spelling wins because
-        # `Flow` is built from conn.log.
-        proto=str(record.get("proto", "")).lower(),
+        src_ip=_address(record.get("src_ip")),
+        src_port=src_port,
+        dst_ip=_address(record.get("dest_ip")),
+        dst_port=dst_port,
+        proto=_proto(record.get("proto")),
         metadata=_metadata(alert.get("metadata")),
     )
+
+
+def _proto(raw: Any) -> str:
+    """The transport protocol in Zeek's spelling.
+
+    Correlation matches the two tools' 5-tuples field by field (spec §9), and `Flow` is built
+    from `conn.log`, so Zeek's spelling wins: lowercase, and `IPv6-ICMP` becomes `icmp` because
+    that is what Zeek's `transport_proto` writes for ICMPv6 (measured — see `PROTO_ALIASES`).
+    """
+    lowered = str(raw or "").lower()
+    return PROTO_ALIASES.get(lowered, lowered)
+
+
+def _address(raw: Any) -> str:
+    """An IP address in Zeek's canonical text form.
+
+    Suricata writes IPv6 addresses expanded (``fd00:0000:0000:0000:0000:0000:0000:00a1``); Zeek
+    writes them compressed (``fd00::a1``). Both name the same address, but correlation compares
+    the *strings*, so without this every IPv6 detection would be uncorrelatable — and spec §9's
+    unmatched gate fails the whole run past 1%. IPv4 is unaffected, and anything unparseable is
+    passed through rather than dropped, since a malformed address is still evidence.
+    """
+    text = str(raw or "")
+    try:
+        return ipaddress.ip_address(text).compressed
+    except ValueError:
+        return text
+
+
+def _ports(record: Mapping[str, Any]) -> tuple[int, int]:
+    """The port columns, mirroring what Zeek puts there for port-less protocols.
+
+    ICMP has no ports, and Suricata's alert record carries `icmp_type`/`icmp_code` instead. Zeek
+    does not leave `conn.log`'s port columns empty either — it writes the ICMP type in
+    `id.orig_p` and, for an echo exchange, the counterpart type in `id.resp_p`. Recording
+    `(0, 0)` here would make **every** ICMP detection unmatchable, and ET Open ships plenty of
+    ICMP rules: three such alerts in 150 detections is enough to trip spec §9's 1% unmatched
+    gate and fail an otherwise good run, with the run block blaming correlation.
+
+    So type and code are mirrored into the port columns. Measured limitation, reported rather
+    than hidden: for ICMPv4 echo this agrees with Zeek exactly (`8, 0`), but for ICMPv6 echo
+    Zeek writes `128, 129` — the *reply* type, not the code — where this yields `128, 0`. A
+    single alert record does not carry the counterpart type, so closing that gap needs
+    correlation to treat ICMP specially (step 7), not a different value here.
+    """
+    for key in ("src_port", "dest_port"):
+        if key in record:
+            return int(record.get("src_port", 0)), int(record.get("dest_port", 0))
+    return int(record.get("icmp_type", 0)), int(record.get("icmp_code", 0))
 
 
 def _epoch(timestamp: Any, path: Path, number: int) -> float:
@@ -601,31 +907,51 @@ def _metadata(raw: Any) -> tuple[str, ...]:
 # --- engine reporting ----------------------------------------------------------------------
 
 
-def _rules_loaded_from_stats(record: Mapping[str, Any]) -> int | None:
-    """`detect.engines[].rules_loaded` from an eve stats record."""
+def _rules_loaded_from_stats(record: Mapping[str, Any]) -> tuple[int, int, int] | None:
+    """``(loaded, failed, skipped)`` from an eve stats record's `detect.engines[]`.
+
+    All three, not just the loaded count: `rules_failed` is how a partial load — the failure
+    that actually happens with real feeds — becomes visible, and `rules_skipped` distinguishes
+    "the engine could not parse this rule" from "two rules share a SID and it kept one".
+    """
     stats = record.get("stats")
     detect = stats.get("detect") if isinstance(stats, dict) else None
     engines = detect.get("engines") if isinstance(detect, dict) else None
-    if not isinstance(engines, list) or not engines:
+    if not isinstance(engines, list):
         return None
-    counts = [engine.get("rules_loaded") for engine in engines if isinstance(engine, dict)]
-    numbers = [count for count in counts if isinstance(count, int)]
-    return max(numbers) if numbers else None
+    reported = [
+        (engine.get("rules_loaded"), engine.get("rules_failed", 0), engine.get("rules_skipped", 0))
+        for engine in engines
+        if isinstance(engine, dict)
+    ]
+    usable = [
+        (loaded, failed, skipped)
+        for loaded, failed, skipped in reported
+        if isinstance(loaded, int) and isinstance(failed, int) and isinstance(skipped, int)
+    ]
+    # Multi-tenant configs report one engine each; flabel runs a single ruleset, so the highest
+    # loaded count is the one that describes it rather than a sum over engines that would
+    # double-count the same rules.
+    return max(usable) if usable else None
 
 
-def _rules_loaded_from_log(path: Path) -> int | None:
-    """The load count Suricata prints to ``suricata.log``.
+def _rules_loaded_from_log(path: Path) -> tuple[int, int, int] | None:
+    """``(loaded, failed, skipped)`` as Suricata prints them to ``suricata.log``.
 
-    Fallback for a configuration with eve stats switched off. The engine's own count is used
-    rather than the snapshot's rule count because a rule that failed to parse never fires,
-    and reporting it as loaded would overstate what the run actually looked for.
+    Fallback for a configuration with eve stats switched off. All three counts come off one
+    line, so reading it is no more work than reading the loaded count alone. The engine's own
+    numbers are used rather than the snapshot's rule count because a rule that failed to parse
+    never fires, and reporting it as loaded would overstate what the run looked for.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     matches = RULES_LOADED.findall(text)
-    return int(matches[-1]) if matches else None
+    if not matches:
+        return None
+    loaded, failed, skipped = matches[-1]
+    return int(loaded), int(failed), int(skipped)
 
 
 def _version() -> tuple[str, ToolFailure | None]:
@@ -636,7 +962,13 @@ def _version() -> tuple[str, ToolFailure | None]:
     """
     argv = [BINARY, "-V"]
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, check=False)
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=VERSION_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown", _failure(
+            argv, None, f"suricata -V did not return within {VERSION_TIMEOUT_SECONDS}s"
+        )
     except OSError as exc:
         return "unknown", _failure(argv, None, f"suricata is not runnable: {exc}")
     if completed.returncode != 0:

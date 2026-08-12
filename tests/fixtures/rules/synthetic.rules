@@ -46,3 +46,30 @@ alert tcp any any -> any 80 (msg:"FLABEL TEST synthetic identify"; content:"GET"
 # looks exactly like a clean run over an uninteresting capture. Used to prove that "the
 # engine loaded nothing" is treated as a tool failure. Never repair this into a valid rule.
 alert tcp any any -> any any (msg:"FLABEL TEST unloadable rule"; not_a_real_keyword:1; classtype:trojan-activity; sid:9000004; rev:1;)
+
+# sid 9000005 — the ONE rule here that deliberately DOES use the address variables, written the
+# way the abuse.ch feeds write their C2 rules. It is the test of flabel's own `suricata.yaml`:
+# the benign canary is RFC 1918 on both ends, so under Suricata's stock config — where
+# `EXTERNAL_NET` is `!$HOME_NET` — this rule can match nothing at all. Measured on 8.0.6: stock
+# config 0 alerts, flabel's config 1 alert. Three of the nine real sources use these variables,
+# so this rule stands in for every abuse.ch label on an internal capture.
+alert http $HOME_NET any -> $EXTERNAL_NET $HTTP_PORTS (msg:"FLABEL TEST synthetic C2 callout"; content:"GET"; http_method; classtype:trojan-activity; sid:9000005; rev:1;)
+
+# sid 9000006 — UDP, because the benign canary has no UDP flow and ET Open's DNS rules are a
+# large share of the ruleset. Proves the parsed tuple and `proto` for UDP, which correlation
+# joins against Zeek's `conn.log` (measured: Zeek writes `proto=udp`, ports 53124 -> 53 for the
+# same fixture, so the two agree field for field).
+alert udp any any -> any 53 (msg:"FLABEL TEST synthetic DNS query"; content:"flabel-test"; classtype:trojan-activity; sid:9000006; rev:1;)
+
+# sid 9000007 — ICMPv4 echo request. There are no ports in an ICMP alert record, and Zeek does
+# not leave `conn.log`'s port columns empty: it writes the ICMP type in `id.orig_p` and the
+# counterpart type in `id.resp_p`. Measured on the same fixture — Zeek: `icmp 8 -> 0`;
+# Suricata: `icmp_type 8, icmp_code 0`. Without mirroring those into the port columns every
+# ICMP detection is uncorrelatable, and spec §9's 1% unmatched gate fails the whole run.
+alert icmp any any -> any any (msg:"FLABEL TEST synthetic ICMP echo"; itype:8; classtype:trojan-activity; sid:9000007; rev:1;)
+
+# sid 9000008 — ICMPv6 echo request, which is where the two tools disagree hardest. Measured:
+# Suricata reports `proto: "IPv6-ICMP"`, Zeek reports `proto=icmp` — its `transport_proto` has
+# only tcp/udp/icmp/unknown_transport. Lowercasing alone would leave `ipv6-icmp` against Zeek's
+# `icmp` and no ICMPv6 detection could ever match a flow.
+alert icmp any any -> any any (msg:"FLABEL TEST synthetic ICMPv6 echo"; itype:128; classtype:trojan-activity; sid:9000008; rev:1;)

@@ -25,6 +25,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import re
 import struct
@@ -47,9 +48,16 @@ HTTP_SID = 9000001
 JA4_SID = 9000002
 IDENTIFY_SID = 9000003
 UNLOADABLE_SID = 9000004
+HOME_NET_SID = 9000005
+DNS_SID = 9000006
+ICMP_SID = 9000007
+ICMP6_SID = 9000008
 
 #: A well-formed id that is not the hash of anything, for injecting an inconsistent snapshot.
 WRONG_SNAPSHOT_ID = "0123456789abcdef"
+
+#: Step 4's SID→source attribution file, which step 6 reads instead of re-deriving from `raw/`.
+SID_INDEX = "sid_index.json"
 
 #: The alert timestamp the HTTP rule must carry: ``make_canary.BASE_TS`` + 0.05s. The canary's
 #: first flow runs one packet every 0.01s and the request is its 4th; Suricata raises the alert
@@ -189,6 +197,79 @@ def write_tls_capture(path: Path) -> None:
     CANARY.write_pcap(str(path), packets)
 
 
+UDP_CLIENT = "10.0.0.9"
+UDP_SERVER = "10.0.0.204"
+UDP_SPORT = 53124
+ICMP_CLIENT = "10.0.0.8"
+ICMP_SERVER = "10.0.0.203"
+ICMP6_CLIENT = "fd00::a1"
+ICMP6_SERVER = "fd00::a2"
+MIXED_BASE_TS = 1700000200.0
+
+
+def _udp(sport: int, dport: int, payload: bytes, src: str, dst: str) -> bytes:
+    length = 8 + len(payload)
+    blank = struct.pack("!HHHH", sport, dport, length, 0) + payload
+    pseudo = CANARY._packed_ip(src) + CANARY._packed_ip(dst) + struct.pack("!BBH", 0, 17, length)
+    return struct.pack("!HHHH", sport, dport, length, CANARY.checksum(pseudo + blank)) + payload
+
+
+def _dns_query(name: bytes = b"flabel-test.invalid") -> bytes:
+    labels = b"".join(bytes([len(part)]) + part for part in name.split(b".")) + b"\x00"
+    return struct.pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + labels + struct.pack("!HH", 1, 1)
+
+
+def _icmp4(kind: int, code: int) -> bytes:
+    blank = struct.pack("!BBHHH", kind, code, 0, 1, 1) + b"flabel"
+    return struct.pack("!BBHHH", kind, code, CANARY.checksum(blank), 1, 1) + b"flabel"
+
+
+def _icmp6(kind: int, code: int, src: bytes, dst: bytes) -> bytes:
+    body = struct.pack("!BBHHH", kind, code, 0, 1, 1) + b"flabel"
+    pseudo = src + dst + struct.pack("!IBBBB", len(body), 0, 0, 0, 58)
+    checksum = CANARY.checksum(pseudo + body)
+    return struct.pack("!BBHHH", kind, code, checksum, 1, 1) + b"flabel"
+
+
+def _ipv6(src: bytes, dst: bytes, payload: bytes, next_header: int) -> bytes:
+    return struct.pack("!IHBB", 0x60000000, len(payload), next_header, 64) + src + dst + payload
+
+
+def write_mixed_capture(path: Path) -> None:
+    """A UDP DNS query plus ICMPv4 and ICMPv6 echoes: the protocols the canary lacks.
+
+    Generated rather than committed, and generated *here* rather than added to
+    `make_canary.py`, which the benign canary's "zero labels" guarantee depends on staying
+    exactly as it is.
+    """
+    v6_src = ipaddress.ip_address(ICMP6_CLIENT).packed
+    v6_dst = ipaddress.ip_address(ICMP6_SERVER).packed
+    query = _dns_query()
+
+    frames = [
+        CANARY.ethernet(
+            CANARY.ipv4(
+                UDP_CLIENT,
+                UDP_SERVER,
+                _udp(UDP_SPORT, 53, query, UDP_CLIENT, UDP_SERVER),
+                proto=17,
+                ident=800,
+            )
+        ),
+        CANARY.ethernet(CANARY.ipv4(ICMP_CLIENT, ICMP_SERVER, _icmp4(8, 0), proto=1, ident=801)),
+        CANARY.ethernet(CANARY.ipv4(ICMP_SERVER, ICMP_CLIENT, _icmp4(0, 0), proto=1, ident=802)),
+        _ETHER6 + _ipv6(v6_src, v6_dst, _icmp6(128, 0, v6_src, v6_dst), 58),
+        _ETHER6 + _ipv6(v6_dst, v6_src, _icmp6(129, 0, v6_dst, v6_src), 58),
+    ]
+    CANARY.write_pcap(
+        str(path), [(MIXED_BASE_TS + index * 0.01, frame) for index, frame in enumerate(frames)]
+    )
+
+
+#: An Ethernet header with the IPv6 ethertype; `make_canary.ethernet` hardcodes IPv4's.
+_ETHER6 = CANARY.SRC_MAC + CANARY.DST_MAC + b"\x86\xdd"
+
+
 def rule_lines() -> dict[int, str]:
     """The synthetic rules, keyed by SID."""
     lines = {}
@@ -209,24 +290,22 @@ def make_snapshot(
     contents: Mapping[str, Sequence[int]],
     classes: Mapping[str, str] | None = None,
     *,
-    raw: bool = True,
-    extra_raw: Mapping[str, Sequence[int]] | None = None,
+    sid_index: bool = True,
     snapshot_id: str | None = None,
 ) -> Path:
     """Hand-build the snapshot layout of spec §7 from `contents` (source name → SIDs).
 
-    Stands in for step 4's ``write_snapshot`` so this step stays independently testable.
-    ``raw=False`` omits the per-source rule files, which is how the "this snapshot cannot
-    attribute its SIDs" failure is injected. ``extra_raw`` adds SIDs to a source's ``raw/``
-    file *without* admitting them — which is what as-fetched text really looks like, since
-    admission rejects most of it.
+    Stands in for step 4's ``write_snapshot`` so this step stays independently testable. Writes
+    the three files step 6 reads — ``rules.rules``, ``manifest.json`` and ``sid_index.json`` —
+    and nothing else; ``raw/`` exists in a real snapshot for audit, and step 6 deliberately no
+    longer looks at it. ``sid_index=False`` omits the attribution file, which is how "this
+    snapshot cannot attribute its SIDs" is injected.
 
-    `snapshot_id` defaults to the real ``sha256(rules.rules)[:16]`` that spec §7 defines, so
-    fixtures are internally consistent the way a written snapshot is; pass a string to inject
-    an id that does not match its own rules.
+    `snapshot_id` defaults to the real ``sha256(rules.rules + sid_index.json)[:16]`` step 4
+    writes, so fixtures are internally consistent the way a written snapshot is; pass a string
+    to inject an id that does not match its own content.
     """
     classes = classes or {}
-    extra_raw = extra_raw or {}
     snapshot = root / "snapshot"
     snapshot.mkdir(parents=True, exist_ok=True)
 
@@ -235,13 +314,6 @@ def make_snapshot(
     for name in sorted(contents):
         lines = [RULES[sid] for sid in sorted(contents[name])]
         admitted.extend(lines)
-        if raw:
-            raw_path = snapshot / "raw" / f"{name}.rules"
-            raw_path.parent.mkdir(parents=True, exist_ok=True)
-            fetched = lines + [RULES[sid] for sid in sorted(extra_raw.get(name, ()))]
-            # A comment line and a blank line, because raw text is "as fetched" and real
-            # feeds ship both — the SID scan must skip them.
-            raw_path.write_text(f"# {name} as fetched\n\n" + "\n".join(fetched) + "\n")
         admissions.append(
             SourceAdmission(
                 name=name,
@@ -263,8 +335,20 @@ def make_snapshot(
 
     rules = snapshot / "rules.rules"
     rules.write_text("\n".join(admitted) + "\n" if admitted else "")
+
+    if sid_index:
+        (snapshot / SID_INDEX).write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "sources": {name: sorted(contents[name]) for name in sorted(contents)},
+                },
+                indent=2,
+            )
+        )
+
     manifest = SnapshotManifest(
-        snapshot_id=snapshot_id or hashlib.sha256(rules.read_bytes()).hexdigest()[:16],
+        snapshot_id=snapshot_id or computed_snapshot_id(snapshot),
         created_at="2026-08-12T00:00:00.000000Z",
         flabel_version="0.0.0",
         sources=tuple(admissions),
@@ -275,22 +359,38 @@ def make_snapshot(
     return snapshot
 
 
+def computed_snapshot_id(snapshot: Path) -> str:
+    """The id step 4 writes: sha256 over the rules and their attribution, truncated to 16."""
+    digest = hashlib.sha256()
+    for name in ("rules.rules", SID_INDEX):
+        path = snapshot / name
+        digest.update(path.read_bytes() if path.exists() else b"")
+    return digest.hexdigest()[:16]
+
+
 def snapshot_id_of(snapshot: Path) -> str:
     """The id the manifest claims, read the way `provenance` will read it."""
     return json.loads((snapshot / "manifest.json").read_text())["snapshot_id"]
 
 
 def reseal(snapshot: Path) -> None:
-    """Recompute `snapshot_id` after a test has rewritten ``rules.rules``.
+    """Recompute `snapshot_id` after a test has rewritten a hashed file.
 
-    Needed because the id is verified against the file's hash: without this, every test that
-    injects a *rules* fault would trip the consistency check first and prove nothing about the
-    fault it meant to inject.
+    Needed because the id is verified against those files' contents: without this, every test
+    that injects a *rules* or *attribution* fault would trip the consistency check first and
+    prove nothing about the fault it meant to inject.
     """
     document = json.loads((snapshot / "manifest.json").read_text())
-    digest = hashlib.sha256((snapshot / "rules.rules").read_bytes()).hexdigest()
-    document["snapshot_id"] = digest[:16]
+    document["snapshot_id"] = computed_snapshot_id(snapshot)
     (snapshot / "manifest.json").write_text(json.dumps(document, indent=2))
+
+
+def set_sid_index(snapshot: Path, sources: Mapping[str, Sequence[int]], schema: int = 1) -> None:
+    """Overwrite the attribution file and reseal, so only the attribution is under test."""
+    (snapshot / SID_INDEX).write_text(
+        json.dumps({"schema": schema, "sources": {name: list(sources[name]) for name in sources}})
+    )
+    reseal(snapshot)
 
 
 # --- the invocation itself -----------------------------------------------------------------
@@ -304,18 +404,99 @@ def test_argv_loads_only_the_snapshot_ruleset():
     from rules that are in no snapshot, i.e. a verdict whose origin cannot be traced
     (spec §13). Same reasoning as step 5's regression test on Zeek's ``-D``.
     """
-    argv = suricata.build_argv(Path("/tmp/cap.pcap"), Path("/snap"), Path("/out"))
+    # Resolved, not literal: `build_argv` absolutises every path, and on macOS `/tmp` is a
+    # symlink to `/private/tmp`, so the expectation has to be resolved the same way.
+    capture, snapshot, outdir = (
+        Path("/tmp/cap.pcap").resolve(),
+        Path("/snap").resolve(),
+        Path("/out").resolve(),
+    )
+    argv = suricata.build_argv(capture, snapshot, outdir)
 
     assert argv[0] == "suricata"
-    assert argv[argv.index("-r") + 1] == "/tmp/cap.pcap"
-    assert argv[argv.index("-l") + 1] == "/out"
-    assert argv[argv.index("-S") + 1] == "/snap/rules.rules"
+    assert argv[argv.index("-r") + 1] == str(capture)
+    assert argv[argv.index("-l") + 1] == str(outdir)
+    assert argv[argv.index("-S") + 1] == str(snapshot / "rules.rules")
     assert "-s" not in argv, "-s adds to the system ruleset; only -S replaces it"
     assert "--rule-reload" not in argv
     assert argv[argv.index("--runmode") + 1] == "single"
     assert "--set" in argv
     assert "app-layer.protocols.tls.ja3-fingerprints=yes" in argv
     assert "app-layer.protocols.tls.ja4-fingerprints=yes" in argv
+
+
+def test_argv_uses_flabels_own_config_not_the_machines():
+    """``-c``, and the two config files it names, are part of the contract.
+
+    Without ``-c`` the operator's `/etc/suricata/suricata.yaml` decides whether an abuse.ch
+    ``$HOME_NET -> $EXTERNAL_NET`` rule can fire, what `classtype` text lands in provenance, and
+    whether capture payloads are written to disk. `default-rule-path` is pinned to the snapshot
+    so a rule's own relative paths (``dataset:``) cannot reach outside it.
+    """
+    argv = suricata.build_argv(Path("/tmp/cap.pcap"), Path("/snap"), Path("/out"))
+    settings = {argv[index + 1] for index, value in enumerate(argv) if value == "--set"}
+
+    config = Path(argv[argv.index("-c") + 1])
+    assert config.name == "suricata.yaml"
+    assert config.is_absolute() and config.exists(), "the config must ship as package data"
+    assert f"classification-file={config.parent / 'classification.config'}" in settings
+    assert f"reference-config-file={config.parent / 'reference.config'}" in settings
+    assert f"default-rule-path={Path('/snap').resolve()}" in settings
+
+
+def test_argv_paths_are_absolute_whatever_the_working_directory(tmp_path, monkeypatch):
+    """A relative snapshot path must not reach the tool.
+
+    Measured on 8.0.6: a relative ``-S`` is resolved against the working directory
+    (``default-rule-path`` is *not* prepended, though the docs read as though it might be). Spec
+    §12's default ``--rules-dir ./.flabel/rules`` is relative, so this is the ordinary case, and
+    an argv that only works from one directory is not a reproducible failure report either.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "snap").mkdir()
+
+    argv = suricata.build_argv(Path("cap.pcap"), Path("snap"), Path("out"))
+
+    for flag in ("-r", "-S", "-l"):
+        value = Path(argv[argv.index(flag) + 1])
+        assert value.is_absolute(), f"{flag} was given the relative path {value}"
+        assert str(value).startswith(str(tmp_path.resolve()))
+
+
+def test_the_vendored_config_is_hashed_for_the_run_block():
+    """One digest over every config file, so a run can say which configuration produced it.
+
+    `HOME_NET`, the classtype descriptions and the eve output selection all change what a label
+    says, so "same input, same output" is only meaningful against a known config (Goal 2).
+    """
+    digest = suricata.config_sha256()
+
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+    names = [path.name for path in suricata.config_files()]
+    assert names == ["suricata.yaml", "classification.config", "reference.config"]
+    assert all(path.exists() for path in suricata.config_files())
+    assert suricata.config_sha256() == digest, "the digest must not depend on read order"
+
+
+@pytest.mark.requires_tools
+def test_the_vendored_config_makes_a_home_net_rule_fire(tmp_path):
+    """The point of `-c`, proved rather than asserted.
+
+    `synthetic.rules` sid 9000005 is written the way the abuse.ch feeds write their C2 rules —
+    ``$HOME_NET any -> $EXTERNAL_NET $HTTP_PORTS``. The benign canary is RFC 1918 on both ends,
+    so under Suricata's stock config (`EXTERNAL_NET: "!$HOME_NET"`) that rule can match nothing
+    at all. Measured: stock config → 0 alerts, flabel's config → 1. Every abuse.ch label on an
+    internal capture depends on this.
+    """
+    snapshot = make_snapshot(tmp_path, {"abuse.ch/feodotracker": [HOME_NET_SID]})
+
+    detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+    assert info.tool_failures == ()
+    assert [detection.sid for detection in detections] == [HOME_NET_SID], (
+        "a $HOME_NET -> $EXTERNAL_NET rule did not fire on an internal-to-internal capture, "
+        "which is what HOME_NET: any in flabel's own suricata.yaml exists to prevent"
+    )
 
 
 @pytest.mark.requires_tools
@@ -421,6 +602,89 @@ def test_alert_timestamps_do_not_depend_on_the_local_timezone(tmp_path, half_hou
 
 
 @pytest.mark.requires_tools
+def test_the_run_directory_holds_no_capture_content(tmp_path):
+    """flabel processes other people's traffic; the run directory must not become a copy of it.
+
+    Stock Suricata configurations commonly enable `file-store`, `pcap-log` or eve `payload`, any
+    of which writes capture bytes to disk. flabel's own config disables all of them, and this
+    asserts the *result* rather than trusting the YAML — it is also the list spec §10 needs for
+    its reproducibility exclusions: `eve.json` (whose `stats` records are wall-clock) and
+    `suricata.log` (wall-clock throughout, never reproducible).
+    """
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+    outdir = tmp_path / "out"
+
+    suricata.run_suricata(BENIGN, snapshot, outdir)
+
+    assert sorted(path.name for path in outdir.iterdir()) == ["eve.json", "suricata.log"]
+    records = [json.loads(line) for line in (outdir / "eve.json").read_text().splitlines() if line]
+    assert {record["event_type"] for record in records} <= {"alert", "flow", "stats"}
+    for record in records:
+        assert "payload" not in record and "payload_printable" not in record
+        assert "packet" not in record
+
+
+@pytest.mark.requires_tools
+def test_a_udp_detection_carries_the_tuple_zeek_will_have(tmp_path):
+    """UDP, which the benign canary has none of and ET Open's DNS rules are full of.
+
+    The values asserted are the ones Zeek writes for the same fixture (measured:
+    ``10.0.0.9 53124 -> 10.0.0.204 53 udp``), because correlation compares the two field by
+    field. Without this, nothing in step 6 evidences that a DNS detection can be matched at all.
+    """
+    capture = tmp_path / "mixed.pcap"
+    write_mixed_capture(capture)
+    snapshot = make_snapshot(tmp_path, {"et/open": [DNS_SID]})
+
+    detections, info = suricata.run_suricata(capture, snapshot, tmp_path / "out")
+
+    assert info.tool_failures == ()
+    assert len(detections) == 1
+    detection = detections[0]
+    assert detection.proto == "udp"
+    assert (detection.src_ip, detection.src_port) == (UDP_CLIENT, UDP_SPORT)
+    assert (detection.dst_ip, detection.dst_port) == (UDP_SERVER, 53)
+    assert detection.app_proto == "dns"
+
+
+@pytest.mark.requires_tools
+def test_icmp_detections_mirror_zeeks_port_columns(tmp_path):
+    """ICMP has no ports, and `(0, 0)` would make every ICMP detection uncorrelatable.
+
+    Zeek writes the ICMP type in `id.orig_p` and the counterpart type in `id.resp_p`; Suricata's
+    alert record has `icmp_type`/`icmp_code` and no ports at all. Measured on this fixture —
+    Zeek: ``icmp 8 -> 0`` for the v4 echo and ``icmp 128 -> 129`` for the v6 one; Suricata:
+    ``icmp_type 8/128, icmp_code 0``. ET Open ships plenty of ICMP rules, and spec §9 fails the
+    **whole run** above 1% unmatched, so three uncorrelatable ICMP alerts in 150 detections would
+    be enough to lose every label in the run.
+
+    The v6 case also pins the protocol name: Suricata says `IPv6-ICMP`, Zeek says `icmp`, and
+    lowercasing alone would leave the two unable to ever match.
+    """
+    capture = tmp_path / "mixed.pcap"
+    write_mixed_capture(capture)
+    snapshot = make_snapshot(tmp_path, {"et/open": [ICMP_SID, ICMP6_SID]})
+
+    detections, info = suricata.run_suricata(capture, snapshot, tmp_path / "out")
+
+    assert info.tool_failures == ()
+    by_sid = {detection.sid: detection for detection in detections}
+    assert set(by_sid) == {ICMP_SID, ICMP6_SID}
+
+    v4 = by_sid[ICMP_SID]
+    assert v4.proto == "icmp"
+    assert (v4.src_ip, v4.src_port) == (ICMP_CLIENT, 8), "ICMP type belongs in the source port"
+    assert (v4.dst_ip, v4.dst_port) == (ICMP_SERVER, 0), "ICMP code belongs in the dest port"
+
+    v6 = by_sid[ICMP6_SID]
+    assert v6.proto == "icmp", "Zeek writes `icmp` for ICMPv6; `ipv6-icmp` could never match"
+    # Compressed, as Zeek writes it. Suricata writes the expanded form, and correlation compares
+    # the strings — so an unnormalised address makes every IPv6 detection unmatchable.
+    assert (v6.src_ip, v6.dst_ip) == (ICMP6_CLIENT, ICMP6_SERVER)
+    assert v6.src_port == 128
+
+
+@pytest.mark.requires_tools
 def test_identify_source_alert_is_suppressed(tmp_path):
     """An `identify` source's rule fires and produces no detection (spec §2.8, US-16).
 
@@ -484,25 +748,22 @@ def test_a_capture_that_matches_nothing_is_an_empty_result_not_a_failure(tmp_pat
     assert info.rules_loaded == 1
 
 
-@pytest.mark.requires_tools
-def test_rules_present_in_raw_but_not_admitted_are_ignored(tmp_path):
-    """`raw/` is the text *as fetched*, so attribution intersects it with what was admitted.
+def test_attribution_comes_from_the_sid_index_not_from_raw_rule_text(tmp_path):
+    """`sid_index.json` is the authority, and `raw/` is not read at all.
 
-    A rule admission rejected sits in `raw/` and is not in `rules.rules`. It can never fire,
-    so it must not make its SID look attributable — and must not be mistaken for a SID the
-    snapshot admits but cannot trace.
+    Step 4 writes the map explicitly, so step 6 does not re-derive it: deriving source names from
+    `raw/<source>.rules` paths invented an unwritten contract about multi-file feeds (ET Open is
+    a tarball of many `.rules` files), and `raw/` is not covered by `snapshot_id`, so it could be
+    edited without detection. A `raw/` tree that contradicts the index must change nothing.
     """
-    snapshot = make_snapshot(
-        tmp_path, {"et/open": [HTTP_SID]}, extra_raw={"et/open": [IDENTIFY_SID, JA4_SID]}
-    )
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+    decoy = snapshot / "raw" / "somebody-elses-feed.rules"
+    decoy.parent.mkdir(parents=True)
+    decoy.write_text(RULES[HTTP_SID] + "\n" + RULES[IDENTIFY_SID] + "\n")
 
-    detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+    index = suricata.sid_source_index(snapshot, suricata.load_manifest(snapshot))
 
-    assert [detection.sid for detection in detections] == [HTTP_SID]
-    assert info.rules_loaded == 1, "only the admitted rule may load, never the raw text"
-    assert suricata.sid_source_index(snapshot, suricata.load_manifest(snapshot)) == {
-        HTTP_SID: "et/open"
-    }
+    assert index == {HTTP_SID: "et/open"}
 
 
 @pytest.mark.requires_tools
@@ -583,7 +844,50 @@ def test_a_ruleset_the_engine_rejects_is_a_tool_failure(tmp_path):
     assert detections == []
     assert len(info.tool_failures) == 1
     assert info.tool_failures[0].exit_code == 0, "the point is that Suricata called this success"
-    assert "no rules" in info.tool_failures[0].message
+    assert "loaded none" in info.tool_failures[0].message
+    assert "1 failed" in info.tool_failures[0].message, "the engine's own count is reported"
+
+
+@pytest.mark.requires_tools
+def test_a_partial_rule_load_is_a_failure_not_a_thinner_run(tmp_path):
+    """Some rules loaded, one rejected: the failure that actually happens with real feeds.
+
+    A snapshot of two rules where one uses an unknown keyword loads *one*, alerts normally, and
+    exits 0 — so the run looks complete while the labels the rejected rule would have produced
+    are simply absent. 26 pawpatrules rules were measured failing to load against Suricata 8, so
+    this is the ordinary case, not the exotic one.
+
+    Hard failure by decision (Craig, 2026-08-12: record, warn above zero, fail above a
+    threshold). The threshold half needs `rules_failed` on `SuricataRunInfo`, which does not
+    exist yet, so for now any shortfall fails — the conservative half. **This will fail real runs
+    until step 4 stops admitting rules this engine cannot load**, which is the intended alarm.
+    """
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID, UNLOADABLE_SID]})
+
+    detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+    assert detections == [], "a partial ruleset must not produce labels that look complete"
+    assert len(info.tool_failures) == 1
+    message = info.tool_failures[0].message
+    assert "loaded 1 of the snapshot's 2 rules" in message
+    assert "1 failed" in message
+
+
+def test_a_run_whose_rule_count_cannot_be_determined_fails(tmp_path):
+    """ "We could not tell" is a third state, and it is not the same as zero.
+
+    Both channels the count comes from — the eve stats record and `suricata.log` — are decided by
+    configuration. If neither reports, the alert set cannot be attested against the snapshot at
+    all, so it is not evidence. Kept distinct from the zero case, which has a different message
+    and a different cause.
+    """
+    failure = suricata._check_ruleset_loaded(None, expected=3, argv=["suricata"], exit_code=0)
+
+    assert failure is not None
+    assert "no rule-load count" in failure.message
+
+    agreed = suricata._check_ruleset_loaded((3, 0, 0), expected=3, argv=["suricata"], exit_code=0)
+    assert agreed is None, "a ruleset that loaded in full is not a failure"
 
 
 # --- eve.json parsing, unit-level -----------------------------------------------------------
@@ -681,23 +985,27 @@ def test_disabled_and_blank_rule_lines_carry_no_sids():
     assert suricata._sids(lines) == set()
 
 
-def test_rules_loaded_is_read_from_the_log_when_stats_are_absent(tmp_path):
-    """The fallback path, which no real run exercises while eve stats are on by default."""
+def test_all_three_rule_counts_are_read_from_the_log(tmp_path):
+    """The fallback path, which no real run exercises while eve stats are on by default.
+
+    All three counts come off one line. Reading only the loaded number — as this did at first —
+    leaves the interesting one, `rules failed`, on the floor.
+    """
     log = tmp_path / "suricata.log"
     log.write_text(
-        "Info: detect: 3 rule files processed. 51778 rules successfully loaded, "
-        "0 rules failed, 0 rules skipped\n"
+        "Info: detect: 3 rule files processed. 51752 rules successfully loaded, "
+        "26 rules failed, 3 rules skipped\n"
     )
 
-    assert suricata._rules_loaded_from_log(log) == 51778
+    assert suricata._rules_loaded_from_log(log) == (51752, 26, 3)
     assert suricata._rules_loaded_from_log(tmp_path / "absent.log") is None
 
 
 def test_a_stats_record_reporting_zero_loaded_is_not_mistaken_for_silence():
     """Zero is an answer — every rule failed — and must not read as "stats said nothing"."""
-    record = {"stats": {"detect": {"engines": [{"id": 0, "rules_loaded": 0}]}}}
+    record = {"stats": {"detect": {"engines": [{"id": 0, "rules_loaded": 0, "rules_failed": 4}]}}}
 
-    assert suricata._rules_loaded_from_stats(record) == 0
+    assert suricata._rules_loaded_from_stats(record) == (0, 4, 0)
     assert suricata._rules_loaded_from_stats({"stats": {"detect": {}}}) is None
     assert suricata._rules_loaded_from_stats({"stats": "not a dict"}) is None
 
@@ -785,23 +1093,68 @@ def test_manifest_with_an_unknown_source_class_is_a_hard_failure(tmp_path):
         suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
 
-def test_snapshot_without_per_source_rules_cannot_attribute_sids(tmp_path):
-    """No ``raw/`` means no SID→source mapping, and eve.json carries none either.
+def test_a_snapshot_without_a_sid_index_cannot_attribute_anything(tmp_path):
+    """No `sid_index.json` means no SID→source mapping, and eve.json carries none either.
 
     Guessing would put a label's provenance — including whether its source may label at all —
     on nothing. Hard failure instead.
     """
-    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]}, raw=False)
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]}, sid_index=False)
 
-    with pytest.raises(SnapshotError, match="raw"):
+    with pytest.raises(SnapshotError, match=SID_INDEX):
+        suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+
+def test_an_unknown_sid_index_schema_is_a_hard_failure(tmp_path):
+    """A format we do not understand is never read on a best-effort basis.
+
+    The file decides which source each alert is attributed to, and therefore whether it may
+    become a label at all — the one thing spec §13 calls absolute.
+    """
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+    set_sid_index(snapshot, {"et/open": [HTTP_SID]}, schema=2)
+
+    with pytest.raises(SnapshotError, match="schema"):
+        suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+
+def test_a_sid_index_naming_a_source_the_manifest_does_not_list_is_a_hard_failure(tmp_path):
+    """The manifest is the authority on which sources a snapshot contains.
+
+    It is where `source_class` — hence `may_label` — comes from, so an attribution to a source it
+    does not describe cannot be evaluated at all.
+    """
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+    set_sid_index(snapshot, {"somebody/else": [HTTP_SID]})
+
+    with pytest.raises(SnapshotError, match="somebody/else"):
+        suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+
+def test_a_malformed_sid_index_entry_is_a_hard_failure(tmp_path):
+    """A non-integer SID or a non-list of them would otherwise crash mid-parse."""
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+    (snapshot / SID_INDEX).write_text(
+        json.dumps({"schema": 1, "sources": {"et/open": ["9000001"]}})
+    )
+    reseal(snapshot)
+
+    with pytest.raises(SnapshotError, match="non-integer"):
         suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
 
 def test_a_sid_claimed_by_two_sources_is_a_hard_failure(tmp_path):
-    """Ambiguous attribution is never resolved by picking one."""
-    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID], "pawpatrules": [HTTP_SID]})
+    """Ambiguous attribution is never resolved by picking one.
 
-    with pytest.raises(SnapshotError, match=str(HTTP_SID)):
+    Kept a hard failure for now. Step 4 is adding a write-time collision check and measuring
+    whether any of the nine feeds actually collide today; once that lands this should soften to
+    match, because "rebuild the snapshot without the collision" is not a remedy an operator who
+    does not control the upstream feeds can carry out.
+    """
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID], "pawpatrules": [JA4_SID]})
+    set_sid_index(snapshot, {"et/open": [HTTP_SID, JA4_SID], "pawpatrules": [JA4_SID]})
+
+    with pytest.raises(SnapshotError, match=str(JA4_SID)):
         suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
 
@@ -816,16 +1169,17 @@ def test_an_admitted_sid_no_source_claims_is_a_hard_failure(tmp_path):
         suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
 
-def test_raw_rules_for_a_source_absent_from_the_manifest_is_a_hard_failure(tmp_path):
-    """The manifest is the authority on which sources are in a snapshot.
+def test_an_attributed_sid_that_is_not_in_the_ruleset_is_a_hard_failure(tmp_path):
+    """The other direction: the index describes rules that are not there.
 
-    A ``raw/`` file the manifest does not mention means the two disagree, and the manifest is
-    where ``source_class`` — hence `may_label` — comes from.
+    `rules.rules` is what Suricata reads, so if the two files disagree neither can be trusted to
+    say what ran — and the snapshot id covers both, so this is a genuine inconsistency rather
+    than drift.
     """
     snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
-    (snapshot / "raw" / "mystery.rules").write_text(RULES[JA4_SID] + "\n")
+    set_sid_index(snapshot, {"et/open": [HTTP_SID, 9999998]})
 
-    with pytest.raises(SnapshotError, match="mystery"):
+    with pytest.raises(SnapshotError, match="9999998"):
         suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
 
@@ -862,6 +1216,60 @@ def test_a_duplicate_source_in_the_manifest_is_a_hard_failure(tmp_path):
 
     with pytest.raises(SnapshotError, match="more than once"):
         suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "where"),
+    [
+        ("snapshot_id", 1234567890123456, "manifest"),
+        ("created_at", 20260812, "manifest"),
+        ("total_admitted", "one", "manifest"),
+        ("name", 5, "source"),
+        ("rules_admitted", "many", "source"),
+        ("licence", None, "source"),
+    ],
+)
+def test_a_manifest_field_of_the_wrong_type_is_a_hard_failure(tmp_path, field, value, where):
+    """Presence is not enough — the type is checked too.
+
+    JSON carries no schema, so `"snapshot_id": 1234567890123456` would otherwise construct a
+    dataclass whose `str` field holds an int, and the failure would surface pages later as a bare
+    `TypeError` or `AttributeError`. Those are not `FlabelError`s, so `cli.py` can only report
+    them as a traceback rather than as a reason — the same bug class as the eve.json decode
+    failure, one layer up.
+    """
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+    document = json.loads((snapshot / "manifest.json").read_text())
+    if where == "manifest":
+        document[field] = value
+    else:
+        document["sources"][0][field] = value
+    (snapshot / "manifest.json").write_text(json.dumps(document))
+
+    with pytest.raises(SnapshotError, match=field):
+        suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+
+def test_a_source_entry_that_is_not_an_object_is_a_hard_failure(tmp_path):
+    """`"sources": [5]` used to reach the dataclass constructor as a bare `TypeError`."""
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+    document = json.loads((snapshot / "manifest.json").read_text())
+    document["sources"] = [5]
+    (snapshot / "manifest.json").write_text(json.dumps(document))
+
+    with pytest.raises(SnapshotError, match="expected a JSON object"):
+        suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+
+def test_a_non_integer_signature_id_is_a_hard_failure(tmp_path):
+    """`int(None)` raises `TypeError`, which `cli.py` could only print as a traceback."""
+    path = eve_file(
+        tmp_path / "eve.json",
+        [{"event_type": "alert", "alert": {"signature_id": None, "signature": "x", "rev": 1}}],
+    )
+
+    with pytest.raises(ToolError, match="signature_id"):
+        suricata._read_eve(path, {HTTP_SID: "et/open"}, {})
 
 
 def test_an_unknown_manifest_field_is_tolerated(tmp_path):
