@@ -31,7 +31,6 @@ from flabel.ingest import (
     LINK_TYPES,
     MAX_PACKET_BYTES,
     NORMALIZED_NAME,
-    ConversionError,
     link_type_name,
     normalize,
     sniff,
@@ -188,6 +187,7 @@ def test_all_four_pcap_magics_are_recognised(tmp_path, variant):
     assert result.packets_read == CANARY_PACKETS
     assert result.input_status == "complete"
     assert result.path.read_bytes() == capture.read_bytes()
+    assert result.warnings == (), "a complete capture has nothing to warn about"
 
 
 def test_the_default_pcap_variant_is_the_canary_byte_for_byte(tmp_path):
@@ -314,6 +314,11 @@ def test_truncated_pcap_is_partial_with_the_offset_of_the_short_record(tmp_path)
     assert result.packets_read == 10
     assert result.capture_format == "pcap"
     assert result.normalization == (f"trim: dropped incomplete final record at offset {offset}",)
+    # The run block's `warnings[]` (spec §10) is a different reader from `run.input`, and this
+    # run still exits 0 — so the loss has to be sayable in a sentence as well as counted.
+    (warning,) = result.warnings
+    assert str(offset) in warning
+    assert "partial" in warning
 
 
 def test_truncation_offset_is_the_record_start_computed_independently(tmp_path):
@@ -719,6 +724,8 @@ def test_multi_datalink_keeps_the_dominant_type_and_records_the_discards(tmp_pat
         "convert: editcap -F pcap -T ether",
         "split: discarded 4 packets of link type(s) LINUX_SLL",
     )
+    (warning,) = result.warnings
+    assert "LINUX_SLL" in warning and "4 packet" in warning
 
     assert capinfos_packet_count(result.path) == 10
     assert capinfos_encapsulation(result.path) == "Ethernet"
@@ -837,9 +844,9 @@ def test_a_missing_conversion_tool_is_reported_by_name(tmp_path, monkeypatch, fi
 
     PATH is emptied rather than `subprocess` patched: the failure being injected is an
     environment fault, and patching the call would test our imitation of the tool instead of
-    our handling of its absence. `ConversionError` is a `ToolError`, so `cli.py` gets exit 1
-    whether or not it knows to read `.failure` — and the recorded `tool` has to name the one
-    that was actually missing, since that is what an operator installs.
+    our handling of its absence. The exception is a plain `ToolError`, so `cli.py` gets exit 1
+    whether or not it reads `failures` — and the recorded `tool` has to name the one that was
+    actually missing, since that is what an operator installs.
     """
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     if tool == "tshark":
@@ -852,10 +859,12 @@ def test_a_missing_conversion_tool_is_reported_by_name(tmp_path, monkeypatch, fi
         normalize(capture, workdir)
 
     error = raised.value
-    assert isinstance(error, ConversionError)
-    assert error.failure.tool == tool
-    assert error.failure.exit_code is None, "None means could not be run at all"
-    assert error.failure.argv[0] == tool
+    assert type(error) is ToolError, "one convention for a tool failure, not a local subclass"
+    assert len(error.failures) == 1
+    assert error.failures[0].tool == tool
+    assert error.failures[0].exit_code is None, "None means could not be run at all"
+    assert error.failures[0].argv[0] == tool
+    assert error.failures[0].message in str(error), "the message must survive to the operator"
     assert not workdir.exists(), "a failed conversion must leave no output"
 
 
@@ -875,10 +884,10 @@ def test_a_real_non_zero_tool_exit_is_reported_with_its_command(tmp_path):
     workdir = tmp_path / "out"
     (workdir / NORMALIZED_NAME).mkdir(parents=True)
 
-    with pytest.raises(ConversionError) as raised:
+    with pytest.raises(ToolError) as raised:
         normalize(capture, workdir)
 
-    failure = raised.value.failure
+    (failure,) = raised.value.failures
     assert failure.tool == "editcap"
     assert failure.exit_code not in (0, None), "the tool's own exit code, not a stand-in"
     assert failure.argv[0] == "editcap"

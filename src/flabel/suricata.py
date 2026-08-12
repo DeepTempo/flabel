@@ -168,9 +168,10 @@ def config_sha256() -> str:
     Recording the digest is what lets two runs be compared without trusting they used the same
     config.
 
-    Returned rather than stored on `SuricataRunInfo`, which has no field for it — `provenance`
-    can call this. TODO(step 9): read this into a `config_sha256` field on `SuricataRunInfo`
-    once the coordinator adds one; it belongs in the run block's `tools` section.
+    Computed once per run and carried on `SuricataRunInfo.config_sha256`, which is where the
+    run block's `tools` section reads it from. Computed *before* the tool starts, so a run that
+    fails still reports the configuration it attempted — and so an unreadable config file is a
+    failure before a subprocess exists rather than a mystery afterwards.
     """
     digest = hashlib.sha256()
     for path in config_files():
@@ -306,9 +307,12 @@ def run_suricata(
     _prepare_outdir(outdir)
 
     argv = build_argv(capture, directory, outdir, rule_path(directory, rules_text))
+    # Before the tool runs, so every return below — including the failure paths — can say which
+    # configuration was in force. A config we cannot hash is a run we cannot attest.
+    config_digest = config_sha256()
     version, failure = _version()
     if failure is not None:
-        return [], _failed(manifest, failure)
+        return [], _failed(manifest, failure, config_sha256=config_digest)
 
     try:
         completed = subprocess.run(
@@ -325,12 +329,14 @@ def run_suricata(
                 f"suricata did not finish within {RUN_TIMEOUT_SECONDS}s and was killed",
             ),
             version=version,
+            config_sha256=config_digest,
         )
     except OSError as exc:
         return [], _failed(
             manifest,
             _failure(argv, None, f"suricata could not be executed: {exc}"),
             version=version,
+            config_sha256=config_digest,
         )
 
     if completed.returncode != 0:
@@ -346,6 +352,7 @@ def run_suricata(
                 f"suricata {detail}: {_tail(completed.stderr or completed.stdout)}",
             ),
             version=version,
+            config_sha256=config_digest,
         )
 
     eve = outdir / EVE_FILE
@@ -358,6 +365,7 @@ def run_suricata(
                 f"suricata exited 0 but wrote no {EVE_FILE} in {outdir}",
             ),
             version=version,
+            config_sha256=config_digest,
         )
 
     detections, alerts_total, suppressed, counts = _read_eve(eve, index, classtypes, sources)
@@ -366,18 +374,41 @@ def run_suricata(
 
     failure = _check_ruleset_loaded(counts, expected=len(index), argv=argv, exit_code=0)
     if failure is not None:
-        return [], _failed(manifest, failure, version=version)
+        return [], _failed(manifest, failure, version=version, config_sha256=config_digest)
 
+    # `counts` is not None here: `_check_ruleset_loaded` returns a failure when it is.
+    loaded, failed, skipped = counts if counts else (0, 0, 0)
     return detections, SuricataRunInfo(
         version=version,
         snapshot_id=manifest.snapshot_id,
-        # `counts` is not None here: `_check_ruleset_loaded` returns a failure when it is.
-        rules_loaded=counts[0] if counts else 0,
+        rules_loaded=loaded,
         alerts_total=alerts_total,
+        rules_failed=failed,
+        rules_skipped=skipped,
         identify_alerts_suppressed=suppressed,
-        # TODO(coordinator): `rules_failed=counts[1]` and `rules_skipped=counts[2]` once the
-        # fields land on `SuricataRunInfo`, and the shortfall in `_check_ruleset_loaded` becomes
-        # a `warnings` entry below a threshold rather than an unconditional failure.
+        config_sha256=config_digest,
+        warnings=_load_warnings(failed, skipped),
+    )
+
+
+def _load_warnings(failed: int, skipped: int) -> tuple[str, ...]:
+    """What to say when the engine reported rejected rules but the load still reconciled.
+
+    `_check_ruleset_loaded` has already failed the run for any *shortfall* against the snapshot,
+    so reaching here with a non-zero `failed` or `skipped` means the engine both rejected rules
+    and reported loading as many as we admitted. The two statements cannot both be complete, and
+    a run that quietly picked one of them would be attesting a ruleset it did not verify.
+
+    Not fatal, because the loaded count is the one that reconciles and every admitted rule is
+    accounted for by it — but not silent either (spec §2.5). Kept as a separate function so the
+    wording is testable without an engine that produces the contradiction on demand.
+    """
+    if not failed and not skipped:
+        return ()
+    return (
+        f"suricata reported {failed} rules failed and {skipped} rules skipped, yet its loaded "
+        f"count matched the snapshot exactly. The two numbers cannot both describe the whole "
+        f"ruleset, so treat the rule coverage of this run as unverified.",
     )
 
 
@@ -398,12 +429,14 @@ def _check_ruleset_loaded(
       run reported success and the labels those rules would have produced are simply absent.
 
     The third is a hard failure by decision (Craig, 2026-08-12): "record it, warn above zero,
-    fail above a threshold". Recording needs a `rules_failed` field on `SuricataRunInfo` that
-    does not exist yet, and a *threshold* is only meaningful once the count is recorded — so
-    until then any shortfall fails, which is the conservative half of that decision. **Note the
-    consequence:** with today's feeds this will fail real runs (26 pawpatrules rules were
-    measured as failing to load), which is the intended alarm, not a surprise — the fix belongs
-    in step 4's admission, which should not admit a rule this engine cannot load.
+    fail above a threshold". Recording now happens — `SuricataRunInfo.rules_failed` and
+    `rules_skipped` carry the engine's own numbers — and the failure stays unconditional, which
+    is the conservative half of that decision and the half that keeps working: a threshold is a
+    number of labels one is willing to lose silently, and nobody has justified one.
+
+    **Note the consequence:** this fails a run whose feeds contain a rule the engine rejects,
+    which is the intended alarm rather than a surprise. The fix belongs in admission, which
+    should not admit a rule this engine cannot load.
     """
     if counts is None:
         return _failure(
@@ -890,13 +923,17 @@ def _failure(argv: Sequence[str], exit_code: int | None, message: str) -> ToolFa
 
 
 def _failed(
-    manifest: SnapshotManifest, failure: ToolFailure, version: str = "unknown"
+    manifest: SnapshotManifest,
+    failure: ToolFailure,
+    version: str = "unknown",
+    config_sha256: str | None = None,
 ) -> SuricataRunInfo:
-    """A run info carrying nothing but the failure — and the snapshot id.
+    """A run info carrying nothing but the failure — the snapshot id, and the config digest.
 
     The snapshot id survives because the run block must still say which ruleset was
     attempted; a failed run that cannot say what it tried is a worse artifact than one that
-    reports both.
+    reports both. The config digest survives for the same reason: `HOME_NET` and the eve
+    selection decide what could have fired, so a failure is only diagnosable against them.
     """
     return SuricataRunInfo(
         version=version,
@@ -904,6 +941,7 @@ def _failed(
         rules_loaded=0,
         alerts_total=0,
         identify_alerts_suppressed=0,
+        config_sha256=config_sha256,
         tool_failures=(failure,),
     )
 

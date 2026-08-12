@@ -56,6 +56,15 @@ InputStatus = Literal["complete", "partial"]
 #: Why a detection could not be attached to exactly one flow.
 UnmatchedReason = Literal["no_flow_match", "ambiguous_flow_match"]
 
+#: Whether JA4 fingerprinting was available to the Zeek pass, and if not, why not.
+#:
+#: Three values, not two, and never absence. Without a status a consumer cannot tell "this
+#: capture had no TLS" from "the fingerprinting package was not installed" — and spec §2.5 says
+#: absence is never a signal. `probe-failed` is separated from `not-installed` because the
+#: first is a defect (a broken ZEEKPATH, a half-finished `zkg` install) and the second is the
+#: ordinary laptop case; both lose JA4, and reporting them as one hides the defect.
+Ja4Status = Literal["present", "not-installed", "probe-failed"]
+
 
 @dataclass(frozen=True)
 class SourceSpec:
@@ -319,6 +328,10 @@ class NormalizedCapture:
     discarded_packets: int = 0
     #: Every transformation applied, in order — decompression, conversion, link-type split.
     normalization: tuple[str, ...] = ()
+    #: Non-fatal losses, in the words the run block's `warnings[]` should carry (spec §10). The
+    #: counters above say *what* was lost in numbers; these say it in a sentence, for the one
+    #: reader who sees only the warnings list.
+    warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _check(self.capture_format, get_args(CaptureFormat), "capture_format", "NormalizedCapture")
@@ -337,8 +350,20 @@ class ZeekRunInfo:
     flags: tuple[str, ...]
     log_dir: Path
     retained_logs: tuple[str, ...] = ()
+    #: Whether JA4 was computable at all. `None` only when nothing probed it.
+    ja4_status: Ja4Status | None = None
+    #: The installed `zeek/foxio/ja4` version, and *only* a version string. `zeek.py` cannot
+    #: know it — `zkg list` is the only local source and a labelling run may not shell out to
+    #: it (spec §2.2) — so the Zeek pass leaves this None and `provenance.py` fills it from
+    #: `/etc/flabel-toolchain.json`. Whether JA4 worked is `ja4_status`; putting a status here
+    #: was a type abuse flagged on PR #30 and is now impossible to read as a version.
     ja4_package_version: str | None = None
+    warnings: tuple[str, ...] = ()
     tool_failures: tuple[ToolFailure, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.ja4_status is not None:
+            _check(self.ja4_status, get_args(Ja4Status), "ja4_status", "ZeekRunInfo")
 
 
 @dataclass(frozen=True)
@@ -349,8 +374,18 @@ class SuricataRunInfo:
     snapshot_id: str
     rules_loaded: int
     alerts_total: int
+    #: Rules the engine rejected, and rules it declined to load. Recorded rather than only
+    #: compared against the snapshot's count: a rule that never loaded never examined the
+    #: capture, so a run that looks complete is missing every label it would have produced.
+    rules_failed: int = 0
+    rules_skipped: int = 0
     #: Alerts dropped because their source may not label (spec §2.8). Counted, never silent.
     identify_alerts_suppressed: int = 0
+    #: sha256 over flabel's own Suricata configuration, in `suricata.config_files()` order. A
+    #: run is only reproducible against a *known* config: `HOME_NET` decides whether a whole
+    #: class of rule can fire, and the eve selection decides what is recorded at all.
+    config_sha256: str | None = None
+    warnings: tuple[str, ...] = ()
     tool_failures: tuple[ToolFailure, ...] = ()
 
 

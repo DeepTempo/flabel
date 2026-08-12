@@ -317,6 +317,9 @@ def test_a_missing_binary_is_recorded_as_a_tool_failure(
     info = caught.value.run_info
     assert isinstance(info, ZeekRunInfo)
     assert len(info.tool_failures) == 1
+    # One convention (`errors.ToolError`), so the record is reachable from the exception without
+    # knowing which stage raised it — and it is the *same* record, not a paraphrase.
+    assert caught.value.failures == info.tool_failures
     failure = info.tool_failures[0]
     assert failure.tool == "zeek"
     assert failure.exit_code is None, "a binary that never ran has no exit code"
@@ -488,11 +491,16 @@ def test_an_uninstalled_ja4_package_is_reported_not_silent(
 
     _, info = zeek.run_zeek(BENIGN, tmp_path / "zeek")
 
-    assert info.ja4_package_version == zeek.JA4_NOT_INSTALLED
+    assert info.ja4_status == zeek.JA4_NOT_INSTALLED
+    assert info.ja4_package_version is None, "the field is for a version string, never a status"
     assert "ja4" not in info.flags, "the package cannot be loaded, so it must not be in the argv"
     warning = capsys.readouterr().err
     assert "not installed" in warning
     assert "not 'no TLS'" in warning, "the warning must say what a missing ja4 does *not* mean"
+    # The same sentence, in both places spec §12 and §10 put a warning: stderr for the operator
+    # watching, `run.warnings[]` for whoever reads labels.json afterwards.
+    (recorded,) = info.warnings
+    assert recorded in warning
 
 
 def test_a_broken_ja4_probe_is_distinguished_from_an_absent_package(
@@ -506,10 +514,13 @@ def test_a_broken_ja4_probe_is_distinguished_from_an_absent_package(
 
     _, info = zeek.run_zeek(BENIGN, tmp_path / "zeek")
 
-    assert info.ja4_package_version == zeek.JA4_PROBE_FAILED
+    assert info.ja4_status == zeek.JA4_PROBE_FAILED
+    assert info.ja4_package_version is None
     warning = capsys.readouterr().err
     assert "unexpected reason" in warning
     assert "some other catastrophe" in warning, "the probe's own output belongs in the warning"
+    (recorded,) = info.warnings
+    assert "some other catastrophe" in recorded
 
 
 def test_reproducible_logs_excludes_the_wall_clock_log():
@@ -559,8 +570,8 @@ def test_benign_capture_yields_exactly_two_flows(tmp_path: Path):
     # CI, `not-installed` on a Homebrew laptop. `probe-failed` here would mean the module could
     # not read real Zeek's "can't find ja4" wording — which is how a real broken install would be
     # misclassified, and the only place that regex meets the actual tool.
-    assert info.ja4_package_version in {zeek.JA4_PRESENT, zeek.JA4_NOT_INSTALLED}, (
-        f"the ja4 probe reached no conclusion: {info.ja4_package_version}"
+    assert info.ja4_status in {zeek.JA4_PRESENT, zeek.JA4_NOT_INSTALLED}, (
+        f"the ja4 probe reached no conclusion: {info.ja4_status}"
     )
 
 
@@ -638,12 +649,12 @@ def test_the_pipeline_works_end_to_end_without_the_ja4_package(
     analysis pass below is a real invocation, and the point is that dropping `ja4` from the argv
     still yields flows, TLS metadata, and a reported reason for the missing fingerprint.
     """
-    monkeypatch.setattr(zeek, "_ja4_status", lambda binary: zeek.JA4_NOT_INSTALLED)
+    monkeypatch.setattr(zeek, "_ja4_status", lambda binary: (zeek.JA4_NOT_INSTALLED, "stubbed"))
 
     flows, info = zeek.run_zeek(tls_capture, tmp_path / "zeek")
 
     assert "ja4" not in info.flags
-    assert info.ja4_package_version == zeek.JA4_NOT_INSTALLED
+    assert info.ja4_status == zeek.JA4_NOT_INSTALLED
     flow = next(iter(flows.values()))
     assert flow.server_name == TLS_SERVER_NAME, "the ssl.log join must not depend on JA4"
     assert flow.ja4 is None and flow.ja4s is None

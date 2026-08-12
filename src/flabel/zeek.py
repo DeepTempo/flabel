@@ -32,7 +32,7 @@ from importlib import resources
 from pathlib import Path
 
 from flabel.errors import ToolError
-from flabel.models import Flow, ToolFailure, ZeekRunInfo
+from flabel.models import Flow, Ja4Status, ToolFailure, ZeekRunInfo
 
 #: Name recorded on every `ToolFailure` from this module.
 TOOL = "zeek"
@@ -78,20 +78,21 @@ NON_REPRODUCIBLE_LOGS = frozenset({"packet_filter.log"})
 #: Version string used when the version probe itself is what failed.
 UNKNOWN_VERSION = "unknown"
 
-#: `ZeekRunInfo.ja4_package_version` values describing whether JA4 was computable at all.
+#: `ZeekRunInfo.ja4_status` values — whether JA4 was computable at all, and if not, why not.
 #:
 #: JA4 absence has to be reportable: with no signal, a consumer cannot tell "this capture had
 #: no TLS" from "the fingerprinting package was not installed", and spec §2.5 says absence is
-#: never a signal. The status rides on this field because `ZeekRunInfo` has nowhere else to put
-#: it and three parallel steps share `models.py` — a `ja4_status` field plus a `warnings` tuple
-#: is the clean fix, proposed on PR #30 rather than taken unilaterally.
+#: never a signal.
 #:
-#: `present:` is a status, not a version: the installed version is not knowable here without
-#: shelling out to `zkg` (see `run_zeek`). `provenance.py` should replace it with the real
-#: version from `/etc/flabel-toolchain.json`.
-JA4_PRESENT = "present:version-unknown"
-JA4_NOT_INSTALLED = "absent:not-installed"
-JA4_PROBE_FAILED = "absent:probe-failed"
+#: These used to be spelled `present:version-unknown` / `absent:not-installed` and stored in
+#: `ja4_package_version`, because `ZeekRunInfo` had nowhere else to put them while three steps
+#: were being built against a shared `models.py`. A status is not a version, and any consumer
+#: printing that field would have printed nonsense — flagged on PR #30, fixed here. The field
+#: is now `ja4_status`, typed by `models.Ja4Status`, and `ja4_package_version` holds a version
+#: string or nothing.
+JA4_PRESENT: Ja4Status = "present"
+JA4_NOT_INSTALLED: Ja4Status = "not-installed"
+JA4_PROBE_FAILED: Ja4Status = "probe-failed"
 
 #: Probes are bounded because they run before any work is done and a hung probe would look
 #: like a hung pipeline. The analysis pass is deliberately unbounded: how long Zeek needs is a
@@ -197,7 +198,8 @@ def run_zeek(capture: Path, outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]
     binary = executable()
     version = UNKNOWN_VERSION
     argv: tuple[str, ...] = ()
-    ja4_status = JA4_PROBE_FAILED
+    ja4_status: Ja4Status = JA4_PROBE_FAILED
+    warnings: tuple[str, ...] = ()
     # Never `()`: the flags this module *would* use are known before anything runs, and an empty
     # tuple on a failure path would read as "-D was lost", which is the one thing `flags` exists
     # to make visible.
@@ -205,7 +207,8 @@ def run_zeek(capture: Path, outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]
 
     try:
         version = _version(binary)
-        ja4_status = _ja4_status(binary)
+        ja4_status, ja4_warning = _ja4_status(binary)
+        warnings = (ja4_warning,) if ja4_warning else ()
         load_ja4 = ja4_status == JA4_PRESENT
         flags = recorded_flags(load_ja4=load_ja4)
         argv = zeek_argv(capture, load_ja4=load_ja4, binary=binary)
@@ -222,23 +225,26 @@ def run_zeek(capture: Path, outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]
             flags=flags,
             log_dir=outdir,
             retained_logs=_retained_logs(outdir),
-            ja4_package_version=ja4_status,
+            ja4_status=ja4_status,
+            warnings=warnings,
             tool_failures=(aborted.failure,),
         )
         raise _tool_error(aborted, info) from aborted
 
     _strip_json_logs(outdir)
-    # `ja4_package_version` carries a *status*, not a version, when JA4 is present: `zkg list` is
-    # the only local source of the version string, and shelling out to zkg from a labelling run
-    # would risk the one thing spec §2.2 forbids — step 9 asserts a run makes no network call —
-    # and I have not verified zkg is offline. `provenance.py` should substitute the real version
-    # from /etc/flabel-toolchain.json. Raised on PR #30.
+    # `ja4_package_version` is left None deliberately, even when JA4 is present: `zkg list` is the
+    # only local source of the version string, and shelling out to zkg from a labelling run would
+    # risk the one thing spec §2.2 forbids — step 9 asserts a run makes no network call — and I
+    # have not verified zkg is offline. `provenance.py` substitutes the real version from
+    # /etc/flabel-toolchain.json. Whether JA4 worked at all is `ja4_status`, which is a status
+    # and is typed as one.
     info = ZeekRunInfo(
         version=version,
         flags=flags,
         log_dir=outdir,
         retained_logs=_retained_logs(outdir),
-        ja4_package_version=ja4_status,
+        ja4_status=ja4_status,
+        warnings=warnings,
     )
     return flows, info
 
@@ -280,8 +286,10 @@ def _version(binary: str) -> str:
     return text.splitlines()[0] if text else UNKNOWN_VERSION
 
 
-def _ja4_status(binary: str) -> str:
-    """Whether `zeek/foxio/ja4` can be loaded, asked the way `docs/dev-setup.md` asks it.
+def _ja4_status(binary: str) -> tuple[Ja4Status, str | None]:
+    """Whether `zeek/foxio/ja4` can be loaded, and the warning text if it cannot.
+
+    Asked the way `docs/dev-setup.md` asks it.
 
     A `--parse-only` probe, not an analysis pass: it reads no packets and writes no logs. It
     exists because `@load ja4` is fatal when the package is absent, and Zeek has no
@@ -297,36 +305,36 @@ def _ja4_status(binary: str) -> str:
     two would hide it. Either way the run continues without JA4 rather than failing: a capture
     is still worth labelling from rule matches, and this is reported rather than silent.
 
-    Warnings go to stderr, which spec §12 reserves for exactly this; the status is also carried
-    in `ZeekRunInfo` so it survives into the run block, where a consumer reading `labels.json`
-    can see it.
+    The warning text is *returned* as well as printed. stderr is where spec §12 puts a warning
+    for the operator watching the run; `ZeekRunInfo.warnings` is where spec §10 puts it for
+    whoever reads `labels.json` afterwards, and those are different readers. Returning it means
+    one sentence serves both instead of the run block paraphrasing what stderr already said.
     """
     probe = (binary, "--parse-only", "-e", f"@load {JA4_SCRIPT}")
     result = _completed(probe, timeout=PROBE_TIMEOUT_SECONDS)
     if result.returncode == 0:
-        return JA4_PRESENT
+        return JA4_PRESENT, None
 
     output = f"{result.stderr}\n{result.stdout}"
     if _JA4_MISSING.search(output):
-        _warn(
+        return JA4_NOT_INSTALLED, _warn(
             f"{JA4_SCRIPT} package not installed: no flow will carry a JA4 fingerprint. "
             f"Labels are unaffected — a fingerprint is never a verdict (spec §2.6) — but a "
             f"missing ja4 in this run's output means 'not computed', not 'no TLS'. "
             f"See docs/dev-setup.md."
         )
-        return JA4_NOT_INSTALLED
 
-    _warn(
+    return JA4_PROBE_FAILED, _warn(
         f"the {JA4_SCRIPT} probe failed for an unexpected reason, so no flow will carry a JA4 "
         f"fingerprint. This is not the ordinary 'package not installed' case — check ZEEKPATH "
         f"and the zkg install. zeek --parse-only exited {result.returncode}: {_tail(result)}"
     )
-    return JA4_PROBE_FAILED
 
 
-def _warn(message: str) -> None:
-    """Report a non-fatal loss on stderr, which spec §12 reserves for progress and warnings."""
+def _warn(message: str) -> str:
+    """Print a non-fatal loss on stderr (spec §12) and return it for the run block (spec §10)."""
     print(f"flabel: warning: {message}", file=sys.stderr)
+    return message
 
 
 def _invoke(argv: tuple[str, ...], outdir: Path) -> None:
@@ -376,11 +384,14 @@ def _tail(result: subprocess.CompletedProcess[str], limit: int = 400) -> str:
 
 
 def _tool_error(aborted: _Aborted, info: ZeekRunInfo) -> ToolError:
-    error = ToolError(f"Zeek failed: {aborted}")
-    # Set dynamically rather than by extending `errors.py`, which three parallel steps share.
-    # The caller needs the run info to report the failure it is about to fail on.
-    error.run_info = info  # type: ignore[attr-defined]
-    return error
+    """The one exception this stage raises, carrying everything the caller has to report.
+
+    `failures` and `run_info` are constructor arguments, not attributes bolted on afterwards:
+    the assignment `error.run_info = info` this used to do was invisible to a type checker and
+    to anyone reading `errors.py`, which is where a caller looks to find out what a `ToolError`
+    carries.
+    """
+    return ToolError(f"Zeek failed: {aborted}", failures=(aborted.failure,), run_info=info)
 
 
 # --- logs ---------------------------------------------------------------------------------
