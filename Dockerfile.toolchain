@@ -52,15 +52,31 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # trusted.gpg.d, which would make it a valid signer for *every* repo including Ubuntu's own,
 # and its fingerprint is asserted before it is trusted — otherwise this is trust-on-first-use
 # over whatever download.opensuse.org served, with root-level package installation at stake.
+# The expected fingerprint is a literal, not an ARG: an ARG is overridable with --build-arg,
+# which would defeat the assertion for exactly the person most likely to be attacked.
 # uid: security OBS Project <security@build.opensuse.org>
-ARG ZEEK_KEY_FINGERPRINT=F9FA0223B56B116C363737EF5DA57BDD6DD785CA
+#
+# The two PPAs still get trust-on-first-use keys. On noble `add-apt-repository` writes a
+# deb822 .sources file with an inline Signed-By, so each key is scoped to its own repo rather
+# than trusted globally — a smaller problem than this key was, but not the same treatment.
+# wireshark-dev supplies editcap, which normalizes every capture, so it is worth knowing.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg software-properties-common \
     && install -d -m 0755 /etc/apt/keyrings \
     && curl -fsSL "https://download.opensuse.org/repositories/security:zeek/xUbuntu_24.04/Release.key" \
         | gpg --dearmor > /etc/apt/keyrings/security-zeek.gpg \
-    && gpg --show-keys --with-colons --fingerprint /etc/apt/keyrings/security-zeek.gpg \
-        | grep -q "^fpr:::::::::${ZEEK_KEY_FINGERPRINT}:" \
+    && expected=F9FA0223B56B116C363737EF5DA57BDD6DD785CA \
+    && colons="$(gpg --show-keys --with-colons /etc/apt/keyrings/security-zeek.gpg)" \
+    && served="$(echo "$colons" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;exit}')" \
+    && keys="$(echo "$colons" | grep -c '^pub:' || true)" \
+    && if [ "$keys" != "1" ] || [ "$served" != "$expected" ]; then \
+           echo "Zeek repo key check failed." >&2; \
+           echo "  expected exactly 1 primary key, fingerprint $expected" >&2; \
+           echo "  served $keys key(s), primary fingerprint: ${served:-none}" >&2; \
+           echo "signed-by trusts EVERY key in this file, so an extra key is as bad as a wrong" >&2; \
+           echo "one. OBS keys do rotate: verify upstream, then update the literal above." >&2; \
+           exit 1; \
+       fi \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/security-zeek.gpg] http://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/ /" \
         > /etc/apt/sources.list.d/security-zeek.list \
     && add-apt-repository -y ppa:oisf/suricata-stable \
@@ -90,7 +106,7 @@ RUN sed -i '1s|.*|#!/usr/bin/python3|' "$(command -v zkg)"
 RUN set -eu; \
     zkg autoconfig; \
     zkg install --force --version "${JA4_PACKAGE_VERSION}" zeek/foxio/ja4; \
-    clone="$(zkg config 2>/dev/null | sed -n 's/^state_dir = //p')/clones/package/ja4"; \
+    clone="$(zkg config | sed -n 's/^state_dir = //p' | head -1)/clones/package/ja4"; \
     resolved="$(git -C "$clone" rev-parse HEAD)"; \
     if [ "$resolved" != "${JA4_PACKAGE_COMMIT}" ]; then \
         echo "ja4 tag ${JA4_PACKAGE_VERSION} resolved to $resolved, expected ${JA4_PACKAGE_COMMIT}." >&2; \
@@ -116,7 +132,7 @@ RUN set -eu; \
     suricata_v="$(suricata -V | semver)"; \
     wireshark_v="$(editcap --version | semver)"; \
     uv_v="$(uv --version | semver)"; \
-    clone="$(zkg config 2>/dev/null | sed -n 's/^state_dir = //p')/clones/package/ja4"; \
+    clone="$(zkg config | sed -n 's/^state_dir = //p' | head -1)/clones/package/ja4"; \
     ja4_commit="$(git -C "$clone" rev-parse HEAD)"; \
     for pair in "zeek:$zeek_v" "suricata:$suricata_v" "wireshark:$wireshark_v" "uv:$uv_v" \
                 "ja4_commit:$ja4_commit"; do \

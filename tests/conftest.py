@@ -34,12 +34,59 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: ``requires_tools`` layer, because a partial toolchain gives partial, misleading results.
 REQUIRED_TOOLS = ("zeek", "suricata", "editcap", "capinfos")
 
-# Session counters. Module-level rather than on `config` because pytest_runtest_logreport
-# receives only the report. Reset in pytest_configure so a nested (pytester) run starts clean.
-# Note for a future pytest-xdist: these live on the workers, so the controller would see zero
-# and the gate would fail closed — safe, but it would look like a mysterious gate bug.
-_tool_tests_passed = 0
-_tool_tests_deselected: list[str] = []
+
+class _ToolGate:
+    """Per-session gate state, registered as a plugin.
+
+    An object rather than module globals: `test_tool_gate.py` runs this same conftest inside
+    a nested pytest session, and relying on module identity to keep the two sets of counters
+    apart would depend on a pytest implementation detail rather than on anything guaranteed.
+
+    Note for a future pytest-xdist: counters would live on the workers, so the controller
+    would see zero and the gate would fail closed — safe, but it would look like a bug.
+    """
+
+    def __init__(self) -> None:
+        self.passed = 0
+        self.deselected: list[str] = []
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        """Count tool tests that ran their body **and passed**.
+
+        Deliberately not ``pytest_runtest_call``, which fires before the body: an ``xfail``ed
+        tool test, or one calling ``pytest.skip`` partway through, would enter its body and
+        satisfy the gate while proving nothing about the toolchain. Marking a broken tool
+        test ``xfail`` must not turn CI green. An ``xpass`` does count — it ran and passed.
+        """
+        if report.when == "call" and report.passed and "requires_tools" in report.keywords:
+            self.passed += 1
+
+    def pytest_deselected(self, items: list[pytest.Item]) -> None:
+        """Remember tool tests filtered out, so narrowing can't silently shrink coverage.
+
+        If the suite is ever split for speed (`-m requires_tools` in one job, the rest in
+        another), only the tool-running job may pass --require-tool-tests.
+        """
+        self.deselected.extend(item.nodeid for item in items if "requires_tools" in item.keywords)
+
+    def failure(self) -> str | None:
+        """Why the gate should fail this run, or None if it shouldn't."""
+        if self.deselected:
+            return (
+                f"{len(self.deselected)} requires_tools test(s) were deselected: "
+                f"{', '.join(self.deselected[:5])}. Under --require-tool-tests the whole tool "
+                f"suite must run — a filtered run proves less than it appears to. Note that "
+                f"--lf/--ff and -k all deselect."
+            )
+        if self.passed == 0:
+            return (
+                "zero requires_tools tests executed and passed. A run that skipped the "
+                "integration layer must not look like a passing one (docs/spec.md §2)."
+            )
+        return None
+
+
+_GATE = "flabel-tool-gate"
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -57,9 +104,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    global _tool_tests_passed
-    _tool_tests_passed = 0
-    _tool_tests_deselected.clear()
+    config.pluginmanager.register(_ToolGate(), _GATE)
     config.addinivalue_line(
         "markers",
         "requires_tools: invokes the real Zeek/Suricata/Wireshark toolchain (docs/spec.md §2)",
@@ -104,47 +149,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(skip)
 
 
-def pytest_runtest_logreport(report: pytest.TestReport) -> None:
-    """Count tool tests that ran their body **and passed**.
-
-    Deliberately not ``pytest_runtest_call``, which fires before the body: an ``xfail``ed
-    tool test, or one that calls ``pytest.skip`` partway through, would enter its body and
-    satisfy the gate while proving nothing about the toolchain. Marking a broken tool test
-    ``xfail`` must not turn CI green. An ``xpass`` does count — it ran and it passed.
-    """
-    global _tool_tests_passed
-    if report.when == "call" and report.passed and "requires_tools" in report.keywords:
-        _tool_tests_passed += 1
-
-
-def pytest_deselected(items: list[pytest.Item]) -> None:
-    """Remember tool tests filtered out, so narrowing can't silently shrink coverage."""
-    _tool_tests_deselected.extend(
-        item.nodeid for item in items if "requires_tools" in item.keywords
-    )
-
-
-def _gate_failure() -> str | None:
-    """Why the toolchain gate should fail this run, or None if it shouldn't."""
-    if _tool_tests_deselected:
-        return (
-            f"{len(_tool_tests_deselected)} requires_tools test(s) were deselected: "
-            f"{', '.join(_tool_tests_deselected[:5])}. Under --require-tool-tests the whole "
-            f"tool suite must run — a filtered run proves less than it appears to."
-        )
-    if _tool_tests_passed == 0:
-        return (
-            "zero requires_tools tests executed and passed. A run that skipped the "
-            "integration layer must not look like a passing one (docs/spec.md §2)."
-        )
-    return None
-
-
 def pytest_terminal_summary(terminalreporter, exitstatus: int, config: pytest.Config) -> None:
     """Explain the gate failure in the summary block, where a reader actually looks."""
     if not config.getoption("--require-tool-tests"):
         return
-    reason = _gate_failure()
+    reason = config.pluginmanager.get_plugin(_GATE).failure()
     if reason is not None:
         terminalreporter.section("toolchain gate", red=True, bold=True)
         terminalreporter.write_line(f"FAILED: {reason}")
@@ -153,5 +162,5 @@ def pytest_terminal_summary(terminalreporter, exitstatus: int, config: pytest.Co
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if not session.config.getoption("--require-tool-tests"):
         return
-    if _gate_failure() is not None:
+    if session.config.pluginmanager.get_plugin(_GATE).failure() is not None:
         session.exitstatus = 1

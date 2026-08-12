@@ -8,7 +8,7 @@ dependency, not an optional extra.
 ## Python
 
 ```sh
-uv sync            # dev deps only — flabel itself has zero runtime dependencies
+uv sync --locked   # dev deps only — flabel itself has zero runtime dependencies
 uv run pytest -q
 uv run ruff check . && uv run ruff format .
 ```
@@ -46,7 +46,7 @@ error: zkg failed to import one or more dependencies:
 Fix it, then install the package:
 
 ```sh
-pip3 install --user GitPython semantic-version    # or: pipx install zkg
+pipx install zkg                                  # see the note below on why not pip --user
 zkg autoconfig
 zkg install --version v0.18.8 zeek/foxio/ja4
 zeek --parse-only -e '@load ja4'                  # should exit 0
@@ -56,6 +56,16 @@ zkg list                                          # should show "installed: v0.1
 `@load ja4` is the same check the tests use, deliberately: if it fails while the package
 directory exists, the package is installed somewhere Zeek won't load it, which is the
 problem worth knowing about.
+
+**Why `pipx` and not `pip3 install --user`.** `zkg`'s shebang is `#!/usr/bin/env python3`,
+which resolves through `PATH`. Under `uv run` the project virtualenv comes first, and a
+virtualenv ignores the user site directory — so `pip3 install --user GitPython` fixes `zkg`
+in your shell and leaves it broken when a test calls it. `pipx` gives `zkg` its own
+interpreter with its own dependencies, immune to whatever `PATH` it is called through. The
+CI image solves the same problem differently, by binding `zkg`'s shebang to `/usr/bin/python3`.
+
+If `zkg` still isn't usable, `test_installed_ja4_version_matches_the_pin` skips locally and
+says so. That is expected on a laptop; in CI the same condition fails.
 
 > **Licence note.** `zeek/foxio/ja4` is **JA4+** under the **FoxIO License 1.1**
 > (non-commercial). It is the approved default while Legal's review proceeds; restricting to
@@ -100,6 +110,10 @@ docker run --rm -v "$PWD":/work -w /work \
   ghcr.io/deeptempo/flabel-toolchain@sha256:<digest> \
   sh -c 'uv sync --locked --dev && uv run pytest -q --require-tool-tests --strict-toolchain'
 ```
+
+Don't add `--lf`, `--ff`, or `-k` to that command: with `--require-tool-tests` they deselect
+tool tests, and deselection fails the gate on purpose. Drop `--require-tool-tests` when you
+want to narrow a run while debugging.
 
 `UV_PROJECT_ENVIRONMENT` matters: without it, `uv sync` replaces your macOS/arm64 `.venv`
 with a root-owned linux/amd64 one inside the bind mount, and your next host-side

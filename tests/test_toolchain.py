@@ -74,8 +74,30 @@ def test_dockerfile_args_match_the_pins(toolchain_pins):
     dockerfile = (REPO_ROOT / "Dockerfile.toolchain").read_text()
     args = dict(re.findall(r"^ARG (\w+)=(\S+)$", dockerfile, re.MULTILINE))
 
-    for name in ("ZEEK_VERSION", "JA4_PACKAGE_VERSION", "JA4_PACKAGE_COMMIT"):
+    required = (
+        "ZEEK_VERSION",
+        "ZEEK_PACKAGE_VERSION",
+        "SURICATA_PACKAGE_VERSION",
+        "WIRESHARK_PACKAGE_VERSION",
+        "JA4_PACKAGE_VERSION",
+        "JA4_PACKAGE_COMMIT",
+    )
+    for name in required:
         assert name in args, f"Dockerfile.toolchain has no `ARG {name}=<value>` with a default"
+
+    # The apt ARGs are what actually get installed, so they must carry the pinned version.
+    # Substring rather than equality: apt versions add epochs and suffixes like
+    # `1:8.0.6-0ubuntu0` and `4.6.6-1~ubuntu24.04.0~ppa1`. Without this, bumping a pin and
+    # forgetting its ARG only surfaces after a ~15-minute image build.
+    for pin, arg in (
+        ("zeek", "ZEEK_PACKAGE_VERSION"),
+        ("suricata", "SURICATA_PACKAGE_VERSION"),
+        ("wireshark", "WIRESHARK_PACKAGE_VERSION"),
+    ):
+        assert toolchain_pins[pin] in args[arg], (
+            f"{arg}={args[arg]} does not contain the pinned {pin} version "
+            f"{toolchain_pins[pin]} — the image would install something else"
+        )
 
     zeek_line = ".".join(toolchain_pins["zeek"].split(".")[:2])
     assert args["ZEEK_VERSION"] == zeek_line, (
@@ -113,16 +135,26 @@ def test_ci_still_passes_the_toolchain_flags(toolchain_pins):
     )
 
 
-@pytest.mark.requires_tools
+# Deliberately not marked requires_tools: it reads a file rather than invoking anything, so
+# counting it toward "a tool test ran" would weaken the gate it sits next to.
 def test_recorded_manifest_matches_the_pins(toolchain_pins, strict_toolchain):
     """``/etc/flabel-toolchain.json`` is what the image says it installed.
 
     It exists only inside the container, and `provenance.py` is earmarked to read it, at
     which point these strings end up on shipped labels. So it is checked against the pins
-    rather than trusted. Absent outside the container, hence the skip.
+    rather than trusted.
+
+    Under ``--strict-toolchain`` a missing manifest is a failure, not a skip: this is the
+    only runtime assertion on ``ja4_zeek_commit``, so if the recorded-versions layer were
+    ever dropped from the Dockerfile, skipping here would leave that pin unguarded in CI.
     """
     manifest = pathlib.Path("/etc/flabel-toolchain.json")
     if not manifest.exists():
+        if strict_toolchain:
+            pytest.fail(
+                "the toolchain image must ship /etc/flabel-toolchain.json — it is the only "
+                "runtime check on the ja4 commit pin, and provenance.py will read it"
+            )
         pytest.skip("not running inside the toolchain container")
 
     recorded = json.loads(manifest.read_text())
@@ -158,6 +190,36 @@ def test_installed_ja4_version_matches_the_pin(toolchain_pins, strict_toolchain)
         f"{toolchain_pins['ja4_zeek_package']}. A different ja4 version can change the JA4 "
         f"value carried on labels (docs/prd.md §9), so this is a reproducibility break."
     )
+
+    # zkg reports the *tag*, which is the mutable thing the commit pin defends against, so
+    # check the commit actually checked out — the code Zeek will load, not a claim about it.
+    clone = _ja4_clone_dir()
+    if clone is None or not (clone / ".git").exists():
+        if strict_toolchain:
+            pytest.fail(f"ja4 clone not found at {clone}, so the commit pin cannot be verified")
+        pytest.skip("ja4 clone directory not found — cannot verify the commit pin")
+
+    head = subprocess.run(
+        ["git", "-C", str(clone), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert head.stdout.strip() == toolchain_pins["ja4_zeek_commit"], (
+        f"ja4 is at commit {head.stdout.strip()} but the pin is "
+        f"{toolchain_pins['ja4_zeek_commit']} — the tag moved, or the pin is stale"
+    )
+
+
+def _ja4_clone_dir() -> pathlib.Path | None:
+    """Where zkg keeps its ja4 clone, derived the same way Dockerfile.toolchain derives it."""
+    config = subprocess.run(["zkg", "config"], capture_output=True, text=True)
+    if config.returncode != 0:
+        return None
+    for line in config.stdout.splitlines():
+        if line.startswith("state_dir = "):
+            return pathlib.Path(line.removeprefix("state_dir = ").strip()) / "clones/package/ja4"
+    return None
 
 
 @pytest.mark.requires_tools

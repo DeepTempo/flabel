@@ -44,9 +44,12 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# --strict-markers: every gate mechanism keys on the literal marker name `requires_tools`,
+#   so a typo like `require_tools` would produce a test that is neither skipped without the
+#   toolchain, nor counted by the gate, nor noticed when deselected. Make it an error.
 # -p pytester: test_tool_gate.py runs pytest-in-pytest to prove the toolchain gate fails
-# when it should. Loading the plugin only registers its fixtures.
-addopts = "-ra -p pytester"
+#   when it should. Loading the plugin only registers its fixtures.
+addopts = "-ra --strict-markers -p pytester"
 markers = [
     "requires_tools: invokes the real Zeek/Suricata/Wireshark toolchain (see docs/spec.md §2)",
 ]

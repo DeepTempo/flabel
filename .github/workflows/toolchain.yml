@@ -33,12 +33,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: build
+      # Built and verified BEFORE it is pushed, so "published" implies "verified" and a
+      # broken image never reaches the registry. The push step below reuses these layers
+      # from cache, so this costs a load rather than a second build.
+      - name: Build into the local daemon
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.toolchain
           # amd64 only — the OBS Zeek repo has no arm64 build. See Dockerfile.toolchain.
+          platforms: linux/amd64
+          load: true
+          tags: flabel-toolchain:candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the suite inside the candidate image
+        run: |
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e UV_PROJECT_ENVIRONMENT=/tmp/venv \
+            flabel-toolchain:candidate \
+            sh -c 'uv sync --locked --dev && uv run pytest -q --require-tool-tests --strict-toolchain'
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.toolchain
           platforms: linux/amd64
           push: true
           # Immutable, commit-scoped tag only. No `latest`: a moving tag is exactly the
@@ -46,17 +68,6 @@ jobs:
           tags: ghcr.io/deeptempo/flabel-toolchain:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      # Without this, "the image built" and "the image is correct" are different facts, and
-      # only the first one is checked: ci.yml still pins the *previous* digest, so a broken
-      # new image publishes green and only breaks whichever unrelated PR later adopts it.
-      - name: Run the suite inside the image just built
-        run: |
-          docker run --rm \
-            -v "$PWD":/work -w /work \
-            -e UV_PROJECT_ENVIRONMENT=/tmp/venv \
-            "ghcr.io/deeptempo/flabel-toolchain@${{ steps.build.outputs.digest }}" \
-            sh -c 'uv sync --locked --dev && uv run pytest -q --require-tool-tests --strict-toolchain'
 
       - name: Report the digest and the versions it installed
         run: |
