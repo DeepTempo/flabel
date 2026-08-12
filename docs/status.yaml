@@ -9,11 +9,12 @@ prd_gdoc_url: "https://docs.google.com/document/d/1WwKukQ71L6JQWkSpKvoR4lgwB96w3
 # place, so it means creating a new Doc and updating this URL). Also: the superseded v0.1 Doc
 # 1q_muS6AmCuvcNva4C1WtRE3_KXArJPxnapttsU6UQIE needs deleting by hand — no delete tool exists.
 current_stage: build
-next_action: "Run /project:verify 2 on PR #29, then /project:build for the {3,4,5,6} parallel group (ingest, rules, zeek, suricata) — up to 3 worktrees, disjoint files."
+next_action: "Merge step 6 (#20, PR #32) once its final round lands, then the consolidation PR (models warnings/ja4_status/rules_failed, ToolError plumbing, spec §7/§8/§10 amendments, canary port 80). Then /project:build for the {7,8} parallel group."
 blocked_on:
   - "Malicious canary capture must be sourced (origin + licence recorded) — needed by Step 10 (#24) only; steps 1-9 are unblocked."
   - "PRD Q1/Q2/Q10: stakeholders, target release, success-metric review dates. Left TBD deliberately, not invented."
 known_gaps:
+  - "The benign canary trips pawpatrules 3300303: make_canary.py generates cleartext HTTP to port 443, which that rule legitimately flags. The fixture is at fault, not the feed — a canary whose whole point is that zero labels is known-correct must not contain anomalous traffic. Fix queued: port 80 + regenerate, together with the port expectations in test_zeek/test_suricata."
   - "Reproducibility has a shelf life: the apt repos serve only newest-patch, so Dockerfile.toolchain will eventually stop being rebuildable and the pinned toolchain survives only as the GHCR image pinned by digest in ci.yml. Decide before Step 10 wires the Goal 2 gate whether to mirror the .debs/image or accept the bound in writing."
   - "ci.yml's toolchain digest is updated by hand after the toolchain workflow publishes, so it can silently lag behind Dockerfile.toolchain — CI would keep running an older toolchain with every test passing, because the pins and the old image still agree. Known weak link, not an oversight."
   - "No LICENSE file. Deliberate (Craig's call, 2026-08-12) while JA4+ licensing is with Legal — the repo is public but unlicensed. Not a scaffold defect; do not re-flag."
@@ -27,7 +28,7 @@ stages:
   eng_review: { status: completed, issue: 6, artifact: docs/eng-review.md, completed: "2026-08-11" }
   plan:       { status: completed, issue: 3, artifact: PLAN.md, completed: "2026-08-11" }
   scaffold:   { status: completed, issue: 4, artifact: .github/workflows/ci.yml, completed: "2026-08-12" }
-  build:      { status: in_progress, issue: 7, artifact: null, completed: null, steps_done: 2, steps_total: 10 }
+  build:      { status: in_progress, issue: 7, artifact: null, completed: null, steps_done: 5, steps_total: 10 }
   verify:     { status: pending, issue: 5, artifact: null, completed: null }
 log:
   - "2026-08-11 init — repo scaffolded, 7 stage issues filed, Notion row created"
@@ -41,3 +42,7 @@ log:
   - "2026-08-12 stage(scaffold)+step 1 (#15, PR #26) — toolchain container pinned by digest (zeek 8.0.9, suricata 8.0.6, wireshark 4.6.6, ja4 v0.18.8); --require-tool-tests makes a skipped integration suite fail; --strict-toolchain asserts exact versions in CI. Found: `suricata --version` exits 1 (use -V), and the OBS Zeek repo has no arm64 build, so the image is amd64-only"
   - "2026-08-12 step 2 (#16, PR #29) — models/errors/config + the ten-source registry. Spec corrected twice with Craig's agreement: ET Open pins suricata-8.0 to match the pinned engine, and package data moved inside the package because hatch force-include is absent from editable installs. Registry URLs/licences taken from the OISF suricata-intel-index; all ten resolve"
   - "2026-08-12 fix (PR #28) — the Claude Code hooks had never run: both called bare ruff/pytest, which are dev dependencies and not on PATH. Now routed through uv run --no-sync"
+  - "2026-08-12 steps 3,4,5 built in parallel worktrees and merged (#31,#33,#30) after fresh review + a fix round each. main at 324 passing. Verification found only silent-wrong-answer defects, none of which CI could see: a valid ARP-only capture reported as a broken JSON filter; a proxy HTML block page accepted as 'zero rules, normal'; host paths in zeek_flags breaking Goal 2 by construction"
+  - "2026-08-12 measured against live feeds: 116,208 distinct SIDs across nine feeds with zero collisions; ET Open 21,221/51,778 admitted (41.0%) reproduced offline by measure_feeds.py -> snapshot 8a39182c18a3c9d3; zero ja4.hash rules anywhere (#13); pawpatrules' 26 dataset rules load only with --set default-rule-path=<snap>/data/pawpatrules"
+  - "2026-08-12 cross-tool tuple mismatches found and fixed in-flight: Zeek writes proto lowercase / Suricata uppercase; Suricata omits ICMP ports where Zeek carries type/code; Suricata expands IPv6 addresses where Zeek compresses them. Any one of these would have made every affected detection uncorrelatable and failed whole runs via the 1% gate"
+  - "2026-08-12 decisions: HOME_NET=any (forced EXTERNAL_NET=any); snapshot_id covers rules+sid_index+companion data; pawpatrules kept as signature with the taxonomy caveat (#34); own minimal classification.config rather than vendoring GPL-2.0 files; tshark added to the toolchain for interleaved multi-interface captures"
