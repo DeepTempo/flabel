@@ -263,14 +263,17 @@ field present, plausible, and unverifiable. The consequential case is not the li
 name" and "this flow is the attack". §8 already resolves a detection's originating source through
 the snapshot for the same reason; this is the same authority, not a second one.
 
-It refuses four things rather than emitting an entry that would look complete and be wrong:
+It refuses six things rather than emitting an entry that would look complete and be wrong, in
+this order:
 
 | Refused | Why |
 | :-- | :-- |
-| `admission.name != detection.source` | Would attribute one feed's licence and admission basis to another feed's alert. Checked **first**, because diagnosing a mis-built mapping as an identify-class suppression bug sends the reader into the wrong module. |
+| An `admission` that is not a `SourceAdmission` | The type hint is not the guard. `SourceSpec` carries all five attributes read off an admission, so before this check a registry spec passed through and produced a well-formed entry — reinstating the very defect the parameter was changed to prevent. Nothing in the repo checks annotations: CI runs ruff, and there is no mypy or pyright. |
+| `admission.name != detection.source` | Would attribute one feed's licence and admission basis to another feed's alert. Checked before the rest, because diagnosing a mis-built mapping as an identify-class suppression bug sends the reader into the wrong module. |
 | `may_label == False` | §2.8, a second enforcement after step 6's suppression. This is the last point at which an identify source could acquire a verdict. |
-| A `snapshot_id` that is not `^[0-9a-f]{16}$` | Not merely non-empty. `--ruleset-snapshot` defaults to `None` meaning "newest available" (§12), so a caller stringifying that default hands over the literal `"None"` — which a non-empty check accepts and which then names a ruleset nobody can look up. The format is the one `load_snapshot` enforces. |
-| A `tier` outside `{1, 2}` | `tier` ranks label trust and `Label.best_tier` is `min(tier)`. A stray edit setting tier 1 in `suricata.py` would present open-source screening as NGFW verdicts — well-formed, and wrong in the field a consumer weights by. The set is `{1, 2}` rather than `{2}` so Phase 2 stays additive (§2.7). |
+| A `snapshot_id` failing `fullmatch` on `[0-9a-f]{16}` | Not merely non-empty. `--ruleset-snapshot` defaults to `None` meaning "newest available" (§12), so a caller stringifying that default hands over the literal `"None"` — which a non-empty check accepts and which then names a ruleset nobody can look up. `fullmatch` rather than `match`, because `$` also matches before a trailing newline. A non-`str` is rejected first, since `None` itself would otherwise raise `TypeError` and reach the operator as the traceback this guard replaces. |
+| A `tier` outside `{1, 2}`, or a `bool` | `tier` ranks label trust and `Label.best_tier` is `min(tier)`. A stray edit setting tier 1 in `suricata.py` would present open-source screening as NGFW verdicts — well-formed, and wrong in the field a consumer weights by. The set is `{1, 2}` rather than `{2}` so Phase 2 stays additive (§2.7). `bool` is excluded explicitly because `True == 1`, and the tier would serialise as `true`. |
+| An empty `threat` or `licence` | §8 checks that the `signature` *key* exists, not that it has a value, so a rule emitting `"signature": ""` yields a label that names no threat while passing every other check. §4 provides `"unstated"` for an unknown licence, and it is not the empty string. |
 
 ### `labels.json` document
 
@@ -637,12 +640,33 @@ snapshot's id. It also settles where the terms come from — the loaded snapshot
 a record of what *was* admitted, and letting a later `enabled = false` change the reading of an
 old snapshot would make labels retroactively unattributable.
 
+**`manifest.sources` is a `tuple`, not a mapping.** Correlation indexes it once, by
+`SourceAdmission.name`, and the wording above should not be read as a dict lookup. Stated
+because `suricata.py` already writes the same line and a step built in an isolated worktree
+would otherwise write a third copy of it.
+
 **A detection whose source is absent from `manifest.sources` is a hard failure** —
 `SnapshotError`, matching §8's handling of a SID that belongs to no source in the snapshot. It
 should be impossible: `-S` loads only snapshot rules, and §8 already resolves every alert's source
 through `sid_index.json` before a `Detection` exists. Failing rather than dropping is the same
-reasoning as there — the alternative is emitting a label with an invented origin. Correlation's
-own job remains attaching detections to flows.
+reasoning as there — the alternative is emitting a label with an invented origin.
+
+**An `identify`-class detection reaching correlation is a hard failure, not a filter.**
+Correlation does not drop it and does not count it: §8 already suppresses those before a
+`Detection` exists and counts them in `identify_alerts_suppressed`, so one arriving here means
+that suppression was bypassed, and continuing would paper over a mis-wired pipeline.
+`build_source_entry` raises, and step 7's test asserts the raise rather than an empty `labels`.
+Stated because "never becomes a label" is satisfied equally by raising and by silently
+filtering, and those differ in exit code, in whether output exists at all, and in what step 10's
+canary observes.
+
+**The manifest handed to `correlate` must be the one Suricata used.** Its `snapshot_id` has to
+equal `SuricataRunInfo.snapshot_id`, and §12's orchestration asserts it. `run_suricata` loads a
+manifest and returns only the id, so the caller loads the snapshot a second time — and with
+`--ruleset-snapshot` defaulting to "newest available", a `rules update` landing between the two
+loads would resolve a *different* snapshot. Every label would then cite a ruleset whose rules
+never ran, with the same terms-versus-rules mismatch this section exists to prevent, moved one
+function to the left. Correlation's own job remains attaching detections to flows.
 
 Pure. For each detection:
 

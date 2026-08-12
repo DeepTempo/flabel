@@ -115,6 +115,30 @@ def test_a_reclassified_source_does_not_change_labels_from_an_older_snapshot():
     assert entry.label_basis == "indicator-reference"
 
 
+def test_a_sourcespec_is_refused_where_an_admission_is_required():
+    """The type hint is not the guard, and this is the test that makes it one.
+
+    `SourceSpec` carries all five attributes this function reads off a `SourceAdmission`, so
+    before this check a registry spec passed straight through and produced a well-formed
+    entry — reintroducing the live-registry defect the signature was changed to prevent, with
+    a spec paragraph asserting it could not happen. Nothing else in the repo checks
+    annotations: CI runs ruff, and there is no mypy or pyright.
+
+    The realistic miswiring is a step 7 worktree writing
+    `build_source_entry(d, load_sources()[d.source], manifest.snapshot_id)` — every test
+    green, CI green, and a reviewer seeing a call to the blessed function.
+    """
+    spec = SourceSpec(
+        name="et/open",
+        url="https://example.invalid/emerging.rules.tar.gz",
+        licence="MIT",
+        source_class="signature",
+        admission_basis="metadata-filter",
+    )
+    with pytest.raises(ValueError, match="SourceAdmission"):
+        build_source_entry(make_detection(), spec, SNAPSHOT_ID)  # type: ignore[arg-type]
+
+
 def test_spec_from_admission_carries_every_term_across():
     """The adapter must not drop a field, or the derivation runs on a default."""
     admission = make_admission(source_class="ioc-dest", licence="CC0-1.0")
@@ -160,6 +184,27 @@ def test_every_mandatory_field_is_populated_with_a_real_value():
         if getattr(entry, name) is None or getattr(entry, name) == ""
     ]
     assert not empty, f"mandatory SourceEntry fields empty or unset: {empty}"
+
+
+@pytest.mark.parametrize(
+    ("field", "detection_kwargs", "admission_kwargs"),
+    [
+        pytest.param("threat", {"threat": ""}, {}, id="threat"),
+        pytest.param("licence", {}, {"licence": ""}, id="licence"),
+    ],
+)
+def test_an_empty_mandatory_field_is_refused(field, detection_kwargs, admission_kwargs):
+    """The invariant the completeness test only appeared to check.
+
+    `SourceEntry` has no field defaults, so a mandatory field can only arrive empty if its
+    input was — and `suricata.py` checks that the `signature` *key* exists, not that it has a
+    value, so a rule emitting `"signature": ""` produces a label naming no threat. Asserting
+    non-emptiness over a populated fixture could never have caught either case.
+    """
+    with pytest.raises(ValueError, match=field):
+        build_source_entry(
+            make_detection(**detection_kwargs), make_admission(**admission_kwargs), SNAPSHOT_ID
+        )
 
 
 def test_fields_come_from_the_detection_and_the_admission_not_from_each_other():
@@ -277,6 +322,12 @@ def test_the_name_check_runs_before_the_identify_check():
         pytest.param("8a39182c", id="truncated"),
         pytest.param("8A39182C18A3C9D3", id="uppercase"),
         pytest.param("../../etc/passwd", id="path"),
+        # `$` matches before a trailing newline, so `match` accepts this and the id lands in
+        # `ruleset` as a string that resolves to no directory. `fullmatch` is what rejects it.
+        pytest.param("8a39182c18a3c9d3\n", id="trailing-newline"),
+        # The un-stringified default. `SNAPSHOT_ID.match(None)` raises TypeError, which would
+        # reach the operator as the traceback this guard exists to replace.
+        pytest.param(None, id="unstringified-default"),
     ],
 )
 def test_an_unresolvable_snapshot_id_is_refused(snapshot_id):
@@ -293,7 +344,19 @@ def test_an_unresolvable_snapshot_id_is_refused(snapshot_id):
 # --- tier is the trust ranking -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("tier", [0, 3, -1, 99])
+@pytest.mark.parametrize(
+    "tier",
+    [
+        0,
+        3,
+        -1,
+        99,
+        # `True == 1` in Python, so `True in (1, 2)` is true and the tier would serialise into
+        # labels.json as `true`. Guarded in suricata.py and rules/snapshot.py for the same
+        # reason.
+        pytest.param(True, id="bool-true"),
+    ],
+)
 def test_an_unknown_tier_is_refused(tier):
     """`Label.best_tier` is `min(tier)` and consumers weight labels by it (spec §4).
 

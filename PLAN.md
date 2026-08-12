@@ -155,16 +155,30 @@ belongs to. `classtype` is read from the rule text rather than from `alert.categ
   Correlation cannot return a `CorrelationResult` without constructing `SourceEntry` values, and
   step 8 was separately told to build them. Step 7 **imports and calls** that function; it does
   not write its own, and it does not derive `label_basis` from `source_class` itself.
-- Consequently `correlate()` takes a `SnapshotManifest` (spec §9, corrected). Resolve each
-  detection's `SourceAdmission` from `manifest.sources`; **do not** call `config.load_sources()`
-  or `config.enabled_sources()` — a label's terms come from the snapshot that produced it, and
-  `enabled` describes the registry now, not what was admitted then.
-- A detection whose source is absent from `manifest.sources` raises `SnapshotError`, matching
+- Consequently `correlate()` takes a `SnapshotManifest` (spec §9, corrected). **`manifest.sources`
+  is a `tuple[SourceAdmission, ...]`, not a mapping** — index it once, exactly as `suricata.py`
+  already does, and pass the record to the builder:
+
+  ```python
+  admissions = {admission.name: admission for admission in manifest.sources}
+  entry = build_source_entry(detection, admissions[detection.source], manifest.snapshot_id)
+  ```
+
+  **Do not** call `config.load_sources()` or `config.enabled_sources()` — a label's terms come
+  from the snapshot that produced it, and `enabled` describes the registry now, not what was
+  admitted then. `build_source_entry` rejects a `SourceSpec` outright, so this is enforced and
+  not merely advised.
+- A detection whose source is absent from that mapping raises `SnapshotError`, matching
   `suricata.py`'s handling of a SID belonging to no source. Not a bare `ValueError`: that reaches
-  the operator as a traceback rather than a reason.
-- The `may_label`, tier and `snapshot_id` checks inside `build_source_entry` are backstops, not
-  this step's excuse to skip the §2.8 test: step 7 still asserts that an `identify` detection
-  reaching correlation never becomes a label.
+  the operator as a traceback rather than a reason. **Duplicate names in `manifest.sources` are a
+  known unchecked case** — `_read_manifest` does not reject them, and the comprehension above
+  silently keeps the last. Tracked separately; do not paper over it here.
+- **An `identify` detection reaching correlation is a hard failure, not a filter.** Do not drop
+  it and do not count it — §8 already suppressed and counted those, so one arriving here means
+  that was bypassed. Let `build_source_entry` raise and assert the raise; asserting `labels == ()`
+  instead would satisfy the words and produce a run that exits 0 having silently lost a detection.
+- The `may_label`, tier, `snapshot_id` and type checks inside `build_source_entry` are backstops,
+  not this step's excuse to skip the §2.8 test.
 
 **Depends on:** 2. **Parallel with:** 8.
 
@@ -215,7 +229,10 @@ JSON encoder rather than to the builder.
 
 **Also required, from step 5 (spec §4, §8):**
 - **Catch `ToolError` and read `.failures` and `.run_info`.** Step 5 records a tool failure *and* raises it, attaching the stage's run info to the exception, precisely so the caller can report the loss it is about to fail on. Catching `ToolError` and printing `str(exc)` would throw away the `ToolFailure` records — the argv, the exit code, and whether the tool was killed rather than exited.
-- **Step 9 must decide where `tool_failures[]` is reported, and say so.** This is a genuine tension in the spec, not an oversight to code around: §11 requires the failure in `tool_failures[]`, and §13 forbids writing a partial `labels.json` on a hard failure — so the array the failure belongs in is inside the file that must not exist. The options are stderr only, a separate `run.json` (or `failure.json`) in a run directory that carries no labels, or a complete `labels.json` with an empty `labels[]`, which reads as "nothing malicious found" and is therefore the one to avoid. **Whichever is chosen, the test asserts both halves: the failure is reported somewhere a script can read, and no `labels.json` claims a verdict.** Take the decision to Craig rather than picking silently.
+- **`tool_failures[]` goes in a separate `run.json`, in a run directory with no `labels.json`** (Craig, 2026-08-12 — issue #23). §11 requires the failure recorded and §13 forbids a partial `labels.json`, so the array belongs in a file that is not `labels.json`. `run.json` carries the full run block including `tool_failures[]` with the argv, the exit code, and whether the tool was killed. Rejected: stderr-only, which makes a script parse prose to learn what was lost; and a complete `labels.json` with empty `labels[]`, which reads as "nothing malicious found" when the pipeline died. **The test asserts both halves: the failure is readable by a script, and no `labels.json` claims a verdict.** Two consequences: `run.json` is a new name in the output contract (spec §10, §12), and step 10's reproducibility gate must skip label-free run directories rather than fail on the missing file.
+
+**Also required, from step 7 (spec §9):**
+- **Assert `manifest.snapshot_id == suricata_run_info.snapshot_id` before correlating.** `run_suricata` loads a manifest and returns only the id, so step 9 loads the snapshot a second time to hand `correlate` its argument. With `--ruleset-snapshot` defaulting to "newest available", a `rules update` landing between those two loads resolves a *different* snapshot — and every label then cites a ruleset whose rules never ran. One assertion closes it; without it the two loads are silently allowed to disagree.
 
 **Depends on:** 3, 4, 5, 6, 7, 8.
 

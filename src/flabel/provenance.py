@@ -78,8 +78,22 @@ def build_source_entry(
     genuinely operator-facing case — a detection whose source is not in the snapshot at all —
     belongs to the caller, and spec §9 makes it a typed `SnapshotError` there.
     """
-    # First, because it is the precondition for every check below. Diagnosing a mis-built
-    # mapping as an identify-class suppression bug would send the reader into the wrong module.
+    # The type hint is not the guard. `SourceSpec` carries all five attributes this function
+    # reads off an admission — `name`, `url`, `licence`, `source_class`, `admission_basis` — so
+    # passing one works at runtime, produces a well-formed entry, and reintroduces exactly the
+    # live-registry defect this signature was changed to prevent. Nothing in the repo checks
+    # annotations: CI runs ruff, and there is no mypy or pyright in the dev group. So the
+    # distinction the module docstring rests on is asserted here or not at all.
+    if not isinstance(admission, SourceAdmission):
+        raise ValueError(
+            f"admission must be a SourceAdmission from the snapshot manifest, not "
+            f"{type(admission).__name__}: a label's terms come from the snapshot that "
+            f"produced it, never from the registry as it reads now"
+        )
+
+    # Then the name, because it is the precondition for every check below. Diagnosing a
+    # mis-built mapping as an identify-class suppression bug sends the reader to the wrong
+    # module.
     if detection.source != admission.name:
         raise ValueError(
             f"admission for {admission.name!r} does not describe a detection from "
@@ -91,7 +105,13 @@ def build_source_entry(
     # naive check, and on every label in the file as a ruleset that can never be looked up.
     # The format is the same one `load_snapshot` enforces, so an id that passes here is one a
     # reader can actually resolve back to a directory.
-    if not SNAPSHOT_ID.match(snapshot_id):
+    #
+    # `isinstance` first because the *un*-stringified `None` is the likelier miswiring, and
+    # `SNAPSHOT_ID.match(None)` raises `TypeError` — reaching the operator as the traceback
+    # this guard exists to replace. `fullmatch` rather than `match`, because `$` also matches
+    # before a trailing newline: an id read from a file with the newline left on would
+    # otherwise pass and land in `ruleset` as a string that resolves to nothing.
+    if not isinstance(snapshot_id, str) or not SNAPSHOT_ID.fullmatch(snapshot_id):
         raise ValueError(
             f"snapshot_id {snapshot_id!r} is not a snapshot id: a label whose ruleset cannot "
             f"be looked up is untraceable (spec §13)"
@@ -112,11 +132,29 @@ def build_source_entry(
     # labels by it — so an out-of-range value is not a cosmetic defect. Unvalidated, a stray
     # edit setting tier 1 in `suricata.py` would present open-source screening results as NGFW
     # verdicts, complete and well-formed and wrong in the field that matters most.
-    if detection.tier not in KNOWN_TIERS:
+    #
+    # `bool` is excluded explicitly because `True == 1` in Python, so `True in (1, 2)` is true
+    # and the tier would serialise into `labels.json` as `true`. `suricata.py` and
+    # `rules/snapshot.py` both guard this same trap; not doing so here would make this the
+    # outlier.
+    if isinstance(detection.tier, bool) or detection.tier not in KNOWN_TIERS:
         raise ValueError(
             f"detection sid {detection.sid} has tier {detection.tier!r}, not one of "
             f"{list(KNOWN_TIERS)}: tier ranks label trust and cannot be invented"
         )
+
+    # Checked here rather than left to the test fixtures. `SourceEntry` has no field defaults,
+    # so the only way a mandatory field arrives empty is that its input was empty — and
+    # `suricata.py` checks only that the `signature` *key* exists, so a rule emitting
+    # `"signature": ""` yields a label that names no threat while passing every other check.
+    # An empty `licence` is likewise a claim about terms rather than an absence of one: §4
+    # provides `"unstated"` for that, and it is not the empty string.
+    for field, value in (("threat", detection.threat), ("licence", admission.licence)):
+        if not value:
+            raise ValueError(
+                f"{field} is empty for sid {detection.sid} from {admission.name}: a label "
+                f"that is missing it looks complete and asserts nothing"
+            )
 
     label_basis = spec.label_basis
     # Unreachable while `may_label` is checked above; asserted so the two cannot drift apart
