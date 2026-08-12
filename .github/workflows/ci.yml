@@ -31,7 +31,7 @@ jobs:
       # zeek 8.0.9, suricata 8.0.6, wireshark 4.6.6, zeek/foxio/ja4 v0.18.8.
       # Built from Dockerfile.toolchain by the `toolchain` workflow; run
       # `docker run --rm <image> cat /etc/flabel-toolchain.json` to see what it ships.
-      image: ghcr.io/deeptempo/flabel-toolchain@sha256:508f104abe1b33d0b21c7807e52832efb7e6107bfa1ce71180d83a65e4094732
+      image: ghcr.io/deeptempo/flabel-toolchain@sha256:b22ae1a072f380323f93c4a1b3d2d2123ee285c6cff0d454d295a5a010c67946
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
