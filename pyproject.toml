@@ -22,6 +22,16 @@ dev = [
     "ruff>=0.6",
 ]
 
+[tool.flabel.toolchain]
+# Exact versions installed by Dockerfile.toolchain. This is the reproducibility contract
+# for Goal 2 — identity across unpinned tool versions is meaningless (docs/prd.md §"CI
+# toolchain container"). Tests assert major.minor by default so brew-based local dev works;
+# CI adds --strict-toolchain to assert these exact strings. Bump them with the image.
+zeek = "8.0.9"
+suricata = "8.0.6"
+wireshark = "4.6.7"  # supplies both editcap and capinfos
+ja4_zeek_package = "v0.18.8"  # git tag of zeek/foxio/ja4; JA4+ under FoxIO License 1.1
+
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
@@ -31,4 +41,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# -p pytester: test_tool_gate.py runs pytest-in-pytest to prove the toolchain gate fails
+# when it should. Loading the plugin only registers its fixtures.
+addopts = "-ra -p pytester"
+markers = [
+    "requires_tools: invokes the real Zeek/Suricata/Wireshark toolchain (see docs/spec.md §2)",
+]

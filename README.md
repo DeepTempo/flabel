@@ -36,14 +36,21 @@ Exact `labels.json` schema is deliberately unsettled — it is a PRD-stage decis
 
 ## Develop
 
-Requires [uv](https://docs.astral.sh/uv/). Python 3.12 is provisioned automatically.
+Requires [uv](https://docs.astral.sh/uv/) and the Zeek/Suricata/Wireshark toolchain — the
+tests invoke those tools for real rather than mocking them. Full setup, including the Zeek
+JA4 package, is in [`docs/dev-setup.md`](docs/dev-setup.md).
 
 ```sh
-uv sync                # install
+brew install zeek suricata wireshark
+uv sync                # install (dev deps only — zero runtime dependencies)
 uv run pytest -q       # test
 uv run ruff check .    # lint
 uv run flabel --help   # run
 ```
+
+Without the toolchain the tool-dependent tests skip with a reason naming what's missing. CI
+runs in a digest-pinned container and passes `--require-tool-tests`, which turns that skip
+into a failure — a build that skipped the integration layer must never look green.
 
 ## License
 

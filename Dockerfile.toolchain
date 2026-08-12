@@ -1,0 +1,81 @@
+# flabel CI toolchain.
+#
+# The testing line is "tools real, network stubbed" (docs/spec.md §2): Zeek, Suricata and
+# editcap are invoked for real in tests, never mocked. This image is how CI gets them, and
+# it is pinned by digest in .github/workflows/ci.yml because reproducibility across
+# unpinned tool versions is meaningless (Goal 2, docs/prd.md §"CI toolchain container").
+#
+# Base is Ubuntu 24.04 rather than the smaller zeek/zeek image because Suricata 8.x comes
+# from the OISF PPA, which is Ubuntu-only — and Debian's own suricata is far too old.
+#
+# Versions installed here must match [tool.flabel.toolchain] in pyproject.toml. CI asserts
+# that with `pytest --strict-toolchain`, so drift fails the build rather than going unnoticed.
+#
+# amd64 is pinned, not incidental: the OBS Zeek repo publishes amd64 and `all` only — there
+# is no arm64 build (verified: .../xUbuntu_24.04/arm64/ is a 404). Without the pin this
+# builds cleanly on an x86 runner and fails confusingly on an Apple-silicon laptop. On
+# Apple silicon it runs under emulation; for native local work use brew (docs/dev-setup.md).
+FROM --platform=linux/amd64 ubuntu:24.04
+
+# The OBS repo carries one package per Zeek release line and serves only its newest patch.
+# zeek-8.0 is the 8.0 LTS line; plain `zeek` would follow the 8.2 feature line instead.
+ARG ZEEK_VERSION=8.0
+# zeek/foxio/ja4 is JA4+ under FoxIO License 1.1 (non-commercial), the approved default
+# while Legal reviews it; plain JA4 (BSD 3-Clause) is the documented contingency.
+# See docs/prd.md §13 Q3 and docs/dev-setup.md. Pinned to a git tag — the package's own
+# zkg.meta reports version 1.2, which is not the tag namespace.
+ARG JA4_PACKAGE_VERSION=v0.18.8
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/opt/zeek/bin:$PATH
+
+# --- Zeek, Suricata, Wireshark ------------------------------------------------------------
+# Zeek: openSUSE Build Service, the project's own packages (they install into /opt/zeek).
+# Suricata: ppa:oisf/suricata-stable, which tracks the current 8.x line.
+# Wireshark: ppa:wireshark-dev/stable — noble's own wireshark is 4.2.x, too old for a 4.6
+#   pin. wireshark-common carries editcap and capinfos; the setuid prompt is preseeded off
+#   because nothing here captures live traffic.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg software-properties-common \
+    && curl -fsSL "https://download.opensuse.org/repositories/security:zeek/xUbuntu_24.04/Release.key" \
+        | gpg --dearmor > /etc/apt/trusted.gpg.d/security_zeek.gpg \
+    && echo "deb [arch=amd64] http://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/ /" \
+        > /etc/apt/sources.list.d/security-zeek.list \
+    && add-apt-repository -y ppa:oisf/suricata-stable \
+    && add-apt-repository -y ppa:wireshark-dev/stable \
+    && echo "wireshark-common wireshark-common/install-setuid boolean false" | debconf-set-selections \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        "zeek-${ZEEK_VERSION}" \
+        "zeek-${ZEEK_VERSION}-zkg" \
+        suricata \
+        wireshark-common \
+        git \
+        python3 \
+        python3-git \
+        python3-semantic-version \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Zeek JA4 package ---------------------------------------------------------------------
+# JA4 is computed by Zeek and is the single authority for the value carried on a label
+# (docs/prd.md §9), so step 5 needs this package present, not optional.
+RUN zkg autoconfig \
+    && zkg install --force --version "${JA4_PACKAGE_VERSION}" zeek/foxio/ja4 \
+    && zeek --parse-only -e '@load packages'
+
+# --- uv -----------------------------------------------------------------------------------
+COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /usr/local/bin/uv
+
+# --- Recorded versions --------------------------------------------------------------------
+# Written once at build time so CI (and later provenance.py) can read the exact versions
+# instead of re-parsing --version output, and so `docker run <image> cat` documents itself.
+RUN set -eu; \
+    printf '{\n' > /etc/flabel-toolchain.json; \
+    printf '  "zeek": "%s",\n'      "$(zeek --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" >> /etc/flabel-toolchain.json; \
+    printf '  "suricata": "%s",\n'  "$(suricata -V | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" >> /etc/flabel-toolchain.json; \
+    printf '  "wireshark": "%s",\n' "$(editcap --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" >> /etc/flabel-toolchain.json; \
+    printf '  "ja4_zeek_package": "%s",\n' "${JA4_PACKAGE_VERSION}" >> /etc/flabel-toolchain.json; \
+    printf '  "uv": "%s"\n' "$(uv --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" >> /etc/flabel-toolchain.json; \
+    printf '}\n' >> /etc/flabel-toolchain.json; \
+    cat /etc/flabel-toolchain.json
+
+WORKDIR /work
