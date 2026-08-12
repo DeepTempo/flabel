@@ -96,7 +96,10 @@ def render_notice(labels: Sequence[Label], manifest: SnapshotManifest) -> str:
     `manifest` supplies each source's URL and is the authority the labels are checked against;
     `labels` decides who is listed at all.
     """
-    admissions = {source.name: source for source in manifest.sources}
+    # The manifest's own index, not a fourth copy of the same comprehension (#49): uniqueness
+    # is guaranteed on the type, so this cannot silently drop an entry the way a local
+    # dict-comprehension over a tuple with a repeated name would.
+    admissions = manifest.sources_by_name
     licences = labelling_sources(labels)
 
     lines = [

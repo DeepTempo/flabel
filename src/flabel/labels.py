@@ -32,7 +32,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from flabel.models import Label, UnmatchedDetection
+from flabel.models import Detection, Flow, Label, UnmatchedDetection
 
 #: Spec §4. Does **not** change when Phase 2 adds tier-1 entries to `sources[]` (Goal 6).
 #: `provenance.py` reads it from here so the document root and the run block cannot disagree.
@@ -47,9 +47,13 @@ INDENT = 2
 
 #: Model fields holding an epoch float that serialises as an ISO-8601 string. Named per model
 #: because they are the only fields whose JSON representation differs from the dataclass's.
-_EPOCH_FIELDS: dict[str, tuple[str, ...]] = {
-    "Flow": ("ts_first", "ts_last"),
-    "Detection": ("ts",),
+#:
+#: Keyed by the class rather than by its name: a string key silently stops matching the day a
+#: model is renamed, and the failure is a timestamp that quietly serialises as a float instead
+#: of an error anyone would see.
+_EPOCH_FIELDS: dict[type, tuple[str, ...]] = {
+    Flow: ("ts_first", "ts_last"),
+    Detection: ("ts",),
 }
 
 
@@ -153,7 +157,7 @@ def _record(instance: Any) -> dict[str, Any]:
     anyone remembering to add it here.
     """
     fields = dataclasses.asdict(instance)
-    for name in _EPOCH_FIELDS.get(type(instance).__name__, ()):
+    for name in _EPOCH_FIELDS.get(type(instance), ()):
         fields[name] = iso_from_epoch(fields[name])
     return fields
 
