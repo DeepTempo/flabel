@@ -1,0 +1,17 @@
+<!doctype html>
+<!--
+  flabel test fixture — what a corporate proxy returns instead of a rule feed.
+
+  HTTP 200, no gzip or tar magic, valid UTF-8, and not one `alert` line in it. Every check that
+  looks at the transport passes; the feed simply contains no rules. Admitting zero rules from
+  this and writing the snapshot anyway would produce a run whose manifest says
+  `rules_admitted: 0` and whose labels.json reads as complete.
+-->
+<html lang="en">
+  <head><title>Access Denied</title></head>
+  <body>
+    <h1>Access Denied</h1>
+    <p>This site has been blocked by the network policy. Category: Malware Sites.</p>
+    <p>If you believe this is an error, contact the service desk and quote reference 0xDEAD.</p>
+  </body>
+</html>

@@ -2,22 +2,34 @@
 
 ```
 <root>/<snapshot_id>/
-  manifest.json        the SnapshotManifest
+  manifest.json        the SnapshotManifest, plus manifest_version
   rules.rules          admitted rules, sorted by (source, sid)
+  sid_index.json       which source each sid came from
+  data/<source>/<file> companion data files the rules read (`dataset:`)
   raw/<source>.rules   as fetched, for audit
 ```
 
-A snapshot is the unit of reproducibility. `snapshot_id = sha256(rules.rules)[:16]`, so the id
-is not a label attached to a directory — it is a claim about the directory's content that
-anyone can re-check, and this module re-checks it on every load. Two consequences worth
-stating plainly:
+A snapshot is the unit of reproducibility, and `snapshot_id` is not a label attached to a
+directory — it is a hash over the directory's content that anyone can recompute, and this module
+recomputes it on every load. Four things follow.
 
-* **Sorting is load-bearing.** Feeds arrive over the network in whatever order they respond,
-  so if arrival order reached `rules.rules`, two runs over identical rules would produce
-  different ids and Goal 2 (identical output for identical input) would be unreachable.
+* **The id covers everything the engine reads**: `rules.rules`, `sid_index.json`, and every
+  companion data file. `pawpatrules` ships 18 `.lst` files that 26 of its rules read with
+  `dataset:`, and a rule whose data file changed underneath it matches differently while its
+  rule text stays byte-identical. `raw/` is deliberately *not* covered: it is the as-fetched
+  audit copy, so hashing it would change the id whenever upstream edited a comment header.
+* **`sid_index.json` exists because the manifest cannot answer "which source is sid 2011465?"**
+  Spec §8 says the originating source is resolved from the snapshot, and per-source *counts*
+  cannot do that. Deriving it from `raw/` filenames instead would resolve labels through a
+  directory listing that nothing hashes and anyone can edit. The index is a file rather than a
+  field on `SourceAdmission` because step 8 copies that struct into every `labels.json`, and
+  21,221 integers per source do not belong in every output file.
+* **Sorting is load-bearing.** Feeds arrive over the network in whatever order they respond, so
+  if arrival order reached `rules.rules` two runs over identical rules would produce different
+  ids and Goal 2 would be unreachable.
 * **A snapshot is immutable.** Re-writing identical content returns the stored manifest
-  untouched, and a directory whose `rules.rules` no longer hashes to its own name is a hard
-  failure rather than something to repair — labels already emitted point at that id.
+  untouched, and a directory whose content no longer hashes to its own name is a hard failure
+  rather than something to repair — labels already emitted point at that id.
 
 This module is classified impure in `test_architecture.py`: it writes files.
 """
@@ -27,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import fields
 from pathlib import Path
@@ -38,26 +51,61 @@ from flabel.rules import utc_now
 
 MANIFEST_NAME = "manifest.json"
 RULES_NAME = "rules.rules"
+SID_INDEX_NAME = "sid_index.json"
+DATA_DIR = "data"
 RAW_DIR = "raw"
+
+#: Version of the on-disk snapshot format, written into `manifest.json`.
+#:
+#: It exists so that a field can ever be added. `_read_manifest` hard-fails on a key it does not
+#: recognise — the right default when a manifest is the provenance of a label — which without a
+#: version means the format could never change without every existing snapshot becoming
+#: unreadable garbage rather than "written by an older flabel".
+MANIFEST_VERSION = 1
+
+#: Schema of `sid_index.json`, versioned separately: step 6 reads that file and nothing else.
+SID_INDEX_SCHEMA = 1
 
 SNAPSHOT_ID_LENGTH = 16
 
-#: A directory in the rules root is a snapshot if it is named like one. Anything else — a
-#: scratch directory, an operator's notes — is ignored by `list_snapshots` rather than
-#: reported as a broken snapshot.
+#: A directory in the rules root is a snapshot if it is named like one. Anything else — a scratch
+#: directory, an operator's notes — is ignored by `list_snapshots`.
 SNAPSHOT_ID = re.compile(rf"^[0-9a-f]{{{SNAPSHOT_ID_LENGTH}}}$")
 
 #: A rule's `sid`, which with the source name is the sort key spec §7 mandates.
 SID = re.compile(r"\bsid\s*:\s*(\d+)")
+
+#: A companion data file name. Names come from a third-party archive and become path components
+#: under `data/<source>/`, so the charset is the guard — the same argument config.py makes for
+#: source names. No separators and no leading dot, so `../` and dotfiles cannot appear.
+DATA_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 #: Prefix for the directory a snapshot is assembled in before it is renamed into place, so a
 #: half-written snapshot never exists under a name something might load.
 STAGING_PREFIX = ".staging-"
 
 
-def snapshot_id_for(rules: bytes) -> str:
-    """The id of a snapshot whose `rules.rules` is exactly `rules`."""
-    return hashlib.sha256(rules).hexdigest()[:SNAPSHOT_ID_LENGTH]
+def snapshot_id_for(components: Mapping[str, bytes]) -> str:
+    """The id of a snapshot whose hashed content is exactly `components`.
+
+    `components` maps a snapshot-relative POSIX path to its bytes. The digest is
+
+        for path in sorted(components):
+            sha256 <- path (utf-8) || 0x00 || len(content) as 8 bytes big-endian || content
+
+    and the id is the first 16 hex characters of it. Paths and lengths are inside the hash, not
+    only the content: without them, renaming `data/pawpatrules/tor.lst` to `nrd.lst` — which
+    changes which rules read what — would leave the id untouched, and so would moving bytes
+    across a file boundary.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(components):
+        content = components[path]
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()[:SNAPSHOT_ID_LENGTH]
 
 
 def render_rules(admitted: Mapping[str, Sequence[str]]) -> bytes:
@@ -65,17 +113,99 @@ def render_rules(admitted: Mapping[str, Sequence[str]]) -> bytes:
 
     Separate from writing so the input to the hash is inspectable rather than a side effect.
 
-    The rule text is the third sort key. Sid is not unique across feeds and a third-party
-    feed may ship a rule with no parseable sid at all; without a total order, two runs over
-    the same rules could still order them differently and produce different ids.
+    The rule text is the third sort key. Sid is not unique across all possible feeds, so without
+    a total order two runs over the same rules could order them differently and produce
+    different ids.
     """
     lines: list[str] = []
     for source in sorted(admitted):
-        rules = sorted(admitted[source], key=lambda rule: (_sid(rule), rule))
+        rules = sorted(admitted[source], key=lambda rule: (_sid_or_none(rule) or -1, rule))
         lines.extend(rule.strip() for rule in rules)
     if not lines:
         return b""
     return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def render_sid_index(admitted: Mapping[str, Sequence[str]]) -> bytes:
+    """The exact bytes of `sid_index.json`: `{"schema": 1, "sources": {name: [sid, ...]}}`.
+
+    This is how step 6 resolves an alert's sid back to the source that admitted it, since
+    `eve.json` does not carry the source. Three conditions are hard failures, because each makes
+    that resolution wrong rather than merely incomplete:
+
+    * **a rule with no `sid`** — unattributable, and Suricata would refuse to load it anyway;
+    * **one sid twice within a source** — Suricata keeps one and drops the rest silently, so
+      `rules_admitted` would overstate the ruleset actually loaded;
+    * **one sid claimed by two sources** — a label would then name the source that did not fire.
+
+    Measured 2026-08-12 across all nine live feeds: 116,208 distinct sids, zero duplicates
+    within a source and zero collisions across sources. None of this costs anything today.
+    """
+    owners: dict[int, str] = {}
+    index: dict[str, list[int]] = {}
+    collisions: list[str] = []
+
+    for source in sorted(admitted):
+        sids: set[int] = set()
+        for rule in admitted[source]:
+            sid = _sid_or_none(rule)
+            if sid is None:
+                raise SnapshotError(
+                    f"source {source!r} admitted a rule with no `sid`, which cannot be "
+                    f"attributed to a source in a label and which Suricata would refuse to "
+                    f"load: {rule[:120]!r}"
+                )
+            if sid in sids:
+                raise SnapshotError(
+                    f"source {source!r} admitted sid {sid} more than once. Suricata keeps one of "
+                    f"them and drops the rest without saying so, so `rules_admitted` would "
+                    f"overstate the ruleset actually loaded."
+                )
+            owner = owners.get(sid)
+            if owner is not None and owner != source:
+                collisions.append(f"{sid} ({owner} and {source})")
+            owners[sid] = source
+            sids.add(sid)
+        index[source] = sorted(sids)
+
+    if collisions:
+        raise SnapshotError(
+            f"{len(collisions)} sid(s) are claimed by more than one source: "
+            f"{', '.join(collisions[:5])}. Suricata would load one rule and drop the other "
+            f"without saying so, and a label would then name the source that did not fire."
+        )
+
+    document = {"schema": SID_INDEX_SCHEMA, "sources": index}
+    return (json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode(
+        "utf-8"
+    )
+
+
+def snapshot_components(
+    admitted: Mapping[str, Sequence[str]],
+    data: Mapping[str, Mapping[str, bytes]] | None = None,
+) -> dict[str, bytes]:
+    """Every file the snapshot id is taken over, keyed by its snapshot-relative path."""
+    components = {
+        RULES_NAME: render_rules(admitted),
+        SID_INDEX_NAME: render_sid_index(admitted),
+    }
+    for source, files in sorted((data or {}).items()):
+        if source not in admitted:
+            raise SnapshotError(
+                f"companion data supplied for {source!r}, which contributes no rules to this "
+                f"snapshot. A data file with no rules reading it is not part of the ruleset."
+            )
+        for name, content in sorted(files.items()):
+            if not DATA_FILE_NAME.match(name):
+                raise SnapshotError(
+                    f"companion data file {name!r} from {source!r} is not a plain file name. "
+                    f"Names come from a third-party archive and become path components under "
+                    f"{DATA_DIR}/, so anything with a separator, a leading dot or '..' is "
+                    f"refused rather than written."
+                )
+            components[f"{DATA_DIR}/{source}/{name}"] = content
+    return components
 
 
 def write_snapshot(
@@ -83,30 +213,31 @@ def write_snapshot(
     admitted: Mapping[str, Sequence[str]],
     admissions: Sequence[SourceAdmission],
     raw: Mapping[str, str] | None = None,
+    data: Mapping[str, Mapping[str, bytes]] | None = None,
     created_at: str | None = None,
 ) -> SnapshotManifest:
     """Write a snapshot under `root` and return its manifest.
 
-    `raw` and `created_at` extend spec §7's three-argument signature. `raw` is how the
-    `raw/<source>.rules` files the same section requires get their content — the filtered file
-    alone cannot show what was dropped, and a label's provenance is only checkable against the
-    feed as fetched. `created_at` is injectable so the ordering `load_snapshot(root, None)`
-    depends on can be tested without sleeping.
+    `raw`, `data` and `created_at` extend spec §7's three-argument signature. `raw` is how the
+    `raw/<source>.rules` files the same section requires get their content. `data` carries the
+    companion files the rules read, keyed source → file name → bytes; unlike `raw` it is part of
+    the hash, because rules and the data they consult are one ruleset. `created_at` is injectable
+    so the ordering `load_snapshot(root, None)` depends on is testable without sleeping.
 
     Idempotent: writing identical content twice yields one directory and the manifest of the
-    first write. Its `created_at` still records when this ruleset first existed, which is what
-    a label pointing at the id needs it to mean.
+    first write. Its `created_at` still records when this ruleset first existed, which is what a
+    label pointing at the id needs it to mean.
     """
     _verify_sources_agree(admitted, admissions)
 
-    rules = render_rules(admitted)
-    if not rules:
+    components = snapshot_components(admitted, data)
+    if not components[RULES_NAME]:
         raise SnapshotError(
             "refusing to write a snapshot with no rules: Suricata would load it cleanly and "
             "label nothing, which is the silent under-reporting docs/spec.md §2.5 forbids."
         )
 
-    snapshot_id = snapshot_id_for(rules)
+    snapshot_id = snapshot_id_for(components)
     manifest = SnapshotManifest(
         snapshot_id=snapshot_id,
         created_at=utc_now() if created_at is None else created_at,
@@ -121,7 +252,7 @@ def write_snapshot(
         return _existing(destination, snapshot_id)
 
     staging = Path(root) / f"{STAGING_PREFIX}{snapshot_id}"
-    _build(staging, rules, manifest, raw)
+    _build(staging, components, manifest, raw)
     try:
         staging.rename(destination)
     except OSError:
@@ -143,15 +274,15 @@ def load_snapshot(root: Path, snapshot_id: str | None) -> tuple[Path, SnapshotMa
         available = list_snapshots(root)
         if not available:
             raise SnapshotError(
-                f"no ruleset snapshot found under {root}. Run `flabel rules update` first, or "
-                f"point --rules-dir at the directory holding one."
+                f"no usable ruleset snapshot found under {root}. Run `flabel rules update` "
+                f"first, or point --rules-dir at the directory holding one."
             )
         snapshot_id = available[-1].snapshot_id
 
     if not SNAPSHOT_ID.match(snapshot_id):
-        # The id becomes a path component under the rules directory and arrives from the
-        # command line (`--ruleset-snapshot <id>`), so it is checked rather than joined
-        # blindly. It also turns a typo into a message that names the mistake.
+        # The id becomes a path component under the rules directory and arrives from the command
+        # line (`--ruleset-snapshot <id>`), so it is checked rather than joined blindly. It also
+        # turns a typo into a message that names the mistake.
         raise SnapshotError(
             f"{snapshot_id!r} is not a ruleset snapshot id: expected {SNAPSHOT_ID_LENGTH} "
             f"lowercase hex characters, as printed by `flabel rules list`."
@@ -167,12 +298,12 @@ def load_snapshot(root: Path, snapshot_id: str | None) -> tuple[Path, SnapshotMa
             f"snapshot {snapshot_id!r} contains a manifest claiming to be "
             f"{manifest.snapshot_id!r}; the directory is not what it says it is."
         )
-    rules = _verify_content(directory, snapshot_id)
+    components = _verify_content(directory, snapshot_id)
 
     # `rules.rules` holds exactly one rule per line, so the manifest's own total is checkable
-    # against the file it describes. The hash proves the rules were not edited; this proves the
-    # counts that a run copies into `labels.json` were not either.
-    admitted = rules.count(b"\n")
+    # against the file it describes. The hash proves the content was not edited; this proves the
+    # counts a run copies into `labels.json` describe that content.
+    admitted = components[RULES_NAME].count(b"\n")
     if manifest.total_admitted != admitted:
         raise SnapshotError(
             f"snapshot {snapshot_id} says total_admitted={manifest.total_admitted} but "
@@ -181,24 +312,79 @@ def load_snapshot(root: Path, snapshot_id: str | None) -> tuple[Path, SnapshotMa
     return directory, manifest
 
 
+def load_sid_index(directory: Path) -> dict[int, str]:
+    """Map each sid in a snapshot to the source that admitted it.
+
+    This is the lookup spec §8 needs when parsing `eve.json`, which carries a signature id but
+    not the ruleset it came from. Reading it from the hashed `sid_index.json` — rather than
+    globbing `raw/*.rules` and taking the source from a file name — is what makes a label's
+    stated source verifiable against the snapshot id.
+    """
+    path = Path(directory) / SID_INDEX_NAME
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SnapshotError(
+            f"snapshot {Path(directory).name} has no {SID_INDEX_NAME}, so no alert from it could "
+            f"be attributed to the source that raised it."
+        ) from exc
+    except OSError as exc:
+        raise SnapshotError(f"could not read {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SnapshotError(f"{path} is not valid JSON: {exc}") from exc
+
+    schema = document.get("schema") if isinstance(document, dict) else None
+    if schema != SID_INDEX_SCHEMA:
+        raise SnapshotError(
+            f"{path} is not a schema-{SID_INDEX_SCHEMA} sid index (found {schema!r})"
+        )
+    sources = document.get("sources")
+    if not isinstance(sources, dict):
+        raise SnapshotError(f"{path} has no `sources` object")
+
+    index: dict[int, str] = {}
+    for source, sids in sorted(sources.items()):
+        if not isinstance(sids, list):
+            raise SnapshotError(f"{path}: the sids for {source!r} are not a list")
+        for sid in sids:
+            # `bool` is an `int` in Python, and `true` in JSON must not become sid 1.
+            if not isinstance(sid, int) or isinstance(sid, bool):
+                raise SnapshotError(f"{path}: {sid!r} under {source!r} is not an integer sid")
+            if index.get(sid, source) != source:
+                raise SnapshotError(
+                    f"{path}: sid {sid} is claimed by both {index[sid]!r} and {source!r}"
+                )
+            index[sid] = source
+    return index
+
+
 def list_snapshots(root: Path) -> list[SnapshotManifest]:
-    """Every snapshot under `root`, oldest first.
+    """Every *usable* snapshot under `root`, oldest first.
 
     An absent root is empty rather than an error: `flabel rules list` before the first
     `rules update` is a reasonable thing to run.
 
-    Manifests are read but content is *not* re-hashed — that is `load_snapshot`'s job, and
-    listing should not read every rule of every snapshot to print a table.
+    A directory whose manifest is missing or unreadable is skipped rather than raised on. One
+    damaged snapshot must not make `rules list` — or `load_snapshot(root, None)`, which takes the
+    newest from this list — impossible for every other snapshot on the machine. Skipping is safe
+    *because* nothing is silently substituted: asking for that snapshot by id still fails hard,
+    so a broken snapshot is never used, only omitted from a listing.
+
+    Manifests are read but content is not re-hashed — that is `load_snapshot`'s job, and listing
+    should not read every rule of every snapshot to print a table.
     """
     root = Path(root)
     if not root.is_dir():
         return []
 
-    manifests = [
-        _read_manifest(entry)
-        for entry in sorted(root.iterdir())
-        if entry.is_dir() and SNAPSHOT_ID.match(entry.name)
-    ]
+    manifests = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or not SNAPSHOT_ID.match(entry.name):
+            continue
+        try:
+            manifests.append(_read_manifest(entry))
+        except SnapshotError:
+            continue
     return sorted(manifests, key=lambda manifest: (manifest.created_at, manifest.snapshot_id))
 
 
@@ -207,7 +393,7 @@ def list_snapshots(root: Path) -> list[SnapshotManifest]:
 
 def _build(
     staging: Path,
-    rules: bytes,
+    components: Mapping[str, bytes],
     manifest: SnapshotManifest,
     raw: Mapping[str, str] | None,
 ) -> None:
@@ -215,11 +401,14 @@ def _build(
     _remove_tree(staging)
     try:
         staging.mkdir(parents=True)
-        (staging / RULES_NAME).write_bytes(rules)
-        for source, text in (raw or {}).items():
-            # A source name legitimately contains one `/` (`abuse.ch/urlhaus`), which becomes
-            # a directory here. config.py's charset check on names is what keeps that from
-            # being a path-traversal write.
+        for relative, content in sorted(components.items()):
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        for source, text in sorted((raw or {}).items()):
+            # A source name legitimately contains one `/` (`abuse.ch/urlhaus`), which becomes a
+            # directory here. config.py's charset check on names is what keeps that from being a
+            # path-traversal write.
             target = staging / RAW_DIR / f"{source}.rules"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding="utf-8")
@@ -232,10 +421,10 @@ def _build(
 
 
 def _existing(directory: Path, snapshot_id: str) -> SnapshotManifest:
-    """Adopt a snapshot already on disk, having checked its bytes still hash to its name.
+    """Adopt a snapshot already on disk, having checked its content still hashes to its name.
 
-    No comparison against the rules just admitted is needed on top of that: the id *is* the
-    hash of those bytes, so agreement on the id is agreement on the content.
+    No comparison against the rules just admitted is needed on top of that: the id *is* the hash
+    of those components, so agreement on the id is agreement on the content.
     """
     _verify_content(directory, snapshot_id)
     return _read_manifest(directory)
@@ -244,6 +433,7 @@ def _existing(directory: Path, snapshot_id: str) -> SnapshotManifest:
 def _render_manifest(manifest: SnapshotManifest) -> str:
     """Canonical JSON, per spec §10 — the same rules `labels.json` follows."""
     document = {
+        "manifest_version": MANIFEST_VERSION,
         "snapshot_id": manifest.snapshot_id,
         "created_at": manifest.created_at,
         "flabel_version": manifest.flabel_version,
@@ -258,15 +448,14 @@ def _render_manifest(manifest: SnapshotManifest) -> str:
 
 
 def _remove_tree(path: Path) -> None:
-    """Delete `path` and anything under it, without importing shutil for four lines."""
-    if not path.exists():
-        return
-    for child in path.iterdir():
-        if child.is_dir():
-            _remove_tree(child)
-        else:
-            child.unlink()
-    path.rmdir()
+    """Delete `path` and everything under it.
+
+    `shutil.rmtree` rather than a hand-rolled walk: `Path.is_dir()` follows symlinks, so a walk
+    that recursed into one would delete the *target's* contents. A stale
+    `.staging-<id>/x -> /Users/craig` in a shared `--rules-dir` would empty a home directory.
+    `rmtree` refuses to follow symlinked directories for exactly this reason.
+    """
+    shutil.rmtree(path, ignore_errors=True)
 
 
 # --- reading --------------------------------------------------------------------------------
@@ -286,6 +475,14 @@ def _read_manifest(directory: Path) -> SnapshotManifest:
     if not isinstance(document, dict):
         raise SnapshotError(f"{path} does not contain a JSON object")
 
+    version = document.pop("manifest_version", None)
+    if version != MANIFEST_VERSION:
+        raise SnapshotError(
+            f"{path} declares manifest_version {version!r}; this flabel reads and writes version "
+            f"{MANIFEST_VERSION}. A snapshot in another format version is not guessed at, because "
+            f"its id may cover a different set of files."
+        )
+
     sources = document.pop("sources", None)
     if not isinstance(sources, list):
         raise SnapshotError(f"{path} has no `sources` list")
@@ -296,8 +493,8 @@ def _read_manifest(directory: Path) -> SnapshotManifest:
         )
     except (TypeError, ValueError) as exc:
         # A missing field, an unexpected one, or a value outside its Literal. All the same
-        # failure: this manifest was not written by a flabel that agrees with this one about
-        # what a snapshot is, and guessing would put untraceable verdicts in the output.
+        # failure: this manifest was not written by a flabel that agrees with this one about what
+        # a snapshot is, and guessing would put untraceable verdicts in the output.
         raise SnapshotError(f"{path} is not a usable snapshot manifest: {exc}") from exc
 
 
@@ -310,29 +507,49 @@ def _source_admission(entry: object, path: Path) -> SourceAdmission:
         raise SnapshotError(f"{path}: unusable source entry: {exc}") from exc
 
 
-def _verify_content(directory: Path, snapshot_id: str) -> bytes:
-    """Check that `rules.rules` still hashes to the directory's own name, and return its bytes.
+def _verify_content(directory: Path, snapshot_id: str) -> dict[str, bytes]:
+    """Check the snapshot's content still hashes to its own name, and return that content.
 
-    Spec §7 calls the id self-verifying, which is only true if something verifies it. Cheap
-    (one sha256 over a few megabytes) and it is the difference between "these labels came from
+    Spec §7 calls the id self-verifying, which is only true if something verifies it. Cheap (one
+    sha256 over a few tens of megabytes) and it is the difference between "these labels came from
     ruleset abc123" being a fact and being a filename.
     """
-    path = directory / RULES_NAME
-    try:
-        rules = path.read_bytes()
-    except FileNotFoundError as exc:
-        raise SnapshotError(f"ruleset snapshot {snapshot_id} has no {RULES_NAME}") from exc
-    except OSError as exc:
-        raise SnapshotError(f"could not read {path}: {exc}") from exc
-
-    actual = snapshot_id_for(rules)
+    components = _components_on_disk(directory)
+    actual = snapshot_id_for(components)
     if actual != snapshot_id:
         raise SnapshotError(
-            f"{path} hashes to {actual}, not {snapshot_id}: the snapshot has been modified "
+            f"{directory} hashes to {actual}, not {snapshot_id}: the snapshot has been modified "
             f"since it was written. It is not repaired or replaced, because labels already "
             f"emitted name this id as the ruleset that produced them."
         )
-    return rules
+    return components
+
+
+def _components_on_disk(directory: Path) -> dict[str, bytes]:
+    """The hashed files of a snapshot, read back exactly as `snapshot_components` wrote them."""
+    components = {
+        name: _read_bytes(directory / name, directory) for name in (RULES_NAME, SID_INDEX_NAME)
+    }
+    data_root = directory / DATA_DIR
+    if data_root.is_dir():
+        for path in sorted(data_root.rglob("*")):
+            # `is_symlink` first: a symlink dropped into `data/` would otherwise contribute the
+            # bytes of whatever it points at to the hash of a snapshot that does not contain them.
+            if path.is_symlink() or not path.is_file():
+                continue
+            components[path.relative_to(directory).as_posix()] = _read_bytes(path, directory)
+    return components
+
+
+def _read_bytes(path: Path, directory: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError as exc:
+        raise SnapshotError(
+            f"ruleset snapshot {directory.name} has no {path.name}; it is incomplete."
+        ) from exc
+    except OSError as exc:
+        raise SnapshotError(f"could not read {path}: {exc}") from exc
 
 
 # --- consistency between the rules and the counts that describe them ------------------------
@@ -343,10 +560,10 @@ def _verify_sources_agree(
 ) -> None:
     """The manifest must describe exactly the rules in the file, source by source.
 
-    A source counted in the manifest but absent from `rules.rules` would overstate the
-    snapshot — `total_admitted` promising coverage the file does not contain — and a source in
-    the file but absent from the manifest would put rules into Suricata whose origin no label
-    could report (spec §13: never emit a label whose origin can't be traced).
+    A source counted in the manifest but absent from `rules.rules` would overstate the snapshot —
+    `total_admitted` promising coverage the file does not contain — and a source in the file but
+    absent from the manifest would put rules into Suricata whose origin no label could report
+    (spec §13: never emit a label whose origin can't be traced).
     """
     counted: dict[str, SourceAdmission] = {}
     for admission in admissions:
@@ -359,8 +576,8 @@ def _verify_sources_agree(
         name = mismatched[0]
         side = "has admitted rules but no admission" if name in admitted else "has no rules"
         raise SnapshotError(
-            f"source {name!r} {side} (all mismatched: {mismatched}). Every source in a "
-            f"snapshot must appear in both, or the manifest does not describe the ruleset."
+            f"source {name!r} {side} (all mismatched: {mismatched}). Every source in a snapshot "
+            f"must appear in both, or the manifest does not describe the ruleset."
         )
 
     for name, admission in sorted(counted.items()):
@@ -371,7 +588,6 @@ def _verify_sources_agree(
             )
 
 
-def _sid(rule: str) -> int:
-    """A rule's sid, or -1 when it has none — sorted first, deterministically."""
+def _sid_or_none(rule: str) -> int | None:
     match = SID.search(rule)
-    return int(match.group(1)) if match else -1
+    return int(match.group(1)) if match else None

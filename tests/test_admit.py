@@ -18,7 +18,8 @@ import pytest
 from flabel import config
 from flabel.errors import ConfigError
 from flabel.models import SourceAdmission, SourceSpec
-from flabel.rules.admit import admit
+from flabel.rules import utc_now
+from flabel.rules.admit import SEVERITY_KEY, admit
 
 FIXTURES = Path(__file__).parent / "fixtures" / "rules"
 
@@ -171,14 +172,15 @@ def test_commented_rules_are_counted_but_never_admitted(
 
 def test_comments_and_blank_lines_are_not_rules():
     """Only `alert` lines count — a header comment is neither fetched nor excluded."""
+    one_rule = 'alert ip any any -> any any (msg:"real"; sid:1; rev:1;)'
     admitted, counts = admit(
         wholesale(),
-        ["# a header", "", "   ", "# alert-looking prose about alerts", "\t"],
+        ["# a header", "", "   ", "# alert-looking prose about alerts", "\t", one_rule],
         FETCHED_AT,
     )
 
-    assert admitted == []
-    assert (counts.rules_fetched, counts.rules_excluded_commented) == (0, 0)
+    assert admitted == [one_rule]
+    assert (counts.rules_fetched, counts.rules_excluded_commented) == (1, 0)
 
 
 # --- wholesale -----------------------------------------------------------------------------
@@ -229,22 +231,25 @@ def test_fingerprint_rules_are_counted_only_when_admitted():
 def test_a_disabled_fingerprint_rule_is_not_counted_as_admitted():
     _, counts = admit(
         wholesale(),
-        ['#alert tls any any -> any any (msg:"off"; ja4.hash; content:"x"; sid:1; rev:1;)'],
+        [
+            '#alert tls any any -> any any (msg:"off"; ja4.hash; content:"x"; sid:1; rev:1;)',
+            'alert ip any any -> any any (msg:"on"; sid:2; rev:1;)',
+        ],
         FETCHED_AT,
     )
     assert (counts.ja4_rules_admitted, counts.rules_excluded_commented) == (0, 1)
 
 
-# --- the hard failure a name check cannot catch --------------------------------------------
+# --- zero admitted rules is a hard failure, from any source --------------------------------
 
 
 def test_a_metadata_filtered_feed_with_no_confidence_keys_is_a_hard_failure():
     """PLAN.md step 4: ET dropping the key must stop the run, not quietly admit nothing.
 
-    `config.load_sources` checks the source *name* against `ET_METADATA_SOURCES` at load
-    time, which cannot see the fetched content. If upstream stopped emitting `confidence`,
-    the filter would admit zero rules and the run would look like a feed that matched
-    nothing — with ~21,000 rules silently absent from the snapshot.
+    `config.load_sources` checks the source *name* against `ET_METADATA_SOURCES` at load time,
+    which cannot see the fetched content. If upstream stopped emitting `confidence`, the filter
+    would admit zero rules and the run would look like a feed that matched nothing — with
+    ~21,000 rules silently absent from the snapshot.
     """
     with pytest.raises(ConfigError) as excinfo:
         admit(et_open(), rule_lines("et_open_no_confidence.rules"), FETCHED_AT)
@@ -254,22 +259,51 @@ def test_a_metadata_filtered_feed_with_no_confidence_keys_is_a_hard_failure():
     assert "et/open" in message
 
 
-def test_an_empty_metadata_filtered_feed_is_the_same_hard_failure():
-    """Zero rules is the degenerate case of zero `confidence` keys, and just as invisible."""
-    with pytest.raises(ConfigError):
-        admit(et_open(), [], FETCHED_AT)
+def test_a_metadata_filtered_feed_that_drops_signature_severity_is_also_a_hard_failure():
+    """The check is "nothing was admitted", which is strictly stronger than "no confidence key".
+
+    Watching only for a missing `confidence` key would miss this: every rule keeps its
+    confidence, upstream stops publishing `signature_severity`, all 51,778 rules land in
+    `rules_excluded_low_severity`, and the snapshot is written with nothing in it.
+    """
+    beheaded = [
+        line.replace(SEVERITY_KEY, "renamed_severity")
+        for line in rule_lines("et_open_metadata.rules")
+    ]
+
+    with pytest.raises(ConfigError, match="admitted none"):
+        admit(et_open(), beheaded, FETCHED_AT)
 
 
-def test_a_wholesale_feed_without_confidence_keys_is_perfectly_normal():
-    """The check is scoped to the filter that depends on the key, not to every source."""
+@pytest.mark.parametrize("spec", [et_open(), wholesale()], ids=["metadata-filter", "wholesale"])
+def test_a_feed_that_yields_no_rules_at_all_is_a_hard_failure(spec: SourceSpec):
+    """Zero admitted rules is never a source with a zero next to its name.
+
+    Spec §5 deleted `abuse.ch/sslbl-c2` precisely because a source that can only ever
+    contribute zero implies coverage it does not deliver, and its zero is indistinguishable
+    from a feed that matched nothing this run.
+    """
+    with pytest.raises(ConfigError, match="no active"):
+        admit(spec, [], FETCHED_AT)
+
+
+@pytest.mark.parametrize("spec", [et_open(), wholesale()], ids=["metadata-filter", "wholesale"])
+def test_a_proxy_block_page_is_a_hard_failure(spec: SourceSpec):
+    """The concrete reachable case, and the reason the check is on *admitted* rather than bytes.
+
+    A corporate proxy answers HTTP 200 with an HTML block page: not gzip, not tar, valid UTF-8,
+    zero `alert` lines. Every transport check passes and the payload decodes cleanly, so the
+    only place left to notice is here.
+    """
+    with pytest.raises(ConfigError, match="no active"):
+        admit(spec, rule_lines("proxy_block_page.html"), FETCHED_AT)
+
+
+def test_a_wholesale_feed_without_confidence_keys_admits_normally():
+    """The metadata check is scoped to the filter that depends on the key, not to every source."""
     admitted, counts = admit(wholesale(), rule_lines("et_open_no_confidence.rules"), FETCHED_AT)
 
     assert counts.rules_admitted == len(admitted) == 3
-
-
-def test_an_empty_wholesale_feed_admits_nothing_without_raising():
-    admitted, counts = admit(wholesale(), [], FETCHED_AT)
-    assert (admitted, counts.rules_fetched) == ([], 0)
 
 
 def test_metadata_filter_on_a_source_that_cannot_carry_metadata_is_rejected():
@@ -326,13 +360,69 @@ def test_the_admission_carries_the_registry_facts_a_label_will_need():
     assert counts.fetched_at == FETCHED_AT
 
 
-def test_fetched_at_defaults_to_now_in_the_one_output_timestamp_format():
-    """Spec §10: ISO-8601 UTC, microsecond precision, `Z` suffix. One format everywhere."""
-    _, counts = admit(wholesale(), rule_lines("ioc_wholesale.rules"))
+def test_fetched_at_is_required_rather_than_read_from_the_clock():
+    """admit is pure, so it must not have a default that makes it non-deterministic.
 
-    assert counts.fetched_at.endswith("Z")
-    assert len(counts.fetched_at) == len("2026-08-12T00:00:00.000000Z")
-    assert "+00:00" not in counts.fetched_at
+    The caller passes `flabel.rules.utc_now()`, which is the one output timestamp format spec
+    §10 requires: ISO-8601 UTC, microsecond precision, `Z` suffix.
+    """
+    with pytest.raises(TypeError):
+        admit(wholesale(), rule_lines("ioc_wholesale.rules"))  # type: ignore[call-arg]
+
+    stamp = utc_now()
+    assert stamp.endswith("Z")
+    assert len(stamp) == len("2026-08-12T00:00:00.000000Z")
+    assert "+00:00" not in stamp
+
+
+# --- rules continued across physical lines --------------------------------------------------
+
+
+def test_a_rule_continued_with_a_backslash_is_admitted_whole():
+    """Suricata joins these; a line-based reader truncates them.
+
+    A truncated rule is worse than a dropped one: it is counted as admitted, written into
+    `rules.rules`, and then refused at load time by the engine that was supposed to run it.
+    """
+    admitted, counts = admit(wholesale(), rule_lines("continued.rules"), FETCHED_AT)
+
+    assert counts.rules_fetched == 3
+    assert sids(admitted) == {7200001, 7200002, 7200004}
+    joined = next(rule for rule in admitted if "sid:7200001" in rule)
+    assert "\\" not in joined
+    assert joined.endswith("rev:1;)")
+    # Joined verbatim, as Suricata does it: the words of the msg must not fuse together.
+    assert 'msg:"FLABEL TEST continued over three lines";' in joined
+    assert 'http.uri; content:"/flabel-continued";' in joined
+
+
+def test_a_comment_ending_in_a_backslash_does_not_swallow_the_next_rule():
+    """The shape `pawpatrules` actually ships, and the reason the `#` test comes first.
+
+    89 of its lines end with a backslash and every one is ASCII art in a file header — the feed
+    has no multi-line rules at all. Splicing those would merge the following line into the
+    comment, and the day a banner sits directly above a rule, that rule would leave the snapshot
+    in silence. Suricata tests for the leading `#` before the continuation; so does admit.
+    """
+    admitted, _ = admit(wholesale(), rule_lines("continued.rules"), FETCHED_AT)
+
+    assert 7200004 in sids(admitted)
+
+
+def test_a_continued_rule_that_was_disabled_stays_disabled():
+    _, counts = admit(wholesale(), rule_lines("continued.rules"), FETCHED_AT)
+
+    assert counts.rules_excluded_commented == 1
+
+
+def test_a_feed_ending_in_a_dangling_continuation_is_a_hard_failure():
+    """A truncated download must not admit the fragment it managed to deliver."""
+    with pytest.raises(ConfigError, match="truncated"):
+        admit(
+            wholesale(),
+            ['alert ip any any -> any any (msg:"a"; sid:1; rev:1;)', "alert ip any any -> \\"],
+            FETCHED_AT,
+        )
 
 
 # --- purity ---------------------------------------------------------------------------------

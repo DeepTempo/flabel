@@ -1,0 +1,30 @@
+# flabel test fixture — rules continued across physical lines with a trailing backslash, and
+# the comment lines that must never be mistaken for one.
+#
+# Suricata joins a continued rule by deleting the backslash and appending the next line
+# verbatim, so the whitespace layout below is load-bearing: sid 7200001 must rejoin without its
+# msg words fusing together.
+#
+# The banner below is the shape `pawpatrules` really ships: 89 of its lines end with a backslash
+# and every one is a line of ASCII art in a file header (measured 2026-08-12; the feed has no
+# multi-line rules at all). Suricata tests for the leading `#` before it tests for a
+# continuation, so those lines are comments. A reader that spliced them instead would swallow
+# whatever followed — here, sid 7200004.
+#
+# Synthetic; sid block 7200000.
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST continued over three lines"; \
+    flow:established,to_server; http.uri; content:"/flabel-continued"; \
+    classtype:trojan-activity; sid:7200001; rev:1;)
+
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST single line beside it"; flow:established,to_server; content:"flabel-single"; classtype:trojan-activity; sid:7200002; rev:1;)
+
+# A disabled rule may be continued too, and must still count as disabled, not as prose. Its
+# leftover fragment on the next line is not a rule either: it fails the `^alert` test and is
+# ignored, where Suricata would report a parse error on it.
+#alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST continued and disabled"; \
+    flow:established,to_server; content:"flabel-continued-disabled"; sid:7200003; rev:1;)
+
+#  ___ _   _ _ __  _ __   ___  _ __| |_  ___  __| |    ___ _ __  __| | ___    \
+#  |__ \ | | | '_ \| '_ \ / _ \| '__| __|/ _ \/ _` |   / __| '_ \/ _` |/ __|   \
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST rule below a backslash banner"; flow:established,to_server; content:"flabel-after-banner"; classtype:trojan-activity; sid:7200004; rev:1;)

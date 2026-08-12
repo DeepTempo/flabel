@@ -15,17 +15,21 @@ research made exactly this mistake).
 rules cannot go missing unaccounted for. Disabled (`#alert`) rules sit outside that identity
 in their own counter: ET Open ships 19,479 of them against 51,778 active rules, and folding
 them in would make the admitted percentage describe a population nobody ever runs.
+
+And one rule about zero: **a source that admits no rules at all is a hard failure**, never a
+source with a zero next to its name. Spec §5 deleted `abuse.ch/sslbl-c2` for exactly this
+reason, and the failure is easy to reach by accident — a corporate proxy answering 200 with an
+HTML block page is valid UTF-8 with no `alert` line in it.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 from flabel import config
 from flabel.errors import ConfigError
 from flabel.models import SourceAdmission, SourceSpec
-from flabel.rules import utc_now
 
 #: An enabled rule. Matched against the stripped line, so a feed that indents its rules — or
 #: ships CRLF — is read the same way Suricata reads it.
@@ -55,11 +59,16 @@ ADMITTED_SEVERITY = frozenset({"major", "critical"})
 JA3_KEYWORD = "ja3.hash"
 JA4_KEYWORD = "ja4.hash"
 
+#: A rule continued on the next physical line. Read line by line, such a rule is truncated at
+#: the backslash and what reaches the snapshot is a fragment Suricata refuses to load. See
+#: `_logical_rules` for why a *comment* ending in a backslash is emphatically not one of these.
+CONTINUATION = "\\"
+
 
 def admit(
     spec: SourceSpec,
     rule_lines: Iterable[str],
-    fetched_at: str | None = None,
+    fetched_at: str,
 ) -> tuple[list[str], SourceAdmission]:
     """Filter `rule_lines` for `spec`, returning the admitted rules and the counts.
 
@@ -68,9 +77,12 @@ def admit(
     snapshot id. Ordering for the snapshot is `snapshot.py`'s job, because the id must not
     depend on fetch order (spec §7).
 
-    `fetched_at` defaults to now, which keeps `flabel rules update` from having to thread a
-    clock through; every test passes it explicitly so an admission can be compared field by
-    field.
+    `fetched_at` is required rather than defaulted to now. This function is pure, and a default
+    that read the clock would make it silently non-deterministic — two identical calls returning
+    different `SourceAdmission` values. `flabel.rules.utc_now()` is what a caller passes.
+
+    Spec §6 types the second argument as `Iterable[str]` of *physical* lines; rules continued
+    with a trailing backslash are rejoined before anything is counted or classified.
     """
     filtered = spec.admission_basis == "metadata-filter"
     if filtered:
@@ -81,7 +93,7 @@ def admit(
     no_confidence = low_confidence = low_severity = 0
     ja3 = ja4 = 0
 
-    for line in rule_lines:
+    for line in _logical_rules(rule_lines, spec):
         rule = line.strip()
         if DISABLED_RULE.match(rule):
             # Never admitted under either basis: the feed's author disabled it, and a
@@ -111,8 +123,14 @@ def admit(
         else:
             low_severity += 1
 
-    if filtered and fetched == no_confidence:
-        raise ConfigError(_no_confidence_message(spec, fetched))
+    if not admitted:
+        # Strictly stronger than checking for a missing `confidence` key, and it covers the
+        # cases that check cannot see: upstream dropping `signature_severity` instead, a proxy
+        # answering 200 with an HTML block page, a feed deprecated into a one-line notice.
+        # Every one of those would otherwise write a snapshot whose manifest reads
+        # `rules_admitted: 0` — indistinguishable from a ruleset that matched nothing, which is
+        # the failure spec §5 deleted a source to avoid.
+        raise ConfigError(_nothing_admitted_message(spec, fetched, no_confidence))
 
     admission = SourceAdmission(
         name=spec.name,
@@ -128,10 +146,56 @@ def admit(
         rules_excluded_commented=commented,
         ja4_rules_admitted=ja4,
         ja3_rules_admitted=ja3,
-        fetched_at=utc_now() if fetched_at is None else fetched_at,
+        fetched_at=fetched_at,
     )
     _verify_identity(admission)
     return admitted, admission
+
+
+def _logical_rules(lines: Iterable[str], spec: SourceSpec) -> Iterator[str]:
+    """Rejoin rules split across physical lines with a trailing backslash.
+
+    Suricata reads a rule file this way, and a reader that did not would admit a fragment
+    ending in `\\` — a rule Suricata then refuses to load, counted meanwhile as admitted.
+
+    **A comment is a comment, even when it ends with a backslash.** Suricata tests for the
+    leading `#` before it tests for a continuation, and so does this. That is not pedantry:
+    `pawpatrules` ends 89 lines with a backslash and every one of them is a line of the ASCII-art
+    banner in its file headers (measured 2026-08-12 — the feed ships no multi-line rules at all).
+    Treating those as continuations would splice the following line into the comment, and the day
+    a banner ends immediately above a rule, that rule would vanish from the snapshot in silence.
+    A fragment left dangling after a commented-out rule is not a rule either — it fails
+    `ACTIVE_RULE` and is ignored, where Suricata would report a parse error.
+
+    The join itself is byte-faithful: only the backslash is removed and the next physical line
+    appended verbatim, exactly as Suricata's parser does it. Whitespace between rule options is
+    insignificant, but inside a quoted `msg:` or `content:` it is not, so nothing is stripped.
+
+    A dangling continuation at end of input is a truncated feed, not a rule.
+    """
+    pending: list[str] = []
+    for raw in lines:
+        line = raw.rstrip("\r\n")
+        if pending:
+            if line.endswith(CONTINUATION):
+                pending.append(line[: -len(CONTINUATION)])
+                continue
+            pending.append(line)
+            yield "".join(pending)
+            pending = []
+            continue
+        if line.lstrip().startswith("#"):
+            yield line
+            continue
+        if line.endswith(CONTINUATION):
+            pending.append(line[: -len(CONTINUATION)])
+            continue
+        yield line
+    if pending:
+        raise ConfigError(
+            f"source {spec.name!r} ends with a rule continued by '{CONTINUATION}' and nothing "
+            f"following it. The feed is truncated; a partial rule is not admitted."
+        )
 
 
 def rule_metadata(rule: str) -> dict[str, str]:
@@ -190,14 +254,33 @@ def _require_metadata_publisher(spec: SourceSpec) -> None:
         )
 
 
-def _no_confidence_message(spec: SourceSpec, fetched: int) -> str:
+def _nothing_admitted_message(spec: SourceSpec, fetched: int, no_confidence: int) -> str:
+    """Why nothing was admitted, in the words that name the likely cause.
+
+    The three cases read very differently to an operator, so the message distinguishes them
+    even though the failure is the same.
+    """
+    if fetched == 0:
+        return (
+            f"source {spec.name!r} produced no active `alert` rules at all. The payload parsed "
+            f"but contained no rules — a proxy block page, an error document, or a feed "
+            f"deprecated into a notice all look like this. A snapshot is not written from it, "
+            f"because `rules_admitted: 0` in the manifest is indistinguishable from a ruleset "
+            f"that matched nothing (docs/spec.md §2.5, and §5's deletion of abuse.ch/sslbl-c2)."
+        )
+    if spec.admission_basis == "metadata-filter" and fetched == no_confidence:
+        return (
+            f"source {spec.name!r} is admitted by metadata filter but not one of its {fetched} "
+            f"active rules carries a `confidence` key. Either the feed stopped publishing ET "
+            f"metadata or the fetch returned the wrong artifact. The registry's load-time check "
+            f"cannot see this — it validates the source name, not the fetched content."
+        )
     return (
-        f"source {spec.name!r} is admitted by metadata filter but not one of its {fetched} "
-        f"active rules carries a `confidence` key. Either the feed stopped publishing ET "
-        f"metadata or the fetch returned the wrong artifact; both would make the filter admit "
-        f"zero rules, which is indistinguishable in the output from a ruleset that matched "
-        f"nothing. The registry's load-time check cannot see this — it validates the source "
-        f"name, not the fetched content — so it is checked here instead."
+        f"source {spec.name!r} admitted none of its {fetched} active rules. Under "
+        f"'{spec.admission_basis}' that should be impossible unless the feed's content changed "
+        f"shape: if `signature_severity` or `confidence` stopped being published, every rule "
+        f"lands in an exclusion counter and the run would otherwise report a ruleset that "
+        f"simply matched nothing."
     )
 
 
