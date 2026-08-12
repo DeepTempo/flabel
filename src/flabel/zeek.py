@@ -25,6 +25,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from collections.abc import Iterator
 from dataclasses import replace
 from importlib import resources
@@ -58,14 +59,39 @@ CONN_JSON = "conn_json.log"
 SSL_JSON = "ssl_json.log"
 JSON_LOGS = (CONN_JSON, SSL_JSON)
 
-#: Logs that are never byte-identical across two runs of the same capture, and so must be
-#: excluded from any reproducibility comparison. `packet_filter.log` records Zeek's wall-clock
-#: start time; it carries no analytic content, and it is retained rather than deleted because
-#: deleting a log Zeek wrote would misrepresent the run.
+#: Zeek's own TSV conn log — the retained artifact, and the discriminator that tells a capture
+#: with no connections from a JSON filter that failed to run. Zeek's ASCII writer creates a log
+#: on the *first record written to that filter*, so neither file exists when there is nothing to
+#: write: an ARP/STP-only capture, or a pcap truncated before its first complete record (which
+#: spec §8 supports as partial input), legitimately produces no conn log at all.
+CONN_TSV = "conn.log"
+
+#: Logs that are not byte-identical across two runs of the same capture, and so are excluded
+#: from reproducibility comparison. `packet_filter.log` records Zeek's wall-clock start time; it
+#: carries no analytic content, and it is retained rather than deleted because deleting a log
+#: Zeek wrote would misrepresent the run.
+#:
+#: This is a filename filter, which is the wrong shape for the whole problem and is knowingly
+#: incomplete — see `reproducible_logs` and the note raised on PR #30.
 NON_REPRODUCIBLE_LOGS = frozenset({"packet_filter.log"})
 
 #: Version string used when the version probe itself is what failed.
 UNKNOWN_VERSION = "unknown"
+
+#: `ZeekRunInfo.ja4_package_version` values describing whether JA4 was computable at all.
+#:
+#: JA4 absence has to be reportable: with no signal, a consumer cannot tell "this capture had
+#: no TLS" from "the fingerprinting package was not installed", and spec §2.5 says absence is
+#: never a signal. The status rides on this field because `ZeekRunInfo` has nowhere else to put
+#: it and three parallel steps share `models.py` — a `ja4_status` field plus a `warnings` tuple
+#: is the clean fix, proposed on PR #30 rather than taken unilaterally.
+#:
+#: `present:` is a status, not a version: the installed version is not knowable here without
+#: shelling out to `zkg` (see `run_zeek`). `provenance.py` should replace it with the real
+#: version from `/etc/flabel-toolchain.json`.
+JA4_PRESENT = "present:version-unknown"
+JA4_NOT_INSTALLED = "absent:not-installed"
+JA4_PROBE_FAILED = "absent:probe-failed"
 
 #: Probes are bounded because they run before any work is done and a hung probe would look
 #: like a hung pipeline. The analysis pass is deliberately unbounded: how long Zeek needs is a
@@ -73,6 +99,12 @@ UNKNOWN_VERSION = "unknown"
 PROBE_TIMEOUT_SECONDS = 60
 
 _SEMVER = re.compile(r"\d+\.\d+(\.\d+)*")
+
+#: How Zeek says a script is not on ZEEKPATH: `can't find ja4`. Matched so that "the package is
+#: not installed" — the ordinary laptop case — is distinguishable from a probe that failed for
+#: some other reason, such as a broken ZEEKPATH or a half-finished `zkg` install. Both degrade
+#: to no JA4, but only the first is expected, and reporting them as one hides the other.
+_JA4_MISSING = re.compile(rf"can't find {re.escape(JA4_SCRIPT)}\b")
 
 #: conn.log keys every record must carry for a flow to be built from it. `duration` is not
 #: among them: an unfinished connection legitimately has none.
@@ -119,15 +151,32 @@ def zeek_argv(capture: Path, *, load_ja4: bool, binary: str | None = None) -> tu
     regression test can assert the argv directly, and does not have to infer the flag from
     behaviour alone.
     """
-    scripts = (JA4_SCRIPT,) if load_ja4 else ()
     return (
         binary or executable(),
         *MANDATORY_FLAGS,
         "-r",
         str(capture),
-        *scripts,
+        *zeek_flags_tail(load_ja4=load_ja4),
         str(script_path()),
     )
+
+
+def zeek_flags_tail(*, load_ja4: bool) -> tuple[str, ...]:
+    """The scripts loaded by name, which `ZeekRunInfo.flags` also records."""
+    return (JA4_SCRIPT,) if load_ja4 else ()
+
+
+def recorded_flags(*, load_ja4: bool) -> tuple[str, ...]:
+    """What `ZeekRunInfo.flags` carries: the flags and script names, and no paths.
+
+    Deliberately **not** the full argv. The argv contains the normalized capture's path, which
+    lives in a per-run directory and therefore differs on every run by construction — so
+    serialising it into `labels.json` would make two otherwise identical runs differ, breaking
+    Goal 2, and would leak host filesystem paths into a shipped artifact. Spec §10 specifies
+    `zeek_flags: ["-C", "-D"]`. The full argv is recorded on `ToolFailure.argv`, where it is
+    diagnostic rather than part of the reproducibility contract.
+    """
+    return MANDATORY_FLAGS + zeek_flags_tail(load_ja4=load_ja4)
 
 
 def run_zeek(capture: Path, outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]:
@@ -148,10 +197,18 @@ def run_zeek(capture: Path, outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]
     binary = executable()
     version = UNKNOWN_VERSION
     argv: tuple[str, ...] = ()
+    ja4_status = JA4_PROBE_FAILED
+    # Never `()`: the flags this module *would* use are known before anything runs, and an empty
+    # tuple on a failure path would read as "-D was lost", which is the one thing `flags` exists
+    # to make visible.
+    flags = MANDATORY_FLAGS
 
     try:
         version = _version(binary)
-        argv = zeek_argv(capture, load_ja4=_ja4_loadable(binary), binary=binary)
+        ja4_status = _ja4_status(binary)
+        load_ja4 = ja4_status == JA4_PRESENT
+        flags = recorded_flags(load_ja4=load_ja4)
+        argv = zeek_argv(capture, load_ja4=load_ja4, binary=binary)
         outdir.mkdir(parents=True, exist_ok=True)
         _invoke(argv, outdir)
         flows = _parse_flows(outdir, argv)
@@ -162,33 +219,42 @@ def run_zeek(capture: Path, outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]
         # therefore reports what is genuinely on disk, JSON logs included.
         info = ZeekRunInfo(
             version=version,
-            flags=tuple(argv[1:]),
+            flags=flags,
             log_dir=outdir,
             retained_logs=_retained_logs(outdir),
+            ja4_package_version=ja4_status,
             tool_failures=(aborted.failure,),
         )
         raise _tool_error(aborted, info) from aborted
 
     _strip_json_logs(outdir)
-    # `ja4_package_version` is left unset on purpose. `zkg list` is the only local source of
-    # that string, and shelling out to zkg from a labelling run would risk the one thing spec
-    # §2.2 forbids — step 9 asserts a run makes no network call — and I have not verified zkg
-    # is offline. Whether ja4 was loaded at all is visible in `flags`; recording the version is
-    # left to `provenance.py`, which can read /etc/flabel-toolchain.json. Raised in the PR.
+    # `ja4_package_version` carries a *status*, not a version, when JA4 is present: `zkg list` is
+    # the only local source of the version string, and shelling out to zkg from a labelling run
+    # would risk the one thing spec §2.2 forbids — step 9 asserts a run makes no network call —
+    # and I have not verified zkg is offline. `provenance.py` should substitute the real version
+    # from /etc/flabel-toolchain.json. Raised on PR #30.
     info = ZeekRunInfo(
         version=version,
-        flags=tuple(argv[1:]),
+        flags=flags,
         log_dir=outdir,
         retained_logs=_retained_logs(outdir),
+        ja4_package_version=ja4_status,
     )
     return flows, info
 
 
 def reproducible_logs(info: ZeekRunInfo) -> tuple[str, ...]:
-    """The retained logs that two runs over one capture must produce identically.
+    """The retained logs whose *records* two runs over one capture must produce identically.
 
-    `packet_filter.log` is excluded: it stamps Zeek's wall-clock start time, so comparing it
-    would fail every time and say nothing about whether the analysis was reproducible.
+    Records, not bytes. Every Zeek TSV log carries `#open` and `#close` wall-clock header lines,
+    so no log is byte-identical across runs and a byte comparison would fail on all of them; the
+    caller must compare non-`#` lines, as `test_zeek.py` does. Naming the excluded logs by
+    filename is the wrong shape for this and is knowingly incomplete — `reporter.log` is
+    reproducible for messages raised while reading packets and *not* for messages raised during
+    startup, which carry wall-clock time even under `-D` (verified). A canonicalizer that drops
+    the wall-clock parts is the right primitive; raised on PR #30 with spec §10 pending.
+
+    `packet_filter.log` is excluded outright because it is nothing but a wall-clock stamp.
     """
     return tuple(name for name in info.retained_logs if name not in NON_REPRODUCIBLE_LOGS)
 
@@ -214,8 +280,8 @@ def _version(binary: str) -> str:
     return text.splitlines()[0] if text else UNKNOWN_VERSION
 
 
-def _ja4_loadable(binary: str) -> bool:
-    """Whether `zeek/foxio/ja4` is installed, asked the way `docs/dev-setup.md` asks it.
+def _ja4_status(binary: str) -> str:
+    """Whether `zeek/foxio/ja4` can be loaded, asked the way `docs/dev-setup.md` asks it.
 
     A `--parse-only` probe, not an analysis pass: it reads no packets and writes no logs. It
     exists because `@load ja4` is fatal when the package is absent, and Zeek has no
@@ -224,10 +290,43 @@ def _ja4_loadable(binary: str) -> bool:
 
     Asking Zeek to load it, rather than looking for its directory, tests the capability that
     is actually needed and stays correct wherever `zkg` chose to install it.
+
+    Three outcomes, not two. "Not installed" is the expected laptop case; a probe that failed
+    for any *other* reason — a broken ZEEKPATH, a half-finished `zkg` install, a syntax error in
+    the installed package — degrades to the same missing JA4 but is a defect, and collapsing the
+    two would hide it. Either way the run continues without JA4 rather than failing: a capture
+    is still worth labelling from rule matches, and this is reported rather than silent.
+
+    Warnings go to stderr, which spec §12 reserves for exactly this; the status is also carried
+    in `ZeekRunInfo` so it survives into the run block, where a consumer reading `labels.json`
+    can see it.
     """
     probe = (binary, "--parse-only", "-e", f"@load {JA4_SCRIPT}")
     result = _completed(probe, timeout=PROBE_TIMEOUT_SECONDS)
-    return result.returncode == 0
+    if result.returncode == 0:
+        return JA4_PRESENT
+
+    output = f"{result.stderr}\n{result.stdout}"
+    if _JA4_MISSING.search(output):
+        _warn(
+            f"{JA4_SCRIPT} package not installed: no flow will carry a JA4 fingerprint. "
+            f"Labels are unaffected — a fingerprint is never a verdict (spec §2.6) — but a "
+            f"missing ja4 in this run's output means 'not computed', not 'no TLS'. "
+            f"See docs/dev-setup.md."
+        )
+        return JA4_NOT_INSTALLED
+
+    _warn(
+        f"the {JA4_SCRIPT} probe failed for an unexpected reason, so no flow will carry a JA4 "
+        f"fingerprint. This is not the ordinary 'package not installed' case — check ZEEKPATH "
+        f"and the zkg install. zeek --parse-only exited {result.returncode}: {_tail(result)}"
+    )
+    return JA4_PROBE_FAILED
+
+
+def _warn(message: str) -> None:
+    """Report a non-fatal loss on stderr, which spec §12 reserves for progress and warnings."""
+    print(f"flabel: warning: {message}", file=sys.stderr)
 
 
 def _invoke(argv: tuple[str, ...], outdir: Path) -> None:
@@ -289,7 +388,7 @@ def _tool_error(aborted: _Aborted, info: ZeekRunInfo) -> ToolError:
 
 def _parse_flows(outdir: Path, argv: tuple[str, ...]) -> dict[str, Flow]:
     """`conn_json.log` into flows, enriched from `ssl_json.log` on `uid`."""
-    flows = _parse_conn(outdir / CONN_JSON, argv)
+    flows = _parse_conn(outdir, argv)
     for uid, tls in _parse_ssl(outdir / SSL_JSON, argv).items():
         flow = flows.get(uid)
         # An ssl record whose uid has no conn record cannot happen — Zeek logs the connection
@@ -299,20 +398,37 @@ def _parse_flows(outdir: Path, argv: tuple[str, ...]) -> dict[str, Flow]:
     return flows
 
 
-def _parse_conn(path: Path, argv: tuple[str, ...]) -> dict[str, Flow]:
+def _parse_conn(outdir: Path, argv: tuple[str, ...]) -> dict[str, Flow]:
     """Every connection Zeek logged, keyed by `uid`.
 
-    A missing `conn_json.log` is a failure rather than an empty result: it means the JSON
-    filter never ran, and reporting zero flows would be indistinguishable from a capture with
-    no traffic (spec §2.5, absence is never a signal). A capture Zeek found nothing in still
-    produces the file, empty.
+    A missing `conn_json.log` means one of two very different things, and the retained TSV log
+    tells them apart. Zeek's ASCII writer creates a log on the first record written to that
+    filter, so a capture with no connections at all — ARP/STP/LLDP only, or a pcap truncated
+    before its first complete record, which spec §8 supports as partial input — writes *neither*
+    `conn.log` nor `conn_json.log`. That is a real, empty result, and failing the run over it
+    would reject captures the pipeline is specified to accept.
+
+    `conn.log` present with `conn_json.log` absent is the other case: Zeek logged connections and
+    our filter did not fire. Reporting zero flows there would be a silent loss of every flow in
+    the capture, so it fails (spec §2.5).
     """
+    json_log = outdir / CONN_JSON
+    if not json_log.exists():
+        if (outdir / CONN_TSV).exists():
+            raise _Aborted(
+                f"zeek wrote {CONN_TSV} but no {CONN_JSON}, so every flow would be lost; "
+                f"the JSON log filter in {SCRIPT_NAME} did not run",
+                0,
+                argv,
+            )
+        return {}
+
     flows: dict[str, Flow] = {}
-    for line_number, record in _records(path, argv):
+    for line_number, record in _records(json_log, argv):
         missing = [key for key in _CONN_REQUIRED if key not in record]
         if missing:
             raise _Aborted(
-                f"{path.name} line {line_number} has no {', '.join(missing)}; "
+                f"{CONN_JSON} line {line_number} has no {', '.join(missing)}; "
                 f"this is not a Zeek conn log",
                 0,
                 argv,
@@ -325,7 +441,10 @@ def _parse_conn(path: Path, argv: tuple[str, ...]) -> dict[str, Flow]:
                 src_port=int(record["id.orig_p"]),
                 dst_ip=str(record["id.resp_h"]),
                 dst_port=int(record["id.resp_p"]),
-                proto=str(record["proto"]),
+                # Lowercased deliberately: Zeek writes `tcp`, Suricata's eve.json writes `TCP`,
+                # and step 7 correlates on a tuple that includes proto — so one of the two has to
+                # normalize or every detection would be unmatchable. Both sides lowercase.
+                proto=str(record["proto"]).lower(),
                 ts_first=timestamp,
                 # An unfinished connection has no duration, so first and last are the same
                 # instant. Correlation's window then spans zero, which is correct: nothing was
@@ -334,8 +453,17 @@ def _parse_conn(path: Path, argv: tuple[str, ...]) -> dict[str, Flow]:
             )
         except (TypeError, ValueError) as exc:
             raise _Aborted(
-                f"{path.name} line {line_number} has an unusable field value: {exc}", 0, argv
+                f"{CONN_JSON} line {line_number} has an unusable field value: {exc}", 0, argv
             ) from exc
+        if flow.uid in flows:
+            # The uid is the join key for every label. Two records sharing one would make
+            # "the flow this label is about" ambiguous, and last-one-wins would silently pick.
+            raise _Aborted(
+                f"{CONN_JSON} line {line_number} repeats uid {flow.uid}, which is the join key "
+                f"for every label and must be unique",
+                0,
+                argv,
+            )
         flows[flow.uid] = flow
     return flows
 
@@ -366,9 +494,22 @@ def _parse_ssl(path: Path, argv: tuple[str, ...]) -> dict[str, dict[str, str]]:
 
 
 def _records(path: Path, argv: tuple[str, ...]) -> Iterator[tuple[int, dict]]:
-    """The JSON objects in a Zeek JSON log, one per line, with line numbers for messages."""
+    """The JSON objects in a Zeek JSON log, one per line, with line numbers for messages.
+
+    Streams the file a line at a time. A `conn_json.log` from a large capture is comfortably
+    bigger than memory, and reading it whole would have this module OOM-kill itself one function
+    after carefully reporting Zeek being OOM-killed.
+
+    `errors="replace"` because the decode is not allowed to fail: `ssl_json.log` carries
+    certificate subject and issuer DNs, which routinely contain non-ASCII, and Zeek does not
+    guarantee valid UTF-8 in a field lifted from the wire. A `UnicodeDecodeError` is a
+    `ValueError`, so it would have escaped every `OSError` handler here and reached the caller as
+    exactly the untyped exception this module promises never to raise. A replacement character in
+    a certificate DN costs nothing — flabel does not parse DNs — whereas a failed run costs the
+    labels.
+    """
     try:
-        text = path.read_text(encoding="utf-8")
+        handle = path.open(encoding="utf-8", errors="replace")
     except FileNotFoundError as exc:
         raise _Aborted(
             f"zeek exited 0 but wrote no {path.name}; the JSON log filter did not run",
@@ -378,20 +519,23 @@ def _records(path: Path, argv: tuple[str, ...]) -> Iterator[tuple[int, dict]]:
     except OSError as exc:
         raise _Aborted(f"could not read {path}: {exc}", 0, argv) from exc
 
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise _Aborted(f"{path.name} line {line_number} is not JSON: {exc}", 0, argv) from exc
-        if not isinstance(record, dict):
-            raise _Aborted(
-                f"{path.name} line {line_number} is {type(record).__name__}, not an object",
-                0,
-                argv,
-            )
-        yield line_number, record
+    with handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise _Aborted(
+                    f"{path.name} line {line_number} is not JSON: {exc}", 0, argv
+                ) from exc
+            if not isinstance(record, dict):
+                raise _Aborted(
+                    f"{path.name} line {line_number} is {type(record).__name__}, not an object",
+                    0,
+                    argv,
+                )
+            yield line_number, record
 
 
 def _strip_json_logs(outdir: Path) -> None:

@@ -200,6 +200,26 @@ def tls_capture(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return path
 
 
+@pytest.fixture(scope="session")
+def arp_only_capture(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A capture with traffic but no connections: four ARP requests.
+
+    Zeek analyses it happily and logs nothing but `packet_filter.log` — verified. That is the case
+    that must come back as zero flows rather than a tool failure, and it is not exotic: the same
+    shape arises from an STP/LLDP-only span port, and from a pcap truncated before its first
+    complete record, which spec §8 step 5 explicitly accepts as partial input.
+    """
+    canary = _canary_module()
+    # ARP request: ethernet/IPv4 hardware and protocol types, opcode 1, unknown target MAC.
+    arp = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1)
+    arp += canary.SRC_MAC + bytes((10, 0, 0, 5)) + bytes(6) + bytes((10, 0, 0, 200))
+    frame = canary.SRC_MAC + canary.DST_MAC + b"\x08\x06" + arp
+
+    path = tmp_path_factory.mktemp("arp") / "arp-only.pcap"
+    canary.write_pcap(str(path), [(1700000200.0 + index, frame) for index in range(4)])
+    return path
+
+
 @pytest.fixture
 def fake_zeek(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Point `FLABEL_ZEEK` at a stub that answers the probes and then does something awful.
@@ -209,13 +229,13 @@ def fake_zeek(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     the path that has to record a failure.
     """
 
-    def install(analysis_body: str) -> Path:
+    def install(analysis_body: str, *, parse_only: str = "exit 0") -> Path:
         script = tmp_path / "fake-zeek"
         script.write_text(
             "#!/bin/sh\n"
             'case "$1" in\n'
             '  --version) echo "zeek version 9.9.9"; exit 0 ;;\n'
-            "  --parse-only) exit 0 ;;\n"
+            f"  --parse-only) {parse_only} ;;\n"
             "esac\n"
             f"{analysis_body}\n"
         )
@@ -318,13 +338,14 @@ def test_a_killed_process_is_recorded_as_a_tool_failure(tmp_path: Path, fake_zee
     assert caught.value.run_info.version == "9.9.9"
 
 
-def test_a_silent_tool_that_writes_no_logs_is_a_failure(tmp_path: Path, fake_zeek):
-    """Exit 0 with no `conn_json.log` must fail, not report zero flows.
+def test_a_conn_log_without_its_json_sibling_is_a_failure(tmp_path: Path, fake_zeek):
+    """Zeek logged connections and the JSON filter did not fire → every flow would be lost.
 
-    Zero flows and "the JSON filter never ran" would otherwise be indistinguishable, which is
-    precisely what spec §2.5 forbids.
+    The retained TSV log is the discriminator. `conn.log` present with `conn_json.log` absent can
+    only mean the filter did not run, and reporting zero flows there would silently drop every
+    flow in the capture (spec §2.5).
     """
-    fake_zeek("exit 0")
+    fake_zeek('printf "#separator x\\n" > conn.log\nexit 0')
 
     with pytest.raises(ToolError) as caught:
         zeek.run_zeek(BENIGN, tmp_path / "zeek")
@@ -332,6 +353,23 @@ def test_a_silent_tool_that_writes_no_logs_is_a_failure(tmp_path: Path, fake_zee
     failure = caught.value.run_info.tool_failures[0]
     assert failure.exit_code == 0
     assert "conn_json.log" in failure.message
+    assert "did not run" in failure.message
+
+
+def test_neither_conn_log_is_zero_flows_not_a_failure(tmp_path: Path, fake_zeek):
+    """Neither log written → the capture genuinely held no connections.
+
+    Zeek's ASCII writer creates a log on the first record written to it, so a capture with
+    nothing to log produces no conn log of either kind. The real-Zeek proof is
+    `test_a_capture_with_no_connections_yields_no_flows`; this pins the branch without a
+    toolchain, and would have caught the version of this module that failed such a run.
+    """
+    fake_zeek("exit 0")
+
+    flows, info = zeek.run_zeek(BENIGN, tmp_path / "zeek")
+
+    assert flows == {}
+    assert info.tool_failures == ()
 
 
 def test_malformed_json_output_is_a_failure_not_an_empty_flow_table(tmp_path: Path, fake_zeek):
@@ -353,6 +391,125 @@ def test_a_conn_log_missing_a_field_is_a_failure(tmp_path: Path, fake_zeek):
 
     message = caught.value.run_info.tool_failures[0].message
     assert "id.orig_h" in message and "proto" in message
+
+
+def test_a_repeated_uid_is_a_failure(tmp_path: Path, fake_zeek):
+    """The join key must be unique. Last-one-wins would silently pick a flow for every label."""
+    record = (
+        '{"ts":1.0,"uid":"C1","id.orig_h":"10.0.0.1","id.orig_p":1,'
+        '"id.resp_h":"10.0.0.2","id.resp_p":2,"proto":"tcp"}'
+    )
+    fake_zeek(f"printf '{record}\\n{record}\\n' > conn_json.log\nexit 0")
+
+    with pytest.raises(ToolError) as caught:
+        zeek.run_zeek(BENIGN, tmp_path / "zeek")
+
+    message = caught.value.run_info.tool_failures[0].message
+    assert "repeats uid C1" in message and "join key" in message
+
+
+def test_a_non_utf8_log_does_not_raise_a_decode_error(tmp_path: Path, fake_zeek):
+    """A certificate DN with invalid UTF-8 must not take the run down.
+
+    `ssl_json.log` carries subject and issuer DNs lifted from the wire, so valid UTF-8 is not
+    guaranteed. `UnicodeDecodeError` is a `ValueError`, not an `OSError` — it would sail past
+    every handler here and reach the caller as exactly the untyped exception this module promises
+    never to raise. flabel does not parse DNs, so a replacement character costs nothing.
+    """
+    conn = (
+        '{"ts":1.0,"uid":"C1","id.orig_h":"10.0.0.1","id.orig_p":1,'
+        '"id.resp_h":"10.0.0.2","id.resp_p":2,"proto":"tcp"}'
+    )
+    outdir = tmp_path / "zeek"
+    outdir.mkdir()
+    # Written from Python, not from the stub: `printf '\xff'` is not POSIX, and CI's /bin/sh is
+    # dash, which would emit the literal characters and quietly turn this into a valid-UTF-8 test.
+    # 0xFF is not valid UTF-8 in any position; here it lands inside the SNI string.
+    (outdir / "ssl_json.log").write_bytes(
+        b'{"uid":"C1","ja4":"t13d","server_name":"caf\xff.test"}\n'
+    )
+    fake_zeek(f"printf '{conn}\\n' > conn_json.log\nexit 0")
+
+    flows, _ = zeek.run_zeek(BENIGN, outdir)
+
+    assert flows["C1"].ja4 == "t13d"
+    assert flows["C1"].server_name is not None
+    assert "�" in flows["C1"].server_name, "the undecodable byte is replaced, not fatal"
+
+
+def test_recorded_flags_are_flags_only(tmp_path: Path, fake_zeek):
+    """`ZeekRunInfo.flags` carries no paths — spec §10 says `zeek_flags: ["-C", "-D"]`.
+
+    The full argv contains the normalized capture's path, which sits in a per-run directory and
+    so differs on every run *by construction*. Serialising that into `labels.json` would make two
+    otherwise identical runs differ — breaking Goal 2 — and would leak host filesystem paths into
+    a shipped artifact. Two runs over captures at different paths must produce the same `flags`.
+    """
+    assert zeek.recorded_flags(load_ja4=False) == ("-C", "-D")
+    assert zeek.recorded_flags(load_ja4=True) == ("-C", "-D", "ja4")
+
+    fake_zeek("exit 0")
+    first = tmp_path / "one.pcap"
+    second = tmp_path / "two.pcap"
+    for path in (first, second):
+        path.write_bytes(BENIGN.read_bytes())
+
+    _, one = zeek.run_zeek(first, tmp_path / "a")
+    _, two = zeek.run_zeek(second, tmp_path / "b")
+
+    assert one.flags == two.flags, "flags must not vary with the capture's path"
+    for flag in one.flags:
+        assert not flag.startswith("/"), f"{flag!r} is a path; flags must carry none"
+    assert "-D" in one.flags
+
+
+def test_a_probe_failure_still_reports_the_mandatory_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An empty `flags` on a failure path would read as "-D was lost"."""
+    monkeypatch.setenv(zeek.ZEEK_ENV, str(tmp_path / "no-such-zeek"))
+
+    with pytest.raises(ToolError) as caught:
+        zeek.run_zeek(BENIGN, tmp_path / "zeek")
+
+    assert caught.value.run_info.flags == ("-C", "-D")
+
+
+def test_an_uninstalled_ja4_package_is_reported_not_silent(
+    tmp_path: Path, fake_zeek, capsys: pytest.CaptureFixture[str]
+):
+    """JA4 absence must be visible in the run's own output and on stderr.
+
+    Without this, `ja4=None` on every flow is indistinguishable from "this capture had no TLS" —
+    spec §2.5. The stub answers `--parse-only` the way Zeek does when the package is not on
+    ZEEKPATH, which is the ordinary laptop case.
+    """
+    fake_zeek("exit 0", parse_only='echo "can\'t find ja4" >&2; exit 1')
+
+    _, info = zeek.run_zeek(BENIGN, tmp_path / "zeek")
+
+    assert info.ja4_package_version == zeek.JA4_NOT_INSTALLED
+    assert "ja4" not in info.flags, "the package cannot be loaded, so it must not be in the argv"
+    warning = capsys.readouterr().err
+    assert "not installed" in warning
+    assert "not 'no TLS'" in warning, "the warning must say what a missing ja4 does *not* mean"
+
+
+def test_a_broken_ja4_probe_is_distinguished_from_an_absent_package(
+    tmp_path: Path, fake_zeek, capsys: pytest.CaptureFixture[str]
+):
+    """A broken ZEEKPATH or half-finished zkg install is a defect, not the laptop case.
+
+    Both degrade to no JA4, so collapsing them into one boolean hides the one worth fixing.
+    """
+    fake_zeek("exit 0", parse_only='echo "some other catastrophe" >&2; exit 1')
+
+    _, info = zeek.run_zeek(BENIGN, tmp_path / "zeek")
+
+    assert info.ja4_package_version == zeek.JA4_PROBE_FAILED
+    warning = capsys.readouterr().err
+    assert "unexpected reason" in warning
+    assert "some other catastrophe" in warning, "the probe's own output belongs in the warning"
 
 
 def test_reproducible_logs_excludes_the_wall_clock_log():
@@ -398,6 +555,14 @@ def test_benign_capture_yields_exactly_two_flows(tmp_path: Path):
     assert info.log_dir == tmp_path / "zeek"
     assert info.tool_failures == ()
 
+    # Whichever environment this runs in, the JA4 probe must reach a *conclusion*: `present` in
+    # CI, `not-installed` on a Homebrew laptop. `probe-failed` here would mean the module could
+    # not read real Zeek's "can't find ja4" wording — which is how a real broken install would be
+    # misclassified, and the only place that regex meets the actual tool.
+    assert info.ja4_package_version in {zeek.JA4_PRESENT, zeek.JA4_NOT_INSTALLED}, (
+        f"the ja4 probe reached no conclusion: {info.ja4_package_version}"
+    )
+
 
 @pytest.mark.requires_tools
 def test_two_runs_produce_identical_uids(tmp_path: Path):
@@ -415,6 +580,86 @@ def test_two_runs_produce_identical_uids(tmp_path: Path):
     assert sorted(first) == sorted(second), "uids differ between runs — was -D dropped?"
     assert first == second, "the whole flow table must be identical, not just its keys"
     assert "-D" in first_info.flags and "-D" in second_info.flags
+
+
+@pytest.mark.requires_tools
+def test_the_retained_tsv_and_the_parsed_json_agree(tmp_path: Path):
+    """The uids in the retained `conn.log` are exactly the uids flabel parsed.
+
+    This is the claim `json-logs.zeek` exists to make (spec §8: "one pass produces both formats,
+    so TSV and JSON cannot disagree") and nothing else asserts it. It is the artifact contract: a
+    consumer reads the TSV logs, flabel labelled from the JSON, and a label pointing at a uid
+    absent from the shipped `conn.log` would be untraceable.
+    """
+    flows, info = zeek.run_zeek(BENIGN, tmp_path / "zeek")
+
+    conn_log = info.log_dir / "conn.log"
+    lines = conn_log.read_text().splitlines()
+    fields = next(line.split("\t")[1:] for line in lines if line.startswith("#fields"))
+    uid_column = fields.index("uid")
+    tsv_uids = {line.split("\t")[uid_column] for line in lines if line and not line.startswith("#")}
+
+    assert tsv_uids == set(flows), "the retained TSV log and the parsed JSON disagree on uids"
+
+    # Only the two parsed logs get a JSON sibling; the rest stay TSV, and `ssl.log` in particular
+    # must not have been turned into JSON by a global writer setting.
+    for name in ("conn.log", "http.log"):
+        assert (info.log_dir / name).read_text().startswith("#separator"), f"{name} is not TSV"
+
+
+@pytest.mark.requires_tools
+def test_a_capture_with_no_connections_yields_no_flows(arp_only_capture: Path, tmp_path: Path):
+    """Real Zeek, real capture, zero connections: an empty result, not a tool failure.
+
+    Zeek writes no conn log at all here — its ASCII writer creates a log on the first record
+    written to it — so "no `conn_json.log`" cannot mean "the filter broke". Failing this run would
+    reject a capture spec §8 accepts, including the truncated-before-the-first-record case that
+    is supposed to proceed as partial input.
+    """
+    flows, info = zeek.run_zeek(arp_only_capture, tmp_path / "zeek")
+
+    assert flows == {}
+    assert info.tool_failures == (), "zero connections is a result, not a failure"
+    assert "conn.log" not in info.retained_logs, (
+        "Zeek wrote a conn.log for an ARP-only capture, so the discriminator in _parse_conn "
+        "rests on a false premise — re-check it before trusting this test"
+    )
+    assert "packet_filter.log" in info.retained_logs, "Zeek still ran and still logged"
+
+
+@pytest.mark.requires_tools
+def test_the_pipeline_works_end_to_end_without_the_ja4_package(
+    tls_capture: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The path every laptop takes: no JA4 package, everything else intact.
+
+    In CI the package *is* installed, so without forcing this branch it would never be exercised
+    where the suite is actually gated. What is stubbed is flabel's own probe, not Zeek: the
+    analysis pass below is a real invocation, and the point is that dropping `ja4` from the argv
+    still yields flows, TLS metadata, and a reported reason for the missing fingerprint.
+    """
+    monkeypatch.setattr(zeek, "_ja4_status", lambda binary: zeek.JA4_NOT_INSTALLED)
+
+    flows, info = zeek.run_zeek(tls_capture, tmp_path / "zeek")
+
+    assert "ja4" not in info.flags
+    assert info.ja4_package_version == zeek.JA4_NOT_INSTALLED
+    flow = next(iter(flows.values()))
+    assert flow.server_name == TLS_SERVER_NAME, "the ssl.log join must not depend on JA4"
+    assert flow.ja4 is None and flow.ja4s is None
+    assert info.tool_failures == (), "a missing fingerprint is a reported loss, not a failure"
+
+
+@pytest.mark.requires_tools
+def test_proto_is_lowercase(tmp_path: Path):
+    """Zeek writes `tcp`, Suricata's eve.json writes `TCP`, and step 7 joins on the tuple.
+
+    Asserted rather than assumed, because if Zeek ever changed case here the mismatch would show
+    up as every detection silently failing to correlate.
+    """
+    flows, _ = zeek.run_zeek(BENIGN, tmp_path / "zeek")
+
+    assert {flow.proto for flow in flows.values()} == {"tcp"}
 
 
 @pytest.mark.requires_tools
