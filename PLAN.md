@@ -150,6 +150,18 @@ belongs to. `classtype` is read from the rule text rather than from `alert.categ
 - **Correlate on the normalised tuple, and do not re-normalise.** Step 6 already translates Suricata's 5-tuple into Zeek's spelling — lowercased proto, `IPv6-ICMP` → `icmp`, compressed IPv6, ICMP type/code mirrored into the port columns. Correlation compares the fields as given; a second normalisation here would be two places that must agree about what a tuple is.
 - **Step 7 owns the ICMPv6 counterpart-type residual.** For an ICMPv6 echo, Zeek writes the *reply* type in `id.resp_p` (`128, 129`) where step 6 can only yield `128, 0`, because a single alert record does not carry the counterpart type. Mirroring is exact for ICMPv4 and one field out for ICMPv6 echo, so closing it means correlation treating ICMP specially — matching on type and accepting the counterpart type in the responder column — not a different value in `suricata.py`. **Test:** an ICMPv6 echo detection correlates to the Zeek flow for the same exchange; an ICMPv4 one still matches exactly.
 
+**Pre-placed before this step, and read-only to it (#44):**
+- **`provenance.build_source_entry(detection, spec, snapshot_id)` already exists on `main`.**
+  Correlation cannot return a `CorrelationResult` without constructing `SourceEntry` values, and
+  step 8 was separately told to build them. Step 7 **imports and calls** that function; it does
+  not write its own, and it does not derive `label_basis` from `source_class` itself.
+- Consequently `correlate()` takes `sources: Mapping[str, SourceSpec]` and `snapshot_id: str`
+  (spec §9, corrected). A detection whose source is absent from `sources` is a hard failure, not
+  a label with a guessed licence.
+- The `may_label` check inside `build_source_entry` is a backstop, not this step's excuse to skip
+  the §2.8 test: step 7 still asserts that an `identify` detection reaching correlation never
+  becomes a label.
+
 **Depends on:** 2. **Parallel with:** 8.
 
 ---
@@ -158,7 +170,15 @@ belongs to. `classtype` is read from the rule text rather than from `alert.categ
 
 **Files:** `src/flabel/labels.py`, `src/flabel/provenance.py`, `src/flabel/notice.py`, `tests/test_labels.py`, `tests/test_provenance.py`
 
-**Changes:** Build `SourceEntry` values, deriving `label_basis` from source class and carrying `admission_basis` and `licence`. Canonical serialisation per spec §10. Assemble the run block including every loss-condition field. Emit `NOTICE` for sources that actually asserted a label.
+**Changes:** Canonical serialisation per spec §10. Assemble the run block including every loss-condition field. Emit `NOTICE` for sources that actually asserted a label.
+
+**No longer this step's job (#44):** *"Build `SourceEntry` values, deriving `label_basis` from
+source class and carrying `admission_basis` and `licence`"* moved to
+`provenance.build_source_entry`, pre-placed on `main` before this step and step 7 started —
+step 7 has to construct `SourceEntry` values to return a `Label` at all, so leaving the job here
+meant both worktrees writing it. Step 8 **imports** that function; `provenance.py` already
+exists and this step adds the run block to it. The field-completeness assertion below is still
+step 8's, and now runs over the shared builder's output.
 
 **Test that proves it:** canonical output is byte-identical across two serialisations of the same data, and the `labels` array sorts by `(ts_first, uid)` regardless of input order. **Required-fields check: every `SourceEntry` carries every field the spec §4 table demands** — this is the automated form of Goal 1, with no "where applicable" escape. `ioc-name` sources yield `indicator-reference`; all other labelling classes yield `direct`. `NOTICE` lists a GPL/CC-BY source that asserted a label and omits a source that asserted none. Every loss-condition field exists in the run block.
 

@@ -235,6 +235,25 @@ step 6: the exception exposes `failures` (the `ToolFailure` records it was raise
 recorded *as well as* raised — an exception carrying only a string would force the caller to
 choose between reporting the loss and failing on it.
 
+**A `SourceEntry` is built in exactly one place: `provenance.build_source_entry(detection,
+spec, snapshot_id)`.** Pre-placed before steps 7 and 8 were built (#44), because as written
+they both claimed the job. Step 7 cannot avoid it — `CorrelationResult.labels` is
+`tuple[Label, ...]` and a `Label` cannot be constructed without its `sources` — while PLAN
+step 8 assigned the derivation of `label_basis`, `admission_basis` and `licence` to
+`labels.py`. Neither could own it alone, and two parallel worktrees deriving `label_basis`
+separately is the shape of defect §13's never-dos exist to prevent: two plausible answers, no
+way for a consumer to tell which one a label carries.
+
+The function is where the three inputs to provenance meet, and it is the only place they do:
+the **detection** for what the engine observed (`tier`, `sid`, `rev`, `classtype`, `threat`),
+the **`SourceSpec`** for the terms the source was admitted on (`admission_basis`, `licence`,
+and `label_basis` via the existing property rather than a second copy of the rule), and the
+**`snapshot_id`** for which exact ruleset produced it. It refuses three things rather than
+emitting an entry that would look complete and be wrong: a source with `may_label == False`
+(§2.8, a second enforcement after step 6's suppression), a `spec` whose `name` does not match
+`detection.source` (which would attribute one feed's licence to another feed's alert), and an
+empty `snapshot_id` (which traces to nothing).
+
 ### `labels.json` document
 
 ```json
@@ -580,8 +599,17 @@ Order of operations:
 
 ```python
 def correlate(detections: Sequence[Detection], flows: Mapping[str, Flow],
+              sources: Mapping[str, SourceSpec], snapshot_id: str,
               threshold: float = 0.01) -> CorrelationResult
 ```
+
+**`sources` and `snapshot_id` were added to this signature in #44.** The original three
+arguments cannot produce the declared return type: `CorrelationResult.labels` is
+`tuple[Label, ...]`, a `Label` requires `SourceEntry` values, and a `SourceEntry` needs four
+fields a `Detection` does not carry — `ruleset`, `admission_basis`, `licence`, `label_basis`.
+Correlation does not derive any of them itself; it passes each matched detection to
+`provenance.build_source_entry` (§4) along with the spec for that detection's source. Its own
+job remains attaching detections to flows.
 
 Pure. For each detection:
 
