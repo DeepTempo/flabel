@@ -107,7 +107,14 @@ Step 10 canaries + reproducibility gates
 
 **Changes:** Single invocation `zeek -C -D -r <pcap> json-logs.zeek`. The Zeek script adds JSON log filters for `conn` and `ssl` so one pass yields both TSV (retained) and JSON (parsed) and they cannot disagree. Parse `conn_json.log` into `Flow`, join `ssl_json.log` for `ja4`/`ja4s`/`server_name` on `uid`. Retain all TSV logs; strip the `_json` files from retained output.
 
-**Test that proves it:** on `benign.pcap`, exactly two flows with the expected tuples. **Determinism gate: two runs produce identical `uid`s** — this is the regression test for the verified spike-3 finding, and it fails if `-D` is ever dropped. `packet_filter.log` is confirmed non-reproducible and excluded. A TLS fixture yields a populated `ja4`. Non-zero exit produces a `tool_failures[]` entry rather than an exception escaping.
+**Test that proves it:** on `benign.pcap`, exactly two flows with the expected tuples. **Determinism gate: two runs produce identical `uid`s** — this is the regression test for the verified spike-3 finding, and it fails if `-D` is ever dropped. A TLS fixture yields a populated `ja4`. Non-zero exit produces a `tool_failures[]` entry rather than an exception escaping.
+
+**As built, and corrected here:** `packet_filter.log` is excluded, but it is not the only
+non-reproducible log — *no* Zeek TSV log is byte-identical across runs, because they all carry
+wall-clock `#open`/`#close` headers. Step 5 compares non-`#` records and ships a filename filter as
+a knowingly-incomplete stopgap; step 10 replaces it with the canonicalizer. Step 5 also loads `ja4`
+explicitly after probing for it, and raises `ToolError` carrying `.failures` and `.run_info` as
+well as recording the failure — see spec §8.
 
 **Depends on:** 2. **Parallel with:** 3, 4, 6.
 
@@ -121,6 +128,12 @@ Step 10 canaries + reproducibility gates
 
 **Test that proves it:** a synthetic rule matching `benign.pcap` produces exactly one parsed `Detection` with correct sid/rev/classtype/tuple/timestamp. A synthetic **`ja4.hash`** rule matching a TLS fixture also produces a detection — proving the JA4 labelling *capability* independent of whether content exists (US-14). An `identify`-source rule that fires yields **zero** detections and increments `identify_alerts_suppressed` (US-16). Two runs produce the same alert set.
 
+**As built, and corrected here:** the invocation also needs `-c` (flabel's own `suricata.yaml`) and
+`--set default-rule-path`, and a SID's originating source is resolved from the snapshot's
+`sid_index.json` — not from the manifest, whose per-source *counts* cannot answer which source a SID
+belongs to. `classtype` is read from the rule text rather than from `alert.category`, and the
+5-tuple is translated into Zeek's spelling before it leaves this step. All in spec §7 and §8.
+
 **Depends on:** 2 (and step 4's snapshot writer for a real snapshot; a hand-built snapshot directory suffices to keep them parallel). **Parallel with:** 3, 4, 5.
 
 ---
@@ -132,6 +145,10 @@ Step 10 canaries + reproducibility gates
 **Changes:** Pure. Tuple match in either direction, time-window disambiguation on multiple candidates, `UnmatchedDetection` with a reason when zero or still-ambiguous. Consolidate to one `Label` per flow with sorted `sources` and `best_tier`. Implement the unmatched gate: silent at zero, warn above zero, fail above the threshold.
 
 **Test that proves it:** synthetic detections and flows only — no tools needed. One flow, one detection → one label. Two detections on one flow → one label with two sources. Port reuse with two candidate flows → resolved by time containment; detection outside both windows → `ambiguous_flow_match`. Tuple absent → `no_flow_match`. Threshold: 1 unmatched in 200 passes, 1 in 50 fails. `best_tier` is the minimum, not the maximum.
+
+**Also required, from step 6's measurements (spec §8, Suricata):**
+- **Correlate on the normalised tuple, and do not re-normalise.** Step 6 already translates Suricata's 5-tuple into Zeek's spelling — lowercased proto, `IPv6-ICMP` → `icmp`, compressed IPv6, ICMP type/code mirrored into the port columns. Correlation compares the fields as given; a second normalisation here would be two places that must agree about what a tuple is.
+- **Step 7 owns the ICMPv6 counterpart-type residual.** For an ICMPv6 echo, Zeek writes the *reply* type in `id.resp_p` (`128, 129`) where step 6 can only yield `128, 0`, because a single alert record does not carry the counterpart type. Mirroring is exact for ICMPv4 and one field out for ICMPv6 echo, so closing it means correlation treating ICMP specially — matching on type and accepting the counterpart type in the responder column — not a different value in `suricata.py`. **Test:** an ICMPv6 echo detection correlates to the Zeek flow for the same exchange; an ICMPv4 one still matches exactly.
 
 **Depends on:** 2. **Parallel with:** 8.
 
@@ -145,6 +162,11 @@ Step 10 canaries + reproducibility gates
 
 **Test that proves it:** canonical output is byte-identical across two serialisations of the same data, and the `labels` array sorts by `(ts_first, uid)` regardless of input order. **Required-fields check: every `SourceEntry` carries every field the spec §4 table demands** — this is the automated form of Goal 1, with no "where applicable" escape. `ioc-name` sources yield `indicator-reference`; all other labelling classes yield `direct`. `NOTICE` lists a GPL/CC-BY source that asserted a label and omits a source that asserted none. Every loss-condition field exists in the run block.
 
+**Also required, from steps 3 and 5 (spec §8, §10):**
+- **`run.input.path` is `NormalizedCapture.original_path`** — the operator's own file, not the normalized copy, which lives in a per-run temporary directory and means nothing to a reader. Spec §10 correspondingly makes it an excluded field in the reproducibility comparison.
+- **Read the toolchain versions from `/etc/flabel-toolchain.json`, not by shelling out.** `zkg list` is the only local source of the `ja4` package version, and calling it from a labelling run risks the network call spec §2.2 forbids and step 9 asserts against. Step 1 already pins and records the toolchain; step 8 reads that manifest and fills `tools.ja4_zeek_package` from it. `tools.ja4_status` comes from `ZeekRunInfo` and is a separate field — a status must never be written into the version slot.
+- **Test:** with a fixture toolchain manifest, `tools.ja4_zeek_package` is the version it names; with the manifest absent the field is null and the run still succeeds; the socket guard from step 9 stays clean throughout.
+
 **Depends on:** 2. **Parallel with:** 7.
 
 ---
@@ -157,6 +179,10 @@ Step 10 canaries + reproducibility gates
 
 **Test that proves it:** end-to-end `--offline` on `benign.pcap` writes a run directory with `zeek/`, `labels.json`, and `NOTICE`, and exits 0. **The stub path prints `Coming Soon (TM)`, names `--offline`, creates no directory, and exits 3** (US-22). Re-running creates a sibling directory and leaves the first untouched; sorted names are chronological. A hard failure writes **no** `labels.json` — never a partial one. `--ruleset-snapshot nonexistent` exits 1. A labelling run makes no network call (asserted by a socket guard).
 
+**Also required, from step 5 (spec §4, §8):**
+- **Catch `ToolError` and read `.failures` and `.run_info`.** Step 5 records a tool failure *and* raises it, attaching the stage's run info to the exception, precisely so the caller can report the loss it is about to fail on. Catching `ToolError` and printing `str(exc)` would throw away the `ToolFailure` records — the argv, the exit code, and whether the tool was killed rather than exited.
+- **Step 9 must decide where `tool_failures[]` is reported, and say so.** This is a genuine tension in the spec, not an oversight to code around: §11 requires the failure in `tool_failures[]`, and §13 forbids writing a partial `labels.json` on a hard failure — so the array the failure belongs in is inside the file that must not exist. The options are stderr only, a separate `run.json` (or `failure.json`) in a run directory that carries no labels, or a complete `labels.json` with an empty `labels[]`, which reads as "nothing malicious found" and is therefore the one to avoid. **Whichever is chosen, the test asserts both halves: the failure is reported somewhere a script can read, and no `labels.json` claims a verdict.** Take the decision to Craig rather than picking silently.
+
 **Depends on:** 3, 4, 5, 6, 7, 8.
 
 ---
@@ -167,7 +193,20 @@ Step 10 canaries + reproducibility gates
 
 **Changes:** Wire Goal 5 and Goal 2 into CI as build-failing gates. Source the malicious canary and record its origin and licence.
 
-**Test that proves it:** **benign canary produces zero labels — any label fails the build** (Goal 5, and the standing FP review for every wholesale-admitted source including `pawpatrules`). Malicious canary produces at least one label. **Reproducibility: two full `--offline` runs against the same capture and pinned snapshot are identical after canonicalisation**, excluding only `started_at`/`finished_at`/`duration_seconds` and `packet_filter.log` (Goal 2). Fault-injection test for every Phase 1 loss condition in spec §11.
+**Test that proves it:** **benign canary produces zero labels — any label fails the build** (Goal 5, and the standing FP review for every wholesale-admitted source including `pawpatrules`). Malicious canary produces at least one label. **Reproducibility: two full `--offline` runs against the same capture and pinned snapshot are identical after canonicalisation** (Goal 2). Fault-injection test for every Phase 1 loss condition in spec §11 — including the two rows added after step 6: a snapshot holding a rule this engine cannot compile, and a run with the `ja4` package absent.
+
+**Corrected after step 5, and this step owns the fix.** The reproducibility gate above originally
+compared bytes, excluding `started_at`/`finished_at`/`duration_seconds` and `packet_filter.log`.
+Byte-identity is unachievable: every Zeek TSV log carries wall-clock `#open`/`#close` headers, so a
+byte comparison fails on all of them. Step 10 builds **the canonicalizer** — drop `#`-prefixed
+header lines — and uses spec §10's corrected exclusion list: `run.input.path` alongside the three
+timestamps, `zeek/packet_filter.log` and `suricata/suricata.log` excluded outright, and within
+`suricata/eve.json` the `stats` records only, since `alert` and `flow` records are byte-stable and
+are the ones worth comparing. `zeek/reporter.log` is canonicalised rather than excluded — its
+startup messages carry wall-clock time even under `-D` while its packet-time messages are
+reproducible, and dropping the file would hide the protocol violations Goal 3 wants reported.
+The canonicalizer is a shared primitive, not test-local: step 5's `reproducible_logs` filename
+filter is the knowingly-incomplete stopgap it replaces.
 
 **Depends on:** 9. **Note:** the malicious canary is the one unresolved input (spec §14); if it slips, the benign canary and reproducibility gates land without it and the sensitivity test follows.
 

@@ -80,8 +80,10 @@ src/flabel/
   notice.py         emit NOTICE attribution (pure)
   cli.py            argument parsing, orchestration, exit codes
   data/
-    sources.toml    the source registry (shipped with the package)
-    json-logs.zeek  Zeek script adding JSON filters
+    sources.toml          the source registry (shipped with the package)
+    json-logs.zeek        Zeek script adding JSON filters
+    suricata.yaml         flabel's own Suricata config (§8) — added in step 6
+    classification.config the classtypes that config names — added in step 6
 ```
 
 **Package data lives inside the package**, not at the repo root. Root-level `data/` can only
@@ -138,7 +140,7 @@ class SourceAdmission:
 
 @dataclass(frozen=True)
 class SnapshotManifest:
-    snapshot_id: str             # sha256(rules.rules)[:16]
+    snapshot_id: str             # content hash over the whole snapshot — see §7
     created_at: str
     flabel_version: str
     sources: tuple[SourceAdmission, ...]
@@ -215,6 +217,23 @@ has to create a shared type collides with its siblings in the file meant to prev
 would otherwise construct happily, and §13's first never-do is asserting a flow is benign. A
 `Label` also rejects empty `sources` (a label with no assertion has no provenance) and a
 `best_tier` disagreeing with `min(sources.tier)`.
+
+**Fields added after steps 3–6 measured the tools.** Each exists because a real loss turned out
+to have nowhere to be reported, and §2.5 says absence is never a signal. They are field
+corrections, not design changes: nothing here alters what a label means.
+
+| Field | Added by | Why |
+| :-- | :-- | :-- |
+| `warnings: tuple[str, ...]` on `NormalizedCapture`, `ZeekRunInfo`, `SuricataRunInfo` | steps 3, 5, 6 | Every stage found non-fatal losses worth reporting — a trimmed tail record, a missing JA4 package, rules the engine refused. Warnings were going to stderr only, so a consumer reading `labels.json` alone could not see them. §10's run block already has a `warnings` array; these are what fills it, per stage, so the stage that observed a loss is the stage that reports it. |
+| `rules_failed`, `rules_skipped` on `SuricataRunInfo` | step 6 | Suricata reports `N loaded, M failed, K skipped` and exits 0 either way. Without the last two, a snapshot of 85,545 rules loading as 85,519 is a run that looks complete and silently never examined the capture with 26 rules. `failed` and `skipped` are separate because they are different faults: `failed` is a rule this build cannot parse, `skipped` is a rule dropped for duplicating another's SID. |
+| `ja4_status: Literal["present", "not-installed", "probe-failed"] \| None` on `ZeekRunInfo` | step 5 | A null `ja4` on a flow has two causes — no TLS in the capture, or no fingerprinting package installed — and they are not the same fact. Step 5 initially overloaded `ja4_package_version` with status strings; that field is now reserved for an actual version (§8 says where it comes from), and the status has its own field. `probe-failed` is separate from `not-installed` because an absent package is the ordinary laptop case and a broken `ZEEKPATH` is a defect. |
+| `rules_excluded_unloadable` on `SourceAdmission` | step 6 | Three pawpatrules rules cannot compile under this configuration (§8). They have to be excluded at admission, and §6's `fetched == admitted + sum(excluded)` identity means every exclusion needs its own counter, or the rules go missing unaccounted for. |
+
+**`ToolError` carries the evidence, not just a message.** Recorded in step 5 and relied on by
+step 6: the exception exposes `failures` (the `ToolFailure` records it was raised over) and
+`run_info` (the stage's run info, carrying those same records). §8 says a tool failure is
+recorded *as well as* raised — an exception carrying only a string would force the caller to
+choose between reporting the loss and failing on it.
 
 ### `labels.json` document
 
@@ -295,6 +314,15 @@ Validation on load, as originally specified: unknown `source_class` or `admissio
 
 A `licence` of `"unstated"` remains legal per §4, but no shipped source uses it and a test asserts so.
 
+**Three `pawpatrules` rules are excluded at admission and can never label — measured in step 6.**
+Sids 3300158, 3300159 and 3321393 ("P2P direct calling via STUN") are each written
+`-> ![..., $HOME_NET]`, and negating flabel's `HOME_NET: any` leaves the empty set, so Suricata
+refuses to compile them: *"Complete IP space negated. Rule address range is NIL."* They are
+counted in `rules_excluded_unloadable` (§4) rather than left to fail at load, because a rule the
+engine rejects is coverage flabel does not have, and a snapshot whose `total_admitted` counts
+rules that cannot run overstates what examined the capture. The configuration trade-off that
+produces this is in §8; 3 lost rules against up to 1,397 is why it is decided that way.
+
 The ET Open URL pins `suricata-8.0` to match the pinned engine (8.0.6). ET compiles per engine version, so the 7.0 set omits rules using 8.0-era keywords; this originally read `suricata-7.0`, corrected in step 2.
 
 ---
@@ -322,9 +350,11 @@ Pure. Given a source and its fetched rule text, return the admitted rules plus c
 
 ```
 .flabel/rules/<snapshot_id>/
-  manifest.json     SnapshotManifest
-  rules.rules       concatenated admitted rules, sorted by (source, sid)
-  raw/<source>.rules  as fetched, for audit
+  manifest.json        SnapshotManifest, plus manifest_version
+  rules.rules          concatenated admitted rules, sorted by (source, sid)
+  sid_index.json       which source each sid came from
+  data/<source>/<file> companion data files the rules read (`dataset:`)
+  raw/<source>.rules   as fetched, for audit
 ```
 
 ```python
@@ -334,11 +364,54 @@ def load_snapshot(root: Path, snapshot_id: str | None) -> tuple[Path, SnapshotMa
 def list_snapshots(root: Path) -> list[SnapshotManifest]
 ```
 
-- `snapshot_id = sha256(rules.rules bytes)[:16]`. Self-verifying: rewriting the file changes the id.
 - `rules.rules` is written **sorted by (source, sid)** so the id depends on content, not fetch order.
 - `load_snapshot(root, None)` returns the most recently created snapshot.
 - A missing or unreadable snapshot is a hard failure (`SnapshotError` → exit 1).
 - `.flabel/` is gitignored.
+
+**The layout and the id are wider than this section originally said — corrected in steps 4 and 6.**
+The original was one hashed file, `rules.rules`, with `snapshot_id = sha256(rules.rules)[:16]`.
+Two things measured against the live feeds made that insufficient.
+
+**`sid_index.json` — `{"schema": 1, "sources": {"<source>": [sid, ...]}}`.** §8 resolves the
+originating source of each alert from the snapshot, because `eve.json` carries a signature id and
+nothing about where the rule came from. Per-source *counts* in the manifest cannot answer "which
+source is sid 2011465?", so the mapping has to be stored. It is a file rather than a field on
+`SourceAdmission` because step 8 copies that struct into every `labels.json`, and 21,221 integers
+per source do not belong in every output file. It is versioned separately from the manifest
+because step 6 reads this file and nothing else in the snapshot.
+
+**Companion data files are part of the ruleset, so they are inside the id.** Measured in step 6:
+`pawpatrules` ships 18 `.lst` files that 26 of its rules read with `dataset:`. Loaded away from
+them, those 26 rules fail; loaded alongside them, 0 fail. Two of those lists — `openphish` and
+`nrd_phishing_14day` — refresh daily upstream. A rules-only hash would therefore let two runs
+share a `snapshot_id`, match different traffic and produce different labels, which is precisely
+the guarantee the id exists to give.
+
+**`snapshot_id` is a sha256 over `rules.rules`, `sid_index.json`, and every file under `data/`, in
+sorted path order, with each contribution framed by its path and length:**
+
+```
+for path in sorted(components):
+    sha256 <- path (utf-8) || 0x00 || len(content) as 8 bytes big-endian || content
+snapshot_id = first 16 hex characters
+```
+
+The framing is not decoration. Under plain concatenation, renaming `data/pawpatrules/tor.lst` to
+`nrd.lst` would leave the id untouched — and a rename changes which rules read which list, so it
+changes which rules match. Length framing likewise stops bytes moving across a file boundary
+unnoticed. Still self-verifying, now over the whole directory: `load_snapshot` recomputes the id
+and refuses a snapshot that no longer hashes to its own name, rather than repairing it, because
+labels already emitted name that id as the ruleset that produced them.
+
+**`raw/` is deliberately outside the hash.** It is the as-fetched audit copy, not what the engine
+reads: hashing it would change the id — and orphan every label pointing at the old one — whenever
+upstream edited a comment header, while changing nothing about which rules match.
+
+**`manifest.json` carries a `manifest_version`.** Reading a manifest hard-fails on any key it does
+not recognise, which is the right default when a manifest is the provenance of a label. Without a
+version, that means the format could never gain a field without every snapshot already on disk
+becoming unreadable garbage rather than "written by an older flabel".
 
 ---
 
@@ -349,24 +422,66 @@ def list_snapshots(root: Path) -> list[SnapshotManifest]
 One invocation per run:
 
 ```
-zeek -C -D -r <normalized.pcap> <package-data>/json-logs.zeek
+zeek -C -D -r <normalized.pcap> [ja4] <package-data>/json-logs.zeek
 ```
 
 - `-C` ignore checksum errors; `-D` deterministic seeds (**mandatory**).
 - `json-logs.zeek` adds a JSON `Log::add_filter` for `conn` and `ssl` writing `conn_json.log` / `ssl_json.log`. **One pass produces both formats, so TSV and JSON cannot disagree.**
 - TSV logs are the retained artifact in `zeek/`. The `_json` files are parse input and are removed from the retained output.
 - Parsed: `conn_json.log` → `Flow`; `ssl_json.log` → `ja4`, `ja4s`, `server_name` joined on `uid`. All other logs retained unparsed.
-- `packet_filter.log` carries a wall-clock stamp, is never reproducible, and is excluded from any reproducibility comparison.
-- Non-zero exit or an OOM kill → `tool_failures[]` entry; the run fails.
+- Non-zero exit or an OOM kill (which arrives as SIGKILL) → `tool_failures[]` entry; the run fails.
 
 ```python
 def run_zeek(capture: Path, outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]
 ```
 
+**Five corrections from step 5**, all measured against Zeek 8.0.4.
+
+**A tool failure is recorded *and* raised.** `run_zeek` puts the `ToolFailure` in
+`ZeekRunInfo.tool_failures` and raises `ToolError` with that same `ZeekRunInfo` attached as
+`run_info`. Recording without raising would let a run continue with no flows; raising without
+recording would lose the only description of what failed. Nothing untyped escapes — no `OSError`,
+`CalledProcessError` or `JSONDecodeError` reaches a caller. §9's consumer therefore catches
+`ToolError` and reads `.failures` and `.run_info` (see PLAN step 9).
+
+**`ja4` is loaded by name, explicitly, and probed first.** This invocation deliberately does not
+read `site/local.zeek` — an ambient local config would make the analysis depend on machine-local
+state — so nothing else would load the package, and JA4 would be silently absent on every flow.
+The probe (`zeek --parse-only -e '@load ja4'`, reading no packets and writing no logs) exists
+because `@load ja4` is **fatal** when the package is missing and Zeek has no load-if-present form:
+without it, a machine without the package could not run the pipeline at all. The outcome is
+recorded in `ja4_status` (§4) with three values, not two: "not installed" is the ordinary laptop
+case, while a broken `ZEEKPATH` or a half-finished `zkg` install is a defect, and reporting them
+as one hides the second. Either way the run continues — a capture is still worth labelling from
+rule matches, and §2.6 says a fingerprint is never a verdict.
+
+**A capture with zero connections writes no `conn.log` at all**, and that is a real result rather
+than a failure. Zeek's ASCII writer creates a log on the *first record written to that filter*, so
+an ARP/STP-only capture — or a pcap truncated before its first complete record, which this section
+accepts as partial input — produces neither `conn.log` nor `conn_json.log`. The retained TSV log is
+therefore the discriminator: **both absent means zero connections; `conn.log` present without
+`conn_json.log` means the JSON filter genuinely failed** and every flow in the capture would be
+lost, which fails the run per §2.5.
+
+**`ZeekRunInfo.flags` records flags and script names only, never the full argv.** The argv contains
+the normalized capture's path, which lives in a per-run directory and so differs on every run by
+construction: serialising it into `labels.json` would make two otherwise identical runs differ and
+break Goal 2, and it would leak host filesystem paths into a shipped artifact. The full argv is
+recorded on `ToolFailure.argv`, where it is diagnostic rather than part of the reproducibility
+contract.
+
+**`ja4_package_version` is the installed package's version, and it comes from the toolchain
+manifest.** `zkg list` is the only local source of that string, and shelling out to `zkg` from a
+labelling run risks the network call §2.2 forbids. Step 8 reads the version from
+`/etc/flabel-toolchain.json` instead; the Zeek stage reports only `ja4_status`.
+
 ### Suricata — `suricata.py`
 
 ```
-suricata -r <normalized.pcap> -S <snapshot>/rules.rules -l <outdir> \
+suricata -r <normalized.pcap> -c <package-data>/suricata.yaml \
+         -S <snapshot>/rules.rules -l <outdir> \
+         --set classification-file=<package-data>/classification.config \
+         --set default-rule-path=<snapshot>/data/<source> \
          --set app-layer.protocols.tls.ja3-fingerprints=yes \
          --set app-layer.protocols.tls.ja4-fingerprints=yes \
          --runmode single
@@ -374,9 +489,70 @@ suricata -r <normalized.pcap> -S <snapshot>/rules.rules -l <outdir> \
 
 - `-S` loads **only** the snapshot rules, replacing any system ruleset — no ambient state.
 - `--runmode single` for determinism of the alert set.
-- Parsed from `eve.json`: records with `event_type == "alert"` → `Detection`, taking `alert.signature_id`, `alert.rev`, `alert.category`, `alert.signature`, `alert.metadata`, `app_proto`, `timestamp`, and the 5-tuple.
-- The originating source for each SID is resolved from the snapshot manifest, since `eve.json` does not carry it.
+- Parsed from `eve.json`: records with `event_type == "alert"` → `Detection`, taking `alert.signature_id`, `alert.rev`, `alert.signature`, `alert.metadata`, `app_proto`, `timestamp`, and the 5-tuple.
+- The originating source for each SID is resolved from the snapshot's `sid_index.json` (§7), since `eve.json` does not carry it.
 - Detections whose source has `may_label == False` are **dropped before correlation** and counted in `identify_alerts_suppressed`.
+- Every path handed to the tool is absolute. Measured on 8.0.6: a relative `-S` resolves against the process's working directory, and §12's default `--rules-dir` is relative — so the ordinary case would otherwise depend on where flabel was launched from.
+
+**The invocation gained three things in step 6**, each measured rather than assumed.
+
+**flabel ships its own `suricata.yaml` and passes `-c`.** Without it Suricata reads the operator's
+`/etc/suricata/suricata.yaml`, and that file decides `HOME_NET` — hence whether an abuse.ch
+`$HOME_NET -> $EXTERNAL_NET` C2 rule can fire at all — the `classtype` description text that lands
+in provenance, whether alerts and stats are written to `eve.json` in the first place, and whether
+payloads, HTTP bodies and carved files are written into the run directory. flabel processes other
+people's captures; none of that may depend on an unreviewed setting on one machine. The config's
+sha256 is recorded in the run block, because a run is only reproducible against a *known*
+configuration.
+
+**`HOME_NET: any` and `EXTERNAL_NET: any`** (Craig, 2026-08-12). Measured against a real
+85,545-rule snapshot: only **3** rules negate `$HOME_NET`, while **1,397** are `$HOME_NET`-anchored.
+An RFC 1918 `HOME_NET` would therefore silently kill up to 1,397 rules on any capture whose own
+endpoints are publicly addressed — the common case for a capture flabel is handed. `EXTERNAL_NET`
+is forced to `any` by that choice: the stock `!$HOME_NET` against a `HOME_NET` of everything
+evaluates to the empty set, so every `$HOME_NET -> $EXTERNAL_NET` rule would match nothing, which
+is the opposite of the point. The cost is the 3 negating rules (§5), which cannot compile at all.
+The trade-off stated plainly: `any -> any` maximises the traffic each rule is tested against, and
+removes directionality as a false-positive filter. The benign canary is the standing check on that.
+
+**`--set default-rule-path=<snapshot>/data/<source>` is required for `dataset:` resolution.**
+Suricata resolves a rule's `dataset: ... load <file>` against the *rule path*, not against the
+config or the `-S` file. Measured: `default-rule-path=<snapshot>` gives 26 rule-load failures;
+the per-source data directory gives 0. Two consequences are recorded rather than discovered later:
+the setting takes **a single path**, so a second dataset-bearing feed cannot be satisfied at the
+same time and admitting one must fail loudly instead of letting half the rules quietly not load;
+and the `data/<source>/` layout is **not** flattenable, because `et/open` and `stamus/lateral` both
+ship a file called `LICENSE` and a flat directory would have them overwrite each other.
+
+**`Detection.classtype` is read from `classtype:` in the rule text, not from `alert.category`.**
+This section originally named `alert.category`, which is not the classtype: it is the *description*
+Suricata looks up by name in `classification.config`. So the text a label carried would depend on a
+file outside the rule — different wording on two machines for one rule, an empty string for any
+classtype that file omits, and, once the file became flabel's own, wording flabel would be
+inventing on the feed's behalf. The rule itself says `classtype:trojan-activity`, that text is
+inside the hashed snapshot, and it is what the feed actually asserted. A rule with no `classtype:`
+yields `None`, which is ordinary: 10,949 of 85,545 admitted rules declare none.
+
+**Tuple normalisation — Suricata's 5-tuple is translated into Zeek's spelling.** §9 correlates by
+comparing the two tools' tuples field by field, and they disagree on three things. Every rule here
+was measured against real Zeek output, not inferred:
+
+| Disagreement | Normalisation | Why |
+| :-- | :-- | :-- |
+| Protocol case | lowercase both sides | Zeek writes `tcp`, Suricata writes `TCP`. One side has to normalise or **no** detection would ever match. |
+| ICMP ports | mirror `icmp_type`/`icmp_code` into the port columns | Suricata omits ports for ICMP; Zeek writes the ICMP type in `id.orig_p` and a counterpart type in `id.resp_p`. Recording `(0, 0)` would make every ICMP detection unmatchable, and ET Open ships plenty of ICMP rules — 3 such alerts in 150 detections is enough to trip §9's 1% gate and fail a good run, with the run block blaming correlation. |
+| `IPv6-ICMP` | maps to `icmp` | Zeek's `transport_proto` holds only tcp/udp/icmp/unknown_transport, so it writes `icmp` for ICMPv6 too. Lowercasing alone would leave `ipv6-icmp` against `icmp`. The IP version is still readable from the addresses, so nothing is lost. |
+| IPv6 address form | canonicalise (compressed) | Suricata expands (`fd00:0000:...:00a1`), Zeek compresses (`fd00::a1`). Correlation compares strings, so without this every IPv6 detection is uncorrelatable. |
+
+**Residual, owned by step 7:** for an ICMPv6 echo, Zeek writes the counterpart *type* in
+`id.resp_p` (`128, 129`) where mirroring yields `128, 0`. A single alert record does not carry the
+counterpart type, so mirroring is exact for ICMPv4 and one field out for ICMPv6 echo. Closing it
+needs correlation to treat ICMP specially, not a different value here.
+
+**A partial rule load is a reported loss, not a silent one.** Suricata exits 0 whether it loaded
+every rule or none, so `rules_loaded`, `rules_failed` and `rules_skipped` are read from the eve
+`stats` record (falling back to `suricata.log`), and a run that cannot obtain those counts at all
+fails: an alert set whose ruleset cannot be attested is not evidence. See §11 for the gate.
 
 ```python
 def run_suricata(capture: Path, snapshot: Path, outdir: Path) -> tuple[list[Detection], SuricataRunInfo]
@@ -431,7 +607,59 @@ Reproducibility depends entirely on this being exact.
 - Timestamps: ISO-8601 UTC with microsecond precision and a `Z` suffix. One format everywhere.
 - Floats never emitted where a string is expected; no locale-dependent formatting.
 
-**Excluded from a reproducibility comparison** — and nothing else: `run.started_at`, `run.finished_at`, `run.duration_seconds`, and `zeek/packet_filter.log`.
+### Reproducibility is over records, after canonicalisation — not bytes
+
+**This section originally claimed byte-identity, excluding `run.started_at`,
+`run.finished_at`, `run.duration_seconds` and `zeek/packet_filter.log` "and nothing else". That
+claim is wrong and unachievable**, found in step 5 and confirmed in step 6. Every Zeek TSV log
+carries `#open` and `#close` wall-clock header lines, so **no** Zeek log is byte-identical across
+two runs and a byte comparison would fail on all of them, not just the one named. A filename
+exclusion list is also the wrong shape for the problem: it forces a whole log to be dropped over a
+single wall-clock line inside it.
+
+So Goal 2 compares **records after canonicalisation**. Canonicalisation drops `#`-prefixed header
+lines, which is where Zeek puts every wall-clock value; what remains is the analytic content.
+
+**Excluded from the comparison entirely:**
+
+| Excluded | Why |
+| :-- | :-- |
+| `run.started_at`, `run.finished_at`, `run.duration_seconds` | Wall-clock by definition. |
+| `run.input.path` | The operator's own file path (see below). |
+| `zeek/packet_filter.log` | Nothing but a wall-clock start time, and no analytic content to compare. Retained rather than deleted — deleting a log Zeek wrote would misrepresent the run. |
+| `suricata/suricata.log` | Wall-clock timestamp *and* pid on every line. Nothing in it is analytic output. |
+| `stats` records within `suricata/eve.json` | Wall-clock counters. **Only** the `stats` records: `alert` and `flow` records are byte-stable, and they are exactly what a reproducibility gate should be comparing. Excluding the file wholesale would exclude the alerts. |
+
+**Canonicalised, not excluded: `zeek/reporter.log`.** It is *conditionally* non-reproducible, which
+is why the filename list could not express it. A message raised in `zeek_init` carries wall-clock
+time even under `-D` (verified); a message raised while reading packets carries **network** time and
+is reproducible run to run. Dropping the file wholesale would hide exactly the protocol violations
+Goal 3 wants reported, so it is canonicalised like any other log.
+
+### Field definitions, as built
+
+These four were ambiguous enough that step 3 had to decide them; the decisions are recorded here so
+a consumer reads the numbers the way they are meant.
+
+- **`packets_read` counts *complete* records in the decompressed input.** An incomplete tail record
+  is not counted, and it is **not** in `discarded_packets` either — `truncated_at_offset` is the
+  only field that reports it. So `discarded_packets: 0` on a truncated capture is correct, not a
+  bug: that counter is for link-type discards.
+- **The normalized file holds `packets_read - discarded_packets` packets.** Stated because it is the
+  only relation between the three counters, and a reader would otherwise have to guess whether the
+  truncated tail is inside `packets_read`.
+- **`truncated_at_offset` indexes the *uncompressed* stream.** For a `.pcap.gz` it therefore does
+  **not** index the file on disk — the offset is where the record walk stopped, and the walk runs
+  after decompression. An operator repairing the capture must decompress first.
+- **`sha256` and `bytes` describe the input as it was handed over**, so a `.gz` hashes and measures
+  compressed. They identify the operator's artifact, which is what provenance needs; the normalized
+  capture is derived and reproducible from it.
+
+**`run.input.path` is the operator's original path** (`NormalizedCapture.original_path`), never the
+normalized copy, because the normalized copy lives in a per-run temporary directory that means
+nothing to a reader. That makes it **the one input field a reproducibility comparison must exclude
+or normalise**: the same capture labelled from two directories would otherwise differ and fail Goal
+2, which would be a false alarm about the pipeline.
 
 ### Run block
 
@@ -450,15 +678,24 @@ Reproducibility depends entirely on this being exact.
   "ruleset": {"snapshot_id": str, "sources": [...SourceAdmission...],
               "total_admitted": int, "total_ja4_admitted": int},
   "tools": {"zeek": str, "zeek_flags": ["-C", "-D"], "suricata": str,
-            "editcap": str, "ja4_zeek_package": str},
+            "editcap": str, "ja4_zeek_package": str | None,
+            "ja4_status": "present|not-installed|probe-failed" | None,
+            "suricata_config_sha256": str},
   "counts": {"flows": int, "detections": int, "labels": int,
              "unmatched": int, "unmatched_ratio": float,
-             "identify_alerts_suppressed": int},
+             "identify_alerts_suppressed": int,
+             "rules_loaded": int, "rules_failed": int, "rules_skipped": int},
   "loss_conditions": {...},               # §11
   "tool_failures": [ ... ],
   "warnings": [str]
 }
 ```
+
+**Five keys were added to the run block in steps 5 and 6**, each because the model field behind it
+had nowhere to surface: `tools.ja4_status` and `tools.suricata_config_sha256`, and
+`counts.rules_loaded` / `rules_failed` / `rules_skipped`. `tools.ja4_zeek_package` is now nullable —
+it holds a real package version read from the toolchain manifest, or nothing, and never a status
+string standing in for one (§8).
 
 ### `NOTICE` — `notice.py`
 
@@ -479,6 +716,24 @@ Each has a field and exactly one fault-injection test. This closed list is what 
 | Tool non-zero exit / OOM | `tool_failures[]` | point at a non-existent binary |
 | Snapshot missing | hard failure, exit 1 | `--ruleset-snapshot nonexistent` |
 | `identify` alert suppressed | `counts.identify_alerts_suppressed` | rule from an `identify` source that fires |
+| Rules failed or skipped at load | `counts.rules_failed`, `counts.rules_skipped` | snapshot containing a rule this engine cannot compile |
+| JA4 unavailable | `tools.ja4_status` | run with the `ja4` package absent from `ZEEKPATH` |
+
+**Two rows added in steps 5 and 6.** Both are losses the tools report and then exit 0 over, which
+is the shape §2.5 exists to catch.
+
+**Rules failed or skipped at load: record always, warn above zero, fail above a threshold** (Craig,
+2026-08-12). Suricata loads what it can and exits 0, so a snapshot of 85,545 rules loading as
+85,519 is a run that looks complete and never examined the capture with 26 of its rules. Any
+shortfall is worth saying out loud, and a large one means the snapshot and the engine disagree about
+what a rule is — but a hard failure on *any* shortfall would fail real runs over a handful of rules
+using a keyword this build lacks, which is why the threshold exists. Rules the engine is known in
+advance to reject are excluded at admission instead (§5), so the counters describe surprises rather
+than known incompatibilities.
+
+**JA4 unavailable: `tools.ja4_status`, so a null `ja4` cannot be mistaken for "no TLS in this
+capture".** Those are different facts about a flow, and with no field to hold the difference a
+consumer training on the output would read a missing package as an observation.
 
 ---
 
