@@ -1,15 +1,51 @@
-# Minimal CI: lint + tests on every push/PR.
+# CI: lint on a plain runner, tests inside the pinned toolchain container.
+#
+# The container is the whole point. Zeek, Suricata and editcap are invoked for real in tests
+# (docs/spec.md §2), so a bare ubuntu-latest runner cannot execute this suite — it could only
+# skip it, which is precisely the failure mode --require-tool-tests exists to prevent.
+#
+# The image is pinned by digest, not tag. It is built by .github/workflows/toolchain.yml,
+# which prints the digest to paste here.
 name: CI
 on: [push, pull_request]
+
+permissions:
+  contents: read
+  packages: read
+
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --dev
+      - run: uv sync --locked --dev
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pytest -q
+
+  test:
+    runs-on: ubuntu-latest
+    container:
+      # zeek 8.0.9, suricata 8.0.6, wireshark 4.6.6, zeek/foxio/ja4 v0.18.8.
+      # Built from Dockerfile.toolchain by the `toolchain` workflow; run
+      # `docker run --rm <image> cat /etc/flabel-toolchain.json` to see what it ships.
+      image: ghcr.io/deeptempo/flabel-toolchain@sha256:508f104abe1b33d0b21c7807e52832efb7e6107bfa1ce71180d83a65e4094732
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain the image ships
+        run: cat /etc/flabel-toolchain.json
+
+      # uv is baked into the image, so no setup action is needed here.
+      - run: uv sync --locked --dev
+
+      # --require-tool-tests: fail unless a real-tool test actually ran, so a skipped
+      #                       integration layer can never be mistaken for a passing build.
+      # --strict-toolchain:   tool versions must match [tool.flabel.toolchain] exactly and
+      #                       the Zeek JA4 package must be present.
+      - run: uv run pytest -q --require-tool-tests --strict-toolchain

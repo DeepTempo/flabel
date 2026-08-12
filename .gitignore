@@ -1,6 +1,9 @@
 # Local-only: GCP teardown manifests (IAM, service accounts, network topology)
 archive/
 
+# Ruleset snapshots and run state (default --rules-dir root, docs/spec.md §7)
+.flabel/
+
 # Capture data and tool output — never in git
 *.pcap
 *.pcapng

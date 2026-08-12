@@ -1,0 +1,147 @@
+# flabel CI toolchain.
+#
+# The testing line is "tools real, network stubbed" (docs/spec.md §2): Zeek, Suricata and
+# editcap are invoked for real in tests, never mocked. This image is how CI gets them, and
+# it is pinned by digest in .github/workflows/ci.yml because reproducibility across
+# unpinned tool versions is meaningless (Goal 2, docs/prd.md §"CI toolchain container").
+#
+# Base is Ubuntu 24.04 rather than the smaller zeek/zeek image because Suricata 8.x comes
+# from the OISF PPA, which is Ubuntu-only — and Debian's own suricata is far too old.
+#
+# Versions installed here must match [tool.flabel.toolchain] in pyproject.toml. CI asserts
+# that with `pytest --strict-toolchain`, so drift fails the build rather than going unnoticed.
+#
+# amd64 is pinned, not incidental: the OBS Zeek repo publishes amd64 and `all` only — there
+# is no arm64 build (verified: .../xUbuntu_24.04/arm64/ is a 404). Without the pin this
+# builds cleanly on an x86 runner and fails confusingly on an Apple-silicon laptop. On
+# Apple silicon it runs under emulation; for native local work use brew (docs/dev-setup.md).
+#
+# The base is pinned by digest, not by the `24.04` tag: that tag moves, and a different
+# libpcap underneath a pcap pipeline is not a cosmetic difference.
+FROM --platform=linux/amd64 ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
+
+# Exact package versions, so this file *installs* the pins rather than merely describing
+# what some past build happened to get. The apt repos serve only the newest patch per line,
+# so an upstream release eventually makes these unavailable and the image build fails —
+# loudly and on purpose. See docs/dev-setup.md §"Version pins".
+ARG ZEEK_VERSION=8.0
+ARG ZEEK_PACKAGE_VERSION=8.0.9-0
+ARG SURICATA_PACKAGE_VERSION=1:8.0.6-0ubuntu0
+ARG WIRESHARK_PACKAGE_VERSION=4.6.6-1~ubuntu24.04.0~ppa1
+# zeek/foxio/ja4 is JA4+ under FoxIO License 1.1 (non-commercial), the approved default
+# while Legal reviews it; plain JA4 (BSD 3-Clause) is the documented contingency.
+# See docs/prd.md §13 Q3 and docs/dev-setup.md.
+#
+# Two pins, because a git tag is mutable and this package's version changes the JA4 value
+# carried on labels: the tag is what zkg installs, the commit is what it must resolve to.
+# If upstream ever moves the tag, the build fails instead of silently shipping other code.
+ARG JA4_PACKAGE_VERSION=v0.18.8
+ARG JA4_PACKAGE_COMMIT=3ecddb5f1d0b92210535171a62901bf3d596c7b8
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/opt/zeek/bin:$PATH
+
+# --- Zeek, Suricata, Wireshark ------------------------------------------------------------
+# Zeek: openSUSE Build Service, the project's own packages (they install into /opt/zeek).
+# Suricata: ppa:oisf/suricata-stable, which tracks the current 8.x line.
+# Wireshark: ppa:wireshark-dev/stable — noble's own wireshark is 4.2.x, too old for a 4.6
+#   pin. wireshark-common carries editcap and capinfos; the setuid prompt is preseeded off
+#   because nothing here captures live traffic.
+#
+# The Zeek signing key goes in /etc/apt/keyrings with `signed-by=` rather than into
+# trusted.gpg.d, which would make it a valid signer for *every* repo including Ubuntu's own,
+# and its fingerprint is asserted before it is trusted — otherwise this is trust-on-first-use
+# over whatever download.opensuse.org served, with root-level package installation at stake.
+# The expected fingerprint is a literal, not an ARG: an ARG is overridable with --build-arg,
+# which would defeat the assertion for exactly the person most likely to be attacked.
+# uid: security OBS Project <security@build.opensuse.org>
+#
+# The two PPAs still get trust-on-first-use keys. On noble `add-apt-repository` writes a
+# deb822 .sources file with an inline Signed-By, so each key is scoped to its own repo rather
+# than trusted globally — a smaller problem than this key was, but not the same treatment.
+# wireshark-dev supplies editcap, which normalizes every capture, so it is worth knowing.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg software-properties-common \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL "https://download.opensuse.org/repositories/security:zeek/xUbuntu_24.04/Release.key" \
+        | gpg --dearmor > /etc/apt/keyrings/security-zeek.gpg \
+    && expected=F9FA0223B56B116C363737EF5DA57BDD6DD785CA \
+    && colons="$(gpg --show-keys --with-colons /etc/apt/keyrings/security-zeek.gpg)" \
+    && served="$(echo "$colons" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;exit}')" \
+    && keys="$(echo "$colons" | grep -c '^pub:' || true)" \
+    && if [ "$keys" != "1" ] || [ "$served" != "$expected" ]; then \
+           echo "Zeek repo key check failed." >&2; \
+           echo "  expected exactly 1 primary key, fingerprint $expected" >&2; \
+           echo "  served $keys key(s), primary fingerprint: ${served:-none}" >&2; \
+           echo "signed-by trusts EVERY key in this file, so an extra key is as bad as a wrong" >&2; \
+           echo "one. OBS keys do rotate: verify upstream, then update the literal above." >&2; \
+           exit 1; \
+       fi \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/security-zeek.gpg] http://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/ /" \
+        > /etc/apt/sources.list.d/security-zeek.list \
+    && add-apt-repository -y ppa:oisf/suricata-stable \
+    && add-apt-repository -y ppa:wireshark-dev/stable \
+    && echo "wireshark-common wireshark-common/install-setuid boolean false" | debconf-set-selections \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        "zeek-${ZEEK_VERSION}=${ZEEK_PACKAGE_VERSION}" \
+        "zeek-${ZEEK_VERSION}-zkg=${ZEEK_PACKAGE_VERSION}" \
+        "suricata=${SURICATA_PACKAGE_VERSION}" \
+        "wireshark-common=${WIRESHARK_PACKAGE_VERSION}" \
+        git \
+        python3 \
+        python3-git \
+        python3-semantic-version \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Zeek JA4 package ---------------------------------------------------------------------
+# JA4 is computed by Zeek and is the single authority for the value carried on a label
+# (docs/prd.md §9), so step 5 needs this package present, not optional.
+#
+# zkg ships with `#!/usr/bin/env python3`, which resolves through PATH. Anything running
+# inside `uv run` puts the project virtualenv first, and that interpreter has none of zkg's
+# dependencies — so zkg breaks only when called from a test, which is the one place it needs
+# to work. Bind it to the interpreter that actually has GitPython and semantic-version.
+RUN sed -i '1s|.*|#!/usr/bin/python3|' "$(command -v zkg)"
+
+RUN set -eu; \
+    zkg autoconfig; \
+    zkg install --force --version "${JA4_PACKAGE_VERSION}" zeek/foxio/ja4; \
+    clone="$(zkg config | sed -n 's/^state_dir = //p' | head -1)/clones/package/ja4"; \
+    resolved="$(git -C "$clone" rev-parse HEAD)"; \
+    if [ "$resolved" != "${JA4_PACKAGE_COMMIT}" ]; then \
+        echo "ja4 tag ${JA4_PACKAGE_VERSION} resolved to $resolved, expected ${JA4_PACKAGE_COMMIT}." >&2; \
+        echo "A moved tag changes JA4 values on labels. Verify upstream, then update the pin." >&2; \
+        exit 1; \
+    fi; \
+    zeek --parse-only -e '@load ja4'
+
+# --- uv -----------------------------------------------------------------------------------
+# Pinned by digest as well as tag, for the same reason as the base image.
+COPY --from=ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a /uv /usr/local/bin/uv
+
+# --- Recorded versions --------------------------------------------------------------------
+# Written once at build time so CI (and later provenance.py) can read the exact versions
+# instead of re-parsing --version output, and so `docker run <image> cat` documents itself.
+# A test asserts every field here equals its pin in [tool.flabel.toolchain], so an empty or
+# malformed value must fail the build rather than ship. `grep | head` always exits 0, so each
+# field is checked for emptiness explicitly — a changed --version format would otherwise
+# record "" and still succeed.
+RUN set -eu; \
+    semver() { grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }; \
+    zeek_v="$(zeek --version | semver)"; \
+    suricata_v="$(suricata -V | semver)"; \
+    wireshark_v="$(editcap --version | semver)"; \
+    uv_v="$(uv --version | semver)"; \
+    clone="$(zkg config | sed -n 's/^state_dir = //p' | head -1)/clones/package/ja4"; \
+    ja4_commit="$(git -C "$clone" rev-parse HEAD)"; \
+    for pair in "zeek:$zeek_v" "suricata:$suricata_v" "wireshark:$wireshark_v" "uv:$uv_v" \
+                "ja4_commit:$ja4_commit"; do \
+        case "$pair" in *:) echo "empty version for ${pair%:*} — parse failed" >&2; exit 1;; esac; \
+    done; \
+    printf '{\n  "zeek": "%s",\n  "suricata": "%s",\n  "wireshark": "%s",\n' \
+        "$zeek_v" "$suricata_v" "$wireshark_v" > /etc/flabel-toolchain.json; \
+    printf '  "ja4_zeek_package": "%s",\n  "ja4_zeek_commit": "%s",\n  "uv": "%s"\n}\n' \
+        "${JA4_PACKAGE_VERSION}" "$ja4_commit" "$uv_v" >> /etc/flabel-toolchain.json; \
+    cat /etc/flabel-toolchain.json
+
+WORKDIR /work

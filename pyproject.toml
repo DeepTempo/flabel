@@ -22,6 +22,19 @@ dev = [
     "ruff>=0.6",
 ]
 
+[tool.flabel.toolchain]
+# Exact versions installed by Dockerfile.toolchain. This is the reproducibility contract
+# for Goal 2 — identity across unpinned tool versions is meaningless (docs/prd.md §"CI
+# toolchain container"). Tests assert major.minor by default so brew-based local dev works;
+# CI adds --strict-toolchain to assert these exact strings. Bump them with the image.
+zeek = "8.0.9"
+suricata = "8.0.6"
+wireshark = "4.6.6"  # supplies both editcap and capinfos
+ja4_zeek_package = "v0.18.8"  # git tag of zeek/foxio/ja4; JA4+ under FoxIO License 1.1
+# Tags are mutable and this package changes JA4 values on labels, so the resolved commit
+# is pinned too. The image build fails if the tag ever stops resolving to it.
+ja4_zeek_commit = "3ecddb5f1d0b92210535171a62901bf3d596c7b8"
+
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
@@ -31,4 +44,12 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# --strict-markers: every gate mechanism keys on the literal marker name `requires_tools`,
+#   so a typo like `require_tools` would produce a test that is neither skipped without the
+#   toolchain, nor counted by the gate, nor noticed when deselected. Make it an error.
+# -p pytester: test_tool_gate.py runs pytest-in-pytest to prove the toolchain gate fails
+#   when it should. Loading the plugin only registers its fixtures.
+addopts = "-ra --strict-markers -p pytester"
+markers = [
+    "requires_tools: invokes the real Zeek/Suricata/Wireshark toolchain (see docs/spec.md §2)",
+]
