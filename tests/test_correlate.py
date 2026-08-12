@@ -512,13 +512,18 @@ def test_the_counterpart_table_is_chosen_by_address_family():
 def test_a_detection_whose_source_is_absent_from_the_manifest_raises():
     """Spec §9: a typed `SnapshotError`, matching §8's handling of a SID owned by no source.
 
-    A bare `ValueError` reaches the operator as a traceback rather than a reason, and dropping
-    the detection instead would emit a run that exits 0 having lost it.
+    The `KeyError` the lookup raises on its own reaches the operator as a traceback rather than
+    a reason, and dropping the detection instead would emit a run that exits 0 having lost it.
+    The message names both halves of the mismatch — the source and the snapshot that does not
+    describe it — because either one alone leaves the reader guessing which is wrong.
     """
     detection = make_detection(source="abuse.ch/urlhaus")
 
-    with pytest.raises(SnapshotError, match="abuse.ch/urlhaus"):
+    with pytest.raises(SnapshotError) as raised:
         correlate([detection], by_uid(make_flow()), make_manifest())
+
+    assert "abuse.ch/urlhaus" in str(raised.value)
+    assert SNAPSHOT_ID in str(raised.value)
 
 
 def test_an_identify_detection_is_a_hard_failure_not_a_filter():
@@ -606,11 +611,12 @@ def test_the_terms_come_from_the_manifest_not_the_live_registry():
     assert (entry.licence, entry.admission_basis) == ("CC0-1.0", "wholesale")
 
 
-def test_the_manifest_sources_are_read_as_a_tuple_of_records():
-    """`SnapshotManifest.sources` is a `tuple`, and this is what proves the indexing is real.
+def test_the_right_admission_is_found_in_a_multi_source_snapshot():
+    """`SnapshotManifest.sources` is a tuple; `sources_by_name` is the index (#49).
 
-    A dict-shaped assumption (`manifest.sources[detection.source]`) raises `TypeError` on a
-    tuple, which is loud — but an implementation that only ever looked at `sources[0]` is not.
+    A dict-shaped assumption about the tuple itself raises `TypeError`, which is loud — but an
+    implementation that only ever looked at `sources[0]` is not, and against a single-source
+    manifest it is indistinguishable from a correct one.
     """
     manifest = make_manifest(
         make_admission(name="stamus/lateral", licence="GPL-3.0"),

@@ -116,7 +116,11 @@ def correlate(
     `threshold` of the detections could not be placed.
     """
     _check_threshold(threshold)
-    admissions = _index(manifest)
+    # From the manifest rather than built here (#49). `sources` is a tuple, and the
+    # comprehension that indexes it is the same one `suricata.py` needs; two copies would carry
+    # two copies of the duplicate-name hazard `SnapshotManifest.__post_init__` now rejects.
+    # Read once into a local, because the property rebuilds the mapping on every access.
+    admissions = manifest.sources_by_name
 
     # Every entry is built *before* any matching, so the guards inside `build_source_entry` run
     # over the whole detection set rather than over the subset that happened to correlate. An
@@ -124,11 +128,7 @@ def correlate(
     # a tuple that matches, and a snapshot id no reader can resolve is broken whether or not
     # this particular capture produced a label from it.
     entries = [
-        (
-            detection,
-            build_source_entry(detection, _admission(detection, admissions), manifest.snapshot_id),
-        )
-        for detection in detections
+        (detection, _entry(detection, admissions, manifest.snapshot_id)) for detection in detections
     ]
 
     matched: dict[str, list[SourceEntry]] = {}
@@ -241,33 +241,30 @@ def _counterparts(address: str) -> Mapping[int, int]:
 # --- provenance ------------------------------------------------------------------------------
 
 
-def _index(manifest: SnapshotManifest) -> Mapping[str, SourceAdmission]:
-    """`manifest.sources` indexed by name — it is a tuple of records, not a mapping.
-
-    Duplicate names are a known unchecked case: `_read_manifest` does not reject them and this
-    keeps the last. Tracked separately rather than papered over here (PLAN step 7).
-    """
-    return {admission.name: admission for admission in manifest.sources}
-
-
-def _admission(detection: Detection, admissions: Mapping[str, SourceAdmission]) -> SourceAdmission:
-    """The snapshot's record of this detection's source.
+def _entry(
+    detection: Detection, admissions: Mapping[str, SourceAdmission], snapshot_id: str
+) -> SourceEntry:
+    """This detection's provenance, built from the snapshot's record of its source.
 
     A source the snapshot does not describe is a hard failure, matching §8's handling of a SID
     that belongs to no source: `-S` loads only snapshot rules and §8 resolves every alert's
     source through `sid_index.json`, so this should be unreachable. Failing rather than
     dropping is the same reasoning as there — the alternative is a label with an invented
-    origin. `SnapshotError` rather than a bare `ValueError` so it reaches the operator as a
-    reason and exit 1, not as a traceback.
+    origin. `SnapshotError` rather than the `KeyError` the lookup would raise, so it reaches
+    the operator as a reason and exit 1 rather than as a traceback.
+
+    Everything past the lookup belongs to `build_source_entry`, which is where `label_basis`,
+    `admission_basis` and `licence` are derived — once, for this step and step 8 both.
     """
     try:
-        return admissions[detection.source]
+        admission = admissions[detection.source]
     except KeyError:
         raise SnapshotError(
-            f"detection sid {detection.sid} names source {detection.source!r}, which is not in "
-            f"snapshot {sorted(admissions)}: its label would cite an origin the snapshot cannot "
-            f"account for"
+            f"detection sid {detection.sid} names source {detection.source!r}, which snapshot "
+            f"{snapshot_id} does not describe (it has {sorted(admissions)}): its label would "
+            f"cite an origin the snapshot cannot account for"
         ) from None
+    return build_source_entry(detection, admission, snapshot_id)
 
 
 # --- consolidation ---------------------------------------------------------------------------
