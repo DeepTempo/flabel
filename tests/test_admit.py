@@ -19,7 +19,7 @@ from flabel import config
 from flabel.errors import ConfigError
 from flabel.models import SourceAdmission, SourceSpec
 from flabel.rules import utc_now
-from flabel.rules.admit import SEVERITY_KEY, admit
+from flabel.rules.admit import SEVERITY_KEY, admit, negates_home_net
 
 FIXTURES = Path(__file__).parent / "fixtures" / "rules"
 
@@ -127,8 +127,9 @@ def _rules_with_sids(*wanted: int) -> list[str]:
         (et_open(), "et_open_metadata.rules"),
         (wholesale(), "et_open_metadata.rules"),
         (wholesale(), "ioc_wholesale.rules"),
+        (wholesale("pawpatrules"), "home_net_negated.rules"),
     ],
-    ids=["filtered-et", "wholesale-et", "wholesale-ioc"],
+    ids=["filtered-et", "wholesale-et", "wholesale-ioc", "wholesale-unloadable"],
 )
 def test_fetched_equals_admitted_plus_every_exclusion(spec: SourceSpec, fixture: str):
     """Spec §6's identity. If it ever fails, rules went missing unaccounted for."""
@@ -139,6 +140,7 @@ def test_fetched_equals_admitted_plus_every_exclusion(spec: SourceSpec, fixture:
         + counts.rules_excluded_no_confidence
         + counts.rules_excluded_low_confidence
         + counts.rules_excluded_low_severity
+        + counts.rules_excluded_unloadable
     )
 
 
@@ -238,6 +240,134 @@ def test_a_disabled_fingerprint_rule_is_not_counted_as_admitted():
         FETCHED_AT,
     )
     assert (counts.ja4_rules_admitted, counts.rules_excluded_commented) == (0, 1)
+
+
+# --- rules this engine cannot load ---------------------------------------------------------
+#
+# pawpatrules sids 3300158, 3300159 and 3321393 are written `alert udp $HOME_NET any ->
+# ![...,$HOME_NET]`, and with flabel's `HOME_NET: any` Suricata 8.0.6 refuses all three:
+# "Complete IP space negated. Rule address range is NIL." That is not a config bug — nothing can
+# make `$HOME_NET` mean everything and `!$HOME_NET` mean something — and it is not survivable
+# either: a rejected rule leaves Suricata exiting 0 with a load count short of the snapshot,
+# which `suricata._check_ruleset_loaded` turns into a hard failure. So they are excluded here.
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "alert udp $HOME_NET any -> !$HOME_NET 53 ",
+        "alert udp $HOME_NET any -> ![10.0.0.0/8,$HOME_NET] 123 ",
+        "alert udp $HOME_NET any -> ![10.0.0.0/8,[172.16.0.0/12,$HOME_NET]] 5353 ",
+        "alert tcp !$HOME_NET any -> $HOME_NET 445 ",
+        "alert tcp !$HOME_NET any -> !$HOME_NET any ",
+    ],
+    ids=["bare", "list", "nested-list", "source-side", "both-sides"],
+)
+def test_a_negated_home_net_is_recognised_in_every_shape(header: str):
+    assert negates_home_net(f'{header}(msg:"x"; sid:1; rev:1;)')
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "alert tcp $HOME_NET any -> $EXTERNAL_NET any ",
+        "alert tcp $HOME_NET any -> !$EXTERNAL_NET 445 ",
+        "alert tcp [$HOME_NET,10.0.0.0/8] any -> any 445 ",
+        "alert tcp any any -> ![10.0.0.0/8,192.168.0.0/16] any ",
+        "alert tcp $HOME_NET any -> !$HOME_NETWORKS any ",
+    ],
+    ids=["plain", "other-variable", "unnegated-list", "no-variable", "longer-variable-name"],
+)
+def test_a_rule_that_does_not_negate_home_net_is_left_alone(header: str):
+    """The near-misses. Over-matching here would silently delete rules the engine loads fine.
+
+    `!$HOME_NETWORKS` is the one that a substring test gets wrong: `$HOME_NET` is a prefix of
+    it, so a `"$HOME_NET" in negated_text` check without a delimiter would exclude a rule about
+    an entirely different variable.
+    """
+    assert not negates_home_net(f'{header}(msg:"x"; sid:1; rev:1;)')
+
+
+def test_a_bang_in_the_options_block_is_not_an_address_negation():
+    """`isdataat:!1,relative` is ordinary in real feeds, and `content:` can hold anything.
+
+    Only the header is examined — everything before the options block — which is where
+    Suricata's own parser splits the rule too.
+    """
+    rule = (
+        'alert tcp $HOME_NET any -> any any (msg:"x"; content:"![$HOME_NET]"; '
+        "isdataat:!1,relative; sid:1; rev:1;)"
+    )
+    assert not negates_home_net(rule)
+
+
+def test_rules_that_negate_home_net_are_excluded_into_their_own_counter():
+    """The fixture carries all four negation shapes and three near-misses.
+
+    Excluded rather than admitted-and-then-failed: Suricata exits 0 on a rule it rejected, and
+    the shortfall against the snapshot then fails the whole run — so admitting these would cost
+    every label, not three rules.
+    """
+    admitted, counts = admit(
+        wholesale("pawpatrules"), rule_lines("home_net_negated.rules"), FETCHED_AT
+    )
+
+    assert sids(admitted) == {7200005, 7200006, 7200007}
+    assert counts.rules_fetched == 7
+    assert counts.rules_admitted == 3
+    assert counts.rules_excluded_unloadable == 4
+    # Nothing about these rules' *content* is at fault, so nothing lands in a metadata bucket.
+    assert (
+        counts.rules_excluded_no_confidence
+        + counts.rules_excluded_low_confidence
+        + counts.rules_excluded_low_severity
+    ) == 0
+
+
+def test_the_metadata_filter_still_owns_a_rule_it_would_have_excluded_anyway():
+    """A rule that fails the metadata filter *and* negates `$HOME_NET` stays a metadata miss.
+
+    The order matters to issue #11's question: "low severity" has to keep reading as "would have
+    been admitted but for its severity". If the unloadable test ran first, that count would
+    quietly mean something else.
+    """
+    both = (
+        "alert udp $HOME_NET any -> !$HOME_NET 53 "
+        '(msg:"low confidence and unloadable"; metadata:confidence Low, '
+        "signature_severity Major; sid:1; rev:1;)"
+    )
+    passes = (
+        "alert tcp $HOME_NET any -> $EXTERNAL_NET any "
+        '(msg:"admitted"; metadata:confidence High, signature_severity Major; sid:2; rev:1;)'
+    )
+
+    admitted, counts = admit(et_open(), [both, passes], FETCHED_AT)
+
+    assert sids(admitted) == {2}
+    assert counts.rules_excluded_low_confidence == 1
+    assert counts.rules_excluded_unloadable == 0
+
+
+def test_a_feed_of_nothing_but_unloadable_rules_is_a_hard_failure():
+    """Zero admitted is a hard failure however it happened — and this cause reads differently.
+
+    "Every rule negates a `HOME_NET` of `any`" is a configuration flabel cannot run the feed
+    under, not a feed that changed shape, so the message says so rather than sending the
+    operator to look for a missing `confidence` key.
+    """
+    with pytest.raises(ConfigError) as raised:
+        admit(
+            wholesale("pawpatrules"),
+            [
+                'alert udp $HOME_NET any -> !$HOME_NET 53 (msg:"a"; sid:1; rev:1;)',
+                'alert udp $HOME_NET any -> ![10.0.0.0/8,$HOME_NET] 123 (msg:"b"; sid:2; rev:1;)',
+            ],
+            FETCHED_AT,
+        )
+
+    message = str(raised.value)
+    assert "negates $HOME_NET" in message
+    assert "Complete IP space negated" in message, "the engine's own wording, so it is greppable"
 
 
 # --- zero admitted rules is a hard failure, from any source --------------------------------
