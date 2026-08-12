@@ -1,0 +1,15 @@
+# flabel test fixture — what an ET-style feed looks like the day upstream stops publishing
+# `confidence`. Every rule still carries metadata, and every rule still looks healthy; the
+# one key the admission filter gates on is simply gone.
+#
+# A metadata-filter source in this state must be a HARD FAILURE (PLAN.md step 4). The
+# load-time registry check cannot catch it — it validates the source *name*, not the fetched
+# content — and the filter's output (zero admitted) is indistinguishable from a feed that
+# legitimately matched nothing. Silently admitting nothing would drop ~21,000 rules from a
+# run whose labels.json would still read as complete.
+#
+# Synthetic; sid block 2100000.
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST untagged one"; flow:established,to_server; http.uri; content:"/flabel-untagged-1"; metadata:created_at 2024_01_01, deployment Perimeter, signature_severity Major, updated_at 2024_01_02; classtype:trojan-activity; sid:2100001; rev:1;)
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST untagged two"; flow:established,to_server; http.uri; content:"/flabel-untagged-2"; metadata:created_at 2024_01_01, deployment Perimeter, signature_severity Critical, updated_at 2024_01_02; classtype:trojan-activity; sid:2100002; rev:1;)
+alert tcp $HOME_NET any -> $EXTERNAL_NET any (msg:"FLABEL TEST untagged three"; flow:established,to_server; content:"flabel-untagged-3"; metadata:created_at 2024_01_01, deployment Perimeter, updated_at 2024_01_02; classtype:trojan-activity; sid:2100003; rev:1;)

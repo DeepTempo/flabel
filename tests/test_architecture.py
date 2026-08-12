@@ -98,7 +98,17 @@ def test_pure_modules_are_all_accounted_for():
 
     Without this, adding a module quietly opts it out of the I/O guard.
     """
-    impure = {"ingest.py", "zeek.py", "suricata.py", "cli.py", NETWORK_MODULE}
+    # rules/snapshot.py is impure because it *writes* files. config.py reads the registry and
+    # is classified pure (spec §3 counts a filesystem read as pure), so the line between them
+    # is writing, not touching the disk at all.
+    impure = {
+        "ingest.py",
+        "zeek.py",
+        "suricata.py",
+        "cli.py",
+        "rules/snapshot.py",
+        NETWORK_MODULE,
+    }
     classified = set(PURE_MODULES) | impure | {"__init__.py", "rules/__init__.py"}
 
     present = {

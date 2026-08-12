@@ -87,6 +87,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         "zeek-${ZEEK_VERSION}-zkg=${ZEEK_PACKAGE_VERSION}" \
         "suricata=${SURICATA_PACKAGE_VERSION}" \
         "wireshark-common=${WIRESHARK_PACKAGE_VERSION}" \
+        # tshark, for selecting one link type out of a multi-interface pcapng. editcap can
+        # only take packet-number ranges, which grow to one range per packet when interfaces
+        # interleave — the normal shape of `dumpcap -i a -i b` — so a real dual-interface
+        # capture would blow past ARG_MAX and hard-fail where spec §8 promises partial output.
+        "tshark=${WIRESHARK_PACKAGE_VERSION}" \
         git \
         python3 \
         python3-git \
