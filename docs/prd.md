@@ -53,7 +53,7 @@ All five goals apply to **Phase 1**. Goal 6 is a Phase 1 design constraint verif
 | | Goal | How it is verified |
 | :-: | :-- | :-- |
 | **Goal 1** | **Every label is traceable to its origin.** A label records its tier, source, the specific rule that fired, the ruleset snapshot in use, the admission basis by which that rule was accepted, and the source's licence. | Automated check: 100% of emitted labels carry every required provenance field for their source class (§6.6 defines the required fields per class — no "where applicable" escape). |
-| **Goal 2** | **Runs are reproducible.** The same capture, the same pinned ruleset snapshot, and the same pinned tool versions produce identical labels **after canonicalisation**. | Two runs produce `labels.json` files that are identical once written in canonical form (§6.6), excluding only the explicitly enumerated run-metadata fields. Requires the determinism controls in §6.2 and §6.3. |
+| **Goal 2** | **Runs are reproducible.** The same capture, the same pinned ruleset snapshot, and the same pinned tool versions produce identical labels **after canonicalisation**. | Two runs produce `labels.json` files that are identical once written in canonical form (§6.6), excluding only the explicitly enumerated run-metadata fields. Requires `zeek -D` (§6.2, verified) and a pinned snapshot (§6.3). |
 | **Goal 3** | **Nothing is lost silently.** Every *enumerated* loss condition is reported in the run block. | Each condition in the §6.6 loss-condition table has a named field **and one fault-injection test**. Verified by tests, not by code review. |
 | **Goal 4** | **One label per flow.** Detections from multiple sources against the same flow consolidate into a single entry retaining all asserting sources. | No duplicate flow identity in `labels`. |
 | **Goal 5** | **Specificity canary.** A curated benign capture produces zero labels; a curated known-malicious capture produces labels. | Two regression tests over committed fixtures. Any label on the benign canary is a false positive by construction and fails the build. |
@@ -79,7 +79,6 @@ All five goals apply to **Phase 1**. Goal 6 is a Phase 1 design constraint verif
 | **Tier 1 detection (PANW VM-Series) and the lab that hosts it** | Roughly 60% of total effort, all recurring cost, and the only part untestable in CI (`docs/eng-review.md`). Phase 1 delivers a working labelling pipeline without it | **Yes — Phase 2, immediate follow-on** |
 | Label validation against a ground-truth corpus | Trust-by-construction decided at Stage 1. Goal 5's canary provides a bounded substitute | No — superseded by Goal 5 |
 | JA4 *rule content* — a source of malicious JA4 fingerprints | No admitted source publishes `ja4.hash` rules today. **The JA4 labeling capability itself is in Phase 1** (§6.3) — only the content is missing | Content only; capability ships in Phase 1 (issue #13) |
-| `pawpatrules` ruleset | Admitted with an FP review still outstanding. Ground-truth data should not ship on an unvetted source; excluded fail-closed, consistent with the project's own posture | Yes — admit once an FP review passes |
 | Snort 3 as the Tier 2 engine | Suricata selected on free high-confidence ruleset volume and native fingerprint keywords | No |
 | FortiGate as the NGFW | PANW VM-Series selected as Tier 1 | No |
 | Free/OSS L7 equivalent to PANW App-ID | No free equivalent exists; line of inquiry closed | No |
@@ -103,7 +102,9 @@ Findings that shaped the design:
 
 **Trust model.** Trust is assigned **per source**, not per rule. Tier 1 (Phase 2) is PANW VM-Series; Tier 2 is Suricata with a curated, admission-filtered ruleset set. Because trust is not modeled per rule, **ruleset curation is the entire false-positive defence** — and in Phase 1, where Tier 2 is the whole product, it is the *only* defence. That is why the admission filter, its per-source policy, and its snapshot are product requirements rather than implementation details.
 
-**Environment.** Phase 1 requires no lab: it runs on one machine against local files. Phase 2 requires a PANW VM-Series in virtual-wire configuration plus a replay host, with an unresolved feasibility question about whether that works in GCP (§13).
+**Environment.** Phase 1 requires no lab: it runs on one machine against local files.
+
+Phase 2 requires **two hosts** — a PANW VM-Series in virtual-wire configuration, and a host that runs flabel and the replay. Suricata does not need a host of its own because it reads the capture file; the original three-host design was reduced accordingly. Clock sync is **NTP to sub-second accuracy with a padded query window**, not millisecond: correlation is tuple-driven and time only scopes the log query, so the design deliberately does not depend on tight clock accuracy — a millisecond gate could fail for a reason that does not affect a single label. Whether virtual-wire replay is achievable in GCP at all is unresolved (§13 Q16).
 
 ## 6. Feature Description
 
@@ -130,7 +131,11 @@ Findings that shaped the design:
 **Key Business Rules / Logic:**
 
 - All Zeek logs generated for the capture are retained in the output.
-- **Zeek is invoked with a fixed, recorded seed**, so `uid` assignment is deterministic for a given input. Without this, Goal 2 is unattainable and labels from two runs of the same capture cannot be joined to each other — which is the entire purpose of US-06. The seed is part of run provenance.
+- **Zeek is invoked with `-D` / `--deterministic`**, which initialises its random seeds to zero and makes `uid` assignment stable for a given input. The mechanism is recorded in run provenance.
+
+  > **Verified empirically, 2026-08-11 (spike 3).** Zeek 8.0.4, 14-packet synthetic capture, two flows. **Default behaviour: UIDs differ on every run** — run A produced `CTCqb34rMyhpo79tSk`, run B produced `Cyh21dwPOqRx2XKui` for the same flow. **With `-D`: byte-identical across three consecutive runs**, and `conn.log`, `files.log`, and `http.log` were fully identical record-for-record. `-G <seed-file>` also works but yields a different stable value set and adds an artifact to manage, so `-D` is preferred. This confirms the review's Critical finding: without this flag Goal 2 would have failed 100% of the time and US-06's cross-run label joins would have been impossible.
+  >
+  > **`packet_filter.log` remains non-deterministic** — it carries Zeek's wall-clock start time. It contains no analytic content and is excluded from reproducibility comparison.
 - JA4 is computed for every TLS connection via the `zeek/foxio/ja4` package. **The JA4 value carried on a label is always the Zeek-computed one**, so there is a single authority — Suricata computes JA4 independently for matching, and the two implementations are cross-checked (§9, US-14).
 - JA4+ (JA4S, JA4H, JA4X, JA4T) is enabled. Licensing: plain JA4 is BSD 3-Clause; the JA4+ suite is FoxIO License 1.1 (non-commercial). JA4+ is **approved for use with Legal's review in progress**; restricting to plain JA4 is the documented contingency if Legal declines (§13 Q3).
 - **A computed fingerprint is an attribute, not a verdict.** Zeek's JA4 output never produces a label by itself. Labels arise only where a fingerprint **matches an admitted rule**, which happens in the Tier 2 path (§6.3).
@@ -154,8 +159,9 @@ Findings that shaped the design:
 **Admission policy is per source:**
 
 - **Signature rulesets** (ET Open) are filtered on rule metadata: `confidence == High` **and** `signature_severity in (Major, Critical)`. Rules lacking a `confidence` tag are **excluded** (fail-closed).
-- **IOC feeds** (abuse.ch, malsilo, and similar) carry no such metadata and are admitted **wholesale**, with the feed snapshot date as provenance. Wholesale admission means *no per-rule gate exists* for those sources — hence `admission_basis` being machine-visible.
-- Excluded: hunting/anomaly rulesets, self-described aggressive blacklists, Positive Technologies, and `pawpatrules` pending an FP review.
+- **IOC feeds and community rulesets without ET-style metadata** (abuse.ch, malsilo, `stamus/lateral`, `the-hunters-ledger`, `pawpatrules`) are admitted **wholesale**, with the feed snapshot date as provenance. Wholesale admission means *no per-rule gate exists* for those sources — hence `admission_basis` being machine-visible.
+- `pawpatrules` is admitted **with its false-positive risk knowingly accepted.** It is the broadest-scope and least-vetted admitted source, and it is share-alike licensed (CC-BY-SA-4.0). **The Goal 5 benign canary is its standing FP review** — it runs on every build, so a noisy source surfaces immediately rather than after a model is trained.
+- Excluded: hunting/anomaly rulesets, self-described aggressive blacklists, and Positive Technologies.
 - The filter is an **inclusion** filter, which `suricata-update`'s subtractive model does not express — flabel parses rule metadata and emits its own filtered rule file.
 
 **Encrypted-traffic detection is part of this tier, in Phase 1:**
@@ -188,7 +194,11 @@ Findings that shaped the design:
 - `best_tier` records the highest-trust source that asserted the flow. **Lower tier numbers are higher trust** — stated explicitly because the ordering is counter-intuitive.
 - **Tier 2 correlation rule:** a Suricata alert is resolved to a Zeek `uid` by flow tuple plus timestamp containment. Where a tuple maps to more than one `conn.log` record (port reuse within a capture), the record whose time window contains the alert wins; if still ambiguous, the detection is emitted unmatched rather than assigned by guess.
 - A detection that **cannot be correlated** to any flow — including a Suricata alert with no corresponding Zeek connection — is emitted in `unmatched_detections[]` with a reason and the raw fields. Never silently dropped, never guessed into a flow.
-- The unmatched count is surfaced in run metadata as a correlation-health signal.
+- **The unmatched count is a gate, not just a signal** (resolves Q9). In Phase 1 both Zeek and Suricata read identical bytes, so any unmatched detection is anomalous:
+  - zero unmatched — silent;
+  - any unmatched — **warn**, run still succeeds;
+  - above a configurable threshold (**default 1%** of detections) — **fail the run**, because a systemic correlation break would otherwise produce a quietly incomplete label set.
+  - Phase 2 will need a looser threshold, since Tier 1 correlation is inherently harder; it is configured separately rather than by relaxing the Phase 1 default.
 
 ### 6.6 Output & Provenance — *Phase 1*
 
@@ -210,7 +220,7 @@ my-capture_2026-08-11T213045Z/
 
 - The `labels` array is sorted by `(flow.ts_first, flow.uid)`; `sources[]` within an entry is sorted by `(tier, source, rule identity)`.
 - Object keys are emitted in sorted order; timestamps use a single fixed format.
-- Only these run-metadata fields are excluded from a reproducibility comparison: run start/end time and run duration. Everything else must match.
+- Only these are excluded from a reproducibility comparison: run start/end time, run duration, and Zeek's `packet_filter.log` (which carries a wall-clock start stamp and no analytic content). Everything else must match.
 
 **Content rules:**
 
@@ -235,7 +245,7 @@ my-capture_2026-08-11T213045Z/
 | Input truncated | `input_status`, `packets_read`, `truncated_at_offset` | 1 |
 | Multi-datalink splits discarded | `discarded_link_types`, `discarded_packets` | 1 |
 | Detection uncorrelatable to a flow | `unmatched_count` + `unmatched_detections[]` | 1 |
-| Zeek or Suricata non-zero exit | `tool_failures[]` | 1 |
+| Zeek or Suricata non-zero exit, **including an OOM kill on a large capture** | `tool_failures[]` | 1 |
 | Ruleset snapshot missing or unreadable | hard failure, `error` | 1 |
 | Replay packet count mismatch | `replay_sent`, `replay_seen`, `replay_device_discards` | 2 |
 | Device rejected sessions as non-SYN | `non_syn_rejected` | 2 |
@@ -445,8 +455,12 @@ Each criterion is marked **[CI]** (testable in continuous integration) or **[LAB
 - **Captures contain real network traffic** and may include personal data, credentials in cleartext protocols, internal addressing, and business-sensitive content. Zeek logs derived from them include URLs, DNS queries, and certificate details.
 - The repository is **public**. Captures, Zeek logs, `labels.json`, credentials, and internal identifiers must never be committed. `.gitignore` excludes `*.pcap`, `*.pcapng`, `*.log`, `zeek/`, and `.env`.
 - **Those ignore rules currently also block the test fixtures** the acceptance criteria require. Narrow negations scoped to `tests/fixtures/**` are a scaffold requirement; the broad ignores stay.
-- Fixtures must contain no real capture data — synthetic or explicitly-licensed public captures only, including the Goal 5 canaries.
-- **Capture provenance is unresolved** (§13 Q11): whether captures come from customer traffic, internal traffic, or public corpora determines whether contractual limits apply to using them to train a product model. That is a different question from "don't commit them."
+- **Fixture strategy (resolves Q8):**
+  - The **benign canary is synthesized**, not sourced. This matters for correctness, not just licensing: a real-world "benign" capture may legitimately trip an admitted rule, which would make the canary flaky and its failures ambiguous. A synthesized capture makes *zero labels* a known-correct expectation rather than an empirical hope. It contains no real hosts, payloads, or addresses.
+  - The **malicious canary is a small publicly-published capture**, because the test needs a rule to genuinely fire and synthesizing that convincingly is harder than sourcing it. Its origin and licence are recorded in the repo alongside it.
+  - No other fixture may contain real capture data.
+- **Phase 1 processes publicly-published captures only** (resolves Q11), with each capture's origin and licence documented. This defers the contractual question of whether customer- or internal-derived captures may lawfully train a product model — a question that must be answered *before* flabel is pointed at such traffic, and one that is contractual rather than technical. Output retention and location are deferred with it.
+- No maximum capture size is enforced. A tested known-good size is established at build; an OOM-killed Zeek surfaces via `tool_failures[]` rather than yielding a silently truncated label set.
 - Labels and Zeek logs inherit the sensitivity of their source capture. flabel transmits capture data nowhere.
 
 **Performance / Scale Requirements:**
@@ -479,7 +493,7 @@ Each criterion is marked **[CI]** (testable in continuous integration) or **[LAB
 |  |  |  |  |
 | :-: | :-: | :-: | :-: |
 | **Risk** | **Likelihood** | **Impact** | **Mitigation** |
-| **Ungated rule sources produce systematically false labels.** In Phase 1 Tier 2 is the entire product, so wholesale-admitted IOC feeds are the dominant quality risk — the `confidence` filter covers ET Open only | High | High | `admission_basis` machine-visible so consumers can exclude ungated sources; `pawpatrules` excluded pending FP review; Goal 5 canary detects gross specificity failures; non-verdict sources cannot label at all |
+| **Ungated rule sources produce systematically false labels.** In Phase 1 Tier 2 is the entire product, so wholesale-admitted sources are the dominant quality risk — the `confidence` filter covers ET Open only | High | High | `admission_basis` machine-visible so consumers can exclude ungated sources; non-verdict sources cannot label at all; **the Goal 5 benign canary is the standing detector and runs on every build**. `pawpatrules` is admitted with its FP risk knowingly accepted (Craig's decision), with the canary as its review |
 | Indicator-reference labels mark benign infrastructure (resolver, proxy) as malicious — a correlated, repeated error, worse than random FPs | High | High | `label_basis` required on every label; canary fixture exercises DNS/URL rules specifically |
 | Trust-by-construction gives no false-positive rate if a label consumer asks | High | Med | Goal 5 canary converts an unfalsifiable claim into a falsifiable one; snapshots make labels reproducible and auditable. Accepted limitation, recorded |
 | Reproducibility quietly abandoned when the byte-identity test fails | Med | High | Fixed Zeek seed, canonical output form, pinned tool versions in CI container, explicit excluded-field list |
@@ -502,16 +516,17 @@ Each criterion is marked **[CI]** (testable in continuous integration) or **[LAB
 | 3 | Does Legal approve JA4+ under FoxIO License 1.1? | Legal | TBD | Open — JA4+ is the default meanwhile; plain JA4 is the contingency |
 | 4 | What is the admitted-rule count per source once the filter is applied, and is Tier 2 coverage adequate? | Craig | Early Phase 1 | Open — issue #11 |
 | 5 | How are concurrent Phase 2 runs against one device serialized? | TBD | Phase 2 spec | Open |
-| 6 | Is there a maximum supported capture size, and what happens beyond it? | Craig | Phase 1 spec | Open |
+| 6 | Is there a maximum supported capture size, and what happens beyond it? | Craig | — | **Resolved 2026-08-11:** no enforced ceiling. Build establishes a tested known-good size and documents it; an OOM-killed Zeek is an enumerated loss condition (`tool_failures[]`) so a truncated label set is never silent |
 | 7 | Exact bounded-`receive_time` filter syntax, and does the threat log need a settling delay? | TBD | Phase 2 spike | Open |
-| 8 | What fixture strategy provides test captures without real traffic — including the Goal 5 benign and malicious canaries? | TBD | Phase 1 scaffold | Open — blocking Goal 5 |
-| 9 | Should `unmatched_detections[]` have a failure threshold rather than being reported without a target? | Craig | Phase 1 spec | Open |
+| 8 | What fixture strategy provides test captures without real traffic — including the Goal 5 benign and malicious canaries? | Craig | — | **Resolved 2026-08-11:** benign canary synthesized (so zero labels is known-correct, not empirical); malicious canary is a small publicly-published capture with origin and licence recorded (§10) |
+| 9 | Should `unmatched_detections[]` have a failure threshold rather than being reported without a target? | Craig | — | **Resolved 2026-08-11:** warn on any unmatched; fail above a configurable threshold, default 1% of detections (§6.5). Phase 2 gets its own looser threshold |
 | 10 | What are the review dates for the success metrics? | Craig | TBD | Open |
-| 11 | Where do captures come from (customer / internal / public), and does that constrain using them to train a product model? | Craig | Phase 1 spec | Open — contractual, not technical |
+| 11 | Where do captures come from (customer / internal / public), and does that constrain using them to train a product model? | Craig | — | **Resolved 2026-08-11:** Phase 1 processes **publicly-published captures only**, with origin and licence documented. This sidesteps the contractual question while the pipeline is built. Pointing flabel at internal or customer traffic requires answering it first — recorded as a gate, not a blocker |
 | 12 | PANW licensing model and estimated monthly lab cost; and does that change the ET Pro decision? | Craig | Before Phase 2 planning | Open |
 | 13 | Can `zeek/foxio/ja4` emit plain JA4 only, if the JA4+ contingency is invoked? | TBD | Phase 1 spec | Open |
 | 14 | What is the Phase 2 replay rate ("controlled rate")? | TBD | Phase 2 spike | Open |
 | 15 | Where do JA4 rules come from — wait for ET, evaluate a feed, or self-derive? | Craig | Post-Phase 1 | Open — issue #13 |
+| 16 | **Is virtual-wire replay achievable for a VM-Series in GCP at all?** Public-cloud VM-Series interfaces may be Layer 3 only, and a VPC drops arbitrary Ethernet frames and spoofed source IPs — which is what replaying an original capture sends. Unverified; recorded as an assumption, not a fact | Craig | Before Phase 2 planning | Open — **blocks all of Phase 2.** Reachability spike runs after Phase 1 by decision, so this sits on the Phase 2 critical path |
 
 ## 14. Basic Test Cases
 

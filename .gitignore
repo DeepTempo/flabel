@@ -8,6 +8,15 @@ archive/
 *.log
 zeek/
 
+# Narrow exception: test fixtures (PRD §10 fixture strategy). The broad rules above
+# still apply everywhere else. Only synthetic captures and explicitly-licensed public
+# captures may live here — never real traffic. The directory patterns must be
+# re-included before the files inside them can be.
+!tests/fixtures/**/zeek/
+!tests/fixtures/**/*.pcap
+!tests/fixtures/**/*.pcapng
+!tests/fixtures/**/*.log
+
 # Secrets / config
 .env
 .env.*
