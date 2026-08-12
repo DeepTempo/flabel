@@ -64,9 +64,9 @@ from flabel.models import (
     Detection,
     SnapshotManifest,
     SourceAdmission,
-    SourceSpec,
     SuricataRunInfo,
     ToolFailure,
+    may_label,
 )
 from flabel.rules.snapshot import DATA_DIR, RULES_NAME, load_sid_index, load_snapshot
 
@@ -673,15 +673,10 @@ def _detection(
             f"snapshot. Only the snapshot's rules were loaded, so this should be impossible."
         )
 
-    admission = sources[source]
-    spec = SourceSpec(
-        name=admission.name,
-        url=admission.url,
-        licence=admission.licence,
-        source_class=admission.source_class,
-        admission_basis=admission.admission_basis,
-    )
-    if not spec.may_label:
+    # Read straight off the admission record. This used to build a throwaway `SourceSpec` to
+    # reach `may_label`, because the rule lived only as a property; `models.may_label` is now
+    # the one derivation and both this module and `provenance.py` call it (#47).
+    if not may_label(sources[source].source_class):
         return None
 
     # From the rule text in the hashed snapshot, not from `alert.category`: see

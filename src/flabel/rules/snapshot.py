@@ -45,6 +45,7 @@ from dataclasses import fields
 from pathlib import Path
 
 import flabel
+from flabel import models
 from flabel.errors import SnapshotError
 from flabel.models import SnapshotManifest, SourceAdmission
 from flabel.rules import utc_now
@@ -66,11 +67,14 @@ MANIFEST_VERSION = 1
 #: Schema of `sid_index.json`, versioned separately: step 6 reads that file and nothing else.
 SID_INDEX_SCHEMA = 1
 
-SNAPSHOT_ID_LENGTH = 16
-
-#: A directory in the rules root is a snapshot if it is named like one. Anything else — a scratch
-#: directory, an operator's notes — is ignored by `list_snapshots`.
-SNAPSHOT_ID = re.compile(rf"^[0-9a-f]{{{SNAPSHOT_ID_LENGTH}}}$")
+#: Both re-exported from `models`, which owns the shape of a snapshot id so that this module
+#: (which resolves an id to a directory) and `provenance.py` (which refuses to write an
+#: unresolvable one onto a label) cannot disagree about it. `provenance.py` is a pure module, so
+#: it must not reach into this one for the pattern. A directory in the rules root is a snapshot
+#: if it is named like one; anything else — a scratch directory, an operator's notes — is
+#: ignored by `list_snapshots`.
+SNAPSHOT_ID_LENGTH = models.SNAPSHOT_ID_LENGTH
+SNAPSHOT_ID = models.SNAPSHOT_ID
 
 #: A rule's `sid`, which with the source name is the sort key spec §7 mandates.
 SID = re.compile(r"\bsid\s*:\s*(\d+)")

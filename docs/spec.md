@@ -247,8 +247,16 @@ way for a consumer to tell which one a label carries.
 The function is where the three inputs to provenance meet, and it is the only place they do:
 the **detection** for what the engine observed (`tier`, `sid`, `rev`, `classtype`, `threat`),
 the **`SourceAdmission`** for the terms the source was admitted on (`admission_basis`,
-`licence`, and `label_basis` derived through `SourceSpec.label_basis` rather than a second copy
-of the rule), and the **`snapshot_id`** for which exact ruleset produced it.
+`licence`, and `label_basis` derived through `models.label_basis` rather than a second copy of
+the rule), and the **`snapshot_id`** for which exact ruleset produced it.
+
+**`may_label` and `label_basis` are module-level functions of `source_class` in `models.py`**,
+with `SourceSpec`'s properties delegating to them. They were properties only, which meant that
+reading either off a `SourceAdmission` — the snapshot's record, and the authority per the
+paragraph below — required building a throwaway `SourceSpec` out of it. Two modules did exactly
+that, independently. An adapter written twice to reach two properties means the properties are
+on the wrong object, so the derivation moved to where both callers can reach it and no caller
+constructs an object it does not need. `SourceSpec`'s API is unchanged.
 
 **The terms come from the snapshot manifest, never from the live registry** — which is why the
 parameter is a `SourceAdmission` and not a `SourceSpec`. Corrected in review before either step

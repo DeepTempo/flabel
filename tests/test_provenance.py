@@ -16,13 +16,25 @@ answer they would otherwise let through, not by the exception type they raise.
 from __future__ import annotations
 
 import dataclasses
+from typing import get_args
 
 import pytest
 
-from flabel.models import Detection, SourceAdmission, SourceEntry, SourceSpec
-from flabel.provenance import KNOWN_TIERS, build_source_entry, spec_from_admission
+from flabel.models import (
+    Detection,
+    SourceAdmission,
+    SourceClass,
+    SourceEntry,
+    SourceSpec,
+    label_basis,
+    may_label,
+)
+from flabel.provenance import KNOWN_TIERS, build_source_entry
 
 SNAPSHOT_ID = "8a39182c18a3c9d3"
+
+#: Derived from the type, not restated, so adding a source class forces a decision here.
+SOURCE_CLASSES = get_args(SourceClass)
 
 #: Every `SourceEntry` field that must carry a real value. `classtype` is the sole legitimate
 #: null — 10,949 of the 85,545 rules in the measured snapshot declare no `classtype:` — so it
@@ -139,17 +151,24 @@ def test_a_sourcespec_is_refused_where_an_admission_is_required():
         build_source_entry(make_detection(), spec, SNAPSHOT_ID)  # type: ignore[arg-type]
 
 
-def test_spec_from_admission_carries_every_term_across():
-    """The adapter must not drop a field, or the derivation runs on a default."""
-    admission = make_admission(source_class="ioc-dest", licence="CC0-1.0")
-    spec = spec_from_admission(admission)
+@pytest.mark.parametrize("source_class", SOURCE_CLASSES)
+def test_a_spec_and_an_admission_of_the_same_class_agree(source_class):
+    """One derivation behind both call styles, asserted over every class.
 
-    assert isinstance(spec, SourceSpec)
-    assert spec.name == admission.name
-    assert spec.url == admission.url
-    assert spec.licence == admission.licence
-    assert spec.source_class == admission.source_class
-    assert spec.admission_basis == admission.admission_basis
+    A caller holding a registry spec asks `spec.may_label`; a caller holding a snapshot record
+    asks `may_label(admission.source_class)`. They must be the same answer — the previous
+    shape reached the second by building a throwaway `SourceSpec`, which is what made the
+    duplication in `suricata.py` and here possible in the first place.
+    """
+    spec = SourceSpec(
+        name="example/source",
+        url="https://example.invalid/rules.tar.gz",
+        licence="MIT",
+        source_class=source_class,
+        admission_basis="wholesale",
+    )
+    assert spec.may_label is may_label(source_class)
+    assert spec.label_basis == label_basis(source_class)
 
 
 # --- every field spec §4 demands is carried ------------------------------------------------
@@ -261,11 +280,11 @@ def test_label_basis_is_derived_from_the_source_class(source_class, expected):
     assert entry.label_basis == expected
 
 
-def test_label_basis_is_taken_from_the_spec_property_not_recomputed():
+def test_label_basis_is_taken_from_the_shared_derivation_not_recomputed():
     """One derivation, not two that must agree."""
     admission = make_admission(source_class="ioc-name")
     entry = build_source_entry(make_detection(), admission, SNAPSHOT_ID)
-    assert entry.label_basis == spec_from_admission(admission).label_basis
+    assert entry.label_basis == label_basis(admission.source_class)
 
 
 # --- spec §2.8: an identify source can never produce a label -------------------------------

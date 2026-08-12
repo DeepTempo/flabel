@@ -10,6 +10,7 @@ and a claim that can be edited after the fact is not provenance.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, get_args
@@ -66,6 +67,54 @@ UnmatchedReason = Literal["no_flow_match", "ambiguous_flow_match"]
 Ja4Status = Literal["present", "not-installed", "probe-failed"]
 
 
+# --- what a source class means -------------------------------------------------------------
+#
+# These two are functions of `source_class` and nothing else, so they are module-level rather
+# than methods. Both facts have to be read off a `SourceAdmission` — the snapshot's record of
+# a source — as well as off a `SourceSpec`, and when the only way to do that was through a
+# `SourceSpec` property, two modules independently built a throwaway `SourceSpec` out of an
+# admission just to reach them. An adapter written twice to get at two properties means the
+# properties are on the wrong object. `SourceSpec` keeps its properties, delegating, so no
+# caller had to change.
+
+
+def may_label(source_class: SourceClass) -> bool:
+    """Whether a detection from a source of this class may become a label.
+
+    False exactly for `identify`, which describes benign software. Enforced in code and
+    asserted in a test, because a label from one would be a false positive by construction
+    (spec §2.8).
+    """
+    return source_class != "identify"
+
+
+def label_basis(source_class: SourceClass) -> LabelBasis | None:
+    """The basis a label from this class carries, or None if it may not label.
+
+    `ioc-name` sources match a name that was looked up — a DNS query or an HTTP host — so the
+    flow referenced the indicator rather than being the malicious traffic itself. Reporting
+    that as `direct` would overstate what was observed.
+    """
+    if not may_label(source_class):
+        return None
+    return "indicator-reference" if source_class == "ioc-name" else "direct"
+
+
+# --- ruleset snapshot identity ---------------------------------------------------------------
+
+#: A snapshot id is the first 16 hex characters of a sha256 over the snapshot's content
+#: (spec §7). The pattern lives here, in the module that imports nothing, because both
+#: `rules/snapshot.py` (which resolves an id to a directory) and `provenance.py` (which refuses
+#: to write an unresolvable one onto a label) have to agree on what an id looks like — and
+#: `provenance.py` is a pure module, so importing the pattern from the snapshot writer would
+#: point a pure module at an impure one.
+SNAPSHOT_ID_LENGTH = 16
+
+#: Use `fullmatch`, never `match`: `$` also matches before a trailing newline, so an id read
+#: from a file with the newline left on would otherwise pass.
+SNAPSHOT_ID = re.compile(rf"^[0-9a-f]{{{SNAPSHOT_ID_LENGTH}}}$")
+
+
 @dataclass(frozen=True)
 class SourceSpec:
     """One rule feed in the registry (spec §5)."""
@@ -81,27 +130,20 @@ class SourceSpec:
         _check(self.source_class, get_args(SourceClass), "source_class", "SourceSpec")
         _check(self.admission_basis, get_args(AdmissionBasis), "admission_basis", "SourceSpec")
 
+    # Both delegate to the module-level functions above. The names deliberately match: a
+    # caller holding a spec asks `spec.may_label`, a caller holding an admission asks
+    # `may_label(admission.source_class)`, and there is one derivation behind both. A method
+    # body resolves names through the module globals, not the class namespace, so the bare
+    # call below reaches the function rather than recursing into the property.
     @property
     def may_label(self) -> bool:
-        """Whether a detection from this source may become a label.
-
-        False exactly for `identify` sources, which describe benign software. Enforced in
-        code and asserted in a test, because a label from one would be a false positive by
-        construction (spec §2.8).
-        """
-        return self.source_class != "identify"
+        """Whether a detection from this source may become a label (spec §2.8)."""
+        return may_label(self.source_class)
 
     @property
     def label_basis(self) -> LabelBasis | None:
-        """The basis a label from this source carries, or None if it may not label.
-
-        `ioc-name` sources match a name that was looked up — a DNS query or an HTTP host —
-        so the flow referenced the indicator rather than being the malicious traffic itself.
-        Reporting that as `direct` would overstate what was observed.
-        """
-        if not self.may_label:
-            return None
-        return "indicator-reference" if self.source_class == "ioc-name" else "direct"
+        """The basis a label from this source carries, or None if it may not label."""
+        return label_basis(self.source_class)
 
 
 # --- ruleset snapshot ---------------------------------------------------------------------

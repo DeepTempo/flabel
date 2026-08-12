@@ -29,36 +29,20 @@ The run block (spec §10) is step 8's to build and lands in this module later.
 
 from __future__ import annotations
 
-from flabel.models import Detection, SourceAdmission, SourceEntry, SourceSpec
-from flabel.rules.snapshot import SNAPSHOT_ID
+from flabel.models import (
+    SNAPSHOT_ID,
+    Detection,
+    SourceAdmission,
+    SourceEntry,
+    label_basis,
+    may_label,
+)
 
 #: Tiers that mean something. Tier 1 is a PANW NGFW verdict, tier 2 is open-source screening;
 #: lower is higher trust, and `Label.best_tier` ranks labels by it. Phase 1 only ever produces
 #: 2, but the closed set is `{1, 2}` so that Phase 2 adding tier-1 entries stays additive
 #: (spec §2.7) rather than requiring this constant to change.
 KNOWN_TIERS = (1, 2)
-
-
-def spec_from_admission(admission: SourceAdmission) -> SourceSpec:
-    """The source's terms as the snapshot recorded them, in `SourceSpec` shape.
-
-    `may_label` and `label_basis` are properties of `SourceSpec`, and duplicating either onto
-    `SourceAdmission` would be a second copy of the rule that decides whether a source may
-    produce a verdict at all. So the admission record is adapted instead of the rule being
-    restated. `url` comes along because `SourceAdmission` carries it precisely so a label's
-    origin traces to an endpoint rather than to a name in a file that can change.
-
-    `suricata.py` builds the same throwaway spec inline to test `may_label` before a detection
-    is emitted. Consolidating the two is worth doing, but it edits step 6's module and so is
-    left to its own change rather than smuggled into this one.
-    """
-    return SourceSpec(
-        name=admission.name,
-        url=admission.url,
-        licence=admission.licence,
-        source_class=admission.source_class,
-        admission_basis=admission.admission_basis,
-    )
 
 
 def build_source_entry(
@@ -121,8 +105,7 @@ def build_source_entry(
     # them in `identify_alerts_suppressed`, so reaching here means that filter was bypassed.
     # Checked again anyway: this is the last point at which an identify source could acquire a
     # verdict, and spec §13 lists a label attributable to one as a never-do.
-    spec = spec_from_admission(admission)
-    if not spec.may_label:
+    if not may_label(admission.source_class):
         raise ValueError(
             f"{admission.name} is an identify-class source and can never produce a label "
             f"(spec §2.8); detection sid {detection.sid} should have been suppressed upstream"
@@ -156,10 +139,10 @@ def build_source_entry(
                 f"that is missing it looks complete and asserts nothing"
             )
 
-    label_basis = spec.label_basis
+    basis = label_basis(admission.source_class)
     # Unreachable while `may_label` is checked above; asserted so the two cannot drift apart
-    # silently if `SourceSpec` ever gains a class that may label without a basis.
-    assert label_basis is not None
+    # silently if a class is ever added that may label without a basis.
+    assert basis is not None
 
     return SourceEntry(
         # From the detection: what the engine actually observed.
@@ -173,9 +156,9 @@ def build_source_entry(
         # with the rules that fired. Never from the live registry — see the module docstring.
         admission_basis=admission.admission_basis,
         licence=admission.licence,
-        # Derived once, from `SourceSpec.label_basis`, rather than recomputed from
-        # `source_class` here. A second copy of that rule is a second place for it to drift.
-        label_basis=label_basis,
+        # Derived once, by `models.label_basis`, rather than recomputed here. A second copy of
+        # that rule is a second place for it to drift.
+        label_basis=basis,
         # From the run: which exact ruleset produced this.
         ruleset=snapshot_id,
     )

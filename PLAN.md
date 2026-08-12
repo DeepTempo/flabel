@@ -196,7 +196,7 @@ source class and carrying `admission_basis` and `licence`"* moved to
 step 7 has to construct `SourceEntry` values to return a `Label` at all, so leaving the job here
 meant both worktrees writing it.
 
-**`build_source_entry`, `spec_from_admission` and `tests/test_provenance.py` are read-only to
+**`build_source_entry` and `tests/test_provenance.py` are read-only to
 this step.** Step 8 **appends** the run block to `provenance.py` below them and adds its own test
 file section. Do not change the builder's signature: step 7's worktree is written against it in
 parallel, so a change here is green in both worktrees and broken on merge — the same defect class
