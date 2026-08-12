@@ -300,7 +300,9 @@ def run_suricata(
     the loader is called with the pair it wants.
     """
     directory, manifest = load_snapshot(snapshot.parent, snapshot.name)
-    sources = {admission.name: admission for admission in manifest.sources}
+    # From the manifest rather than built here: correlation needs the same lookup, and two
+    # copies of it carry two copies of the duplicate-name hazard the manifest now rejects.
+    sources = manifest.sources_by_name
     index = load_sid_index(directory)
     rules_text = _rules_text(directory)
     classtypes = rule_classtypes(rules_text, index, directory)

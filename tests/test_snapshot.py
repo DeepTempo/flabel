@@ -380,6 +380,24 @@ def test_the_manifest_carries_a_format_version_so_a_field_can_ever_be_added(tmp_
         load_snapshot(tmp_path, manifest.snapshot_id)
 
 
+def test_a_manifest_naming_one_source_twice_is_refused_on_load(tmp_path: Path):
+    """Issue #49, at the boundary where a hand-edited manifest actually arrives.
+
+    `SnapshotManifest.__post_init__` rejects the duplicate, and `_read_manifest` turns that into
+    a `SnapshotError` — so the operator gets a reason and exit 1 rather than a traceback from a
+    dataclass constructor. Tested here as well as in `test_models.py` because the two halves are
+    separable: the invariant could hold on the type while the read path swallowed or mistyped
+    the failure, and then the only signal an operator ever sees would be wrong.
+    """
+    directory, manifest = one_source(tmp_path, created_at=CREATED_AT)
+    document = json.loads((directory / MANIFEST_NAME).read_text(encoding="utf-8"))
+    document["sources"] = [document["sources"][0], dict(document["sources"][0])]
+    (directory / MANIFEST_NAME).write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(SnapshotError, match="once"):
+        load_snapshot(tmp_path, manifest.snapshot_id)
+
+
 def test_the_manifest_totals_are_the_sum_of_its_sources(tmp_path: Path):
     manifest = write_snapshot(
         tmp_path,
