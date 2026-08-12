@@ -30,7 +30,7 @@ AUTHORITATIVE = {
     "the-hunters-ledger/open": SourceRow("CC-BY-4.0", "signature", "wholesale", "https://the-hunters-ledger.com/feeds/suricata/hunters-ledger.rules"),
     "pawpatrules": SourceRow("CC-BY-SA-4.0", "signature", "wholesale", "https://rules.pawpatrules.fr/suricata/paw-patrules.tar.gz"),
     "abuse.ch/feodotracker": SourceRow("CC0-1.0", "ioc-dest", "wholesale", "https://feodotracker.abuse.ch/downloads/feodotracker.tar.gz"),
-    "sslbl/ssl-fp-blacklist": SourceRow("CC0-1.0", "ioc-dest", "wholesale", "https://sslbl.abuse.ch/blacklist/sslblacklist_tls_cert.tar.gz"),
+    "abuse.ch/sslbl-blacklist": SourceRow("CC0-1.0", "ioc-dest", "wholesale", "https://sslbl.abuse.ch/blacklist/sslblacklist_tls_cert.tar.gz"),
     "abuse.ch/urlhaus": SourceRow("CC0-1.0", "ioc-name", "wholesale", "https://urlhaus.abuse.ch/downloads/urlhaus_suricata.tar.gz"),
     "oisf/trafficid": SourceRow("MIT", "identify", "wholesale", "https://openinfosecfoundation.org/rules/trafficid/trafficid.rules"),
 }
@@ -44,6 +44,8 @@ EXCLUDED = (
     "sslbl/ja3-fingerprints",
     # Removed in step 2: deprecated by abuse.ch on 2025-01-03 and shipping zero rules.
     "abuse.ch/sslbl-c2",
+    # Deprecated alias, renamed upstream to abuse.ch/sslbl-blacklist.
+    "sslbl/ssl-fp-blacklist",
 )
 
 

@@ -269,15 +269,19 @@ admission_basis  = "wholesale"
 | :-- | :-- | :-- | :-- | :-: |
 | `et/open` | MIT | `signature` | metadata-filter | direct |
 | `stamus/lateral` | GPL-3.0-only | `signature` | wholesale | direct |
-| `malsilo/win-malware` | MIT | `signature` | wholesale | direct |
+| `malsilo/win-malware` | MIT | `signature` | wholesale | direct (unmaintained — risk accepted) |
 | `the-hunters-ledger/open` | CC-BY-4.0 | `signature` | wholesale | direct |
 | `pawpatrules` | CC-BY-SA-4.0 | `signature` | wholesale | direct |
 | `abuse.ch/feodotracker` | CC0-1.0 | `ioc-dest` | wholesale | direct |
-| `sslbl/ssl-fp-blacklist` | CC0-1.0 | `ioc-dest` | wholesale | direct |
+| `abuse.ch/sslbl-blacklist` | CC0-1.0 | `ioc-dest` | wholesale | direct |
 | `abuse.ch/urlhaus` | CC0-1.0 | `ioc-name` | wholesale | **indicator-reference** |
 | `oisf/trafficid` | MIT | `identify` | wholesale | **never** |
 
 Excluded entirely and absent from the registry: `tgreen/hunting`, `etnetera/aggressive`, `ptresearch/attackdetection`, `ptrules/open`, `sslbl/ja3-fingerprints`, and all commercial sources.
+
+**`sslbl/ssl-fp-blacklist` was renamed to `abuse.ch/sslbl-blacklist` in step 2.** The OISF index marks the old name `deprecated: Renamed to abuse.ch/sslbl-blacklist` (same URL). Since the source name is recorded on every label as provenance, the canonical name was adopted before any label could carry the stale alias. The exclusion list above likewise cites `sslbl/ja3-fingerprints` by its old name; upstream now calls it `abuse.ch/sslbl-ja3`, and both are excluded.
+
+**`malsilo/win-malware` is upstream-unmaintained, and that risk is accepted** (Craig, 2026-08-12). The OISF index flags it `obsolete: unmaintained`; the live artifact is 1,089 bytes with 14 alert rules across three files, last modified 2022-12-01. Kept on the same terms as `pawpatrules`: no per-rule gate, with the benign canary as its standing review. This knowingly accepts an inconsistency — `docs/research.md` §B1 excluded `sslbl/ja3-fingerprints` partly for being abandoned. Revisit if it ever produces a false positive.
 
 **`abuse.ch/sslbl-c2` was removed in step 2** after verification against the live feed, leaving nine sources. The OISF index marks it `deprecated: Deprecated by source on 2025-01-03`, and the artifact is 335 bytes: a header plus "ATTENTION: This list has been deprecated". It ships zero rules. Shipping it would imply coverage that cannot exist, and its zero count would be indistinguishable from a feed that matched nothing that run.
 

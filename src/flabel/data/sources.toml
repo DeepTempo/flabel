@@ -43,6 +43,11 @@ admission_basis  = "wholesale"
 
 [[source]]
 name             = "malsilo/win-malware"
+# RISK ACCEPTED (Craig, 2026-08-12). The OISF index flags this feed `obsolete: unmaintained`;
+# the live artifact is 1,089 bytes with 14 alert rules across three files, last modified
+# 2022-12-01. Kept deliberately, on the same terms as pawpatrules: the benign canary is its
+# standing review. Note the inconsistency this accepts — docs/research.md §B1 excluded
+# sslbl/ja3-fingerprints partly for being abandoned. Revisit if it produces a false positive.
 url              = "https://malsilo.gitlab.io/feeds/dumps/malsilo.rules.tar.gz"
 licence          = "MIT"
 source_class     = "signature"
@@ -74,7 +79,9 @@ source_class     = "ioc-dest"
 admission_basis  = "wholesale"
 
 [[source]]
-name             = "sslbl/ssl-fp-blacklist"
+name             = "abuse.ch/sslbl-blacklist"
+# Renamed from `sslbl/ssl-fp-blacklist`, which the OISF index marks deprecated in favour of
+# this name (same URL). Changed in step 2, before any label carried the stale alias.
 # TLS certificate fingerprints of known C2 — an observed certificate, not a computed
 # client fingerprint, which is why this is admitted where ja3-fingerprints is not.
 url              = "https://sslbl.abuse.ch/blacklist/sslblacklist_tls_cert.tar.gz"
