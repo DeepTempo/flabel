@@ -30,6 +30,27 @@ def test_needs_no_tools():
     pass
 """
 
+# A tool test marked xfail still enters its body. If the gate counts bodies entered rather
+# than tests passed, marking a broken tool test xfail turns CI green with the toolchain
+# unexercised — the exact outcome the gate exists to prevent.
+XFAIL_TOOL_TEST = """
+import pytest
+
+@pytest.mark.requires_tools
+@pytest.mark.xfail(reason="pretend someone parked a broken tool test")
+def test_uses_the_toolchain():
+    raise AssertionError("the tool check is broken")
+"""
+
+# Same hazard from the other direction: a test that decides mid-body it cannot run.
+INBODY_SKIP_TOOL_TEST = """
+import pytest
+
+@pytest.mark.requires_tools
+def test_uses_the_toolchain():
+    pytest.skip("decided at runtime that a fixture was missing")
+"""
+
 
 @pytest.fixture
 def gate(pytester):
@@ -73,6 +94,55 @@ def test_require_tool_tests_fails_when_no_tool_test_is_collected(gate, monkeypat
 
     assert result.ret != 0
     result.stdout.fnmatch_lines(["*zero requires_tools tests executed*"])
+
+
+def test_xfailed_tool_test_does_not_satisfy_the_gate(gate, monkeypatch):
+    """A parked-as-xfail tool test must not count. It proves nothing about the toolchain."""
+    _stub_which(monkeypatch, found=True)
+    gate.makepyfile(test_tools=XFAIL_TOOL_TEST)
+
+    result = gate.runpytest("--require-tool-tests")
+
+    assert result.ret != 0
+    result.stdout.fnmatch_lines(["*zero requires_tools tests executed*"])
+
+
+def test_inbody_skip_does_not_satisfy_the_gate(gate, monkeypatch):
+    """A test that skips itself mid-body never exercised a tool, so it cannot count."""
+    _stub_which(monkeypatch, found=True)
+    gate.makepyfile(test_tools=INBODY_SKIP_TOOL_TEST)
+
+    result = gate.runpytest("--require-tool-tests")
+
+    assert result.ret != 0
+    result.stdout.fnmatch_lines(["*zero requires_tools tests executed*"])
+
+
+def test_deselecting_a_tool_test_fails_the_gate(gate, monkeypatch):
+    """`-k` narrowing must not quietly shrink the toolchain coverage CI thinks it has.
+
+    By step 10 there will be dozens of these; "at least one ran" is too weak a floor if
+    the rest can be filtered away unnoticed.
+    """
+    _stub_which(monkeypatch, found=True)
+    gate.makepyfile(
+        test_tools="""
+import pytest
+
+@pytest.mark.requires_tools
+def test_alpha():
+    pass
+
+@pytest.mark.requires_tools
+def test_beta():
+    pass
+"""
+    )
+
+    result = gate.runpytest("--require-tool-tests", "-k", "alpha")
+
+    assert result.ret != 0
+    result.stdout.fnmatch_lines(["*deselected*"])
 
 
 def test_require_tool_tests_passes_when_a_tool_test_ran(gate, monkeypatch):

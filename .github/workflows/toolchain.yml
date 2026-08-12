@@ -47,6 +47,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Without this, "the image built" and "the image is correct" are different facts, and
+      # only the first one is checked: ci.yml still pins the *previous* digest, so a broken
+      # new image publishes green and only breaks whichever unrelated PR later adopts it.
+      - name: Run the suite inside the image just built
+        run: |
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e UV_PROJECT_ENVIRONMENT=/tmp/venv \
+            "ghcr.io/deeptempo/flabel-toolchain@${{ steps.build.outputs.digest }}" \
+            sh -c 'uv sync --locked --dev && uv run pytest -q --require-tool-tests --strict-toolchain'
+
       - name: Report the digest and the versions it installed
         run: |
           image="ghcr.io/deeptempo/flabel-toolchain@${{ steps.build.outputs.digest }}"

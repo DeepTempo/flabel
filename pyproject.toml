@@ -31,6 +31,9 @@ zeek = "8.0.9"
 suricata = "8.0.6"
 wireshark = "4.6.6"  # supplies both editcap and capinfos
 ja4_zeek_package = "v0.18.8"  # git tag of zeek/foxio/ja4; JA4+ under FoxIO License 1.1
+# Tags are mutable and this package changes JA4 values on labels, so the resolved commit
+# is pinned too. The image build fails if the tag ever stops resolving to it.
+ja4_zeek_commit = "3ecddb5f1d0b92210535171a62901bf3d596c7b8"
 
 [tool.ruff]
 line-length = 100

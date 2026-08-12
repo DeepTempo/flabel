@@ -10,11 +10,14 @@ Version comparison is major.minor by default and exact under ``--strict-toolchai
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import subprocess
 
 import pytest
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # Suricata has no --version: it exits 1 with "unrecognized option". -V is the flag that
 # works, and PLAN.md step 1 / issue #15 say --version only as shorthand for "reports its
@@ -68,8 +71,11 @@ def test_dockerfile_args_match_the_pins(toolchain_pins):
     is what the tests assert. If they disagree, CI either fails mysteriously or — worse —
     passes while asserting the wrong thing. Needs no tools, so it runs everywhere.
     """
-    dockerfile = (pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.toolchain").read_text()
+    dockerfile = (REPO_ROOT / "Dockerfile.toolchain").read_text()
     args = dict(re.findall(r"^ARG (\w+)=(\S+)$", dockerfile, re.MULTILINE))
+
+    for name in ("ZEEK_VERSION", "JA4_PACKAGE_VERSION", "JA4_PACKAGE_COMMIT"):
+        assert name in args, f"Dockerfile.toolchain has no `ARG {name}=<value>` with a default"
 
     zeek_line = ".".join(toolchain_pins["zeek"].split(".")[:2])
     assert args["ZEEK_VERSION"] == zeek_line, (
@@ -79,6 +85,78 @@ def test_dockerfile_args_match_the_pins(toolchain_pins):
     assert args["JA4_PACKAGE_VERSION"] == toolchain_pins["ja4_zeek_package"], (
         f"Dockerfile installs ja4 {args['JA4_PACKAGE_VERSION']} but the pin is "
         f"{toolchain_pins['ja4_zeek_package']}"
+    )
+    assert args["JA4_PACKAGE_COMMIT"] == toolchain_pins["ja4_zeek_commit"], (
+        f"Dockerfile expects ja4 commit {args['JA4_PACKAGE_COMMIT']} but the pin is "
+        f"{toolchain_pins['ja4_zeek_commit']}"
+    )
+
+
+def test_ci_still_passes_the_toolchain_flags(toolchain_pins):
+    """CI's own invocation is a gate, not a convention.
+
+    Everything here rests on one line of YAML. Drop ``--require-tool-tests``, or swap the
+    digest for a moving tag, and every test in this repo still passes while the guarantees
+    quietly evaporate. So the workflow is asserted like any other contract.
+    """
+    ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+
+    assert "--require-tool-tests" in ci, "ci.yml no longer fails on a skipped tool suite"
+    assert "--strict-toolchain" in ci, "ci.yml no longer asserts exact tool versions"
+    assert re.search(r"image:\s*\S+@sha256:[0-9a-f]{64}", ci), (
+        "ci.yml's container must be pinned by digest, not by tag — a tag can move "
+        "underneath a green build, which is what Goal 2 rules out"
+    )
+    assert "uv sync --locked" in ci, (
+        "ci.yml must use `uv sync --locked`; plain `uv sync` silently re-resolves "
+        "dependencies when uv.lock is stale"
+    )
+
+
+@pytest.mark.requires_tools
+def test_recorded_manifest_matches_the_pins(toolchain_pins, strict_toolchain):
+    """``/etc/flabel-toolchain.json`` is what the image says it installed.
+
+    It exists only inside the container, and `provenance.py` is earmarked to read it, at
+    which point these strings end up on shipped labels. So it is checked against the pins
+    rather than trusted. Absent outside the container, hence the skip.
+    """
+    manifest = pathlib.Path("/etc/flabel-toolchain.json")
+    if not manifest.exists():
+        pytest.skip("not running inside the toolchain container")
+
+    recorded = json.loads(manifest.read_text())
+    for key in ("zeek", "suricata", "wireshark", "ja4_zeek_package", "ja4_zeek_commit"):
+        assert recorded.get(key) == toolchain_pins[key], (
+            f"image recorded {key}={recorded.get(key)!r}, pin says "
+            f"{toolchain_pins[key]!r} — rebuild the image or fix the pin"
+        )
+
+
+@pytest.mark.requires_tools
+def test_installed_ja4_version_matches_the_pin(toolchain_pins, strict_toolchain):
+    """The ja4 version Zeek will actually use, as reported by zkg.
+
+    Checked separately from the Dockerfile text because that text only describes the build
+    that *should* have happened: a ``--build-arg`` override, or a rebuild after upstream
+    moved the tag, both yield an image whose ja4 differs from the pin while every other
+    assertion here still passes. This one changes label content, so it gets a real check.
+    """
+    listing = subprocess.run(["zkg", "list"], capture_output=True, text=True)
+    if listing.returncode != 0:
+        if strict_toolchain:
+            pytest.fail(f"zkg is not usable, so the ja4 pin cannot be verified: {listing.stderr}")
+        pytest.skip("zkg is not usable here — see docs/dev-setup.md")
+
+    match = re.search(r"zeek/foxio/ja4 \(installed: (\S+)\)", listing.stdout)
+    if match is None and not strict_toolchain:
+        pytest.skip("zeek/foxio/ja4 is not installed — see docs/dev-setup.md")
+
+    assert match is not None, f"zkg does not report ja4 as installed:\n{listing.stdout}"
+    assert match.group(1) == toolchain_pins["ja4_zeek_package"], (
+        f"ja4 {match.group(1)} is installed but the pin is "
+        f"{toolchain_pins['ja4_zeek_package']}. A different ja4 version can change the JA4 "
+        f"value carried on labels (docs/prd.md §9), so this is a reproducibility break."
     )
 
 

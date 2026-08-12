@@ -14,6 +14,7 @@ blocked_on:
   - "Malicious canary capture must be sourced (origin + licence recorded) — needed by Step 10 (#24) only; steps 1-9 are unblocked."
   - "PRD Q1/Q2/Q10: stakeholders, target release, success-metric review dates. Left TBD deliberately, not invented."
 known_gaps:
+  - "Reproducibility has a shelf life: the apt repos serve only newest-patch, so Dockerfile.toolchain will eventually stop being rebuildable and the pinned toolchain survives only as the GHCR image pinned by digest in ci.yml. Decide before Step 10 wires the Goal 2 gate whether to mirror the .debs/image or accept the bound in writing."
   - "No LICENSE file. Deliberate (Craig's call, 2026-08-12) while JA4+ licensing is with Legal — the repo is public but unlicensed. Not a scaffold defect; do not re-flag."
   - "README §Status and §Output layout are stale: they say 'Pre-research', call labels.json 'unsettled', and describe replay-based detection, which is Phase 2. Its Develop section is current."
 # NOTE: issue numbers are not in stage order. Two creates hit a transient TLS

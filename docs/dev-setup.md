@@ -49,8 +49,13 @@ Fix it, then install the package:
 pip3 install --user GitPython semantic-version    # or: pipx install zkg
 zkg autoconfig
 zkg install --version v0.18.8 zeek/foxio/ja4
-zeek --parse-only -e '@load packages'             # should exit 0
+zeek --parse-only -e '@load ja4'                  # should exit 0
+zkg list                                          # should show "installed: v0.18.8"
 ```
+
+`@load ja4` is the same check the tests use, deliberately: if it fails while the package
+directory exists, the package is installed somewhere Zeek won't load it, which is the
+problem worth knowing about.
 
 > **Licence note.** `zeek/foxio/ja4` is **JA4+** under the **FoxIO License 1.1**
 > (non-commercial). It is the approved default while Legal's review proceeds; restricting to
@@ -67,7 +72,7 @@ CI runs inside the digest-pinned image built by `Dockerfile.toolchain`, and adds
 
 | Flag | Effect |
 | :-- | :-- |
-| `--require-tool-tests` | The run fails unless at least one `requires_tools` test actually executed. A suite that skipped the whole integration layer must never look like a passing one. |
+| `--require-tool-tests` | The run fails unless a `requires_tools` test actually ran **and passed**, and fails if any was deselected. An `xfail`ed or mid-body-skipped tool test does not count — a suite that skipped the integration layer must never look like a passing one. |
 | `--strict-toolchain` | Tool versions must match `[tool.flabel.toolchain]` in `pyproject.toml` **exactly**, and the JA4 package must be present. |
 
 Locally, neither flag is passed: versions are checked at major.minor only, so a `brew
@@ -90,10 +95,16 @@ success.
 Take the digest from the `container:` line in `.github/workflows/ci.yml`:
 
 ```sh
-docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
+docker run --rm -v "$PWD":/work -w /work \
+  -e UV_PROJECT_ENVIRONMENT=/tmp/venv \
   ghcr.io/deeptempo/flabel-toolchain@sha256:<digest> \
-  sh -c 'uv sync --dev && uv run pytest -q --require-tool-tests --strict-toolchain'
+  sh -c 'uv sync --locked --dev && uv run pytest -q --require-tool-tests --strict-toolchain'
 ```
+
+`UV_PROJECT_ENVIRONMENT` matters: without it, `uv sync` replaces your macOS/arm64 `.venv`
+with a root-owned linux/amd64 one inside the bind mount, and your next host-side
+`uv run pytest` fails confusingly. For the same reason, expect root-owned `__pycache__`
+directories if you run this often — add `--user "$(id -u):$(id -g)"` to avoid them.
 
 **The image is amd64-only**, because the openSUSE Build Service repo that packages Zeek
 publishes no arm64 build. On Apple silicon it runs under emulation — correct but slow, so
@@ -110,10 +121,31 @@ across unpinned tool versions means nothing.
 
 To bump the toolchain:
 
-1. Edit the `ARG` values in `Dockerfile.toolchain` (or let the apt line move).
-2. Push; the `toolchain` workflow builds and prints the new digest and versions.
-3. Update `[tool.flabel.toolchain]` and the `container:` digest in `ci.yml` to match.
+1. Edit the `ARG` values in `Dockerfile.toolchain` — the exact apt versions
+   (`SURICATA_PACKAGE_VERSION`, `WIRESHARK_PACKAGE_VERSION`, `ZEEK_PACKAGE_VERSION`) and, for
+   JA4, both the tag and the commit it must resolve to.
+2. Update `[tool.flabel.toolchain]` in the same commit. The `toolchain` workflow runs the
+   suite inside the new image with `--strict-toolchain`, so a Dockerfile bump without a
+   matching pin bump fails there rather than silently publishing.
+3. Push; the workflow prints the new digest. Put it in `ci.yml`'s `container:` line.
 
 The apt repositories serve only the newest patch of each release line, so an upstream patch
-release eventually breaks the exact pin and CI goes red. That is the intended behaviour: a
-toolchain change should be a visible, deliberate commit, never a silent drift.
+release eventually makes a pinned version unavailable and the **image build** fails. That is
+intended: a toolchain change should be a visible, deliberate commit, never a silent drift.
+
+### What pinning does and does not buy you
+
+The pins now install exact versions rather than describing a past build, and the base image,
+`uv`, and the JA4 commit are all pinned. But the apt repositories do not keep old patches, so
+`Dockerfile.toolchain` will eventually stop being rebuildable, and the pinned environment
+survives only as the GHCR image referenced by digest from `ci.yml`. Reproducing a labelling
+run older than that image's retention means keeping the image, not rebuilding it. See
+`docs/status.yaml` `known_gaps`.
+
+### Why the GHCR package stays private
+
+`ci.yml` pulls the image with `credentials:`, because the package is private. It contains
+the JA4+ package, which is FoxIO License 1.1 (non-commercial), and republishing it in a
+public image is not a call to make while Legal's review is open. Consequence: a pull request
+from a **fork** cannot pull the image and its `test` job will fail. There are no external
+contributors today; revisit if that changes.

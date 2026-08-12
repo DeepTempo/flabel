@@ -21,7 +21,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --dev
+      - run: uv sync --locked --dev
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
@@ -42,7 +42,7 @@ jobs:
         run: cat /etc/flabel-toolchain.json
 
       # uv is baked into the image, so no setup action is needed here.
-      - run: uv sync --dev
+      - run: uv sync --locked --dev
 
       # --require-tool-tests: fail unless a real-tool test actually ran, so a skipped
       #                       integration layer can never be mistaken for a passing build.
