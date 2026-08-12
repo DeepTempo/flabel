@@ -73,3 +73,16 @@ alert icmp any any -> any any (msg:"FLABEL TEST synthetic ICMP echo"; itype:8; c
 # only tcp/udp/icmp/unknown_transport. Lowercasing alone would leave `ipv6-icmp` against Zeek's
 # `icmp` and no ICMPv6 detection could ever match a flow.
 alert icmp any any -> any any (msg:"FLABEL TEST synthetic ICMPv6 echo"; itype:128; classtype:trojan-activity; sid:9000008; rev:1;)
+
+# sid 9000009 — DELIBERATELY UNLOADABLE, and for a reason no rule text can fix: it negates
+# `$HOME_NET`, which flabel's `suricata.yaml` sets to `any`. Measured on 8.0.6:
+#
+#     Complete IP space negated. Rule address range is NIL.
+#
+# This is the shape of pawpatrules sids 3300158, 3300159 and 3321393, all written
+# `alert udp $HOME_NET any -> ![...,$HOME_NET] <port>`. Negating a `HOME_NET` of `any` leaves the
+# empty set, so no configuration makes this rule loadable while `$HOME_NET` still means
+# everything. `rules/admit.py` therefore excludes rules of this shape at admission
+# (`negates_home_net`); this rule is what proves the engine really does reject them, so the
+# exclusion rests on a measurement rather than on a claim in a comment. Never "repair" it.
+alert udp $HOME_NET any -> ![10.0.0.0/8,$HOME_NET] 123 (msg:"FLABEL TEST negated home_net"; classtype:trojan-activity; sid:9000009; rev:1;)

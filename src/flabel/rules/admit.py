@@ -16,6 +16,11 @@ rules cannot go missing unaccounted for. Disabled (`#alert`) rules sit outside t
 in their own counter: ET Open ships 19,479 of them against 51,778 active rules, and folding
 them in would make the admitted percentage describe a population nobody ever runs.
 
+One of those buckets is not about the feed's content at all. **A rule this engine cannot load
+is excluded here rather than handed over to fail**, because Suricata exits 0 on a rule it
+rejected and `suricata._check_ruleset_loaded` then fails the whole run — see
+`negates_home_net`, which is the three pawpatrules rules that negate a `$HOME_NET` of `any`.
+
 And one rule about zero: **a source that admits no rules at all is a hard failure**, never a
 source with a zero next to its name. Spec §5 deleted `abuse.ch/sslbl-c2` for exactly this
 reason, and the failure is easy to reach by accident — a corporate proxy answering 200 with an
@@ -64,6 +69,19 @@ JA4_KEYWORD = "ja4.hash"
 #: `_logical_rules` for why a *comment* ending in a backslash is emphatically not one of these.
 CONTINUATION = "\\"
 
+#: The Suricata variable flabel sets to `any`, and which therefore cannot be negated.
+HOME_NET_VAR = "$HOME_NET"
+
+#: `$HOME_NET` as a whole variable reference. The lookahead is the whole point: `$HOME_NET` is a
+#: prefix of `$HOME_NETWORKS`, and a plain substring test would delete rules about an entirely
+#: different variable — a silent loss of coverage, which is the failure this module exists to
+#: make impossible.
+HOME_NET_REFERENCE = re.compile(rf"{re.escape(HOME_NET_VAR)}(?![A-Za-z0-9_])")
+
+#: Characters that end a bare address term inside an address specification. A negation applies
+#: to the term or bracketed list that follows the `!`, and these are where that term stops.
+ADDRESS_DELIMITERS = frozenset({",", "[", "]", " ", "\t"})
+
 
 def admit(
     spec: SourceSpec,
@@ -90,7 +108,7 @@ def admit(
 
     admitted: list[str] = []
     fetched = commented = 0
-    no_confidence = low_confidence = low_severity = 0
+    no_confidence = low_confidence = low_severity = unloadable = 0
     ja3 = ja4 = 0
 
     for line in _logical_rules(rule_lines, spec):
@@ -105,6 +123,11 @@ def admit(
         fetched += 1
 
         verdict = _metadata_verdict(rule) if filtered else None
+        # Checked *after* the metadata filter, so a rule the filter already excluded stays in
+        # its metadata bucket and "low severity" keeps reading as "would have been admitted but
+        # for its severity" (issue #11). A rule reaches this test only if it would be admitted.
+        if verdict is None and negates_home_net(rule):
+            verdict = "unloadable"
 
         if verdict is None:
             admitted.append(rule)
@@ -120,6 +143,8 @@ def admit(
             no_confidence += 1
         elif verdict == "low_confidence":
             low_confidence += 1
+        elif verdict == "unloadable":
+            unloadable += 1
         else:
             low_severity += 1
 
@@ -130,7 +155,7 @@ def admit(
         # Every one of those would otherwise write a snapshot whose manifest reads
         # `rules_admitted: 0` — indistinguishable from a ruleset that matched nothing, which is
         # the failure spec §5 deleted a source to avoid.
-        raise ConfigError(_nothing_admitted_message(spec, fetched, no_confidence))
+        raise ConfigError(_nothing_admitted_message(spec, fetched, no_confidence, unloadable))
 
     admission = SourceAdmission(
         name=spec.name,
@@ -147,6 +172,7 @@ def admit(
         ja4_rules_admitted=ja4,
         ja3_rules_admitted=ja3,
         fetched_at=fetched_at,
+        rules_excluded_unloadable=unloadable,
     )
     _verify_identity(admission)
     return admitted, admission
@@ -215,6 +241,75 @@ def rule_metadata(rule: str) -> dict[str, str]:
     return metadata
 
 
+def negates_home_net(rule: str) -> bool:
+    """Whether `rule`'s address specification negates `$HOME_NET`, which flabel sets to `any`.
+
+    **Measured, and logically unavoidable.** With `HOME_NET: any`, Suricata 8.0.6 refuses three
+    pawpatrules rules — sids **3300158**, **3300159** and **3321393** — with:
+
+        Complete IP space negated. Rule address range is NIL.
+
+    All three are written `alert udp $HOME_NET any -> ![…,$HOME_NET] …`. Negating a `HOME_NET` of
+    `any` leaves the empty set, so the rule can never match anything and Suricata says so. This
+    is not a misconfiguration that a better `HOME_NET` would fix: nothing can make `$HOME_NET`
+    mean everything *and* `!$HOME_NET` mean something.
+
+    `HOME_NET: any` is settled. Measured against the live feeds: only these 3 rules negate
+    `HOME_NET`, while **1,397** are `$HOME_NET`-anchored and would go silently dead on a
+    public-addressed capture if `HOME_NET` were RFC1918 — a capture from a hosting provider or a
+    cloud VPC would simply produce no labels, which is the worst failure this tool has. Trading
+    3 rules for 1,397 is the whole of the decision.
+
+    So they are excluded here rather than left to fail at load time. Suricata still exits 0 with
+    a failed-rule count, which `suricata._check_ruleset_loaded` turns into a hard failure — so
+    "let them fail" is not a quiet degradation, it is a run that never produces labels at all.
+
+    **What counts as a negation.** A `!` applying to a bare term or to a bracketed list that
+    contains `$HOME_NET`: `!$HOME_NET`, `![10.0.0.0/8,$HOME_NET]`, and the nested forms. Only the
+    rule *header* is examined — everything before the options block — so a `!` inside a
+    `content:` or `pcre:` cannot be mistaken for an address negation. Suricata's own parser
+    splits the rule at the same place. `$HOME_NET` is matched as a whole variable reference, not
+    as a substring, so `!$HOME_NETWORKS` is a different variable and is left alone.
+
+    Public because the measurement script reports on it, and because "which rules did flabel
+    refuse to hand the engine" should be answerable without a second parser written for it.
+    """
+    header = rule.split("(", 1)[0]
+    return any(
+        HOME_NET_REFERENCE.search(_negated_term(header, index + 1))
+        for index, char in enumerate(header)
+        if char == "!"
+    )
+
+
+def _negated_term(header: str, start: int) -> str:
+    """The text a `!` at `start - 1` applies to: a bracketed list, or a bare term.
+
+    Brackets are matched by depth rather than by the first `]`, because Suricata's address lists
+    nest — `![10.0.0.0/8,[192.168.0.0/16,$HOME_NET]]` negates the whole outer list, and stopping
+    at the first `]` would read only part of it. An unbalanced bracket yields the rest of the
+    header, which over-reports rather than under-reports: a malformed header is a rule Suricata
+    will not load either way, and the safe direction is to keep it out of the snapshot.
+    """
+    if start >= len(header):
+        return ""
+    if header[start] != "[":
+        end = start
+        while end < len(header) and header[end] not in ADDRESS_DELIMITERS:
+            end += 1
+        return header[start:end]
+
+    depth = 0
+    for index in range(start, len(header)):
+        if header[index] == "[":
+            depth += 1
+        elif header[index] == "]":
+            depth -= 1
+            if depth == 0:
+                return header[start : index + 1]
+    return header[start:]
+
+
 def _metadata_verdict(rule: str) -> str | None:
     """`None` to admit, otherwise the name of the counter this rule is excluded into.
 
@@ -254,11 +349,14 @@ def _require_metadata_publisher(spec: SourceSpec) -> None:
         )
 
 
-def _nothing_admitted_message(spec: SourceSpec, fetched: int, no_confidence: int) -> str:
+def _nothing_admitted_message(
+    spec: SourceSpec, fetched: int, no_confidence: int, unloadable: int
+) -> str:
     """Why nothing was admitted, in the words that name the likely cause.
 
-    The three cases read very differently to an operator, so the message distinguishes them
-    even though the failure is the same.
+    The four cases read very differently to an operator, so the message distinguishes them even
+    though the failure is the same. Order matters: `fetched == 0` is checked first, because with
+    no rules at all every other test below is also trivially true.
     """
     if fetched == 0:
         return (
@@ -267,6 +365,14 @@ def _nothing_admitted_message(spec: SourceSpec, fetched: int, no_confidence: int
             f"deprecated into a notice all look like this. A snapshot is not written from it, "
             f"because `rules_admitted: 0` in the manifest is indistinguishable from a ruleset "
             f"that matched nothing (docs/spec.md §2.5, and §5's deletion of abuse.ch/sslbl-c2)."
+        )
+    if fetched == unloadable:
+        return (
+            f"source {spec.name!r} published {fetched} active rules and every one of them "
+            f"negates {HOME_NET_VAR}, which flabel sets to `any` — so none of them can match "
+            f'anything and Suricata refuses to load them ("Complete IP space negated"). This '
+            f"is a feed flabel's configuration cannot run at all rather than a feed that "
+            f"matched nothing; see `negates_home_net`."
         )
     if spec.admission_basis == "metadata-filter" and fetched == no_confidence:
         return (
@@ -295,6 +401,7 @@ def _verify_identity(admission: SourceAdmission) -> None:
         + admission.rules_excluded_no_confidence
         + admission.rules_excluded_low_confidence
         + admission.rules_excluded_low_severity
+        + admission.rules_excluded_unloadable
     )
     if accounted != admission.rules_fetched:
         raise ValueError(

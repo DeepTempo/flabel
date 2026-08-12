@@ -113,7 +113,8 @@ class SourceAdmission:
 
     The exclusion counters are separate on purpose: `fetched == admitted + sum(excluded)` is
     asserted, so rules cannot go missing unaccounted for. "No confidence key" is counted
-    apart from "confidence too low" because the distinction feeds issue #10.
+    apart from "confidence too low" because the distinction feeds issue #10, and "unloadable"
+    apart from both because it is flabel's configuration talking, not the feed's metadata.
     """
 
     name: str
@@ -139,6 +140,16 @@ class SourceAdmission:
     ja4_rules_admitted: int
     ja3_rules_admitted: int
     fetched_at: str
+    #: Rules this engine cannot load, excluded at admission rather than left to fail at load
+    #: time. Today that is exactly the rules whose address specification negates `$HOME_NET`,
+    #: which is the empty set under flabel's `HOME_NET: any` — see `rules/admit.py`. Counted
+    #: apart from the metadata buckets because nothing about the rule's *content* is at fault:
+    #: it is a rule flabel's configuration cannot run. Part of the `fetched == admitted +
+    #: sum(excluded)` identity like every other exclusion.
+    #:
+    #: Last in the field list, with a default, only because every field above it is required —
+    #: a defaulted field cannot precede a mandatory one. Every call site passes it by keyword.
+    rules_excluded_unloadable: int = 0
 
     def __post_init__(self) -> None:
         _check(self.source_class, get_args(SourceClass), "source_class", "SourceAdmission")
