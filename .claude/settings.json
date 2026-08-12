@@ -1,18 +1,18 @@
 {
-  "_comment": "Adjust commands to the project's stack (these defaults are Python: ruff + pytest). Delete '_disabled' from a key to enable it.",
+  "_comment": "Commands must go through `uv run`: this project installs ruff and pytest as dev dependencies, so bare `ruff`/`pytest` are not on PATH and a hook using them fails silently.",
   "hooks": {
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
-          { "type": "command", "command": "jq -r '.tool_input.file_path' | { read f; case \"$f\" in *.py) ruff format \"$f\" && ruff check --fix \"$f\";; esac; }" }
+          { "type": "command", "command": "jq -r '.tool_input.file_path' | { read f; case \"$f\" in *.py) uv run --no-sync ruff format \"$f\" && uv run --no-sync ruff check --fix \"$f\";; esac; }" }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "pytest -q" }
+          { "type": "command", "command": "uv run --no-sync pytest -q" }
         ]
       }
     ]
