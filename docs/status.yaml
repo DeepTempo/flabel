@@ -9,7 +9,7 @@ prd_gdoc_url: "https://docs.google.com/document/d/1WwKukQ71L6JQWkSpKvoR4lgwB96w3
 # place, so it means creating a new Doc and updating this URL). Also: the superseded v0.1 Doc
 # 1q_muS6AmCuvcNva4C1WtRE3_KXArJPxnapttsU6UQIE needs deleting by hand — no delete tool exists.
 current_stage: build
-next_action: "Run /project:build for Step 2 (#16, models/errors/config), which unblocks the parallel group {3,4,5,6}."
+next_action: "Run /project:verify 2 on PR #29, then /project:build for the {3,4,5,6} parallel group (ingest, rules, zeek, suricata) — up to 3 worktrees, disjoint files."
 blocked_on:
   - "Malicious canary capture must be sourced (origin + licence recorded) — needed by Step 10 (#24) only; steps 1-9 are unblocked."
   - "PRD Q1/Q2/Q10: stakeholders, target release, success-metric review dates. Left TBD deliberately, not invented."
@@ -27,7 +27,7 @@ stages:
   eng_review: { status: completed, issue: 6, artifact: docs/eng-review.md, completed: "2026-08-11" }
   plan:       { status: completed, issue: 3, artifact: PLAN.md, completed: "2026-08-11" }
   scaffold:   { status: completed, issue: 4, artifact: .github/workflows/ci.yml, completed: "2026-08-12" }
-  build:      { status: in_progress, issue: 7, artifact: null, completed: null, steps_done: 1, steps_total: 10 }
+  build:      { status: in_progress, issue: 7, artifact: null, completed: null, steps_done: 2, steps_total: 10 }
   verify:     { status: pending, issue: 5, artifact: null, completed: null }
 log:
   - "2026-08-11 init — repo scaffolded, 7 stage issues filed, Notion row created"
@@ -39,3 +39,5 @@ log:
   - "2026-08-12 session handoff — CLAUDE.md architecture filled in from the plan; PR #25 open and unmerged; local branches stage/{research,prd,eng-review} are merged and prunable"
   - "2026-08-12 PR #25 merged (spec.md + PLAN.md on main); stage/* branches pruned"
   - "2026-08-12 stage(scaffold)+step 1 (#15, PR #26) — toolchain container pinned by digest (zeek 8.0.9, suricata 8.0.6, wireshark 4.6.6, ja4 v0.18.8); --require-tool-tests makes a skipped integration suite fail; --strict-toolchain asserts exact versions in CI. Found: `suricata --version` exits 1 (use -V), and the OBS Zeek repo has no arm64 build, so the image is amd64-only"
+  - "2026-08-12 step 2 (#16, PR #29) — models/errors/config + the ten-source registry. Spec corrected twice with Craig's agreement: ET Open pins suricata-8.0 to match the pinned engine, and package data moved inside the package because hatch force-include is absent from editable installs. Registry URLs/licences taken from the OISF suricata-intel-index; all ten resolve"
+  - "2026-08-12 fix (PR #28) — the Claude Code hooks had never run: both called bare ruff/pytest, which are dev dependencies and not on PATH. Now routed through uv run --no-sync"
