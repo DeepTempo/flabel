@@ -57,9 +57,9 @@ Step 10 canaries + reproducibility gates
 
 ## Step 2 — Foundations: models, errors, config
 
-**Files:** `src/flabel/models.py`, `src/flabel/errors.py`, `src/flabel/config.py`, `data/sources.toml`, `tests/test_models.py`, `tests/test_config.py`
+**Files:** `src/flabel/models.py`, `src/flabel/errors.py`, `src/flabel/config.py`, `src/flabel/data/sources.toml`, `tests/test_models.py`, `tests/test_config.py`
 
-**Changes:** All frozen dataclasses from spec §4, in one module that imports nothing from the package. Typed exceptions mapped to exit codes (spec §12). Source-registry loader with validation. `data/sources.toml` populated with the ten sources and their authoritative class/basis/licence assignments from spec §5.
+**Changes:** All frozen dataclasses from spec §4, **plus the four types spec §8/§9 name as return values** (`NormalizedCapture`, `ZeekRunInfo`, `SuricataRunInfo`, `CorrelationResult`) and `ToolFailure`, in one module that imports nothing from the package. Defining them here rather than in steps 3/5/6/7 is what keeps those steps read-only against `models.py` — a step that has to *create* a shared type collides with its siblings in the file meant to prevent that. Typed exceptions mapped to exit codes (spec §12). Source-registry loader with validation. `data/sources.toml` populated with the ten sources and their authoritative class/basis/licence assignments from spec §5.
 
 **Test that proves it:** `SourceSpec.may_label` is `False` exactly for `identify`; `label_basis` is `indicator-reference` exactly for `ioc-name`; unknown `source_class` or `admission_basis` raises; `metadata-filter` on a source without ET metadata raises; every exception type maps to exactly one exit code, and every exit code in spec §12 is reachable. **Plus the architectural guard:** a test asserting no pure module's source contains `subprocess`, `urllib`, or `socket`.
 
@@ -89,13 +89,21 @@ Step 10 canaries + reproducibility gates
 
 **Test that proves it:** on committed rule fixtures, `fetched == admitted + sum(excluded)` exactly; a `confidence Low` rule and a rule with no `confidence` key are excluded into *different* counters; `#alert` lines never admit; `ja3.hash` / `ja4.hash` rules are counted separately. Snapshot id is stable across writes of identical content and changes when content changes; `rules.rules` is sorted so fetch order cannot affect the id; `load_snapshot(None)` returns the newest; a missing snapshot raises. **Reports the real ET Open admitted counts, closing issue #11.**
 
+**Also required, from step 2's verification (measured against the live feeds):**
+- Import `ET_METADATA_SOURCES` from `config.py`; do not re-encode which feeds carry ET metadata.
+- **A `metadata-filter` source whose fetched rules contain zero `confidence` keys is a hard failure.** The load-time name check cannot detect ET dropping the key: the filter would admit zero rules, indistinguishable from a feed that matched nothing.
+- Count `#alert` lines into `rules_excluded_commented`. ET Open 8.0 ships **19,479** of them against 51,778 active rules, so `rules_fetched` counts active `alert` lines only.
+- Feeds differ in shape: six are `.tar.gz`, two are plain `.rules`, and `malsilo` is a tarball of **three** rules files. `malsilo` is also the only feed publishing a checksum.
+- Expected ET Open result, measured 2026-08-12: **21,221 admitted of 51,778** (41.0%); excluded 5,836 no-confidence, 11,425 low-confidence, 13,296 low-severity. The four counters sum exactly. Closing #11 means reproducing these from code.
+- ET Open 8.0 contains **zero `ja4.hash` rules** (19 `ja3.hash`), confirming #13: the capability ships, the content does not exist upstream yet.
+
 **Depends on:** 2. **Parallel with:** 3, 5, 6.
 
 ---
 
 ## Step 5 — Zeek invocation and parsing ⟂
 
-**Files:** `src/flabel/zeek.py`, `data/json-logs.zeek`, `tests/test_zeek.py`
+**Files:** `src/flabel/zeek.py`, `src/flabel/data/json-logs.zeek`, `tests/test_zeek.py`
 
 **Changes:** Single invocation `zeek -C -D -r <pcap> json-logs.zeek`. The Zeek script adds JSON log filters for `conn` and `ssl` so one pass yields both TSV (retained) and JSON (parsed) and they cannot disagree. Parse `conn_json.log` into `Flow`, join `ssl_json.log` for `ja4`/`ja4s`/`server_name` on `uid`. Retain all TSV logs; strip the `_json` files from retained output.
 

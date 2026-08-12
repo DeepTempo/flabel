@@ -8,6 +8,7 @@ and one silently ignored produces a run that looks complete while missing a whol
 
 from __future__ import annotations
 
+import re
 import tomllib
 from importlib import resources
 from pathlib import Path
@@ -29,6 +30,13 @@ OPTIONAL_FIELDS = ("enabled",)
 ET_METADATA_SOURCES = frozenset({"et/open"})
 
 PACKAGED_REGISTRY = "sources.toml"
+
+#: A source name becomes a path component in a snapshot (`raw/<source>.rules`, spec §7) and is
+#: recorded on every label as provenance. Names legitimately contain one `/` (`abuse.ch/urlhaus`),
+#: so path construction from this string is unavoidable — which makes the charset the guard.
+#: Without it, `--sources` with `name = "../../../.ssh/authorized_keys"` writes fetched rule
+#: text outside the snapshot directory, and step 4 has no reason to expect that to be its job.
+SOURCE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)?$")
 
 
 def default_registry_path() -> Path:
@@ -56,13 +64,21 @@ def load_sources(path: Path | None = None) -> tuple[SourceSpec, ...]:
         raise ConfigError(f"source registry could not be read: {path}: {exc}") from exc
 
     try:
-        document = tomllib.loads(raw.decode("utf-8"))
+        # utf-8-sig, so a registry saved by a Windows editor doesn't fail with a cryptic
+        # "Expected '=' after a key" caused by an invisible byte-order mark.
+        document = tomllib.loads(raw.decode("utf-8-sig"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise ConfigError(f"could not parse source registry {path}: {exc}") from exc
 
     entries = document.get("source")
     if not entries:
         raise ConfigError(f"source registry {path} declares no sources")
+    if not isinstance(entries, list):
+        # `[source]` instead of `[[source]]` is the likely human error, and iterating a dict
+        # would otherwise produce a baffling complaint about strings.
+        raise ConfigError(
+            f"{path}: `source` must be a list of tables — write [[source]], not [source]"
+        )
 
     specs = tuple(_build_spec(entry, path) for entry in entries)
     _reject_duplicates(specs, path)
@@ -75,14 +91,42 @@ def _build_spec(entry: Any, path: Path) -> SourceSpec:
 
     name = entry.get("name", "<unnamed>")
 
+    # Both reported together: a misspelled key produces *both* a missing field and an unknown
+    # one, and reporting only the first sends the reader looking for the wrong mistake.
+    problems = []
     missing = [field for field in REQUIRED_FIELDS if field not in entry]
     if missing:
-        raise ConfigError(f"{path}: source {name!r} is missing {', '.join(missing)}")
-
+        problems.append(f"missing {', '.join(missing)}")
     unknown = set(entry) - set(REQUIRED_FIELDS) - set(OPTIONAL_FIELDS)
     if unknown:
         # A typo'd key would otherwise read as a setting that took effect.
-        raise ConfigError(f"{path}: source {name!r} has unknown field(s): {sorted(unknown)}")
+        problems.append(f"unknown field(s) {sorted(unknown)}")
+    if problems:
+        raise ConfigError(f"{path}: source {name!r} has {'; '.join(problems)}")
+
+    for field in ("name", "url", "licence"):
+        value = entry[field]
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"{path}: source {name!r} has a non-string or empty {field}: {value!r}"
+            )
+
+    if not SOURCE_NAME.match(name):
+        raise ConfigError(
+            f"{path}: source name {name!r} is not of the form `vendor/feed` in lowercase "
+            f"[a-z0-9._-]. The name becomes a path component in a snapshot and is recorded "
+            f"on every label, so it cannot contain path separators beyond one '/', '..', "
+            f"whitespace or uppercase."
+        )
+
+    url = entry["url"]
+    if not url.startswith("https://"):
+        # Rules become labels. Fetching them over http:// or file:// would make the trust
+        # root of every verdict either forgeable in transit or an arbitrary local file.
+        raise ConfigError(
+            f"{path}: source {name!r} has a non-HTTPS url: {url!r}. Rule feeds must be "
+            f"fetched over HTTPS."
+        )
 
     source_class = entry["source_class"]
     if source_class not in SOURCE_CLASSES:
@@ -111,7 +155,7 @@ def _build_spec(entry: Any, path: Path) -> SourceSpec:
 
     return SourceSpec(
         name=name,
-        url=entry["url"],
+        url=url,
         licence=entry["licence"],
         source_class=source_class,
         admission_basis=admission_basis,
@@ -120,8 +164,25 @@ def _build_spec(entry: Any, path: Path) -> SourceSpec:
 
 
 def _reject_duplicates(specs: tuple[SourceSpec, ...], path: Path) -> None:
+    """Reject repeated names, compared case-insensitively.
+
+    Case-folded because step 4 writes `raw/<source>.rules`: on a case-insensitive filesystem
+    two names differing only in case would silently clobber each other's fetched rules.
+    """
     seen: set[str] = set()
     for spec in specs:
-        if spec.name in seen:
+        key = spec.name.casefold()
+        if key in seen:
             raise ConfigError(f"{path}: duplicate source name {spec.name!r}")
-        seen.add(spec.name)
+        seen.add(key)
+
+
+def enabled_sources(path: Path | None = None) -> tuple[SourceSpec, ...]:
+    """Only the sources that should contribute rules.
+
+    Exists so no caller has to remember to filter on `enabled` — forgetting would let a
+    source the operator switched off keep producing labels. The complement is deliberately
+    still available via `load_sources`, because a run must be able to report which sources
+    were skipped: absence is never a signal (spec §2.5).
+    """
+    return tuple(spec for spec in load_sources(path) if spec.enabled)

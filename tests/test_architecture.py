@@ -11,6 +11,11 @@ refactoring because they read the source rather than the behaviour:
 
 Imports are read from the AST rather than grepped, so a module may still *mention*
 `subprocess` in a comment explaining why it doesn't use one.
+
+Scope, stated honestly: this catches direct imports, including the `os.system`/`os.popen` and
+`importlib.import_module` spellings of the same thing. It does **not** prove a run makes no
+network call — a runtime socket guard on the real pipeline is step 9's job (PLAN step 9). What
+it does buy is that the decision is explicit: no module can quietly become impure.
 """
 
 from __future__ import annotations
@@ -38,12 +43,24 @@ PURE_MODULES = (
 #: Spec §2.2: only `flabel rules update` touches the network, and only through this module.
 NETWORK_MODULE = "rules/fetch.py"
 
-FORBIDDEN_IN_PURE = frozenset({"subprocess", "urllib", "socket", "http", "requests", "ftplib"})
+#: `os` is here for `os.system`/`os.popen`, which are subprocess execution by another name and
+#: would otherwise sail past a guard that only looks at imports of `subprocess`. `importlib`
+#: because `importlib.import_module("subprocess")` is the same bypass spelled differently.
+FORBIDDEN_IN_PURE = frozenset(
+    {"subprocess", "urllib", "socket", "http", "requests", "ftplib", "asyncio", "ssl", "importlib"}
+)
+
+#: Modules a pure module may legitimately import despite the rule above, with the reason.
+PURE_EXEMPTIONS = {
+    # config.py reads the registry from disk; spec §3 classes filesystem reads as pure. It
+    # needs importlib.resources to find package data, which cannot execute anything.
+    ("config.py", "importlib"),
+}
 
 
 def imported_modules(path: pathlib.Path) -> set[str]:
     """Top-level names of everything `path` imports."""
-    tree = ast.parse(path.read_text())
+    tree = ast.parse(path.read_text(encoding="utf-8"))
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -53,18 +70,17 @@ def imported_modules(path: pathlib.Path) -> set[str]:
     return names
 
 
-def existing(*relative: str) -> list[pathlib.Path]:
-    """Only the modules that exist yet — the guard grows as steps land."""
-    return [PACKAGE / name for name in relative if (PACKAGE / name).exists()]
-
-
 @pytest.mark.parametrize("module", PURE_MODULES)
 def test_pure_modules_perform_no_io(module):
     path = PACKAGE / module
     if not path.exists():
         pytest.skip(f"{module} lands in a later step")
 
-    offenders = imported_modules(path) & FORBIDDEN_IN_PURE
+    offenders = {
+        name
+        for name in imported_modules(path) & FORBIDDEN_IN_PURE
+        if (module, name) not in PURE_EXEMPTIONS
+    }
     assert not offenders, (
         f"{module} is a pure module (spec §3) but imports {sorted(offenders)}. "
         f"Move the I/O to an impure module rather than relaxing this guard."
@@ -99,7 +115,7 @@ def test_pure_modules_are_all_accounted_for():
 
 def test_only_the_fetch_module_may_touch_the_network():
     """The inverse of the purity guard: network I/O is confined to one file, by name."""
-    network_names = frozenset({"urllib", "socket", "http", "requests", "ftplib"})
+    network_names = frozenset({"urllib", "socket", "http", "requests", "ftplib", "ssl"})
     for path in PACKAGE.rglob("*.py"):
         if "__pycache__" in path.parts:
             continue

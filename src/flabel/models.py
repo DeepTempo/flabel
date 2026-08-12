@@ -11,7 +11,23 @@ and a claim that can be edited after the fact is not provenance.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from pathlib import Path
+from typing import Literal, get_args
+
+
+def _check(value: object, allowed: tuple[object, ...], field: str, owner: str) -> None:
+    """Reject a value outside its `Literal`.
+
+    `Literal` is a type hint, not a runtime check: without this, `Label(verdict="benign")`
+    constructs happily. Spec §13's first never-do is asserting a flow is benign, so the
+    constraint is enforced rather than annotated.
+
+    Raises `ValueError` rather than a flabel exception because this module imports nothing
+    from the package; `cli.py` maps anything unrecognised to exit 1.
+    """
+    if value not in allowed:
+        raise ValueError(f"{owner}.{field}: {value!r} is not one of {list(allowed)}")
+
 
 # --- configuration ------------------------------------------------------------------------
 
@@ -30,6 +46,16 @@ AdmissionBasis = Literal["metadata-filter", "wholesale"]
 #: consumer can tell a content match from an indirect reference without reading rule text.
 LabelBasis = Literal["direct", "indicator-reference"]
 
+#: Container format of the capture as sniffed by magic bytes, never by file extension.
+CaptureFormat = Literal["pcap", "pcapng", "pcap.gz", "pcapng.gz"]
+
+#: Whether the whole capture was read. `partial` covers truncation and discarded link types;
+#: both still exit 0, with the run block saying what was lost (spec §12).
+InputStatus = Literal["complete", "partial"]
+
+#: Why a detection could not be attached to exactly one flow.
+UnmatchedReason = Literal["no_flow_match", "ambiguous_flow_match"]
+
 
 @dataclass(frozen=True)
 class SourceSpec:
@@ -41,6 +67,10 @@ class SourceSpec:
     source_class: SourceClass
     admission_basis: AdmissionBasis
     enabled: bool = True
+
+    def __post_init__(self) -> None:
+        _check(self.source_class, get_args(SourceClass), "source_class", "SourceSpec")
+        _check(self.admission_basis, get_args(AdmissionBasis), "admission_basis", "SourceSpec")
 
     @property
     def may_label(self) -> bool:
@@ -78,17 +108,37 @@ class SourceAdmission:
     """
 
     name: str
+    #: The exact endpoint the rules came from. Without it, a label's origin traces only to a
+    #: source *name* in a TOML file that can change between runs, and swapping two feeds'
+    #: URLs would be undetectable in the output (spec §13: never emit a label whose origin
+    #: can't be traced). Added in step 2 over spec §4's field list.
+    url: str
     licence: str
     source_class: SourceClass
     admission_basis: AdmissionBasis
+    #: Candidate rule lines seen — active `alert` lines only. Commented-out rules are counted
+    #: in `rules_excluded_commented` instead, and are NOT part of this total.
     rules_fetched: int
     rules_admitted: int
     rules_excluded_no_confidence: int
     rules_excluded_low_confidence: int
     rules_excluded_low_severity: int
+    #: Disabled (`#alert`) rules. Added in step 2 over spec §4: ET Open 8.0 ships 19,479 of
+    #: them against 51,778 active rules, so without this counter they are invisible, and
+    #: spec §6's `fetched == admitted + sum(excluded)` identity cannot describe the feed.
+    rules_excluded_commented: int
     ja4_rules_admitted: int
     ja3_rules_admitted: int
     fetched_at: str
+
+    def __post_init__(self) -> None:
+        _check(self.source_class, get_args(SourceClass), "source_class", "SourceAdmission")
+        _check(
+            self.admission_basis,
+            get_args(AdmissionBasis),
+            "admission_basis",
+            "SourceAdmission",
+        )
 
 
 @dataclass(frozen=True)
@@ -147,6 +197,10 @@ class Detection:
     dst_ip: str
     dst_port: int
     proto: str
+    #: The rule's `metadata:` values, as Suricata reports them in `alert.metadata`. Spec §8
+    #: says to parse this; spec §4's field list omitted somewhere to put it. It is what issue
+    #: #10 (should untagged ET rules be admitted?) will be answered from.
+    metadata: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -168,6 +222,10 @@ class SourceEntry:
     label_basis: LabelBasis
     threat: str
 
+    def __post_init__(self) -> None:
+        _check(self.admission_basis, get_args(AdmissionBasis), "admission_basis", "SourceEntry")
+        _check(self.label_basis, get_args(LabelBasis), "label_basis", "SourceEntry")
+
 
 @dataclass(frozen=True)
 class Label:
@@ -183,6 +241,20 @@ class Label:
     best_tier: int
     sources: tuple[SourceEntry, ...]
 
+    def __post_init__(self) -> None:
+        _check(self.verdict, ("malicious",), "verdict", "Label")
+        if not self.sources:
+            raise ValueError(
+                "Label.sources is empty: a label with no asserting source has no provenance"
+            )
+        expected = min(entry.tier for entry in self.sources)
+        if self.best_tier != expected:
+            # Two fields that can disagree is a flaw in an artifact whose whole value is
+            # provenance, so agreement is enforced rather than assumed.
+            raise ValueError(
+                f"Label.best_tier is {self.best_tier} but min(sources.tier) is {expected}"
+            )
+
 
 @dataclass(frozen=True)
 class UnmatchedDetection:
@@ -194,3 +266,110 @@ class UnmatchedDetection:
 
     detection: Detection
     reason: Literal["no_flow_match", "ambiguous_flow_match"]
+
+    def __post_init__(self) -> None:
+        _check(self.reason, get_args(UnmatchedReason), "reason", "UnmatchedDetection")
+
+
+# --- tool and stage results ----------------------------------------------------------------
+#
+# These four are named by spec §8 and §9 as return types but were absent from spec §4's field
+# list, so they are defined here in step 2 rather than by whichever of steps 3/5/6/7 reaches
+# them first. models.py exists so those steps can be built in parallel; a step that has to
+# *create* a shared type collides with its siblings in exactly the file meant to prevent that.
+#
+# Fields are derived from the run block in spec §10, which is what these ultimately populate.
+# A later step may need to *add* a field — a far smaller collision than defining the type.
+
+
+@dataclass(frozen=True)
+class ToolFailure:
+    """A tool that exited non-zero, was killed, or could not be run at all (spec §11).
+
+    Recorded as well as raised: the run reports what was lost rather than merely dying.
+    """
+
+    tool: str
+    argv: tuple[str, ...]
+    exit_code: int | None
+    message: str
+
+
+@dataclass(frozen=True)
+class NormalizedCapture:
+    """The capture every consumer reads, plus everything provenance needs about it.
+
+    One normalized file, so Zeek and Suricata cannot disagree about the input (spec §2.4).
+
+    Two field names differ from their `labels.json` keys because `format` and `bytes` shadow
+    builtins: `capture_format` serialises as `format`, `bytes_total` as `bytes`.
+    """
+
+    path: Path
+    original_path: Path
+    sha256: str
+    capture_format: CaptureFormat
+    bytes_total: int
+    input_status: InputStatus
+    packets_read: int
+    #: Byte offset of the first short record, or None when the capture is complete. A
+    #: truncated pcap proceeds as partial input; a truncated pcapng is a hard failure.
+    truncated_at_offset: int | None = None
+    discarded_link_types: tuple[str, ...] = ()
+    discarded_packets: int = 0
+    #: Every transformation applied, in order — decompression, conversion, link-type split.
+    normalization: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _check(self.capture_format, get_args(CaptureFormat), "capture_format", "NormalizedCapture")
+        _check(self.input_status, get_args(InputStatus), "input_status", "NormalizedCapture")
+
+
+@dataclass(frozen=True)
+class ZeekRunInfo:
+    """What the Zeek pass did, for the run block's `tools` section.
+
+    `flags` is recorded because `-D` is mandatory (spec §2.3): without it connection uids
+    differ every run, so a run that lost the flag must be visible in its own output.
+    """
+
+    version: str
+    flags: tuple[str, ...]
+    log_dir: Path
+    retained_logs: tuple[str, ...] = ()
+    ja4_package_version: str | None = None
+    tool_failures: tuple[ToolFailure, ...] = ()
+
+
+@dataclass(frozen=True)
+class SuricataRunInfo:
+    """What the Suricata pass did, for the run block's `tools` and `counts` sections."""
+
+    version: str
+    snapshot_id: str
+    rules_loaded: int
+    alerts_total: int
+    #: Alerts dropped because their source may not label (spec §2.8). Counted, never silent.
+    identify_alerts_suppressed: int = 0
+    tool_failures: tuple[ToolFailure, ...] = ()
+
+
+@dataclass(frozen=True)
+class CorrelationResult:
+    """The outcome of attaching detections to flows (spec §9).
+
+    Carries the unmatched detections alongside the labels because a detection that could not
+    be placed is a loss condition to report, not a row to drop (spec §2.5).
+    """
+
+    labels: tuple[Label, ...]
+    unmatched: tuple[UnmatchedDetection, ...]
+    flows_total: int
+    detections_total: int
+
+    @property
+    def unmatched_ratio(self) -> float:
+        """Share of detections that could not be placed. Zero detections is zero loss."""
+        if self.detections_total == 0:
+            return 0.0
+        return len(self.unmatched) / self.detections_total

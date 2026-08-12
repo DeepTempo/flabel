@@ -14,6 +14,12 @@
 #
 # sslbl/ja3-fingerprints is excluded even though it is free and available: a computed
 # fingerprint is never a verdict (spec §2.6), and JA3 is trivially forgeable.
+#
+# abuse.ch/sslbl-c2 (sslipblacklist) was removed in step 2 after verification: the OISF index
+# marks it `deprecated: Deprecated by source on 2025-01-03`, and the live artifact is 335 bytes
+# containing a header and "ATTENTION: This list has been deprecated" — zero rules. A source
+# that cannot ever contribute implies coverage it does not deliver, and its zero count would
+# read as "matched nothing this run". Nine live sources remain.
 
 # --- signature feeds: a rule matched traffic content -> the flow is malicious --------------
 
@@ -63,13 +69,6 @@ admission_basis  = "wholesale"
 [[source]]
 name             = "abuse.ch/feodotracker"
 url              = "https://feodotracker.abuse.ch/downloads/feodotracker.tar.gz"
-licence          = "CC0-1.0"
-source_class     = "ioc-dest"
-admission_basis  = "wholesale"
-
-[[source]]
-name             = "abuse.ch/sslbl-c2"
-url              = "https://sslbl.abuse.ch/blacklist/sslipblacklist.tar.gz"
 licence          = "CC0-1.0"
 source_class     = "ioc-dest"
 admission_basis  = "wholesale"
