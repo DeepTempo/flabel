@@ -196,11 +196,21 @@ source class and carrying `admission_basis` and `licence`"* moved to
 step 7 has to construct `SourceEntry` values to return a `Label` at all, so leaving the job here
 meant both worktrees writing it.
 
-**`build_source_entry` and `tests/test_provenance.py` are read-only to
-this step.** Step 8 **appends** the run block to `provenance.py` below them and adds its own test
-file section. Do not change the builder's signature: step 7's worktree is written against it in
-parallel, so a change here is green in both worktrees and broken on merge — the same defect class
-the pre-placement exists to prevent. If it looks wrong, raise it rather than edit it.
+**`provenance.py` and `tests/test_provenance.py` are append-only to this step**, which is not the
+same as read-only and the difference matters:
+
+| File | Step 8 may | Step 8 may not |
+| :-- | :-- | :-- |
+| `src/flabel/provenance.py` | add the run-block assembly **below** the existing contents | change `build_source_entry`, its signature, its guards, or `KNOWN_TIERS` |
+| `tests/test_provenance.py` | add a new section of run-block tests below the existing ones | modify, weaken or delete any existing test |
+
+Do not change the builder's signature: step 7's worktree is written against it in parallel, so a
+change here is green in both worktrees and broken on merge — the same defect class the
+pre-placement exists to prevent. If it looks wrong, **raise it rather than edit it.**
+
+(An earlier revision of this section called both files "read-only" while also telling step 8 to add
+a test section to one of them, which cannot both be true. Recorded because the ambiguity was found
+by having to answer it for a build agent, not by reading the plan — the plan read fine.)
 
 The required-fields assertion below **already exists** as
 `test_every_mandatory_field_is_populated_with_a_real_value` and

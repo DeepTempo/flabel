@@ -18,7 +18,7 @@ import inspect
 import pytest
 
 from flabel import errors
-from flabel.models import SuricataRunInfo, ToolFailure
+from flabel.models import CorrelationResult, SuricataRunInfo, ToolFailure
 
 #: Every code spec §12 documents. The table is the contract; this list mirrors it.
 DOCUMENTED_CODES = {
@@ -145,3 +145,49 @@ def test_tool_error_accepts_its_record_positionally_or_by_keyword():
 
     assert errors.ToolError("m", (failure,)).failures == (failure,)
     assert errors.ToolError("m", failures=(failure,)).failures == (failure,)
+
+
+# --- CorrelationError carries the detections it failed over ---------------------------------
+#
+# Spec §9's gate fires *because* detections went unplaced, so the `UnmatchedDetection` records
+# are the whole content of the failure — a bare message would discard them at the moment they
+# became the point, and spec §11 requires them reported. Same convention as `ToolError` above,
+# for the same reason, so a caller can write one `except` clause shape across the pipeline.
+
+
+def test_correlation_error_carries_the_result():
+    """The caller has to report the loss it is about to fail on.
+
+    A hard failure writes `run.json` with no `labels.json` (spec §10), so `unmatched_detections[]`
+    has somewhere to go — but only if it survives the raise.
+    """
+    result = CorrelationResult(labels=(), unmatched=(), flows_total=3, detections_total=200)
+
+    error = errors.CorrelationError("14 of 200 detections unplaced (7.0%)", result=result)
+
+    assert error.result is result
+    assert str(error) == "14 of 200 detections unplaced (7.0%)"
+    assert error.exit_code == errors.EXIT_FAILURE
+
+
+def test_correlation_error_without_a_result_still_has_the_attribute():
+    """Read unconditionally by the caller, so the empty case must not be `AttributeError`.
+
+    Mirrors `ToolError`'s guarantee. It also keeps the exception constructible by the sweeps
+    above, which build every subclass with a message alone.
+    """
+    error = errors.CorrelationError("boom")
+
+    assert error.result is None
+    assert error.exit_code == errors.EXIT_FAILURE
+
+
+def test_correlation_error_is_in_the_errors_module_namespace():
+    """Where it has to be, or the guards in this file do not see it.
+
+    `flabel_exceptions()` enumerates `FlabelError` subclasses found in *this module's*
+    namespace. Defined next to its raiser in `correlate.py` instead, it would be a real
+    exception with a real exit code that no test in this file ever checked — the gate would
+    still pass, over a smaller set than it claims to cover.
+    """
+    assert errors.CorrelationError in flabel_exceptions()

@@ -93,6 +93,33 @@ class ToolError(FlabelError):
         self.run_info = run_info
 
 
+class CorrelationError(FlabelError):
+    """Too many detections could not be attached to a flow (spec §9's gate).
+
+    Carries `result` for exactly the reason `ToolError` carries `failures`: the caller has to
+    report the loss it is about to fail on. The gate fires *because* detections went unplaced,
+    so the `UnmatchedDetection` records — each with the reason it could not be matched — are
+    the whole content of the failure. Raising a bare message would discard them at the moment
+    they became the point, and spec §11 requires them reported.
+
+    They now have somewhere to go: a hard failure writes `run.json` with no `labels.json`
+    (spec §10), so a caller catching this can serialise `unmatched_detections[]` into the run
+    block and still exit 1.
+
+    Typed `object` rather than `CorrelationResult` for the same reason `ToolError.run_info` is:
+    `errors.py` sits below the stages and must not import from them. `None` is permitted so the
+    exception is constructible where a result does not exist yet.
+
+    It lives here rather than in `correlate.py` because `tests/test_errors.py` enumerates
+    `FlabelError` subclasses found in *this module's* namespace — a class defined next to its
+    raiser would silently escape the gate asserting every exception maps to one exit code.
+    """
+
+    def __init__(self, message: str, result: object | None = None) -> None:
+        super().__init__(message)
+        self.result = result
+
+
 class UsageError(FlabelError):
     """Invalid invocation that argparse cannot express structurally."""
 
