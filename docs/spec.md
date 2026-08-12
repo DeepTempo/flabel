@@ -76,7 +76,7 @@ src/flabel/
     snapshot.py     hash, write, load snapshots
   correlate.py      detections -> flows (pure)
   labels.py         build labels, canonical serialisation (pure)
-  provenance.py     assemble the run block (pure)
+  provenance.py     build SourceEntry values; assemble the run block (pure)
   notice.py         emit NOTICE attribution (pure)
   cli.py            argument parsing, orchestration, exit codes
   data/
@@ -236,8 +236,8 @@ recorded *as well as* raised — an exception carrying only a string would force
 choose between reporting the loss and failing on it.
 
 **A `SourceEntry` is built in exactly one place: `provenance.build_source_entry(detection,
-spec, snapshot_id)`.** Pre-placed before steps 7 and 8 were built (#44), because as written
-they both claimed the job. Step 7 cannot avoid it — `CorrelationResult.labels` is
+admission, snapshot_id)`.** Pre-placed before steps 7 and 8 were built (#44), because as
+written they both claimed the job. Step 7 cannot avoid it — `CorrelationResult.labels` is
 `tuple[Label, ...]` and a `Label` cannot be constructed without its `sources` — while PLAN
 step 8 assigned the derivation of `label_basis`, `admission_basis` and `licence` to
 `labels.py`. Neither could own it alone, and two parallel worktrees deriving `label_basis`
@@ -246,13 +246,31 @@ way for a consumer to tell which one a label carries.
 
 The function is where the three inputs to provenance meet, and it is the only place they do:
 the **detection** for what the engine observed (`tier`, `sid`, `rev`, `classtype`, `threat`),
-the **`SourceSpec`** for the terms the source was admitted on (`admission_basis`, `licence`,
-and `label_basis` via the existing property rather than a second copy of the rule), and the
-**`snapshot_id`** for which exact ruleset produced it. It refuses three things rather than
-emitting an entry that would look complete and be wrong: a source with `may_label == False`
-(§2.8, a second enforcement after step 6's suppression), a `spec` whose `name` does not match
-`detection.source` (which would attribute one feed's licence to another feed's alert), and an
-empty `snapshot_id` (which traces to nothing).
+the **`SourceAdmission`** for the terms the source was admitted on (`admission_basis`,
+`licence`, and `label_basis` derived through `SourceSpec.label_basis` rather than a second copy
+of the rule), and the **`snapshot_id`** for which exact ruleset produced it.
+
+**The terms come from the snapshot manifest, never from the live registry** — which is why the
+parameter is a `SourceAdmission` and not a `SourceSpec`. Corrected in review before either step
+was built. `SourceAdmission` is what the manifest recorded when the rules were fetched, frozen
+alongside the rules that fired; a `SourceSpec` is whatever `data/sources.toml` says today, and
+`--sources` lets an operator substitute a different file entirely. Between `flabel rules update`
+and a labelling run a licence can be corrected upstream or a `source_class` reconsidered, and
+every label from the older snapshot would then carry today's terms over yesterday's rules — every
+field present, plausible, and unverifiable. The consequential case is not the licence: moving
+`abuse.ch/urlhaus` from `ioc-name` to `ioc-dest` silently turns `indicator-reference` into
+`direct` on labels already emitted, which is the difference between "this flow looked up a bad
+name" and "this flow is the attack". §8 already resolves a detection's originating source through
+the snapshot for the same reason; this is the same authority, not a second one.
+
+It refuses four things rather than emitting an entry that would look complete and be wrong:
+
+| Refused | Why |
+| :-- | :-- |
+| `admission.name != detection.source` | Would attribute one feed's licence and admission basis to another feed's alert. Checked **first**, because diagnosing a mis-built mapping as an identify-class suppression bug sends the reader into the wrong module. |
+| `may_label == False` | §2.8, a second enforcement after step 6's suppression. This is the last point at which an identify source could acquire a verdict. |
+| A `snapshot_id` that is not `^[0-9a-f]{16}$` | Not merely non-empty. `--ruleset-snapshot` defaults to `None` meaning "newest available" (§12), so a caller stringifying that default hands over the literal `"None"` — which a non-empty check accepts and which then names a ruleset nobody can look up. The format is the one `load_snapshot` enforces. |
+| A `tier` outside `{1, 2}` | `tier` ranks label trust and `Label.best_tier` is `min(tier)`. A stray edit setting tier 1 in `suricata.py` would present open-source screening as NGFW verdicts — well-formed, and wrong in the field a consumer weights by. The set is `{1, 2}` rather than `{2}` so Phase 2 stays additive (§2.7). |
 
 ### `labels.json` document
 
@@ -599,17 +617,32 @@ Order of operations:
 
 ```python
 def correlate(detections: Sequence[Detection], flows: Mapping[str, Flow],
-              sources: Mapping[str, SourceSpec], snapshot_id: str,
+              manifest: SnapshotManifest,
               threshold: float = 0.01) -> CorrelationResult
 ```
 
-**`sources` and `snapshot_id` were added to this signature in #44.** The original three
-arguments cannot produce the declared return type: `CorrelationResult.labels` is
-`tuple[Label, ...]`, a `Label` requires `SourceEntry` values, and a `SourceEntry` needs four
-fields a `Detection` does not carry — `ruleset`, `admission_basis`, `licence`, `label_basis`.
-Correlation does not derive any of them itself; it passes each matched detection to
-`provenance.build_source_entry` (§4) along with the spec for that detection's source. Its own
-job remains attaching detections to flows.
+**`manifest` was added to this signature in #44.** The original three arguments cannot produce
+the declared return type: `CorrelationResult.labels` is `tuple[Label, ...]`, a `Label` requires
+`SourceEntry` values, and a `SourceEntry` needs four fields a `Detection` does not carry —
+`ruleset`, `admission_basis`, `licence`, `label_basis`. Correlation does not derive any of them
+itself; it passes each matched detection to `provenance.build_source_entry` (§4) with the
+`SourceAdmission` for that detection's source.
+
+**It is the whole manifest rather than a mapping plus an id**, because those two arguments can
+disagree and this one cannot: the manifest carries `sources` and `snapshot_id` together, already
+validated by `load_snapshot`, so there is no way to pass one snapshot's admissions with another
+snapshot's id. It also settles where the terms come from — the loaded snapshot, never
+`config.load_sources()` or `config.enabled_sources()`. Those describe the registry *now*;
+`enabled` in particular has no bearing on a run against an existing snapshot, since a snapshot is
+a record of what *was* admitted, and letting a later `enabled = false` change the reading of an
+old snapshot would make labels retroactively unattributable.
+
+**A detection whose source is absent from `manifest.sources` is a hard failure** —
+`SnapshotError`, matching §8's handling of a SID that belongs to no source in the snapshot. It
+should be impossible: `-S` loads only snapshot rules, and §8 already resolves every alert's source
+through `sid_index.json` before a `Detection` exists. Failing rather than dropping is the same
+reasoning as there — the alternative is emitting a label with an invented origin. Correlation's
+own job remains attaching detections to flows.
 
 Pure. For each detection:
 

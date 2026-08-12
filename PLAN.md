@@ -151,16 +151,20 @@ belongs to. `classtype` is read from the rule text rather than from `alert.categ
 - **Step 7 owns the ICMPv6 counterpart-type residual.** For an ICMPv6 echo, Zeek writes the *reply* type in `id.resp_p` (`128, 129`) where step 6 can only yield `128, 0`, because a single alert record does not carry the counterpart type. Mirroring is exact for ICMPv4 and one field out for ICMPv6 echo, so closing it means correlation treating ICMP specially — matching on type and accepting the counterpart type in the responder column — not a different value in `suricata.py`. **Test:** an ICMPv6 echo detection correlates to the Zeek flow for the same exchange; an ICMPv4 one still matches exactly.
 
 **Pre-placed before this step, and read-only to it (#44):**
-- **`provenance.build_source_entry(detection, spec, snapshot_id)` already exists on `main`.**
+- **`provenance.build_source_entry(detection, admission, snapshot_id)` already exists on `main`.**
   Correlation cannot return a `CorrelationResult` without constructing `SourceEntry` values, and
   step 8 was separately told to build them. Step 7 **imports and calls** that function; it does
   not write its own, and it does not derive `label_basis` from `source_class` itself.
-- Consequently `correlate()` takes `sources: Mapping[str, SourceSpec]` and `snapshot_id: str`
-  (spec §9, corrected). A detection whose source is absent from `sources` is a hard failure, not
-  a label with a guessed licence.
-- The `may_label` check inside `build_source_entry` is a backstop, not this step's excuse to skip
-  the §2.8 test: step 7 still asserts that an `identify` detection reaching correlation never
-  becomes a label.
+- Consequently `correlate()` takes a `SnapshotManifest` (spec §9, corrected). Resolve each
+  detection's `SourceAdmission` from `manifest.sources`; **do not** call `config.load_sources()`
+  or `config.enabled_sources()` — a label's terms come from the snapshot that produced it, and
+  `enabled` describes the registry now, not what was admitted then.
+- A detection whose source is absent from `manifest.sources` raises `SnapshotError`, matching
+  `suricata.py`'s handling of a SID belonging to no source. Not a bare `ValueError`: that reaches
+  the operator as a traceback rather than a reason.
+- The `may_label`, tier and `snapshot_id` checks inside `build_source_entry` are backstops, not
+  this step's excuse to skip the §2.8 test: step 7 still asserts that an `identify` detection
+  reaching correlation never becomes a label.
 
 **Depends on:** 2. **Parallel with:** 8.
 
@@ -176,9 +180,19 @@ belongs to. `classtype` is read from the rule text rather than from `alert.categ
 source class and carrying `admission_basis` and `licence`"* moved to
 `provenance.build_source_entry`, pre-placed on `main` before this step and step 7 started —
 step 7 has to construct `SourceEntry` values to return a `Label` at all, so leaving the job here
-meant both worktrees writing it. Step 8 **imports** that function; `provenance.py` already
-exists and this step adds the run block to it. The field-completeness assertion below is still
-step 8's, and now runs over the shared builder's output.
+meant both worktrees writing it.
+
+**`build_source_entry`, `spec_from_admission` and `tests/test_provenance.py` are read-only to
+this step.** Step 8 **appends** the run block to `provenance.py` below them and adds its own test
+file section. Do not change the builder's signature: step 7's worktree is written against it in
+parallel, so a change here is green in both worktrees and broken on merge — the same defect class
+the pre-placement exists to prevent. If it looks wrong, raise it rather than edit it.
+
+The required-fields assertion below **already exists** as
+`test_every_mandatory_field_is_populated_with_a_real_value` and
+`test_the_mandatory_field_set_is_exactly_this`. Step 8 does not rewrite them; its Goal 1 work is
+the equivalent check over the *serialised* `labels.json`, where a field can also be lost to the
+JSON encoder rather than to the builder.
 
 **Test that proves it:** canonical output is byte-identical across two serialisations of the same data, and the `labels` array sorts by `(ts_first, uid)` regardless of input order. **Required-fields check: every `SourceEntry` carries every field the spec §4 table demands** — this is the automated form of Goal 1, with no "where applicable" escape. `ioc-name` sources yield `indicator-reference`; all other labelling classes yield `direct`. `NOTICE` lists a GPL/CC-BY source that asserted a label and omits a source that asserted none. Every loss-condition field exists in the run block.
 

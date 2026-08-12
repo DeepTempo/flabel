@@ -5,54 +5,118 @@ Pure: no `subprocess`, no `urllib`, no `socket`. Enforced by `tests/test_archite
 This module currently holds one function. `build_source_entry` is pre-placed here ahead of
 steps 7 and 8 (#44) because both need it and neither owns it. Step 7 cannot avoid it —
 `CorrelationResult.labels` is `tuple[Label, ...]` and a `Label` requires `SourceEntry` values —
-while PLAN step 8 assigns the derivation of `label_basis`, `admission_basis` and `licence` to
-the labelling side. Two parallel worktrees writing that separately is precisely how steps 3-6
-produced three incompatible tool-failure conventions; the fix there was one shape in one place,
-and the fix here is the same one applied before the collision rather than after.
+while PLAN step 8 assigned the derivation of `label_basis`, `admission_basis` and `licence` to
+the labelling side. Two parallel worktrees writing that separately is how steps 3-6 produced
+three incompatible tool-failure conventions; the fix there was one shape in one place, and the
+fix here is the same one applied before the collision rather than after.
+
+**A label's terms come from the snapshot, never from the live registry.** This is the whole
+reason the function takes a `SourceAdmission` rather than a `SourceSpec`. `SourceAdmission` is
+what the manifest recorded when the rules were fetched, frozen alongside the rules that actually
+fired; `SourceSpec` is whatever `data/sources.toml` says today, and `--sources` lets an operator
+substitute a different file entirely. Between `flabel rules update` and a labelling run, a
+licence can be corrected upstream or a `source_class` reconsidered — and then every label from
+the older snapshot would carry today's terms over yesterday's rules, with every field present
+and plausible and nothing downstream able to tell. The worst version is not the licence: a
+`source_class` edit moving `abuse.ch/urlhaus` from `ioc-name` to `ioc-dest` silently turns
+`indicator-reference` into `direct` on labels already emitted, which is the difference between
+"this flow looked up a bad name" and "this flow is the attack" — `docs/prd.md`'s highest-ranked
+risk. `suricata.py` already resolves a detection's source through the manifest for the same
+reason; this function agrees with it rather than introducing a second authority.
 
 The run block (spec §10) is step 8's to build and lands in this module later.
 """
 
 from __future__ import annotations
 
-from flabel.models import Detection, SourceEntry, SourceSpec
+from flabel.models import Detection, SourceAdmission, SourceEntry, SourceSpec
+from flabel.rules.snapshot import SNAPSHOT_ID
+
+#: Tiers that mean something. Tier 1 is a PANW NGFW verdict, tier 2 is open-source screening;
+#: lower is higher trust, and `Label.best_tier` ranks labels by it. Phase 1 only ever produces
+#: 2, but the closed set is `{1, 2}` so that Phase 2 adding tier-1 entries stays additive
+#: (spec §2.7) rather than requiring this constant to change.
+KNOWN_TIERS = (1, 2)
 
 
-def build_source_entry(detection: Detection, spec: SourceSpec, snapshot_id: str) -> SourceEntry:
+def spec_from_admission(admission: SourceAdmission) -> SourceSpec:
+    """The source's terms as the snapshot recorded them, in `SourceSpec` shape.
+
+    `may_label` and `label_basis` are properties of `SourceSpec`, and duplicating either onto
+    `SourceAdmission` would be a second copy of the rule that decides whether a source may
+    produce a verdict at all. So the admission record is adapted instead of the rule being
+    restated. `url` comes along because `SourceAdmission` carries it precisely so a label's
+    origin traces to an endpoint rather than to a name in a file that can change.
+
+    `suricata.py` builds the same throwaway spec inline to test `may_label` before a detection
+    is emitted. Consolidating the two is worth doing, but it edits step 6's module and so is
+    left to its own change rather than smuggled into this one.
+    """
+    return SourceSpec(
+        name=admission.name,
+        url=admission.url,
+        licence=admission.licence,
+        source_class=admission.source_class,
+        admission_basis=admission.admission_basis,
+    )
+
+
+def build_source_entry(
+    detection: Detection, admission: SourceAdmission, snapshot_id: str
+) -> SourceEntry:
     """The one place a `Detection` becomes a label's provenance.
 
-    A `Detection` says what the engine observed; `spec` says what flabel admitted and on what
-    terms; `snapshot_id` says which exact ruleset produced it. A `SourceEntry` is those three
-    facts joined, and it is the only thing a consumer of `labels.json` has to trace a verdict
-    back to its origin — so every field is populated from a named source and none is defaulted.
+    A `Detection` says what the engine observed; `admission` says what flabel admitted and on
+    what terms, as recorded in the snapshot manifest; `snapshot_id` says which exact ruleset
+    produced it. A `SourceEntry` is those three facts joined, and it is the only thing a
+    consumer of `labels.json` has to trace a verdict back to its origin — so every field is
+    populated from a named source and none is defaulted.
 
-    Raises `ValueError` rather than a `FlabelError` for the same reason `models.py` does: these
-    are broken invariants, not operator-facing failures, and `cli.py` maps anything
-    unrecognised to exit 1.
+    Raises `ValueError` rather than a `FlabelError` for every guard below, because each marks a
+    mis-wired pipeline rather than anything an operator did: reaching them means an earlier
+    stage failed to do its job, and `cli.py` maps anything unrecognised to exit 1. The one
+    genuinely operator-facing case — a detection whose source is not in the snapshot at all —
+    belongs to the caller, and spec §9 makes it a typed `SnapshotError` there.
     """
+    # First, because it is the precondition for every check below. Diagnosing a mis-built
+    # mapping as an identify-class suppression bug would send the reader into the wrong module.
+    if detection.source != admission.name:
+        raise ValueError(
+            f"admission for {admission.name!r} does not describe a detection from "
+            f"{detection.source!r}: a label would cite the wrong origin"
+        )
+
+    # Not merely non-empty. `--ruleset-snapshot` defaults to None meaning "newest available",
+    # so a caller stringifying it hands over the literal "None" — non-empty, well-formed to a
+    # naive check, and on every label in the file as a ruleset that can never be looked up.
+    # The format is the same one `load_snapshot` enforces, so an id that passes here is one a
+    # reader can actually resolve back to a directory.
+    if not SNAPSHOT_ID.match(snapshot_id):
+        raise ValueError(
+            f"snapshot_id {snapshot_id!r} is not a snapshot id: a label whose ruleset cannot "
+            f"be looked up is untraceable (spec §13)"
+        )
+
     # Spec §2.8. Step 6 already drops identify-class detections before correlation and counts
     # them in `identify_alerts_suppressed`, so reaching here means that filter was bypassed.
     # Checked again anyway: this is the last point at which an identify source could acquire a
     # verdict, and spec §13 lists a label attributable to one as a never-do.
+    spec = spec_from_admission(admission)
     if not spec.may_label:
         raise ValueError(
-            f"{spec.name} is an identify-class source and can never produce a label "
+            f"{admission.name} is an identify-class source and can never produce a label "
             f"(spec §2.8); detection sid {detection.sid} should have been suppressed upstream"
         )
 
-    # A plausible wrong answer is the dangerous one here. Handing the wrong spec would attribute
-    # one feed's licence and admission basis to another feed's alert, and every field would
-    # still be present and well-formed, so nothing downstream could notice.
-    if detection.source != spec.name:
+    # `tier` is the trust ranking — `Label.best_tier` is `min(tier)` and a consumer weights
+    # labels by it — so an out-of-range value is not a cosmetic defect. Unvalidated, a stray
+    # edit setting tier 1 in `suricata.py` would present open-source screening results as NGFW
+    # verdicts, complete and well-formed and wrong in the field that matters most.
+    if detection.tier not in KNOWN_TIERS:
         raise ValueError(
-            f"spec {spec.name!r} does not describe detection from {detection.source!r}: "
-            f"a label would cite the wrong origin"
+            f"detection sid {detection.sid} has tier {detection.tier!r}, not one of "
+            f"{list(KNOWN_TIERS)}: tier ranks label trust and cannot be invented"
         )
-
-    # `ruleset` is what makes a label reproducible against a known set of rules. An empty id
-    # traces to nothing, and a snapshot is not optional (spec §7).
-    if not snapshot_id:
-        raise ValueError("snapshot_id is empty: a label whose ruleset is unnamed is untraceable")
 
     label_basis = spec.label_basis
     # Unreachable while `may_label` is checked above; asserted so the two cannot drift apart
@@ -67,10 +131,10 @@ def build_source_entry(detection: Detection, spec: SourceSpec, snapshot_id: str)
         rev=detection.rev,
         classtype=detection.classtype,
         threat=detection.threat,
-        # From the registry: the terms this source was admitted on. Never from the rule text —
-        # a label must trace to a reviewed source, not to whatever an alert claimed to be.
-        admission_basis=spec.admission_basis,
-        licence=spec.licence,
+        # From the snapshot's admission record: the terms this source was admitted on, frozen
+        # with the rules that fired. Never from the live registry — see the module docstring.
+        admission_basis=admission.admission_basis,
+        licence=admission.licence,
         # Derived once, from `SourceSpec.label_basis`, rather than recomputed from
         # `source_class` here. A second copy of that rule is a second place for it to drift.
         label_basis=label_basis,
