@@ -455,6 +455,13 @@ The `fetched == admitted + sum(excluded)` identity holds for every source. `rule
 active `alert` lines only; the 19,495 `#alert` lines (19,479 of them ET Open's) are counted in
 `rules_excluded_commented`.
 
+**This table predates `exclude_classtypes`, which now ships in the registry.** Re-measured
+2026-08-13 from the same mirror with the policy in force: **84,995 admitted of 115,991 (73.3%)**
+— 436 fewer, exactly the `policy-violation` count above. The drop falls on `pawpatrules`
+(21,464 → 21,052), `et/open` (21,221 → 21,202) and `the-hunters-ledger/open` (96 → 91). The
+2026-08-12 figures are kept as the issue #11 closure record; **84,995 is what a snapshot built
+today contains.**
+
 **41.0% is not the coverage figure, and reading it as one would be the wrong conclusion.** The
 metadata filter applies to exactly one source. ET Open is 24.8% of admitted volume, so Tier 2
 coverage is **85,431 rules across nine sources, 73.7% of everything fetched** — the per-source
@@ -522,10 +529,12 @@ because step 6 reads this file and nothing else in the snapshot.
 
 **`address_indicator` records which rules fire on the address tuple alone** (issue #75, schema 3).
 Such a rule establishes that a flow *reached a known-bad address*, not that the flow *is* the
-malicious activity — the distinction `label_basis` already names. Measured 2026-08-13:
-**16,079 of 85,431 admitted rules (18.8%)**, of which **99.9% name a literal IP as their
-destination**, and they sit almost entirely in `pawpatrules` (16,064) — a feed that declares
-itself `signature`, which is why the feed-level answer alone cannot find them.
+malicious activity — the distinction `label_basis` already names. Re-measured 2026-08-13 against
+a snapshot built with `exclude_classtypes` in force: **16,075 of 84,995 admitted rules (18.9%)**,
+of which **99.9% name a literal IP as their destination**, and they sit almost entirely in
+`pawpatrules` (16,061) — a feed that declares itself `signature`, which is why the feed-level
+answer alone cannot find them. (Before the policy shipped: 16,079 of 85,431, 16,064 in
+`pawpatrules`. Four address indicators declared `policy-violation` and are now excluded.)
 
 **The two classifications compose rather than compete.** `source_class` covers name and URL
 indicators at the feed level; this covers address indicators buried inside a signature feed.

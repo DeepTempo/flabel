@@ -40,9 +40,23 @@ def rule(sid: int, *, classtype: str | None = None, payload: str | None = 'conte
     return f"alert tcp any any -> any any ({body}sid:{sid}; rev:1;)"
 
 
+def registry_without_admission() -> str:
+    """The shipped registry text with its own `[admission]` table removed.
+
+    The registry ships one now, and TOML forbids declaring the same table twice — so a fixture
+    that appends its own has to take the shipped one out first. The assertion is deliberate: if
+    `[admission]` ever disappears from `sources.toml` again, this fails rather than quietly
+    reverting every test below to testing a permissive registry.
+    """
+    text = REGISTRY.read_text(encoding="utf-8")
+    head, marker, _ = text.partition("\n[admission]\n")
+    assert marker, "the shipped registry has no [admission] table — see issue #75"
+    return head + "\n"
+
+
 @pytest.fixture
 def registry_with(tmp_path: Path):
-    """The real registry plus an `[admission]` table, so the nine sources stay valid.
+    """The real registry, its own `[admission]` table swapped for this one.
 
     Built on the shipped registry rather than a minimal stub: `load_admission_policy` reads the
     same file the sources come from, and a stub would not prove the two coexist.
@@ -50,7 +64,7 @@ def registry_with(tmp_path: Path):
 
     def build(admission: str) -> Path:
         path = tmp_path / "sources.toml"
-        path.write_text(REGISTRY.read_text(encoding="utf-8") + admission, encoding="utf-8")
+        path.write_text(registry_without_admission() + admission, encoding="utf-8")
         return path
 
     return build
@@ -259,8 +273,35 @@ def test_a_metadata_excluded_rule_stays_in_its_metadata_bucket():
 # --- loading the policy from the registry --------------------------------------------------------
 
 
-def test_a_registry_with_no_admission_table_is_permissive():
-    assert load_admission_policy(REGISTRY) == AdmissionPolicy()
+def test_a_registry_with_no_admission_table_is_permissive(registry_with):
+    """A registry that names no policy excludes nothing — the absent-table default.
+
+    This asserted the same thing against the *shipped* registry until 2026-08-13, and that is
+    the whole of why the defect below survived: the name reads like a unit test of the default,
+    but what it actually pinned was `sources.toml` having no `[admission]` table at all.
+    """
+    assert load_admission_policy(registry_with("")) == AdmissionPolicy()
+
+
+def test_the_shipped_registry_really_excludes_policy_violation():
+    """Building the mechanism is not the fix — the policy being *in force* is (issue #75).
+
+    `[admission] exclude_classtypes` landed in #78 with its loader, its counter and its tests,
+    and the PR described the registry change as made. It was not: `sources.toml` had not been
+    touched since step 2, so every real run still admitted the 436 `policy-violation` rules that
+    #75 measured as **84.8% of the false-positive source entries** (138 -> 21). An operator
+    labelling ordinary traffic got `verdict: malicious` with `label_basis: direct` on TLS 1.0
+    and cleartext FTP, in a file whose purpose is training data.
+
+    So this asserts the shipped artifact, not the loader. A test of the loader alone passed
+    throughout.
+    """
+    policy = load_admission_policy(REGISTRY)
+
+    assert policy.excludes("policy-violation"), (
+        "the shipped registry admits classtype:policy-violation again — issue #75"
+    )
+    assert policy != AdmissionPolicy(), "the shipped registry carries no admission policy at all"
 
 
 def test_the_admission_table_is_read_from_the_registry(registry_with):
