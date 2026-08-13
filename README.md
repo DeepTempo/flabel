@@ -39,8 +39,12 @@ capture ──▶ ingest ──▶ zeek ──────▶ flows ──┐
 Rules come from **nine open-source feeds**. Only Emerging Threats Open carries per-rule
 confidence metadata, so only it can be filtered on quality; the rest are admitted wholesale,
 which is recorded on every label as `admission_basis` so a consumer can exclude ungated sources.
-Measured 2026-08-12: **85,431 rules admitted from 115,991 fetched**, ET Open contributing
-21,221 of 51,778 (41.0%).
+One classtype is excluded across every feed — `policy-violation`, 436 rules — because those
+rules observe a policy breach rather than an attack, and promoting "TLS 1.0 is in use" to
+`verdict: malicious` teaches a model the wrong thing (issue #75).
+
+Measured 2026-08-13: **84,995 rules admitted from 115,991 fetched**, ET Open contributing
+21,202 of 51,778 (40.9%).
 
 A snapshot is **content-addressed** — its id is a hash over the rules, the SID-to-source index,
 and every companion data file the rules read. Two runs against the same `snapshot_id` matched

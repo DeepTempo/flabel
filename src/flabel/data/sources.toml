@@ -111,3 +111,21 @@ url              = "https://openinfosecfoundation.org/rules/trafficid/trafficid.
 licence          = "MIT"
 source_class     = "identify"
 admission_basis  = "wholesale"
+
+# --- per-rule admission, across every source above (spec §6, issue #75) --------------------
+#
+# `source_class` classifies a *feed*. This classifies individual *rules*, and the two are not
+# substitutes: pawpatrules is one source carrying both direct detections and policy
+# observations, so no per-source setting can separate them.
+#
+# Measured 2026-08-13 over 23 captures of ordinary protocol traffic against the full nine-feed
+# snapshot: excluding this one classtype — 436 rules, 0.51% of the ruleset — removes 84.8% of
+# the false-positive source entries (138 -> 21). Those rules are not wrong about what they
+# observe; TLS 1.0 really is in use. The defect is promoting an observation to
+# "verdict": "malicious" with label_basis: direct, in a file whose purpose is training data.
+#
+# A rule declaring no classtype: is never excluded. 10,949 of 85,431 admitted rules declare
+# none, so treating absence as a match would drop 12.8% of the ruleset on a setting that never
+# named it.
+[admission]
+exclude_classtypes = ["policy-violation"]
