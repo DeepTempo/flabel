@@ -711,7 +711,11 @@ def test_packet_filter_log_is_retained_but_never_reproducible(tmp_path: Path):
         if f"zeek/{name}" in canonical.EXCLUDED_FILES:
             continue
         records = [
-            canonical.canonical_records((info.log_dir / name).read_text())
+            # `_canonical_file`, not `canonical_records`: dispatching on the filename is the
+            # point. `reporter.log` has its own rule, and calling the plain `#`-stripping one
+            # here would make this test disagree with the Goal 2 gate the first time Zeek emits
+            # a startup warning — the exact divergence the comment above claims to prevent.
+            canonical._canonical_file(f"zeek/{name}", info.log_dir / name)
             for info in (first, second)
         ]
         assert records[0] == records[1], f"{name} is not reproducible across runs"

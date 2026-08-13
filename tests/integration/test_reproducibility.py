@@ -101,9 +101,21 @@ def test_a_different_capture_is_not_reproducible_against_the_first(
     first = label_once(labelling_snapshot, tmp_path / "one")
     second = label_once(labelling_snapshot, tmp_path / "two", capture=truncated)
 
-    assert canonical.differences(first, second) != [], (
-        "two runs over different captures compared equal — the canonicalizer is erasing the "
-        "analytic content, not just the wall-clock noise"
+    reported = canonical.differences(first, second)
+
+    # **Naming the files is the whole assertion.** Asserting only that the list is non-empty was
+    # useless: two different captures have different `input.sha256`, and `sha256` is deliberately
+    # not excluded, so `run.json` and `labels.json` differ no matter what the canonicalizer does
+    # to the logs. Verified by sabotage — making `_canonical_file` return `()` for every `.log`,
+    # which erases all of Zeek's and Suricata's output, left this test *and* the headline Goal 2
+    # test both green. The gate could be hollowed out completely with CI passing.
+    differing = {line.split(":")[0] for line in reported}
+    assert "zeek/conn.log" in differing, (
+        f"the tool logs compared equal across two different captures: {sorted(differing)}. The "
+        f"canonicalizer is erasing analytic content, not just wall-clock noise."
+    )
+    assert "suricata/eve.json" in differing, (
+        f"suricata's alerts compared equal across two different captures: {sorted(differing)}"
     )
 
 
@@ -137,3 +149,38 @@ def test_a_quiet_ruleset_is_reproducible_too(quiet_snapshot: Path, tmp_path: Pat
 
     assert canonical.differences(first, second) == []
     assert json.loads((first / "labels.json").read_text())["labels"] == []
+
+
+def test_the_gate_notices_when_the_log_comparison_is_disabled(
+    labelling_snapshot: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Sabotage the primitive and confirm the gate goes red — the guard on the guard.
+
+    A reproducibility gate is uniquely dangerous to get wrong, because a gate that cannot fail
+    looks exactly like one that passes, forever. Every other test here asserts that two runs are
+    *equal*, and all of them would keep passing if `canonical` started returning nothing at all.
+
+    So this one breaks it on purpose. With `.log` files canonicalising to nothing, two runs over
+    genuinely different captures must still be caught by the remaining comparisons — and the
+    moment they are not, the whole gate is decorative.
+    """
+    truncated = truncate_mid_record(BENIGN, tmp_path / "shorter.pcap", keep=5)
+    first = label_once(labelling_snapshot, tmp_path / "one")
+    second = label_once(labelling_snapshot, tmp_path / "two", capture=truncated)
+
+    # Sanity: intact, the logs are what carries the difference.
+    intact = {line.split(":")[0] for line in canonical.differences(first, second)}
+    assert "zeek/conn.log" in intact
+
+    real = canonical.canonical_records
+    monkeypatch.setattr(canonical, "canonical_records", lambda text: ())
+    sabotaged = {line.split(":")[0] for line in canonical.differences(first, second)}
+    monkeypatch.setattr(canonical, "canonical_records", real)
+
+    assert "zeek/conn.log" not in sabotaged, (
+        "the sabotage did not take effect, so this test proves nothing about the gate"
+    )
+    assert intact - sabotaged, (
+        "disabling the log comparison changed nothing the gate reports — the log comparison "
+        "was never contributing to it"
+    )
