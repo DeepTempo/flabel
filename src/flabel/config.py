@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, get_args
 
 from flabel.errors import ConfigError
-from flabel.models import AdmissionBasis, SourceClass, SourceSpec
+from flabel.models import AdmissionBasis, AdmissionPolicy, SourceClass, SourceSpec
 
 SOURCE_CLASSES = frozenset(get_args(SourceClass))
 ADMISSION_BASES = frozenset(get_args(AdmissionBasis))
@@ -36,6 +36,8 @@ PACKAGED_REGISTRY = "sources.toml"
 #: so path construction from this string is unavoidable — which makes the charset the guard.
 #: Without it, `--sources` with `name = "../../../.ssh/authorized_keys"` writes fetched rule
 #: text outside the snapshot directory, and step 4 has no reason to expect that to be its job.
+CLASSTYPE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
 SOURCE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)?$")
 
 
@@ -55,20 +57,7 @@ def load_sources(path: Path | None = None) -> tuple[SourceSpec, ...]:
     NOTICE file — is reproducible regardless of file order.
     """
     path = default_registry_path() if path is None else Path(path)
-
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError as exc:
-        raise ConfigError(f"source registry not found: {path}") from exc
-    except OSError as exc:
-        raise ConfigError(f"source registry could not be read: {path}: {exc}") from exc
-
-    try:
-        # utf-8-sig, so a registry saved by a Windows editor doesn't fail with a cryptic
-        # "Expected '=' after a key" caused by an invisible byte-order mark.
-        document = tomllib.loads(raw.decode("utf-8-sig"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        raise ConfigError(f"could not parse source registry {path}: {exc}") from exc
+    document = _read_registry(path)
 
     entries = document.get("source")
     if not entries:
@@ -83,6 +72,79 @@ def load_sources(path: Path | None = None) -> tuple[SourceSpec, ...]:
     specs = tuple(_build_spec(entry, path) for entry in entries)
     _reject_duplicates(specs, path)
     return tuple(sorted(specs, key=lambda spec: spec.name))
+
+
+def _read_registry(path: Path) -> dict[str, Any]:
+    """The parsed registry document, with the decoding rules stated once."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise ConfigError(f"source registry not found: {path}") from exc
+    except OSError as exc:
+        raise ConfigError(f"source registry could not be read: {path}: {exc}") from exc
+
+    try:
+        # utf-8-sig, so a registry saved by a Windows editor doesn't fail with a cryptic
+        # "Expected '=' after a key" caused by an invisible byte-order mark.
+        document = tomllib.loads(raw.decode("utf-8-sig"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"could not parse source registry {path}: {exc}") from exc
+    return document
+
+
+#: Keys permitted in the registry's `[admission]` table. Unknown keys are refused for the same
+#: reason a misspelled `[[source]]` field is (spec §5): a registry that loads with a setting
+#: silently ignored is worse than one that refuses to load, because it reads as working — and
+#: here the ignored setting would be the one deciding which rules may assert a verdict.
+ADMISSION_FIELDS = ("exclude_classtypes",)
+
+
+def load_admission_policy(path: Path | None = None) -> AdmissionPolicy:
+    """Read the `[admission]` table from the registry, or return the permissive default (#75).
+
+    **In the registry rather than on the CLI**, because spec §12's contract is closed —
+    `--offline` is permanent and Phase 2 adds no flags — and `--sources` already exists as the
+    override. It also puts the policy inside admission, so it is inside `snapshot_id`: the rules
+    a label cites are exactly the rules the policy admitted, and the two cannot drift apart.
+
+    **In one table rather than per source**, because the policy is about kinds of rule, not about
+    feeds. `pawpatrules` is one source containing both direct detections and policy observations
+    (#75), which is why no per-source setting could express this; stating it nine times would
+    just be one decision with nine chances to disagree with itself. A per-source override is a
+    pure addition if a feed ever needs one.
+
+    An absent table admits everything, so an existing registry keeps its current behaviour.
+    """
+    path = default_registry_path() if path is None else Path(path)
+    document = _read_registry(path)
+
+    table = document.get("admission")
+    if table is None:
+        return AdmissionPolicy()
+    if not isinstance(table, dict):
+        raise ConfigError(f"{path}: `admission` must be a table — write [admission]")
+
+    unknown = sorted(set(table) - set(ADMISSION_FIELDS))
+    if unknown:
+        raise ConfigError(
+            f"{path}: unknown key(s) in [admission]: {', '.join(unknown)}. "
+            f"Known keys: {', '.join(ADMISSION_FIELDS)}."
+        )
+
+    excluded = table.get("exclude_classtypes", [])
+    if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
+        raise ConfigError(f"{path}: `exclude_classtypes` must be a list of strings")
+    for item in excluded:
+        if not item.strip():
+            raise ConfigError(f"{path}: `exclude_classtypes` contains an empty classtype")
+        if not CLASSTYPE_NAME.fullmatch(item):
+            # A classtype that cannot appear in a rule would silently exclude nothing, which is
+            # the same failure as a misspelled key: it reads as a policy that is in force.
+            raise ConfigError(
+                f"{path}: {item!r} is not a valid classtype name. A classtype that no rule can "
+                f"declare would exclude nothing while appearing to be in force."
+            )
+    return AdmissionPolicy(exclude_classtypes=frozenset(excluded))
 
 
 def _build_spec(entry: Any, path: Path) -> SourceSpec:

@@ -34,7 +34,7 @@ from collections.abc import Iterable, Iterator
 
 from flabel import config
 from flabel.errors import ConfigError
-from flabel.models import SourceAdmission, SourceSpec
+from flabel.models import AdmissionPolicy, SourceAdmission, SourceSpec
 
 #: An enabled rule. Matched against the stripped line, so a feed that indents its rules — or
 #: ships CRLF — is read the same way Suricata reads it.
@@ -64,6 +64,15 @@ ADMITTED_SEVERITY = frozenset({"major", "critical"})
 JA3_KEYWORD = "ja3.hash"
 JA4_KEYWORD = "ja4.hash"
 
+#: `classtype:` as declared in the rule text. Read from the rule rather than from
+#: `classification.config`, for the reason spec §8 gives: `alert.category` is a *description*
+#: looked up by name, so it varies by machine and is empty for any classtype the file omits.
+CLASSTYPE = re.compile(r"\bclasstype\s*:\s*([A-Za-z0-9._-]+)\s*;")
+
+#: Keywords that make a rule inspect the packet's *contents*. A rule with none of these decides
+#: purely from the header tuple — see `is_ioc_shaped`.
+PAYLOAD_KEYWORDS = ("content:", "pcre:", "ja3.hash", "ja4.hash", "dataset:")
+
 #: A rule continued on the next physical line. Read line by line, such a rule is truncated at
 #: the backslash and what reaches the snapshot is a fragment Suricata refuses to load. See
 #: `_logical_rules` for why a *comment* ending in a backslash is emphatically not one of these.
@@ -87,6 +96,7 @@ def admit(
     spec: SourceSpec,
     rule_lines: Iterable[str],
     fetched_at: str,
+    policy: AdmissionPolicy | None = None,
 ) -> tuple[list[str], SourceAdmission]:
     """Filter `rule_lines` for `spec`, returning the admitted rules and the counts.
 
@@ -109,6 +119,8 @@ def admit(
     admitted: list[str] = []
     fetched = commented = 0
     no_confidence = low_confidence = low_severity = unloadable = 0
+    by_classtype = 0
+    policy = AdmissionPolicy() if policy is None else policy
     ja3 = ja4 = 0
 
     for line in _logical_rules(rule_lines, spec):
@@ -128,6 +140,11 @@ def admit(
         # for its severity" (issue #11). A rule reaches this test only if it would be admitted.
         if verdict is None and negates_home_net(rule):
             verdict = "unloadable"
+        # After the two tests above, for the reason the comment there gives: a rule the metadata
+        # filter already dropped stays in its metadata bucket, so "excluded by classtype" keeps
+        # reading as "would have been admitted, but its kind is not one we label from".
+        if verdict is None and policy.excludes(classtype_of(rule)):
+            verdict = "classtype"
 
         if verdict is None:
             admitted.append(rule)
@@ -145,6 +162,8 @@ def admit(
             low_confidence += 1
         elif verdict == "unloadable":
             unloadable += 1
+        elif verdict == "classtype":
+            by_classtype += 1
         else:
             low_severity += 1
 
@@ -173,6 +192,7 @@ def admit(
         ja3_rules_admitted=ja3,
         fetched_at=fetched_at,
         rules_excluded_unloadable=unloadable,
+        rules_excluded_classtype=by_classtype,
     )
     _verify_identity(admission)
     return admitted, admission
@@ -239,6 +259,43 @@ def rule_metadata(rule: str) -> dict[str, str]:
                 continue
             metadata[pair[0].casefold()] = pair[1].strip() if len(pair) > 1 else ""
     return metadata
+
+
+def classtype_of(rule: str) -> str | None:
+    """The `classtype:` a rule declares, or `None` when it declares none.
+
+    `None` is ordinary rather than exceptional: measured 2026-08-13, 10,949 of 85,431 admitted
+    rules across the nine feeds declare no classtype at all.
+    """
+    match = CLASSTYPE.search(rule)
+    return match.group(1) if match else None
+
+
+def is_ioc_shaped(rule: str) -> bool:
+    """Whether a rule decides purely from the header tuple, with no payload inspection.
+
+    **This is the definition that separates "this flow *is* the malicious activity" from "this
+    flow touched a known-bad indicator"**, and it is applied per rule because the existing
+    `source_class` applies per feed. Measured 2026-08-13: 16,667 of 85,431 admitted rules are
+    IOC-shaped (19.5%), and **16,067 of those declare `classtype: trojan-activity`** — so the
+    declared classtype cannot be used to find them. The shape has to be read off the rule.
+
+    The test is the absence of every keyword that inspects content: `content`, `pcre`, the JA3/JA4
+    hash matches, and `dataset` lookups. What remains matches on addresses, ports, protocol and
+    flow state — which is exactly what an indicator is.
+
+    Why the distinction earns its keep: an IOC rule cannot be *wrong about the traffic*. It can
+    only be wrong about whether the indicator is still bad, which is a different failure mode with
+    a different half-life, and it is the failure mode behind the stale `127.0.0.1` rule in #75.
+
+    **First cut, and deliberately conservative.** It counts a TLS-SNI or DNS-name match as
+    IOC-shaped, which is right — a name is an indicator. It does not attempt to distinguish a
+    single-address rule from one matching a large network, and it says nothing about whether the
+    indicator is fresh. Before this drives `label_basis` (step 3 of #75) a sample of the 16,667
+    should be read by hand, because it moves the meaning of a label on a fifth of the ruleset.
+    """
+    body = rule.split("(", 1)[1] if "(" in rule else ""
+    return not any(keyword in body for keyword in PAYLOAD_KEYWORDS)
 
 
 def negates_home_net(rule: str) -> bool:
@@ -402,6 +459,7 @@ def _verify_identity(admission: SourceAdmission) -> None:
         + admission.rules_excluded_low_confidence
         + admission.rules_excluded_low_severity
         + admission.rules_excluded_unloadable
+        + admission.rules_excluded_classtype
     )
     if accounted != admission.rules_fetched:
         raise ValueError(

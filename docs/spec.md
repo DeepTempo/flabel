@@ -391,7 +391,47 @@ Pure. Given a source and its fetched rule text, return the admitted rules plus c
 
   Rules with no `confidence` key are excluded and counted separately from rules with `confidence Low`/`Medium` — the distinction feeds issue #10.
 - Commented-out rules (`#alert`) are never admitted.
+- **A rule whose `classtype:` the registry's `[admission]` table excludes is never admitted**, counted in `rules_excluded_classtype`.
 - Every exclusion increments exactly one counter; `fetched == admitted + sum(excluded)` is asserted.
+
+### Per-rule admission — `[admission]` (issue #75)
+
+`source_class` classifies a **feed**. This classifies individual **rules**, and the two are not
+substitutes: `pawpatrules` is one source carrying both direct detections and policy observations,
+so no per-source setting can separate them.
+
+```toml
+[admission]
+exclude_classtypes = ["policy-violation"]
+```
+
+**Measured 2026-08-13.** 23 captures of ordinary protocol traffic (Suricata's own
+protocol-conformance corpus) against the full nine-feed snapshot produced **100 malicious labels
+across 12 captures, 138 source entries, every one from `pawpatrules`**. Excluding the single
+classtype `policy-violation` — **436 rules, 0.51% of the ruleset** — removes **84.8%** of them:
+
+| | before | after |
+| :-- | --: | --: |
+| captures producing labels | 12 | 8 |
+| labels | 100 | 12 |
+| source entries | 138 | 21 |
+
+Those rules are not wrong about what they observe — TLS 1.0 really is in use, the FTP password
+really is in clear text. The defect is promoting an observation to `"verdict": "malicious"` with
+`label_basis: direct`, which asserts the flow *is* the attack. The output is training data, so a
+model learns that curl and TLS 1.0 are malicious.
+
+**In the registry rather than on the CLI**, because §12's contract is closed and `--sources`
+already exists as the override — and because it puts the policy inside admission, so it is inside
+`snapshot_id`. The rules a label cites are exactly the rules the policy admitted.
+
+**A rule declaring no `classtype:` is never excluded by this policy.** 10,949 of 85,431 admitted
+rules declare none, so treating absence as a match would drop 12.8% of the ruleset on a setting
+that never named it.
+
+**What this does not fix**, both confirmed by what survives the filter: one structurally broken
+rule (sid 3317444, whose destination is literally `127.0.0.1`), and the directionality loss from
+`HOME_NET: any` (issue #77). Different causes, different fixes.
 
 ### Measured yield — 2026-08-12 (closes issue #11)
 
@@ -463,13 +503,30 @@ def list_snapshots(root: Path) -> list[SnapshotManifest]
 The original was one hashed file, `rules.rules`, with `snapshot_id = sha256(rules.rules)[:16]`.
 Two things measured against the live feeds made that insufficient.
 
-**`sid_index.json` — `{"schema": 1, "sources": {"<source>": [sid, ...]}}`.** §8 resolves the
+**`sid_index.json` — `{"schema": 2, "sources": {"<source>": [sid, ...]}, "ioc_shaped": [sid, ...]}`.** §8 resolves the
 originating source of each alert from the snapshot, because `eve.json` carries a signature id and
 nothing about where the rule came from. Per-source *counts* in the manifest cannot answer "which
 source is sid 2011465?", so the mapping has to be stored. It is a file rather than a field on
 `SourceAdmission` because step 8 copies that struct into every `labels.json`, and 21,221 integers
 per source do not belong in every output file. It is versioned separately from the manifest
 because step 6 reads this file and nothing else in the snapshot.
+
+**`ioc_shaped` records which rules decide purely from the header tuple** (issue #75, schema 2).
+A rule with no `content`, `pcre`, `ja3.hash`/`ja4.hash` or `dataset:` establishes that a flow
+*touched a known-bad indicator*, not that the flow *is* the malicious activity — the distinction
+`label_basis` already names. Measured: **16,667 of 85,431 admitted rules are IOC-shaped (19.5%),
+and 16,067 of those declare `classtype: trojan-activity`**, so the declared classtype cannot
+identify them and the shape has to be read off the rule.
+
+It lives here, **inside the hash**, rather than in `manifest.json`, and that placement is
+load-bearing. Exclusion changes `rules.rules`, so `snapshot_id` moves with it. Re-labelling
+changes no rules at all — recorded in the manifest it would sit outside the id (issue #48), and
+two snapshots sharing an id could then produce labels with different bases, which is exactly the
+guarantee the id exists to give.
+
+A schema-1 index remains readable and reports no shape, because it recorded none; claiming
+otherwise would invent provenance for labels already emitted. That graceful path is why this file
+carries a version of its own.
 
 **Companion data files are part of the ruleset, so they are inside the id.** Measured in step 6:
 `pawpatrules` ships 18 `.lst` files that 26 of its rules read with `dataset:`. Loaded away from
