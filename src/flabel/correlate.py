@@ -34,6 +34,7 @@ from collections.abc import Mapping, Sequence
 
 from flabel.errors import CorrelationError, SnapshotError
 from flabel.models import (
+    CORRELATABLE_PROTOCOLS,
     CorrelationResult,
     Detection,
     Flow,
@@ -262,11 +263,32 @@ def _candidates(detection: Detection, index: TupleIndex) -> list[Flow]:
 def _place(detection: Detection, index: TupleIndex) -> tuple[Flow | None, UnmatchedReason | None]:
     """The flow this detection belongs to, or `None` and the reason it could not be decided.
 
-    Spec §9's four steps, in order. The order is load-bearing: a *lone* candidate is matched
+    Spec §9's steps, in order. The order is load-bearing: a *lone* candidate is matched
     without consulting the clock, because Suricata timestamps the alerting packet while Zeek's
     window is bounded by the packets it attributed to the connection, and those disagree at the
     edges often enough that requiring containment unconditionally would lose real detections.
+
+    The protocol check comes first and needs no index (issue #84). Zeek writes
+    `unknown_transport` with both port columns zeroed for anything that is not TCP, UDP or ICMP,
+    so there is no tuple to compare — and two such conversations between one host pair are
+    written with the *same* 5-tuple, which is why this returns a reason instead of falling
+    through to a candidate lookup that could only guess between them.
+
+    Zeek does record the difference in `conn.log`'s `ip_proto` column and `Flow` does not carry
+    it, so this is flabel's limit rather than the data's. Correlating these properly is issue
+    #96; reporting is the right answer either way, and it is the one that does not invent a
+    correlation the model cannot support.
     """
+    # Casefolded *here and only here*. The tuple comparison below stays exact, because §8 says
+    # step 6 already translated the tuple into Zeek's spelling and a second normalisation would
+    # be two places that must agree. But this decision is about whether Zeek has a *name* for
+    # the protocol, and an un-normalised `TCP` is not an unsupported transport — it is a step-6
+    # regression, which must stay visible as `no_flow_match` and stay inside the gate. Matching
+    # exactly here would classify every detection as unsupported the moment step 6 broke, empty
+    # the gate's denominator, and switch the gate off exactly when it was needed.
+    if detection.proto.casefold() not in CORRELATABLE_PROTOCOLS:
+        return None, "unsupported_transport"
+
     candidates = _candidates(detection, index)
 
     if not candidates:
@@ -436,9 +458,19 @@ def _gate(result: CorrelationResult, threshold: float) -> None:
     if not result.unmatched:
         return
 
+    # Reported apart from the ratio, because they are not in it (issue #84). Folding them into
+    # one percentage would print a numerator and a denominator drawn from different populations
+    # — the operator would check the arithmetic, find it wrong, and stop trusting the number.
+    unsupported = result.unsupported_transport_total
+    aside = (
+        f", plus {unsupported} on a transport Zeek cannot express, which the gate does not judge"
+        if unsupported
+        else ""
+    )
     summary = (
-        f"{len(result.unmatched)} of {result.detections_total} detections "
-        f"({result.unmatched_ratio:.2%}) could not be attached to exactly one flow"
+        f"{len(result.unmatched) - unsupported} of {result.correlatable_total} correlatable "
+        f"detections ({result.unmatched_ratio:.2%}) could not be attached to exactly one flow"
+        f"{aside}"
     )
     if result.unmatched_ratio > threshold:
         # Warned as well as raised. The exception carries the result, so the caller can write

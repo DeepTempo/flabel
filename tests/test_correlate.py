@@ -1200,3 +1200,165 @@ def test_correlation_stays_fast_at_capture_scale():
     assert elapsed < 5.0, (
         f"correlation took {elapsed:.1f}s — the O(detections x flows) scan is back"
     )
+
+
+# --- protocols Zeek cannot express (issue #84, PLAN step 12) --------------------------------
+#
+# Zeek's `transport_proto` holds only tcp/udp/icmp/unknown_transport, and it zeroes the port
+# columns for anything else, while Suricata reports the real protocol and — for SCTP — the real
+# ports. Before step 12 this made every such detection uncorrelatable, and the 1% gate then
+# failed the whole run on a capture that was otherwise perfectly labellable.
+#
+# Craig's decision (2026-08-13, issue #84): report it, never correlate it. The alternative,
+# matching on the address pair alone, is refused by `test_two_such_flows_are_indistinguishable`
+# below.
+
+UNSUPPORTED = "unsupported_transport"
+
+
+def esp_detection(**overrides) -> Detection:
+    """An alert Suricata reported on IP protocol 50, which carries no ports at any layer."""
+    fields = {"proto": "esp", "src_port": 0, "dst_port": 0, "dst_ip": SERVER}
+    return make_detection(**{**fields, **overrides})
+
+
+def unknown_transport_flow(**overrides) -> Flow:
+    """A flow as Zeek writes it for anything that is not TCP, UDP or ICMP: no protocol, no ports."""
+    fields = {
+        "uid": "CUnknown000000000001",
+        "src_port": 0,
+        "dst_port": 0,
+        "proto": "unknown_transport",
+        "dst_ip": SERVER,
+    }
+    return make_flow(**{**fields, **overrides})
+
+
+def test_a_detection_on_an_unsupported_transport_is_never_attached_to_a_flow():
+    """Even though a flow between exactly these two addresses exists and is the right one.
+
+    That is the whole decision: `unknown_transport` is not a protocol, it is Zeek saying it has
+    no name for one. Attaching to it would assert a correlation the data cannot support.
+    """
+    flow = unknown_transport_flow()
+
+    result = correlate([esp_detection()], by_uid(flow), make_manifest(), threshold=NO_GATE)
+
+    assert result.labels == ()
+    assert len(result.unmatched) == 1
+    assert result.unmatched[0].reason == UNSUPPORTED
+    assert result.unmatched[0].detection.proto == "esp"
+
+
+def test_two_such_flows_are_indistinguishable_which_is_why_the_address_pair_was_refused():
+    """Measured on Zeek 8.0.4: ESP and SCTP between one host pair give two flows, one tuple.
+
+    `tests/fixtures/make_awkward.py::write_two_unsupported_transports_pcap` produces exactly
+    this, and Zeek writes both as `10.0.0.5 0 10.0.0.200 0 unknown_transport` with different
+    uids. So matching on the address pair would attach an ESP alert to the SCTP flow, and no
+    check `Flow` can currently make would notice — the tuples are equal. This test pins the
+    refusal, not the ambiguity: the answer is `unsupported_transport`, not
+    `ambiguous_flow_match`.
+
+    Zeek does record `ip_proto` (50 and 132) and `Flow` does not carry it, so this is flabel's
+    limit rather than the data's — issue #96, and `test_canaries.py` asserts the column exists
+    so nobody has to take that on trust.
+    """
+    flows = by_uid(
+        unknown_transport_flow(uid="CJKFoj4bpHEhTeaRoj"),
+        unknown_transport_flow(uid="CRdT6w4PA64qWKmBk3"),
+    )
+
+    result = correlate([esp_detection()], flows, make_manifest(), threshold=NO_GATE)
+
+    assert [record.reason for record in result.unmatched] == [UNSUPPORTED]
+
+
+def test_sctp_disagrees_on_the_ports_too_and_is_still_reported_the_same_way():
+    """Suricata reads SCTP's real ports; Zeek writes `0 0`. Two fields out, one answer."""
+    detection = esp_detection(proto="sctp", src_port=40000, dst_port=80)
+
+    result = correlate([detection], by_uid(unknown_transport_flow()), make_manifest(), NO_GATE)
+
+    assert [record.reason for record in result.unmatched] == [UNSUPPORTED]
+
+
+def test_an_unsupported_transport_with_no_flow_at_all_still_names_the_protocol():
+    """`no_flow_match` would be true but useless: the protocol is the cause, not the tuple."""
+    result = correlate([esp_detection()], {}, make_manifest(), threshold=NO_GATE)
+
+    assert [record.reason for record in result.unmatched] == [UNSUPPORTED]
+
+
+def test_unsupported_transports_alone_do_not_fire_the_gate():
+    """A capture that is entirely ESP is a successful run with no labels, not a failed one.
+
+    At the default 1% threshold, ten unmatched detections out of ten would fail every time if
+    they counted. They are excluded from the denominator, so the ratio is 0.0 and the run lives.
+    """
+    detections = [esp_detection(sid=index) for index in range(10)]
+
+    result = correlate(detections, by_uid(unknown_transport_flow()), make_manifest())
+
+    assert result.unmatched_ratio == 0.0
+    assert len(result.unmatched) == 10
+
+
+def test_the_gate_still_fires_on_a_real_tuple_failure_beside_unsupported_transports():
+    """The test that stops this fix from becoming a way to switch the gate off.
+
+    100 correlatable detections with 2 unplaced is 2% — above the 1% default. Adding 200 ESP
+    detections would drag that to 0.67% and silence the gate if they counted in the denominator,
+    which is exactly the regression to guard: a genuine tuple-normalisation defect hidden behind
+    a pile of traffic correlation was never going to place anyway.
+    """
+    detections = many_detections(100, unmatched=2)
+    detections += [esp_detection(sid=1000 + index) for index in range(200)]
+
+    with pytest.raises(CorrelationError) as raised:
+        correlate(detections, by_uid(make_flow(), unknown_transport_flow()), make_manifest())
+
+    result = raised.value.result
+    assert result.unmatched_ratio == pytest.approx(0.02)
+    assert exit_code_for(raised.value) == 1
+
+
+def test_the_count_holds_every_unmatched_while_the_ratio_holds_only_the_correlatable():
+    """Asserted together, because the risk is that they quietly become the same number.
+
+    `counts.unmatched` is the scale of the loss and must not hide anything; `unmatched_ratio`
+    is the number the gate acted on. One run, both read.
+    """
+    detections = many_detections(10, unmatched=1)
+    detections += [esp_detection(sid=2000 + index) for index in range(20)]
+
+    result = correlate(
+        detections, by_uid(make_flow(), unknown_transport_flow()), make_manifest(), NO_GATE
+    )
+
+    assert len(result.unmatched) == 21, "every unmatched detection is reported"
+    assert result.unmatched_ratio == pytest.approx(0.1), "1 of 10 correlatable, not 21 of 30"
+    assert result.detections_total == 30
+
+
+def test_an_unnormalised_protocol_name_is_a_step_6_regression_not_an_unsupported_transport():
+    """The protocol check casefolds; the tuple comparison does not. Both halves matter.
+
+    Written after the first implementation of #84 got this wrong. Matching the correlatable set
+    exactly would classify `TCP` as `unsupported_transport` — and because unsupported
+    transports are excluded from the gate's denominator, a step-6 regression that stopped
+    lowercasing would empty the denominator entirely and silence the gate on every run. The
+    gate would report 0.00% while nothing correlated at all.
+
+    So an un-normalised name stays correlatable, fails the exact tuple compare, and is reported
+    as `no_flow_match` — inside the gate, where it can fail the run.
+    """
+    detections = [make_detection(sid=index, proto="TCP") for index in range(10)]
+
+    with pytest.raises(CorrelationError) as raised:
+        correlate(detections, by_uid(make_flow()), make_manifest())
+
+    result = raised.value.result
+    assert [record.reason for record in result.unmatched] == ["no_flow_match"] * 10
+    assert result.correlatable_total == 10, "an unknown spelling must not leave the denominator"
+    assert result.unmatched_ratio == 1.0

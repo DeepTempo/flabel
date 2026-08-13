@@ -24,6 +24,7 @@ Step 9  cli (integration)
 Step 10 canaries + reproducibility gates
    │
 Step 11 per-rule label basis   ── post-Phase 1 (#75)
+Step 12 unsupported transports ── post-Phase 1 (#84), independent of 11
 ```
 
 **Parallel groups:** {3, 4, 5, 6} and {7, 8}. Cap at 2–3 worktrees at a time. Every other step is sequential.
@@ -41,6 +42,7 @@ Step 11 per-rule label basis   ── post-Phase 1 (#75)
 | 9 CLI | [#23](https://github.com/DeepTempo/flabel/issues/23) | |
 | 10 Canaries | [#24](https://github.com/DeepTempo/flabel/issues/24) | |
 | 11 Per-rule label basis | [#75](https://github.com/DeepTempo/flabel/issues/75) | *post-Phase 1* |
+| 12 Unsupported transports | [#84](https://github.com/DeepTempo/flabel/issues/84) | *post-Phase 1* |
 
 **Why step 1 is first:** the testing decision is *tools real, network stubbed* — Zeek, Suricata, and `editcap` are invoked for real in tests. Until CI can run them, **nothing else is testable**, so this is a hard prerequisite rather than scaffolding to do later.
 
@@ -366,6 +368,96 @@ structurally broken rule, a loose regex, and #77's directionality loss — so th
 "zero" only once those are settled too.
 
 **Depends on:** 11c, and a decision on the three residual causes in #75.
+
+---
+
+## Step 12 — Unsupported transport protocols (#84)
+
+**Not part of Phase 1**, and found the same way #75 was: by running the pipeline over traffic
+nobody had tried. Filed from the final `/project:verify` pass.
+
+**The defect, demonstrated.** Zeek's `transport_proto` holds only `tcp`/`udp`/`icmp`/
+`unknown_transport`, and it zeroes the port columns for anything else. Suricata reports the real
+protocol, and for SCTP the real ports. So the tuples disagree in the protocol field *always*:
+
+| capture | flows | detections | unmatched | ratio | exit |
+| :-- | --: | --: | --: | --: | --: |
+| ESP (IP proto 50) | 1 | 1 | 1 | 100% | **1** |
+| SCTP (IP proto 132) | 1 | 1 | 1 | 100% | **1** |
+| GRE carrying TCP | 1 | 9 | 7 | 77.8% | **1** |
+
+The run **dies** — `CorrelationError`, exit 1, no `labels.json` — on a capture that is otherwise
+perfectly labellable, and the message misdirects the operator to check that Zeek and Suricata read
+the same capture, which they did. Below the 1% threshold the failure flips to the other bad one:
+the detections vanish into `unmatched_detections[]` and a C2-over-GRE alert never becomes a label.
+
+`suricata.py:130` already recorded the gap in a comment. What nobody measured is that "reported"
+meant the run dies.
+
+**DECIDED (Craig, 2026-08-13) — report it, never correlate it.** A detection on a protocol Zeek
+writes as `unknown_transport` is never attached to a flow. It lands in `unmatched_detections[]`
+under a new reason, `unsupported_transport`, is counted separately, and is **excluded from the 1%
+gate denominator** so a legitimate IPsec or tunnelled capture no longer fails the run.
+
+**Rejected: matching on the address pair.** Two different such protocols between one host pair
+produce two Zeek flows with **identical 5-tuples** — both `10.0.0.5 0 10.0.0.200 0
+unknown_transport`. Address-pair matching therefore fails as `ambiguous_flow_match` exactly where
+a host is busiest, and before it detects the ambiguity it can attach an ESP detection to an SCTP
+flow. That trades the guarantee the output exists to provide for labels that cannot be trusted.
+
+**Corrected during the build, by reading the log rather than the plan.** Zeek 8's `conn.log`
+carries an **`ip_proto`** column — 50 for ESP, 132 for SCTP — so the two conversations *are*
+distinguishable; `Flow` simply does not parse it. The decision stands, because reporting is right
+either way and parsing `ip_proto` means mapping Suricata's protocol names onto IP protocol numbers
+and widening `Flow`, which is a larger change than a crash fix should carry. But the reason is now
+"flabel cannot tell them apart", not "the data does not exist" — filed as **#96**.
+
+**Files:** `src/flabel/models.py`, `src/flabel/correlate.py`, `src/flabel/provenance.py`,
+`docs/spec.md` (§4, §8, §9, §10, §11), `tests/fixtures/make_awkward.py`, `tests/test_correlate.py`,
+`tests/test_provenance.py`, `tests/integration/test_canaries.py`.
+
+**The classification is computable from the detection alone**, which is the same property that let
+step 7 handle the ICMP counterpart without a second index: if the detection's normalised protocol
+is not one of `tcp`/`udp`/`icmp`, the reason is `unsupported_transport` — decided before any
+candidate lookup, so a detection on a protocol Zeek cannot express never reaches the tuple compare.
+This also means an ESP detection with no Zeek flow at all is reported as `unsupported_transport`
+rather than `no_flow_match`, which is right: the protocol is the cause.
+
+**The one sub-decision this step takes, because it changes a published field.** `counts` gains
+`unmatched_unsupported_transport`, and **`unmatched_ratio` becomes the ratio the gate actually
+used** — correlatable unmatched over correlatable detections — rather than `unmatched / detections`.
+Recording a ratio the gate did not use is issue #68's complaint one field over. `counts.unmatched`
+keeps counting *every* unmatched detection, so nothing is hidden and the descriptive number stays
+recoverable. §10 must say so explicitly, since a consumer recomputing `unmatched / detections` will
+now get a different number when the count is non-zero. Zero correlatable detections yields ratio
+`0.0`, not a division by zero.
+
+**Test that proves it, test-first:**
+
+1. A detection whose protocol is `esp` yields `UnmatchedDetection(reason="unsupported_transport")`
+   even when a Zeek flow exists between the same addresses — the ambiguity measurement above is
+   why this is the assertion rather than a match.
+2. A capture that is *entirely* ESP completes: **exit 0**, a full run directory, `labels.json`
+   present with an empty `labels` array, every detection in `unmatched_detections[]`.
+3. The gate is not fired by unsupported transports alone — `unmatched_ratio` is `0.0` when every
+   unmatched detection is one, and the run succeeds.
+4. The gate still fires on a genuine tuple failure *mixed with* unsupported transports: the
+   denominator excludes the latter, so one uncorrelatable TCP detection in a small correlatable
+   population still fails. **This is the test that stops the fix from becoming a way to switch the
+   gate off**, which is the step-10 lesson.
+5. `counts.unmatched` counts all of them while `unmatched_ratio` counts only the correlatable —
+   asserted together on one run, since the whole risk is that they silently become the same number.
+6. The §11 loss-condition row resolves against real output, and §10's run block key set still
+   equals the spec literal. Both are existing spec-parsing tests and will fail until the spec is
+   edited, which is the point.
+
+**Fixtures:** the repo has no capture carrying a non-TCP/UDP/ICMP protocol and `unknown_transport`
+appears nowhere in `tests/`. `make_awkward.py` gains ESP, SCTP and GRE generators — byte-deterministic
+like its siblings, so they can be regenerated and byte-compared.
+
+**Depends on:** nothing outstanding. **Related, deliberately not folded in:** #68 (the run block
+does not record the `--unmatched-threshold` the gate used) and #87 (the corpus correlation test is
+vacuous, and would have caught this on day one).
 
 ---
 

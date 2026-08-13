@@ -38,6 +38,10 @@ RULES = rule_lines()
 #: Matches the benign canary's HTTP flows. Used where a gate needs labels to exist.
 MATCHES_CANARY = 9000001
 
+#: `alert ip`, which fires on any IP protocol — including the ones Zeek writes as
+#: `unknown_transport` (issue #84). The rule shape most of the wholesale feeds use.
+ANY_IP_PROTOCOL = 9000010
+
 #: Rules that cannot match the benign canary: it carries no UDP, no ICMP and no TLS. Used where a
 #: gate needs a *loaded, real* ruleset that nonetheless asserts nothing about this capture.
 MISSES_CANARY = (9000006, 9000007, 9000008)

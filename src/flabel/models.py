@@ -56,7 +56,17 @@ CaptureFormat = Literal["pcap", "pcapng", "pcap.gz", "pcapng.gz"]
 InputStatus = Literal["complete", "partial"]
 
 #: Why a detection could not be attached to exactly one flow.
-UnmatchedReason = Literal["no_flow_match", "ambiguous_flow_match"]
+#:
+#: `unsupported_transport` is decided from the detection alone and before any flow lookup
+#: (issue #84): Zeek's `transport_proto` holds only tcp/udp/icmp/unknown_transport, so a
+#: detection on ESP, SCTP or GRE has no tuple to compare against. It is reported rather than
+#: correlated, and excluded from the gate's denominator — see `CorrelationResult`.
+UnmatchedReason = Literal["no_flow_match", "ambiguous_flow_match", "unsupported_transport"]
+
+#: The protocols Zeek can name in `transport_proto`, and so the only ones a detection can be
+#: correlated on. Anything else is `unknown_transport` on Zeek's side, with the port columns
+#: zeroed — not a tuple that can be compared, whatever Suricata reported.
+CORRELATABLE_PROTOCOLS = frozenset({"tcp", "udp", "icmp"})
 
 #: Whether JA4 fingerprinting was available to the Zeek pass, and if not, why not.
 #:
@@ -410,7 +420,7 @@ class UnmatchedDetection:
     """
 
     detection: Detection
-    reason: Literal["no_flow_match", "ambiguous_flow_match"]
+    reason: UnmatchedReason
 
     def __post_init__(self) -> None:
         _check(self.reason, get_args(UnmatchedReason), "reason", "UnmatchedDetection")
@@ -539,8 +549,29 @@ class CorrelationResult:
     detections_total: int
 
     @property
+    def unsupported_transport_total(self) -> int:
+        """Unmatched detections on a protocol Zeek cannot express at all (issue #84)."""
+        return sum(1 for record in self.unmatched if record.reason == "unsupported_transport")
+
+    @property
+    def correlatable_total(self) -> int:
+        """Detections that had a tuple worth comparing — the gate's denominator."""
+        return self.detections_total - self.unsupported_transport_total
+
+    @property
     def unmatched_ratio(self) -> float:
-        """Share of detections that could not be placed. Zero detections is zero loss."""
-        if self.detections_total == 0:
+        """The share the gate acts on: correlatable unmatched over correlatable detections.
+
+        **Not `len(unmatched) / detections_total`**, and spec §10 says so where this is
+        published. A detection on ESP or SCTP was never going to correlate — Zeek has no name
+        for its protocol — so counting it would let ordinary IPsec traffic fail a run, and
+        counting enough of it would drag a genuine tuple-normalisation defect below the
+        threshold and silence the gate. `counts.unmatched` still reports every one of them, so
+        the scale of the loss is not hidden; only the ratio is narrowed to what it can judge.
+
+        Zero correlatable detections is zero loss, not a division by zero.
+        """
+        correlatable = self.correlatable_total
+        if correlatable == 0:
             return 0.0
-        return len(self.unmatched) / self.detections_total
+        return (len(self.unmatched) - self.unsupported_transport_total) / correlatable

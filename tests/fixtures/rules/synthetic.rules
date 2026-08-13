@@ -86,3 +86,14 @@ alert icmp any any -> any any (msg:"FLABEL TEST synthetic ICMPv6 echo"; itype:12
 # (`negates_home_net`); this rule is what proves the engine really does reject them, so the
 # exclusion rests on a measurement rather than on a claim in a comment. Never "repair" it.
 alert udp $HOME_NET any -> ![10.0.0.0/8,$HOME_NET] 123 (msg:"FLABEL TEST negated home_net"; classtype:trojan-activity; sid:9000009; rev:1;)
+
+# sid 9000010 — `alert ip`, which fires on ANY IP protocol, including the ones Zeek cannot name
+# in `transport_proto` (issue #84, PLAN step 12). This is not an exotic rule shape: the
+# reputation and address-list rules that make up most of the wholesale-admitted feeds are
+# written exactly this way, which is why an IPsec or tunnelled capture reached correlation at
+# all. Measured on Suricata 8.0.6 against the four-packet ESP fixture: **one** alert, not one per
+# packet — `alert ip` is flow-based, and the four datagrams are one flow. `proto` parses as `esp`,
+# both ports 0. Zeek writes one flow for the same file: `10.0.0.5 0 10.0.0.200 0
+# unknown_transport`. So the two tools agree there is one conversation and disagree about how to
+# name it, which is the whole of #84.
+alert ip any any -> any any (msg:"FLABEL TEST synthetic any-IP-protocol"; classtype:trojan-activity; sid:9000010; rev:1;)

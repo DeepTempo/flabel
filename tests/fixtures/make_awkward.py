@@ -33,7 +33,7 @@ import struct
 import sys
 from pathlib import Path
 
-from make_canary import LINKTYPE_ETHERNET, build_packets, write_pcap
+from make_canary import LINKTYPE_ETHERNET, build_packets, ethernet, ipv4, write_pcap
 
 #: pcap file header, then a 16-byte header per record (spec §8's "record headers").
 PCAP_HEADER_BYTES = 24
@@ -456,6 +456,95 @@ def write_all(outdir: Path) -> dict[str, Path]:
         written[f"{name}.gz"] = write_gzipped(written[name], outdir / f"{name}.gz")
 
     return written
+
+
+# --- protocols Zeek cannot express in `transport_proto` (issue #84) ----------------------------
+#
+# Zeek's `transport_proto` holds only tcp/udp/icmp/unknown_transport, and it zeroes the port
+# columns for anything else, while Suricata reports the real protocol — and for SCTP, the real
+# ports. Nothing else in the repo carries such a protocol, so step 12's behaviour could not be
+# tested against a real capture until these existed.
+
+#: IP protocol numbers. ESP is the one that matters most in practice: IPsec is ordinary in
+#: enterprise captures, and a reputation rule written `alert ip` fires on it.
+IPPROTO_ESP = 50
+IPPROTO_SCTP = 132
+
+
+def esp_packets(
+    src: str = "10.0.0.5", dst: str = "10.0.0.200", count: int = 4, first_ts: float = 1700000000.0
+) -> list[tuple[float, bytes]]:
+    """ESP datagrams between one host pair — IP protocol 50, no ports at any layer.
+
+    The payload is a fixed SPI and an incrementing sequence number followed by filler standing
+    in for the encrypted body. Deterministic on purpose: like every other writer here, these
+    can be regenerated and byte-compared.
+    """
+    packets = []
+    for index in range(count):
+        body = struct.pack("!II", 0x1000_0001, index + 1) + bytes(range(16))
+        frame = ethernet(ipv4(src, dst, body, proto=IPPROTO_ESP, ident=index + 1))
+        packets.append((first_ts + index, frame))
+    return packets
+
+
+def sctp_packets(
+    src: str = "10.0.0.5",
+    dst: str = "10.0.0.200",
+    sport: int = 40000,
+    dport: int = 80,
+    count: int = 2,
+    first_ts: float = 1700000100.0,
+) -> list[tuple[float, bytes]]:
+    """SCTP datagrams — IP protocol 132, carrying *real* ports Suricata reports and Zeek does not.
+
+    That asymmetry is the second half of #84: for ESP the tuples disagree on protocol alone, but
+    for SCTP they disagree on the port columns too, because Zeek writes `0 0` for anything it
+    cannot express while Suricata reads the SCTP header.
+
+    A single DATA chunk with a zero checksum — Suricata does not verify SCTP CRC32c, and a real
+    checksum would add a table for nothing this fixture needs to prove.
+    """
+    packets = []
+    for index in range(count):
+        chunk = struct.pack("!BBH", 0, 3, 16) + struct.pack("!IHHI", index, 0, 0, 0)
+        body = struct.pack("!HHII", sport, dport, 0xDEADBEEF, 0) + chunk
+        frame = ethernet(ipv4(src, dst, body, proto=IPPROTO_SCTP, ident=100 + index))
+        packets.append((first_ts + index, frame))
+    return packets
+
+
+def write_esp_pcap(path: Path) -> Path:
+    """A capture that is *entirely* ESP: valid, labellable in principle, zero correlatable flows."""
+    write_pcap(str(path), esp_packets())
+    return path
+
+
+def write_sctp_pcap(path: Path) -> Path:
+    write_pcap(str(path), sctp_packets())
+    return path
+
+
+def write_two_unsupported_transports_pcap(path: Path) -> Path:
+    """ESP *and* SCTP between the same host pair — the case that rules out address-pair matching.
+
+    Zeek writes both as `10.0.0.5 0 10.0.0.200 0 unknown_transport`, so the two conversations are
+    indistinguishable in `conn.log`: matching a detection on the address pair alone would attach
+    an ESP alert to the SCTP flow with nothing able to tell. Measured on Zeek 8.0.4 — two flows,
+    identical 5-tuples, different `uid`s.
+    """
+    write_pcap(str(path), esp_packets() + sctp_packets())
+    return path
+
+
+def write_mixed_transport_pcap(path: Path) -> Path:
+    """The canary's ordinary TCP flows plus ESP, so one capture holds both populations.
+
+    Step 12's gate must keep counting the TCP detections while excluding the ESP ones, and a
+    fixture carrying only one of the two cannot show the difference.
+    """
+    write_pcap(str(path), build_packets() + esp_packets())
+    return path
 
 
 def main() -> int:
