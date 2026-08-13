@@ -11,6 +11,7 @@ that depend on them so a future reader can tell a measurement from an assumption
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ import pytest
 from flabel.config import load_admission_policy
 from flabel.errors import ConfigError
 from flabel.models import AdmissionPolicy, SourceSpec
-from flabel.rules.admit import admit, classtype_of, is_ioc_shaped
+from flabel.rules.admit import admit, classtype_of, is_address_indicator, rule_options
 
 REGISTRY = Path(__file__).resolve().parents[1] / "src" / "flabel" / "data" / "sources.toml"
 
@@ -72,58 +73,105 @@ def test_a_rule_with_no_classtype_reads_as_none_rather_than_empty():
     assert classtype_of(rule(1)) is None
 
 
-# --- the IOC shape -----------------------------------------------------------------------------
+# --- the address-indicator shape ------------------------------------------------------------
 #
 # This is the definition that will separate "this flow IS the malicious activity" from "this flow
-# touched a known-bad indicator" (step 3 of #75). It moves the meaning of a label on 19.5% of the
-# ruleset, so each case below is spelled out rather than left to a single example.
+# reached a known-bad address" (step 3 of #75). It decides `label_basis` on 18.8% of the ruleset,
+# so each case is spelled out rather than left to one example.
+#
+# **It is an allowlist of non-detecting options, and the first cut was a blocklist that was wrong
+# by 585 rules.** Suricata has dozens of matching keywords that touch no payload buffer, and a
+# sample immediately turned up two: `stamus/lateral` detects RPC calls with `dcerpc.iface`, and
+# `pawpatrules` reads certificate state with `tls_cert_expired`. Neither uses `content`, so both
+# were counted as indicators. A blocklist of everything that inspects cannot be enumerated; the
+# handful of options that do not inspect can be.
 
 
 @pytest.mark.parametrize(
-    "payload, shaped",
+    "options, indicator",
     [
-        (None, True),
+        ("", True),
+        ("flow:to_server; ", True),
+        ("threshold: type limit, track by_dst,count 1, seconds 60; ", True),
+        ("flowbits:set,x; ", True),
         ('content:"GET"; ', False),
         ('pcre:"/^a+$/"; ', False),
         ("ja3.hash; ", False),
         ("ja4.hash; ", False),
         ("dataset:isset,tor,type string,load tor.lst; ", False),
-        ("flow:to_server; ", True),
-        ("threshold: type limit, track by_dst,count 1, seconds 60; ", True),
+        ("dcerpc.iface:367abb81-9844-35f1-ad32-98f038001003; ", False),
+        ("dcerpc.opnum:12; ", False),
+        ("tls_cert_expired; ", False),
+        ("tls.version:1.0; ", False),
+        ("itype:8; ", False),
     ],
     ids=[
         "bare-tuple",
+        "flow-only",
+        "threshold-only",
+        "flowbits-only",
         "content",
         "pcre",
         "ja3",
         "ja4",
         "dataset",
-        "flow-state-only",
-        "threshold-only",
+        "dcerpc-iface",
+        "dcerpc-opnum",
+        "tls-cert-expired",
+        "tls-version",
+        "itype",
     ],
 )
-def test_ioc_shape_is_the_absence_of_payload_inspection(payload: str | None, shaped: bool):
-    """A rule matching on addresses, ports, protocol and flow state alone is an indicator.
+def test_an_address_indicator_inspects_nothing_but_the_tuple(options: str, indicator: bool):
+    """`flow`, `threshold` and `flowbits` restrict *when* a rule may fire, not *what* it matches.
 
-    `flow:` and `threshold:` do not make a rule a signature — neither looks at bytes. Getting
-    that wrong would misclassify the abuse.ch feeds, which are indicators with flow state.
+    The four `False` cases at the end are the ones the blocklist missed, and each is a real rule
+    shape from the live feeds rather than an invention.
     """
-    assert is_ioc_shaped(rule(1, payload=payload)) is shaped
+    rule = f'alert ip any any -> 1.2.3.4 any (msg:"x"; {options}sid:1; rev:1;)'
+
+    assert is_address_indicator(rule) is indicator
 
 
-def test_the_declared_classtype_cannot_identify_an_ioc_rule():
-    """The measurement that forces this to be structural rather than declared.
+def test_options_are_split_outside_quotes_only():
+    """`content:"a;b"` carries a semicolon inside a quoted value, and `\\"` escapes a quote.
 
-    Of the 16,667 IOC-shaped rules in the nine feeds, **16,067 declare `trojan-activity`** — the
-    same classtype the strongest direct detections use. So the shape has to be read off the rule;
-    asking the rule what kind it is gets the wrong answer for 96% of them.
+    Splitting naively on `;` would invent option names out of the fragments and misclassify the
+    rule — in the direction that matters, since a fragment is unlikely to be an allowlisted name.
     """
-    ioc = rule(1, classtype="trojan-activity", payload=None)
-    signature = rule(2, classtype="trojan-activity")
+    rule = 'alert ip any any -> 1.2.3.4 any (msg:"a;b"; content:"say \\"hi\\"; now"; sid:1;)'
 
-    assert classtype_of(ioc) == classtype_of(signature) == "trojan-activity"
-    assert is_ioc_shaped(ioc) is True
-    assert is_ioc_shaped(signature) is False
+    names = [option.split(":")[0] for option in rule_options(rule)]
+
+    assert names == ["msg", "content", "sid"]
+    assert is_address_indicator(rule) is False
+
+
+def test_a_name_indicator_is_not_an_address_indicator():
+    """The measurement that forced the rename, and the reason the two mechanisms compose.
+
+    `abuse.ch/urlhaus` is the canonical `ioc-name` source and scores **0%** here: a domain-name
+    indicator is matched in payload content. So this test does not identify indicator-based rules
+    in general — only address lists. `source_class` covers the rest at the feed level, which is
+    why a rule is `indicator-reference` if *either* answer says so.
+    """
+    urlhaus_shaped = 'alert dns any any -> any any (msg:"bad name"; content:"evil.invalid"; sid:1;)'
+
+    assert is_address_indicator(urlhaus_shaped) is False
+
+
+def test_the_declared_classtype_cannot_identify_an_address_indicator():
+    """Measured: of the address-list rules in the nine feeds, the overwhelming majority declare
+    `trojan-activity` — the same classtype the strongest direct detections use. So the shape has
+    to be read off the rule; asking the rule what kind it is gets the wrong answer."""
+    indicator = 'alert ip any any -> 1.2.3.4 any (msg:"c2"; classtype:trojan-activity; sid:1;)'
+    signature = (
+        'alert ip any any -> any any (msg:"c2"; content:"x"; classtype:trojan-activity; sid:2;)'
+    )
+
+    assert classtype_of(indicator) == classtype_of(signature) == "trojan-activity"
+    assert is_address_indicator(indicator) is True
+    assert is_address_indicator(signature) is False
 
 
 # --- the policy --------------------------------------------------------------------------------
@@ -243,3 +291,42 @@ def test_an_unusable_admission_table_refuses_to_load(table: str, reason: str, re
     """
     with pytest.raises(ConfigError):
         load_admission_policy(registry_with(table))
+
+
+# --- what a snapshot records, and which schemas are trusted --------------------------------------
+
+
+def test_a_schema_2_index_is_readable_but_its_classification_is_not_trusted(tmp_path: Path):
+    """Schema 2 recorded `ioc_shaped`, computed by a definition since measured wrong.
+
+    The snapshot stays *readable* — its sid→source attribution was never in question, and refusing
+    it would strand every label already traced to it. What is refused is its **classification**:
+    reading it would put a known-bad answer behind a label's `label_basis`, and inventing
+    provenance is the one thing this project must not do.
+
+    The remedy is a re-run of `flabel rules update`, not a fallback.
+    """
+    from flabel.rules.snapshot import SID_INDEX_NAME, load_address_indicators, load_sid_index
+
+    directory = tmp_path / "snap"
+    directory.mkdir()
+    (directory / SID_INDEX_NAME).write_text(
+        json.dumps({"schema": 2, "sources": {"a/one": [1, 2]}, "ioc_shaped": [1, 2]}),
+        encoding="utf-8",
+    )
+
+    assert load_sid_index(directory) == {1: "a/one", 2: "a/one"}, "attribution still readable"
+    assert load_address_indicators(directory) == frozenset(), "its classification is not trusted"
+
+
+def test_a_schema_1_index_records_no_classification(tmp_path: Path):
+    """It predates the idea entirely, so there is nothing to distrust — only nothing to report."""
+    from flabel.rules.snapshot import SID_INDEX_NAME, load_address_indicators
+
+    directory = tmp_path / "snap"
+    directory.mkdir()
+    (directory / SID_INDEX_NAME).write_text(
+        json.dumps({"schema": 1, "sources": {"a/one": [1]}}), encoding="utf-8"
+    )
+
+    assert load_address_indicators(directory) == frozenset()

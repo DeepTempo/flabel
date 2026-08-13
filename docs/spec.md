@@ -503,7 +503,7 @@ def list_snapshots(root: Path) -> list[SnapshotManifest]
 The original was one hashed file, `rules.rules`, with `snapshot_id = sha256(rules.rules)[:16]`.
 Two things measured against the live feeds made that insufficient.
 
-**`sid_index.json` — `{"schema": 2, "sources": {"<source>": [sid, ...]}, "ioc_shaped": [sid, ...]}`.** §8 resolves the
+**`sid_index.json` — `{"schema": 3, "sources": {"<source>": [sid, ...]}, "address_indicator": [sid, ...]}`.** §8 resolves the
 originating source of each alert from the snapshot, because `eve.json` carries a signature id and
 nothing about where the rule came from. Per-source *counts* in the manifest cannot answer "which
 source is sid 2011465?", so the mapping has to be stored. It is a file rather than a field on
@@ -511,12 +511,24 @@ source is sid 2011465?", so the mapping has to be stored. It is a file rather th
 per source do not belong in every output file. It is versioned separately from the manifest
 because step 6 reads this file and nothing else in the snapshot.
 
-**`ioc_shaped` records which rules decide purely from the header tuple** (issue #75, schema 2).
-A rule with no `content`, `pcre`, `ja3.hash`/`ja4.hash` or `dataset:` establishes that a flow
-*touched a known-bad indicator*, not that the flow *is* the malicious activity — the distinction
-`label_basis` already names. Measured: **16,667 of 85,431 admitted rules are IOC-shaped (19.5%),
-and 16,067 of those declare `classtype: trojan-activity`**, so the declared classtype cannot
-identify them and the shape has to be read off the rule.
+**`address_indicator` records which rules fire on the address tuple alone** (issue #75, schema 3).
+Such a rule establishes that a flow *reached a known-bad address*, not that the flow *is* the
+malicious activity — the distinction `label_basis` already names. Measured 2026-08-13:
+**16,079 of 85,431 admitted rules (18.8%)**, of which **99.8% name a literal IP as their
+destination**, and they sit almost entirely in `pawpatrules` (16,064) — a feed that declares
+itself `signature`, which is why the feed-level answer alone cannot find them.
+
+**The two classifications compose rather than compete.** `source_class` covers name and URL
+indicators at the feed level; this covers address indicators buried inside a signature feed.
+`abuse.ch/urlhaus` is the canonical `ioc-name` source and scores **0%** here, because a
+domain-name indicator is matched in payload content — so a rule is an indicator if *either*
+answer says so.
+
+**Computed by an allowlist of non-detecting options**, not a blocklist of payload keywords. The
+first cut was a blocklist — `content`, `pcre`, `ja3.hash`, `ja4.hash`, `dataset` — and it was
+wrong by 585 rules: `stamus/lateral` detects RPC calls with `dcerpc.iface`/`dcerpc.opnum` and
+`pawpatrules` reads certificate state with `tls_cert_expired`, and neither uses `content`.
+Everything that inspects cannot be enumerated; the handful of options that do not inspect can be.
 
 It lives here, **inside the hash**, rather than in `manifest.json`, and that placement is
 load-bearing. Exclusion changes `rules.rules`, so `snapshot_id` moves with it. Re-labelling
@@ -524,9 +536,11 @@ changes no rules at all — recorded in the manifest it would sit outside the id
 two snapshots sharing an id could then produce labels with different bases, which is exactly the
 guarantee the id exists to give.
 
-A schema-1 index remains readable and reports no shape, because it recorded none; claiming
-otherwise would invent provenance for labels already emitted. That graceful path is why this file
-carries a version of its own.
+**Schemas 1 and 2 read as "no classification recorded".** For 1 that is literally true; for 2 it
+is a judgement — the data is there but was computed by the blocklist since measured wrong, and
+reading it would put a known-bad answer behind a label's basis. Both stay readable for sid→source
+attribution, so no label already traced to such a snapshot is stranded. The remedy is a re-run of
+`flabel rules update`, not a fallback.
 
 **Companion data files are part of the ruleset, so they are inside the id.** Measured in step 6:
 `pawpatrules` ships 18 `.lst` files that 26 of its rules read with `dataset:`. Loaded away from
