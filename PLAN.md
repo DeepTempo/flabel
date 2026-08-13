@@ -324,9 +324,33 @@ source yields `indicator-reference` regardless of shape; and an `identify` sourc
 `None` for a snapshot that recorded no classification — schema 1, or the schema 2 written by the
 definition #79 corrected. `build_source_entry` must not read that as "no rule is an indicator",
 which would emit `direct` for ~16,000 address-list rules and say nothing. Spec §2.5: absence is
-never a signal. Either the run refuses to label against an unclassified snapshot, or it records
-the fact in the run block's `warnings[]` — **decide before writing the code**, and note that the
-first option strands every snapshot built before #79.
+never a signal.
+
+**DECIDED (Craig, 2026-08-13) — warn, and downgrade to `indicator-reference`.** A run against an
+unclassified snapshot proceeds. It records the fact once in the run block's `warnings[]`, naming
+the snapshot, and every `SourceEntry` takes `indicator-reference` rather than `direct`.
+
+Under the composed rule that means: `ioc-name` is unaffected (its feed-level answer already says
+`indicator-reference`), `identify` still raises, and `signature` — the only class whose basis
+depends on the missing per-rule answer — takes the weaker claim instead of the stronger one. So
+when the classification is absent, *every* entry is `indicator-reference`.
+
+Why: it strands no snapshot, and it cannot reproduce #75. The error it risks instead is
+understating a genuine `direct` detection, which is wrong in the safer direction — an overclaim
+of `direct` on ~16,000 address-list rules is the defect this whole step exists to remove, and it
+would land in a file whose purpose is ML training data. Rejected: **refusing to label**, which
+strands every snapshot built before #79 (and `load_address_indicators`' own docstring argues for
+it — that argument is noted and overruled); and **warning while labelling `direct`**, which
+reproduces #75 exactly with only a warning saying so.
+
+Implementation consequence to carry into the build: `build_source_entry` is per-detection and
+pure, so it cannot by itself put a once-per-run entry in `warnings[]`. Expect 11c's file list to
+grow `src/flabel/cli.py` — confirm the plumbing before writing, rather than emitting the warning
+per label.
+
+**Tests this adds** to the four above: a `signature`-class content-matching rule against a `None`
+classification yields `indicator-reference`, not `direct`; and the run block carries the warning
+exactly once.
 
 **Depends on:** 11b. **Blocks:** 11d.
 

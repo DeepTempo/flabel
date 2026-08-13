@@ -92,6 +92,27 @@ Candidate sources worth checking against points 1 and 2: Netresec's published ca
 Stratosphere IPS datasets, and malware-traffic-analysis.net — each has its own terms, and the
 terms are the part to read first.
 
+**Ruled out 2026-08-13 — EICAR.** `benign-corpus/smb-eicar-file-segmentation-random.pcap` clears
+points 1, 2 and 3 outright — MIT, a suricata-verify test capture carrying no real party's data,
+and 22 KB — and looks like the obvious candidate. It fails
+point 4, and not for the reason it appears to. ET Open is the only feed of the nine carrying any
+EICAR rule at all — checked by grepping every mirror payload for both the ASCII string and its
+hex encoding — and none of the three enabled ones detects EICAR as such:
+
+| sid | What it actually requires |
+| --- | --- |
+| 2022932, 2022933 | `alert http`, `to_client`, and a Symantec MIME name-overflow shape: `Content-Type: … name="<78+ chars>"` |
+| 2039680 | `alert http`, an `x-powered-by: Kaspersky Labs` response header, and `filename="eicar.zip"` |
+
+All three are HTTP; the fixture is SMB. The metadata filter that excludes them is therefore not
+the blocker, and admitting them would gain nothing. The one rule that did match the raw EICAR
+string, 2012591, is `# ET DELETED` upstream and additionally demands an MZ header. Adopting the
+fixture would also have meant moving it out of `benign-corpus/`, which step 11d asserts produces
+zero labels.
+
+**Decided 2026-08-13 (Craig):** Phase 1 signs off with this criterion explicitly **not met**.
+Issue #24 stays open and the skip above stays, so the gap remains visible in test output.
+
 ## Regenerating the benign canary
 
 ```sh
