@@ -514,7 +514,7 @@ because step 6 reads this file and nothing else in the snapshot.
 **`address_indicator` records which rules fire on the address tuple alone** (issue #75, schema 3).
 Such a rule establishes that a flow *reached a known-bad address*, not that the flow *is* the
 malicious activity — the distinction `label_basis` already names. Measured 2026-08-13:
-**16,079 of 85,431 admitted rules (18.8%)**, of which **99.8% name a literal IP as their
+**16,079 of 85,431 admitted rules (18.8%)**, of which **99.9% name a literal IP as their
 destination**, and they sit almost entirely in `pawpatrules` (16,064) — a feed that declares
 itself `signature`, which is why the feed-level answer alone cannot find them.
 
@@ -526,7 +526,7 @@ answer says so.
 
 **Computed by an allowlist of non-detecting options**, not a blocklist of payload keywords. The
 first cut was a blocklist — `content`, `pcre`, `ja3.hash`, `ja4.hash`, `dataset` — and it was
-wrong by 585 rules: `stamus/lateral` detects RPC calls with `dcerpc.iface`/`dcerpc.opnum` and
+wrong by 588 rules: `stamus/lateral` detects RPC calls with `dcerpc.iface`/`dcerpc.opnum` and
 `pawpatrules` reads certificate state with `tls_cert_expired`, and neither uses `content`.
 Everything that inspects cannot be enumerated; the handful of options that do not inspect can be.
 

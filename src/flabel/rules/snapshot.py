@@ -70,7 +70,7 @@ MANIFEST_VERSION = 1
 #:
 #: * **1** — sources only.
 #: * **2** — added `ioc_shaped`, computed by a *blocklist* of payload keywords. Measured wrong by
-#:   585 rules: it counted `stamus/lateral`'s `dcerpc.iface` detections and `pawpatrules`'
+#:   588 rules: it counted `stamus/lateral`'s `dcerpc.iface` detections and `pawpatrules`'
 #:   `tls_cert_expired` as indicators, because neither uses `content`.
 #: * **3** — `address_indicator`, computed by an allowlist of non-detecting options.
 #:
@@ -148,7 +148,8 @@ def render_rules(admitted: Mapping[str, Sequence[str]]) -> bytes:
 
 
 def render_sid_index(admitted: Mapping[str, Sequence[str]]) -> bytes:
-    """The exact bytes of `sid_index.json`: `{"schema": 1, "sources": {name: [sid, ...]}}`.
+    """The exact bytes of `sid_index.json`:
+    `{"schema": 3, "sources": {name: [sid, ...]}, "address_indicator": [sid, ...]}`.
 
     This is how step 6 resolves an alert's sid back to the source that admitted it, since
     `eve.json` does not carry the source. Three conditions are hard failures, because each makes
@@ -395,19 +396,25 @@ def load_sid_index(directory: Path) -> dict[int, str]:
     return index
 
 
-def load_address_indicators(directory: Path) -> frozenset[int]:
+def load_address_indicators(directory: Path) -> frozenset[int] | None:
     """The sids in a snapshot whose rules fire on the address tuple alone (#75).
 
     An address-list rule establishes that a flow *reached a known-bad address*, not that the flow
     *is* the malicious activity — the difference `label_basis` already names as
-    `indicator-reference` versus `direct`. Today that is decided per **source**, so the 16,078
+    `indicator-reference` versus `direct`. Today that is decided per **source**, so the 16,064
     address-list rules measured inside `pawpatrules` — a `signature`-class feed — all label
     `direct`. This is what lets it be decided per rule as well.
 
-    **A snapshot older than schema 3 returns an empty set**, and that is correct rather than a
-    fallback. Schema 1 recorded no classification; schema 2 recorded one computed by a definition
-    since measured wrong by 585 rules. Reading either would put an unverified classification
-    behind a label's basis, and inventing provenance is the one thing this project must not do.
+    **`None` means the snapshot recorded no classification; an empty set means it recorded that
+    no rule is an address indicator.** Those are different facts and must not share an answer: a
+    caller handed `frozenset()` for a schema-2 snapshot would label ~16,000 address-list rules
+    `direct` — the exact defect #75 exists to fix — with nothing anywhere saying so. `None` forces
+    the decision to be taken rather than defaulted (spec §2.5: absence is never a signal).
+
+    Schema 1 recorded no classification at all; schema 2 recorded one computed by a definition
+    since measured wrong, and reading it would put a known-bad answer behind a label's basis. Both
+    stay readable for sid->source attribution, so no label already traced to such a snapshot is
+    stranded. The remedy is a re-run of `flabel rules update`, not a fallback.
     """
     path = Path(directory) / SID_INDEX_NAME
     try:
@@ -417,10 +424,19 @@ def load_address_indicators(directory: Path) -> frozenset[int]:
     except (OSError, json.JSONDecodeError) as exc:
         raise SnapshotError(f"could not read {path}: {exc}") from exc
 
+    if not isinstance(document, dict):
+        raise SnapshotError(f"{path} is not a JSON object")
     if document.get("schema") not in CLASSIFIED_SID_INDEX_SCHEMAS:
-        return frozenset()
+        return None
 
-    sids = document.get("address_indicator", [])
+    # Schema 3 always writes this key, so its absence means the file was truncated or hand-edited
+    # — which must not read as "no rule is an indicator".
+    if "address_indicator" not in document:
+        raise SnapshotError(
+            f"{path} declares schema {document.get('schema')} but has no `address_indicator` "
+            f"key. A schema-3 index always writes it, so this file is incomplete."
+        )
+    sids = document["address_indicator"]
     if not isinstance(sids, list):
         raise SnapshotError(f"{path}: `address_indicator` is not a list")
     for sid in sids:

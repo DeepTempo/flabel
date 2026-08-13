@@ -22,13 +22,14 @@ snapshot id, the sid index and the companion data files were checked at full sca
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 from flabel.config import enabled_sources, load_admission_policy
 from flabel.errors import FlabelError
 from flabel.models import SourceSpec
 from flabel.rules import utc_now
-from flabel.rules.admit import admit
+from flabel.rules.admit import admit, is_address_indicator
 from flabel.rules.fetch import Fetcher, HttpsFetcher, LocalFetcher, extract_feed
 from flabel.rules.snapshot import load_sid_index, load_snapshot, write_snapshot
 
@@ -123,6 +124,37 @@ def main() -> int:
         )
         assert accounted == admission.rules_fetched, f"{admission.name} does not balance"
     print("spec §6 identity holds for every source: fetched == admitted + sum(excluded)")
+
+    # The address-indicator classification, printed rather than asserted. Every number quoted in
+    # `admit.is_address_indicator`, in spec §7 and on issue #75 comes from this block, so a reader
+    # can reproduce them offline instead of trusting a docstring.
+    literal = re.compile(r"^\[?(\d{1,3}\.){3}\d{1,3}(/\d+)?\]?$|^\[?[0-9a-fA-F:]{3,}(/\d+)?\]?$")
+    indicators = with_literal_ip = 0
+    per_source: dict[str, int] = {}
+    for name, rules in sorted(admitted.items()):
+        count = sum(1 for rule in rules if is_address_indicator(rule))
+        if count:
+            per_source[name] = count
+        indicators += count
+        for rule in rules:
+            if not is_address_indicator(rule):
+                continue
+            header = rule.split("(")[0].split()
+            if len(header) > 6 and literal.match(header[5]):
+                with_literal_ip += 1
+    total_admitted = sum(len(rules) for rules in admitted.values())
+    print()
+    print(
+        f"address indicators: {indicators} of {total_admitted} "
+        f"({indicators / total_admitted * 100:.1f}%)"
+    )
+    for name, count in sorted(per_source.items(), key=lambda item: -item[1]):
+        print(f"  {name:<26}{count:>7}")
+    if indicators:
+        print(
+            f"  of those, destination is a literal IP: {with_literal_ip} "
+            f"({with_literal_ip / indicators * 100:.1f}%)"
+        )
 
     if args.snapshot:
         manifest = write_snapshot(args.snapshot, admitted, admissions, raw=raw, data=data)

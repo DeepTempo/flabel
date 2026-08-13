@@ -144,7 +144,7 @@ def load_admission_policy(path: Path | None = None) -> AdmissionPolicy:
                 f"{path}: {item!r} is not a valid classtype name. A classtype that no rule can "
                 f"declare would exclude nothing while appearing to be in force."
             )
-    return AdmissionPolicy(exclude_classtypes=frozenset(excluded))
+    return AdmissionPolicy(exclude_classtypes=frozenset(item.casefold() for item in excluded))
 
 
 def _build_spec(entry: Any, path: Path) -> SourceSpec:
