@@ -147,6 +147,36 @@ class SourceSpec:
         return label_basis(self.source_class)
 
 
+@dataclass(frozen=True)
+class AdmissionPolicy:
+    """What to admit, by rule kind rather than by source (#75).
+
+    `SourceSpec.source_class` classifies a whole **feed**; this classifies individual **rules**.
+    The distinction is the whole of #75: `pawpatrules` is one source containing both direct
+    detections and policy observations, so no per-source setting can separate them. Measured
+    2026-08-13 against 85,431 admitted rules — 23 captures of ordinary protocol traffic produced
+    138 malicious labels, 117 of them from the 436 rules whose `classtype` is `policy-violation`.
+    Excluding that one classtype removes 85% of the measured false positives at a cost of 0.5%
+    of the ruleset.
+
+    Empty by default, so a registry that says nothing admits exactly what it admitted before.
+    """
+
+    #: `classtype:` values whose rules are never admitted. A rule declaring one of these is
+    #: excluded at admission rather than filtered later, so `snapshot_id` describes exactly the
+    #: ruleset that ran and a label's terms cannot disagree with what produced it.
+    exclude_classtypes: frozenset[str] = frozenset()
+
+    def excludes(self, classtype: str | None) -> bool:
+        """Whether a rule declaring `classtype` is excluded.
+
+        A rule with no `classtype:` is never excluded by this policy. 10,949 of 85,431 admitted
+        rules declare none, so treating absence as a match would silently drop 12.8% of the
+        ruleset on a policy that never named it.
+        """
+        return classtype is not None and classtype in self.exclude_classtypes
+
+
 # --- ruleset snapshot ---------------------------------------------------------------------
 
 
@@ -193,6 +223,10 @@ class SourceAdmission:
     #: Last in the field list, with a default, only because every field above it is required —
     #: a defaulted field cannot precede a mandatory one. Every call site passes it by keyword.
     rules_excluded_unloadable: int = 0
+    #: Rules dropped because their `classtype:` is one the admission policy excludes (#75).
+    #: Its own counter, like every other exclusion, because §6's
+    #: `fetched == admitted + sum(excluded)` identity has to keep describing the feed.
+    rules_excluded_classtype: int = 0
 
     def __post_init__(self) -> None:
         _check(self.source_class, get_args(SourceClass), "source_class", "SourceAdmission")

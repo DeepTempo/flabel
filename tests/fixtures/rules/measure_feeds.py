@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from flabel.config import enabled_sources
+from flabel.config import enabled_sources, load_admission_policy
 from flabel.errors import FlabelError
 from flabel.models import SourceSpec
 from flabel.rules import utc_now
@@ -63,6 +63,7 @@ def main() -> int:
     specs = enabled_sources(args.sources)
     fetcher = transport(args, specs)
     fetched_at = utc_now()
+    policy = load_admission_policy(args.sources)
 
     admitted: dict[str, list[str]] = {}
     admissions = []
@@ -80,7 +81,7 @@ def main() -> int:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(payload)
             text, files = extract_feed(payload, spec.url)
-            rules, counts = admit(spec, text.splitlines(), fetched_at)
+            rules, counts = admit(spec, text.splitlines(), fetched_at, policy)
         except FlabelError as exc:
             # Printed rather than raised: one dead feed should not hide the other eight from a
             # measurement run, even though a real `rules update` fails on it.
@@ -118,6 +119,7 @@ def main() -> int:
             + admission.rules_excluded_low_confidence
             + admission.rules_excluded_low_severity
             + admission.rules_excluded_unloadable
+            + admission.rules_excluded_classtype
         )
         assert accounted == admission.rules_fetched, f"{admission.name} does not balance"
     print("spec §6 identity holds for every source: fetched == admitted + sum(excluded)")

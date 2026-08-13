@@ -49,6 +49,7 @@ from flabel import models
 from flabel.errors import SnapshotError
 from flabel.models import SnapshotManifest, SourceAdmission
 from flabel.rules import utc_now
+from flabel.rules.admit import is_ioc_shaped
 
 MANIFEST_NAME = "manifest.json"
 RULES_NAME = "rules.rules"
@@ -65,7 +66,12 @@ RAW_DIR = "raw"
 MANIFEST_VERSION = 1
 
 #: Schema of `sid_index.json`, versioned separately: step 6 reads that file and nothing else.
-SID_INDEX_SCHEMA = 1
+#: Bumped to 2 in #75, when `ioc_shaped` was added. A schema-1 index is still readable: it simply
+#: recorded no shape, so `load_ioc_shaped` returns an empty set for it and a label from that
+#: snapshot keeps the per-source `label_basis` it always had. That graceful path is the entire
+#: reason this file carries a version separate from the manifest's (spec §7).
+SID_INDEX_SCHEMA = 2
+SID_INDEX_SCHEMA_WITHOUT_SHAPE = 1
 
 #: Both re-exported from `models`, which owns the shape of a snapshot id so that this module
 #: (which resolves an id to a directory) and `provenance.py` (which refuses to write an
@@ -179,7 +185,18 @@ def render_sid_index(admitted: Mapping[str, Sequence[str]]) -> bytes:
             f"without saying so, and a label would then name the source that did not fire."
         )
 
-    document = {"schema": SID_INDEX_SCHEMA, "sources": index}
+    # Inside `snapshot_id`, and that placement is load-bearing rather than convenient. The
+    # classification changes what a label *means* — `direct` versus `indicator-reference` — while
+    # leaving `rules.rules` untouched. Recorded in `manifest.json` it would sit outside the hash
+    # (issue #48), and two snapshots sharing an id could then produce labels with different
+    # bases, which is precisely the guarantee the id exists to give.
+    ioc_shaped = sorted(
+        sid
+        for source in sorted(admitted)
+        for rule in admitted[source]
+        if (sid := _sid_or_none(rule)) is not None and is_ioc_shaped(rule)
+    )
+    document = {"schema": SID_INDEX_SCHEMA, "sources": index, "ioc_shaped": ioc_shaped}
     return (json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode(
         "utf-8"
     )
@@ -338,9 +355,10 @@ def load_sid_index(directory: Path) -> dict[int, str]:
         raise SnapshotError(f"{path} is not valid JSON: {exc}") from exc
 
     schema = document.get("schema") if isinstance(document, dict) else None
-    if schema != SID_INDEX_SCHEMA:
+    if schema not in (SID_INDEX_SCHEMA, SID_INDEX_SCHEMA_WITHOUT_SHAPE):
         raise SnapshotError(
-            f"{path} is not a schema-{SID_INDEX_SCHEMA} sid index (found {schema!r})"
+            f"{path} is not a readable sid index: expected schema "
+            f"{SID_INDEX_SCHEMA_WITHOUT_SHAPE} or {SID_INDEX_SCHEMA}, found {schema!r}"
         )
     sources = document.get("sources")
     if not isinstance(sources, dict):
@@ -360,6 +378,37 @@ def load_sid_index(directory: Path) -> dict[int, str]:
                 )
             index[sid] = source
     return index
+
+
+def load_ioc_shaped(directory: Path) -> frozenset[int]:
+    """The sids in a snapshot whose rules decide purely from the header tuple (#75).
+
+    An IOC-shaped rule establishes that a flow *touched a known-bad indicator*, not that the flow
+    *is* the malicious activity — the difference `label_basis` already names as
+    `indicator-reference` versus `direct`. Today that distinction is drawn per **source**, so the
+    16,067 IOC-shaped rules measured inside `et/open` — a `signature`-class feed — all label
+    `direct`. This is what lets it be drawn per rule instead.
+
+    **A schema-1 snapshot returns an empty set, and that is correct rather than a fallback.** It
+    recorded no shape, so nothing about it is known; claiming otherwise would invent provenance
+    for labels already emitted. Those snapshots keep the per-source basis they were written with.
+    """
+    path = Path(directory) / SID_INDEX_NAME
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SnapshotError(f"snapshot {Path(directory).name} has no {SID_INDEX_NAME}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SnapshotError(f"could not read {path}: {exc}") from exc
+
+    shaped = document.get("ioc_shaped", [])
+    if not isinstance(shaped, list):
+        raise SnapshotError(f"{path}: `ioc_shaped` is not a list")
+    for sid in shaped:
+        # `bool` is an `int` in Python, and `true` in JSON must not become sid 1.
+        if not isinstance(sid, int) or isinstance(sid, bool):
+            raise SnapshotError(f"{path}: {sid!r} in `ioc_shaped` is not an integer sid")
+    return frozenset(shaped)
 
 
 def list_snapshots(root: Path) -> list[SnapshotManifest]:

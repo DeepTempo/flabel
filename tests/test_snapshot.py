@@ -147,8 +147,11 @@ def test_the_snapshot_records_which_source_each_sid_came_from(tmp_path: Path):
     directory = tmp_path / manifest.snapshot_id
 
     assert json.loads((directory / SID_INDEX_NAME).read_text(encoding="utf-8")) == {
-        "schema": 1,
+        "schema": 2,
         "sources": {"et/open": [2000001, 2000002], "pawpatrules": [3300303]},
+        # Every fixture rule here matches on the header tuple alone, so all three are
+        # IOC-shaped by the definition in `admit.is_ioc_shaped` (#75).
+        "ioc_shaped": [2000001, 2000002, 3300303],
     }
     assert load_sid_index(directory) == {
         2000001: "et/open",
@@ -222,7 +225,7 @@ def test_the_sid_index_is_sorted_so_it_cannot_depend_on_fetch_order():
     "document",
     [
         {"sources": {"a/one": [1]}},
-        {"schema": 2, "sources": {"a/one": [1]}},
+        {"schema": 3, "sources": {"a/one": [1]}},
         {"schema": 1},
         {"schema": 1, "sources": {"a/one": "1"}},
         {"schema": 1, "sources": {"a/one": [True]}},

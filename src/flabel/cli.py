@@ -31,7 +31,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from flabel import __version__
-from flabel.config import enabled_sources
+from flabel.config import enabled_sources, load_admission_policy
 from flabel.correlate import DEFAULT_THRESHOLD, _check_threshold, correlate
 from flabel.errors import (
     EXIT_SUCCESS,
@@ -607,6 +607,9 @@ def _rules_update(args: argparse.Namespace) -> int:
     clock readings would make two identical updates produce different manifests.
     """
     specs = enabled_sources(args.sources)
+    # Read from the same registry the sources come from, so one `--sources` selects both the
+    # feeds and the terms they are admitted on (#75).
+    policy = load_admission_policy(args.sources)
     fetched_at = utc_now()
 
     admitted: dict[str, list[str]] = {}
@@ -616,7 +619,7 @@ def _rules_update(args: argparse.Namespace) -> int:
 
     for spec in specs:
         text, files = fetch_feed(spec)
-        rules, admission = admit(spec, text.splitlines(), fetched_at)
+        rules, admission = admit(spec, text.splitlines(), fetched_at, policy)
         admitted[spec.name] = rules
         admissions.append(admission)
         raw[spec.name] = text
