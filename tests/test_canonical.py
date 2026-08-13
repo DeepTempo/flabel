@@ -490,3 +490,108 @@ def test_the_rest_of_the_flow_record_still_compares():
     nine = eve({**FLOW, "flow": {"pkts_toserver": 9, "reason": "shutdown"}})
 
     assert canonical.canonical_eve_records(seven) != canonical.canonical_eve_records(nine)
+
+
+# --- the measurement, re-taken against the real Zeek ------------------------------------------
+#
+# `REPORTER_RUN_A`/`REPORTER_RUN_B` above are transcribed from a measurement taken by hand. That
+# is exactly the shape of defect an earlier round of this project found and rejected — a spec
+# amendment resting on a number that lived only in a docstring, where nothing would notice if the
+# tool's behaviour changed underneath it. So the premise is re-measured against the pinned Zeek on
+# every CI run, the same way step 7's ICMP counterpart tables are.
+
+
+@pytest.mark.requires_tools
+def test_zeek_really_does_stamp_wall_clock_on_a_startup_reporter_message(tmp_path: Path):
+    """The premise `canonical_reporter_records` rests on, taken from the engine itself.
+
+    Two runs over one capture, with a message raised in `zeek_init`. If Zeek ever stops writing
+    wall-clock time into `ts` for startup messages, dropping the column is no longer justified and
+    this test says so by failing — rather than the rule quietly outliving its reason.
+
+    `-e` is used to provoke the message because flabel's own invocation does not raise one on the
+    canary. What is being measured is Zeek's behaviour, which is what the rule depends on.
+    """
+    import subprocess
+    import time
+
+    from flabel import zeek
+
+    capture = Path(__file__).resolve().parent / "fixtures" / "benign.pcap"
+    outputs = []
+    for name in ("one", "two"):
+        outdir = tmp_path / name
+        outdir.mkdir()
+        subprocess.run(
+            [
+                zeek.executable(),
+                "-C",
+                "-D",
+                "-r",
+                str(capture),
+                "-e",
+                'event zeek_init() { Reporter::warning("flabel canonicalizer premise"); }',
+            ],
+            cwd=outdir,
+            capture_output=True,
+            check=True,
+            timeout=120,
+        )
+        outputs.append((outdir / "reporter.log").read_text(encoding="utf-8"))
+        time.sleep(1.1)  # so two wall-clock readings cannot land in the same microsecond
+
+    first, second = outputs
+    assert "flabel canonicalizer premise" in first, "the probe message was not raised"
+
+    assert canonical.canonical_records(first) != canonical.canonical_records(second), (
+        "two runs' reporter.log records were identical after dropping # header lines. If Zeek "
+        "no longer stamps wall-clock time on a zeek_init message, canonical_reporter_records "
+        "should stop dropping the ts column — do not relax the rule without re-measuring."
+    )
+    assert canonical.canonical_reporter_records(first) == canonical.canonical_reporter_records(
+        second
+    ), "dropping the ts column did not make two runs comparable"
+
+
+@pytest.mark.requires_tools
+def test_a_packet_time_reporter_message_is_reproducible(tmp_path: Path):
+    """The other half of the premise: only *startup* messages carry wall-clock.
+
+    Without this, "drop the ts column" could be justified by a Zeek that stamped wall-clock on
+    everything — in which case `reporter.log` would have no reproducible content at all and
+    excluding the file, not the column, would be the right answer.
+    """
+    import subprocess
+
+    from flabel import zeek
+
+    capture = Path(__file__).resolve().parent / "fixtures" / "benign.pcap"
+    outputs = []
+    for name in ("one", "two"):
+        outdir = tmp_path / name
+        outdir.mkdir()
+        subprocess.run(
+            [
+                zeek.executable(),
+                "-C",
+                "-D",
+                "-r",
+                str(capture),
+                "-e",
+                "event new_connection(c: connection) "
+                '{ Reporter::warning(fmt("flabel packet-time %s", c$id$orig_h)); }',
+            ],
+            cwd=outdir,
+            capture_output=True,
+            check=True,
+            timeout=120,
+        )
+        outputs.append((outdir / "reporter.log").read_text(encoding="utf-8"))
+
+    first, second = outputs
+    assert "flabel packet-time" in first
+    assert canonical.canonical_records(first) == canonical.canonical_records(second), (
+        "a message raised while reading packets was not reproducible across runs. The ts column "
+        "would then carry no stable value at all, and reporter.log should be excluded outright "
+        "rather than canonicalised."
+    )
