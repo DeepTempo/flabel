@@ -1,0 +1,1263 @@
+"""CLI surface and pipeline orchestration (docs/spec.md §12, PLAN.md step 9).
+
+Two layers here, and the split is deliberate.
+
+The **orchestration** tests replace one stage with a stub that raises, because step 9's job is
+not to make Zeek fail — it is to do the right thing *when* a stage fails, and every one of
+those paths is about which files exist afterwards. Provoking a real OOM kill or a real
+correlation-gate breach through the toolchain would test steps 5–7 again and leave step 9's
+actual behaviour — run.json written, labels.json absent — asserted by accident.
+
+The **end-to-end** tests run the real pipeline over the benign canary and carry
+``requires_tools``. They are what proves the wiring itself, which no stub can.
+
+The rule of the file: every failure test asserts *both* halves of issue #23 — the loss is
+readable by a script, and nothing claims a verdict.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import socket
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from flabel import cli
+from flabel.errors import (
+    EXIT_FAILURE,
+    EXIT_NOT_IMPLEMENTED,
+    EXIT_SUCCESS,
+    EXIT_USAGE,
+    CorrelationError,
+    ToolError,
+)
+from flabel.models import (
+    CorrelationResult,
+    Detection,
+    Flow,
+    SourceAdmission,
+    SourceSpec,
+    ToolFailure,
+    UnmatchedDetection,
+    ZeekRunInfo,
+)
+from flabel.rules.snapshot import write_snapshot
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+BENIGN = FIXTURES / "benign.pcap"
+SYNTHETIC_RULES = FIXTURES / "rules" / "synthetic.rules"
+
+
+# --- fixture construction -------------------------------------------------------------------
+#
+# Snapshots are written by step 4's real `write_snapshot`, never hand-assembled, for the reason
+# `tests/test_suricata.py` gives at its own copy of this helper: a hand-built snapshot agrees
+# with the reader by construction, which is exactly the disagreement worth catching. The two
+# copies are deliberate rather than shared — a fixture helper in `conftest.py` would be a step-1
+# file, and these two steps want different source names in their snapshots.
+
+
+def rule_lines() -> dict[int, str]:
+    """The synthetic fixture rules, keyed by SID."""
+    lines = {}
+    for line in SYNTHETIC_RULES.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("alert"):
+            continue
+        match = re.search(r"\bsid:(\d+);", line)
+        assert match is not None, f"synthetic rule has no sid: {line}"
+        lines[int(match.group(1))] = line
+    return lines
+
+
+RULES = rule_lines()
+
+#: The rule that matches the benign canary's HTTP flow (10.0.0.5:49152 -> 10.0.0.200:80), so a
+#: run over `benign.pcap` produces exactly one label and a NOTICE with content in it.
+MATCHES_CANARY = 9000001
+
+
+def make_snapshot(root: Path, contents: Mapping[str, Sequence[int]]) -> Path:
+    """A real snapshot under `root`, from `contents` (source name -> SIDs)."""
+    admitted = {name: [RULES[sid] for sid in sorted(contents[name])] for name in sorted(contents)}
+    admissions = [
+        SourceAdmission(
+            name=name,
+            url=f"https://example.invalid/{name}.rules",
+            licence="MIT",
+            source_class="signature",
+            admission_basis="wholesale",
+            rules_fetched=len(rules),
+            rules_admitted=len(rules),
+            rules_excluded_no_confidence=0,
+            rules_excluded_low_confidence=0,
+            rules_excluded_low_severity=0,
+            rules_excluded_commented=0,
+            ja4_rules_admitted=0,
+            ja3_rules_admitted=0,
+            fetched_at="2026-08-12T00:00:00.000000Z",
+        )
+        for name, rules in admitted.items()
+    ]
+    manifest = write_snapshot(root, admitted, admissions, created_at="2026-08-12T00:00:00.000000Z")
+    return root / manifest.snapshot_id
+
+
+@pytest.fixture
+def rules_dir(tmp_path: Path) -> Path:
+    """A rules root holding one snapshot whose single rule matches the benign canary."""
+    root = tmp_path / "rules"
+    make_snapshot(root, {"et/open": [MATCHES_CANARY]})
+    return root
+
+
+def offline(capture: Path, rules_dir: Path, output_dir: Path, *extra: str) -> list[str]:
+    """The argv for an ordinary labelling run, so a test names only what it varies."""
+    return [
+        "--offline",
+        str(capture),
+        "--rules-dir",
+        str(rules_dir),
+        "--output-dir",
+        str(output_dir),
+        *extra,
+    ]
+
+
+def run_dirs(output_dir: Path) -> list[Path]:
+    """The run directories under `output_dir`, in name order."""
+    return sorted(path for path in output_dir.iterdir() if path.is_dir())
+
+
+def only_run_dir(output_dir: Path) -> Path:
+    directories = run_dirs(output_dir)
+    assert len(directories) == 1, f"expected exactly one run directory, found {directories}"
+    return directories[0]
+
+
+def snapshot_id_of(rules_dir: Path) -> str:
+    """The id of the one snapshot under `rules_dir`, which is also its directory name."""
+    directories = [path for path in rules_dir.iterdir() if path.is_dir()]
+    assert len(directories) == 1, f"expected exactly one snapshot, found {directories}"
+    return directories[0].name
+
+
+# --- the no-network guard -------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if flabel's own code opens a socket (spec §2.2).
+
+    Guards the Python package, which is the claim spec §2.2 actually makes: only
+    `flabel rules update` performs network I/O. Zeek and Suricata are separate processes with
+    their own sockets, and this cannot see them — nor should it, since they are handed a file
+    and never a URL.
+    """
+
+    def deny(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "a labelling run attempted a network connection; spec §2.2 permits network I/O "
+            "only in `flabel rules update`, and Goal 2 depends on it"
+        )
+
+    monkeypatch.setattr(socket.socket, "connect", deny)
+    monkeypatch.setattr(socket.socket, "connect_ex", deny)
+    monkeypatch.setattr(socket, "create_connection", deny)
+
+
+# --- usage: the threshold is rejected at parse time (#59) -------------------------------------
+#
+# `correlate._check_threshold` is a sharp guard in the wrong place: it fires after ingest, Zeek
+# and Suricata have run, and it raises `ValueError`, which maps to exit 1. So a typo cost the
+# whole pipeline — up to the ~35 minutes issue #56 measured — and then reported "the run failed"
+# rather than "you invoked it wrong". Validating in an argparse `type=` callable moves both.
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["nan", "inf", "-inf", "1.5", "-0.1", "abc", "", "1e400"],
+)
+def test_a_bad_unmatched_threshold_exits_2_before_anything_runs(
+    value: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §12 assigns 2 to usage errors, and argv is readable before any tool starts (#59).
+
+    `nan` is the sharp one: every comparison against it is `False`, so the unmatched gate would
+    be silently switched off and the run would exit 0 having discarded any proportion of the
+    detections. `1e400` is `inf` by another spelling, which a plain range check would miss.
+    """
+
+    def never(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the pipeline ran before the threshold was validated")
+
+    monkeypatch.setattr(cli, "load_snapshot", never)
+    monkeypatch.setattr(cli, "normalize", never)
+
+    with pytest.raises(SystemExit) as raised:
+        cli.main(offline(BENIGN, tmp_path / "rules", tmp_path, "--unmatched-threshold", value))
+
+    assert raised.value.code == EXIT_USAGE
+
+
+@pytest.mark.parametrize("value", ["0", "0.01", "1", "0.5"])
+def test_a_valid_unmatched_threshold_is_accepted(value: str) -> None:
+    """The guard must not reject the range it exists to defend."""
+    args = cli.build_parser().parse_args(["--offline", "x.pcap", "--unmatched-threshold", value])
+    assert args.unmatched_threshold == float(value)
+
+
+def test_the_threshold_default_is_the_specs(tmp_path: Path) -> None:
+    """Spec §12 fixes it at 0.01, and correlate.py must not hold a second copy of that number."""
+    from flabel.correlate import DEFAULT_THRESHOLD
+
+    args = cli.build_parser().parse_args(["--offline", "x.pcap"])
+    assert args.unmatched_threshold == DEFAULT_THRESHOLD == 0.01
+
+
+# --- the Phase 1 default path is a stub (US-22) ----------------------------------------------
+
+
+def test_the_default_path_prints_coming_soon_names_offline_and_exits_3(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Spec §12: exit 3 is "not implemented", which is not the same as failure.
+
+    A caller scripting against flabel has to tell "the Tier 1 feature is not built" from "the
+    run failed", and the message has to name the flag that does work or the operator is left
+    guessing at a capability that exists.
+    """
+    code = cli.main([str(BENIGN), "--output-dir", str(tmp_path)])
+
+    assert code == EXIT_NOT_IMPLEMENTED
+    captured = capsys.readouterr()
+    assert cli.STUB_MESSAGE in captured.err
+    assert "--offline" in captured.err
+
+
+def test_the_stub_writes_nothing_at_all(tmp_path: Path) -> None:
+    """Spec §13: a run directory is complete or absent, and the stub performs no run."""
+    cli.main([str(BENIGN), "--output-dir", str(tmp_path)])
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_stub_leaves_stdout_untouched(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Spec §12 reserves stdout. A message on it would become someone's parse target."""
+    cli.main([str(BENIGN), "--output-dir", str(tmp_path)])
+
+    assert capsys.readouterr().out == ""
+
+
+# --- failures that happen before a run directory can exist ------------------------------------
+#
+# Spec §12's exit-1 row names two: a missing snapshot and an unreadable capture. Both are
+# refusals to start rather than runs that died, so there is nothing to report about a run and a
+# directory holding only a `run.json` saying "nothing happened" would be noise on disk.
+
+
+def test_a_missing_snapshot_exits_1_and_creates_no_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Spec §11's `snapshot missing` loss condition, and spec §7: never fall back to another."""
+    output = tmp_path / "out"
+    output.mkdir()
+
+    code = cli.main(
+        offline(BENIGN, tmp_path / "rules", output, "--ruleset-snapshot", "0123456789abcdef")
+    )
+
+    assert code == EXIT_FAILURE
+    assert list(output.iterdir()) == []
+    assert capsys.readouterr().err != ""
+
+
+def test_an_unreadable_capture_exits_1_and_creates_no_directory(
+    tmp_path: Path, rules_dir: Path
+) -> None:
+    """The second pre-directory failure spec §12 names."""
+    output = tmp_path / "out"
+    output.mkdir()
+
+    code = cli.main(offline(tmp_path / "not-a-capture.pcap", rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    assert list(output.iterdir()) == []
+
+
+# --- a stage that dies mid-run: run.json, and no labels.json (#23) ----------------------------
+
+
+def zeek_that_dies(monkeypatch: pytest.MonkeyPatch, failure: ToolFailure) -> None:
+    """Replace the Zeek stage with one that fails exactly as step 5 promises it will."""
+    info = ZeekRunInfo(
+        version="8.0.9",
+        flags=("-C", "-D"),
+        log_dir=Path("zeek"),
+        tool_failures=(failure,),
+    )
+
+    def boom(capture: Path, outdir: Path) -> None:
+        outdir.mkdir(parents=True, exist_ok=True)
+        raise ToolError("zeek killed by signal 9", failures=(failure,), run_info=info)
+
+    monkeypatch.setattr(cli, "run_zeek", boom)
+
+
+OOM = ToolFailure(
+    tool="zeek",
+    argv=("zeek", "-C", "-D", "-r", "capture.pcap"),
+    exit_code=None,
+    message="zeek killed by signal 9 (an OOM kill arrives as SIGKILL)",
+)
+
+
+def test_a_tool_failure_writes_run_json_and_no_labels_json(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """Both halves of issue #23, which is the whole point of the decision.
+
+    Spec §11 requires the failure recorded; spec §13 forbids a partial `labels.json`. The array
+    therefore lives in a document that may exist — and the *absence* of `labels.json` is the
+    signal, because a consumer can test for a missing file but has to be told to read a status
+    field inside one.
+    """
+    zeek_that_dies(monkeypatch, OOM)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert (rundir / "run.json").is_file()
+    assert not (rundir / "labels.json").exists(), "a dead run must claim no verdict"
+
+
+def test_the_tool_failure_is_readable_by_a_script(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rejected alternative was stderr only, which makes a caller parse prose.
+
+    `ToolError.failures` exists to carry the argv, the exit code and whether the tool was
+    killed rather than exited. Catching the exception and printing `str(exc)` would throw all
+    three away at the moment they became the point.
+    """
+    zeek_that_dies(monkeypatch, OOM)
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    run = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))
+    failures = run["run"]["tool_failures"]
+    assert len(failures) == 1
+    assert failures[0]["tool"] == "zeek"
+    assert failures[0]["argv"] == list(OOM.argv)
+    # None, not 0: a killed process has no exit code, and reporting one would invent it.
+    assert failures[0]["exit_code"] is None
+    assert "signal 9" in failures[0]["message"]
+
+
+def test_a_dead_run_still_records_the_ruleset_it_attempted(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed run that cannot say what it tried is a worse artifact than one that reports both."""
+    zeek_that_dies(monkeypatch, OOM)
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    run = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))
+    assert run["run"]["ruleset"]["snapshot_id"] == snapshot_id_of(rules_dir)
+    assert run["run"]["input"]["path"] == str(BENIGN)
+
+
+def test_a_stage_that_never_ran_is_null_not_zero(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §10: `null` distinguishes "not measured" from "measured as none".
+
+    Zero detections from a Suricata pass that never happened is a claim about the capture. It
+    is the §2.5 failure mode in the run block itself.
+    """
+    zeek_that_dies(monkeypatch, OOM)
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    run = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))
+    assert run["run"]["counts"]["detections"] is None
+    assert run["run"]["counts"]["labels"] is None
+
+
+# --- the correlation gate: the unmatched records survive the failure (Craig, 2026-08-13) ------
+
+
+def gate_failure() -> CorrelationError:
+    """The gate firing over detections that could not be placed."""
+    detection = Detection(
+        source="et/open",
+        tier=2,
+        sid=MATCHES_CANARY,
+        rev=3,
+        classtype="trojan-activity",
+        app_proto="http",
+        threat="FLABEL TEST synthetic HTTP request",
+        ts=1700000000.0,
+        src_ip="10.0.0.5",
+        src_port=49152,
+        dst_ip="10.0.0.200",
+        dst_port=80,
+        proto="tcp",
+    )
+    result = CorrelationResult(
+        labels=(),
+        unmatched=(UnmatchedDetection(detection=detection, reason="no_flow_match"),),
+        flows_total=2,
+        detections_total=1,
+    )
+    return CorrelationError("1 of 1 detections unplaced (100.0%)", result=result)
+
+
+def test_the_gate_failure_writes_the_unmatched_records_into_run_json(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run.json` is `labels.json` minus the verdicts (Craig, 2026-08-13).
+
+    The gate fires *because* detections went unplaced, so a run.json carrying only
+    `counts.unmatched` would report the scale of the loss and not its content — and the reason
+    is the diagnosis: `no_flow_match` is a tuple-normalisation bug, `ambiguous_flow_match` is
+    port reuse. They are different faults in different modules.
+    """
+    error = gate_failure()
+    monkeypatch.setattr(cli, "correlate", lambda *args, **kwargs: (_ for _ in ()).throw(error))
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists()
+    document = json.loads((rundir / "run.json").read_text(encoding="utf-8"))
+    assert [item["reason"] for item in document["unmatched_detections"]] == ["no_flow_match"]
+    assert document["unmatched_detections"][0]["detection"]["sid"] == MATCHES_CANARY
+
+
+def test_run_json_never_carries_an_empty_labels_array(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rejected alternative, and the reason the whole file exists (#23).
+
+    `"labels": []` reads as "nothing malicious was found" when the pipeline in fact died. A
+    consumer training on the output cannot tell it from a clean capture. The key is *absent*,
+    not empty.
+    """
+    monkeypatch.setattr(
+        cli, "correlate", lambda *args, **kwargs: (_ for _ in ()).throw(gate_failure())
+    )
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    document = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))
+    assert "labels" not in document
+    assert document["schema_version"] == "1.0"
+    assert "run" in document
+
+
+# --- the snapshot Suricata ran must be the snapshot correlation is given (PLAN step 9) --------
+
+
+def test_a_snapshot_id_disagreement_fails_the_run(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_suricata` returns only an id, so step 9 loads the snapshot a second time.
+
+    With `--ruleset-snapshot` defaulting to "newest available", a `rules update` landing between
+    the two loads resolves a *different* snapshot — and every label then cites a ruleset whose
+    rules never ran. The assertion is one line; without it the two loads are silently allowed to
+    disagree, and the output is well-formed and wrong.
+    """
+
+    def wrong_snapshot(capture: Path, snapshot: Path, outdir: Path):
+        from flabel.models import SuricataRunInfo
+
+        outdir.mkdir(parents=True, exist_ok=True)
+        return [], SuricataRunInfo(
+            version="8.0.6",
+            snapshot_id="ffffffffffffffff",
+            rules_loaded=1,
+            alerts_total=0,
+        )
+
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", wrong_snapshot)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists()
+    assert (rundir / "run.json").is_file()
+
+
+def _zeek_ok(outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]:
+    """A Zeek stage that succeeded with no flows — enough to reach the stages under test."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    return {}, ZeekRunInfo(version="8.0.9", flags=("-C", "-D"), log_dir=outdir)
+
+
+def _total_admitted(rules_dir: Path) -> int:
+    """What the snapshot says it admitted, read from the manifest rather than assumed.
+
+    A literal here would agree with the fixture by construction and stop agreeing the moment the
+    fixture gained a rule — which is how a stub starts reporting a shortfall nobody intended.
+    """
+    manifest = json.loads(
+        (rules_dir / snapshot_id_of(rules_dir) / "manifest.json").read_text(encoding="utf-8")
+    )
+    return manifest["total_admitted"]
+
+
+def _suricata_ok(rules_dir: Path, snapshot_id: str | None = None):
+    """A Suricata stage that loaded the whole snapshot cleanly and found nothing.
+
+    `snapshot_id` overrides the real one, which is how the mid-run `rules update` is simulated.
+    """
+    from flabel.models import SuricataRunInfo
+
+    resolved = snapshot_id or snapshot_id_of(rules_dir)
+    loaded = _total_admitted(rules_dir)
+
+    def run(capture: Path, snapshot: Path, outdir: Path):
+        outdir.mkdir(parents=True, exist_ok=True)
+        return [], SuricataRunInfo(
+            version="8.0.6",
+            snapshot_id=resolved,
+            rules_loaded=loaded,
+            alerts_total=0,
+        )
+
+    return run
+
+
+# --- the rules shortfall: warn, quantify, and never block a non-TTY (#46) ---------------------
+
+
+def suricata_with_shortfall(monkeypatch: pytest.MonkeyPatch, snapshot_id: str) -> None:
+    """A Suricata pass that loaded fewer rules than the snapshot admitted."""
+    from flabel.models import SuricataRunInfo
+
+    def short(capture: Path, snapshot: Path, outdir: Path):
+        outdir.mkdir(parents=True, exist_ok=True)
+        return [], SuricataRunInfo(
+            version="8.0.6",
+            snapshot_id=snapshot_id,
+            rules_loaded=1,
+            alerts_total=0,
+            rules_failed=1,
+            rules_skipped=0,
+            warnings=("1 of 2 rules (50.00%) did not load: 1 failed, 0 skipped.",),
+        )
+
+    monkeypatch.setattr(cli, "run_suricata", short)
+
+
+@pytest.fixture
+def two_rule_snapshot(tmp_path: Path) -> Path:
+    root = tmp_path / "rules"
+    make_snapshot(root, {"et/open": [MATCHES_CANARY, 9000006]})
+    return root
+
+
+def test_a_shortfall_without_a_tty_proceeds_and_never_blocks(
+    tmp_path: Path,
+    two_rule_snapshot: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """flabel runs in CI, cron and `set -e` scripts (#46).
+
+    "Default yes" is the answer for the case where nobody can be asked. A prompt there either
+    hangs the pipeline or blocks step 10's own gates, and the fault would look like a hang
+    rather than a question.
+    """
+    snapshot = snapshot_id_of(two_rule_snapshot)
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot)
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: False)
+
+    def never(*args: object, **kwargs: object) -> str:
+        raise AssertionError("a non-interactive run must never wait on a prompt")
+
+    monkeypatch.setattr("builtins.input", never)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, two_rule_snapshot, output))
+
+    assert code == EXIT_SUCCESS
+    assert (only_run_dir(output) / "labels.json").is_file()
+
+
+def test_a_shortfall_is_recorded_in_the_run_block_either_way(
+    tmp_path: Path, two_rule_snapshot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-interactive run must never lose the fact that rules went missing (spec §2.5)."""
+    snapshot = snapshot_id_of(two_rule_snapshot)
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot)
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: False)
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, two_rule_snapshot, output))
+
+    document = json.loads((only_run_dir(output) / "labels.json").read_text(encoding="utf-8"))
+    assert document["run"]["counts"]["rules_failed"] == 1
+    assert any("did not load" in warning for warning in document["run"]["warnings"])
+
+
+def test_a_shortfall_shows_the_count_and_the_percentage(
+    tmp_path: Path,
+    two_rule_snapshot: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """ "N rules failed" alone does not tell an operator whether to care (#46).
+
+    26 of 85,431 is a curiosity; 26 of 40 is a broken snapshot. The percentage is what makes
+    the number answerable, and it is why no threshold was invented in its place.
+    """
+    snapshot = snapshot_id_of(two_rule_snapshot)
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot)
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: False)
+
+    cli.main(offline(BENIGN, two_rule_snapshot, tmp_path / "out"))
+
+    err = capsys.readouterr().err
+    assert "50.00%" in err
+    assert "did not load" in err
+
+
+def test_declining_the_prompt_stops_the_run_and_claims_no_verdict(
+    tmp_path: Path, two_rule_snapshot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator decides in the moment, with the loss quantified in front of them (#46).
+
+    Declining is a deliberate stop, so it exits 1 with no `labels.json` — a partial ruleset
+    that the operator judged unacceptable must not leave behind labels that look complete.
+    """
+    snapshot = snapshot_id_of(two_rule_snapshot)
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot)
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, two_rule_snapshot, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists()
+    assert (rundir / "run.json").is_file()
+
+
+@pytest.mark.parametrize("answer", ["", "y", "Y", "yes", "  "])
+def test_the_prompt_defaults_to_yes(
+    answer: str, tmp_path: Path, two_rule_snapshot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Y/n` with a capital Y means bare Enter continues (#46)."""
+    snapshot = snapshot_id_of(two_rule_snapshot)
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot)
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": answer)
+
+    code = cli.main(offline(BENIGN, two_rule_snapshot, tmp_path / "out"))
+
+    assert code == EXIT_SUCCESS
+
+
+def test_no_shortfall_asks_nothing(
+    tmp_path: Path,
+    rules_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Spec §9's habit, applied here: silence means nothing was lost.
+
+    A prompt on every run would train the operator to answer it without reading, which is the
+    same as not asking.
+    """
+    from flabel.models import SuricataRunInfo
+
+    snapshot = snapshot_id_of(rules_dir)
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(
+        cli,
+        "run_suricata",
+        lambda capture, snap, outdir: (
+            outdir.mkdir(parents=True, exist_ok=True),
+            (
+                [],
+                SuricataRunInfo(
+                    version="8.0.6", snapshot_id=snapshot, rules_loaded=1, alerts_total=0
+                ),
+            ),
+        )[1],
+    )
+
+    def never(*args: object, **kwargs: object) -> str:
+        raise AssertionError("nothing was lost, so nothing should be asked")
+
+    monkeypatch.setattr("builtins.input", never)
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
+
+    assert cli.main(offline(BENIGN, rules_dir, tmp_path / "out")) == EXIT_SUCCESS
+
+
+# --- run directory naming -------------------------------------------------------------------
+
+
+def test_the_run_directory_is_named_for_the_capture_and_the_time() -> None:
+    """Spec §1: `{capture-name}_{datetime}/`."""
+    when = datetime(2026, 8, 13, 14, 25, 30, 123456, tzinfo=UTC)
+
+    assert cli.run_directory_name(Path("/tmp/benign.pcap"), when).startswith("benign_")
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("benign.pcap", "benign"),
+        ("benign.pcapng", "benign"),
+        ("benign.pcap.gz", "benign"),
+        ("benign.pcapng.gz", "benign"),
+        ("capture", "capture"),
+        ("my.capture.2026.pcap", "my.capture.2026"),
+    ],
+)
+def test_every_capture_suffix_is_stripped_from_the_run_directory_name(
+    name: str, expected: str
+) -> None:
+    """A directory called `benign.pcap_2026...` reads as a file, and `.pcap.gz` is two suffixes.
+
+    Only the container suffixes are stripped. `my.capture.2026.pcap` keeps its dots, because
+    they are the operator's naming and not ours to reinterpret.
+    """
+    when = datetime(2026, 8, 13, 14, 25, 30, 123456, tzinfo=UTC)
+
+    assert cli.run_directory_name(Path(name), when).split("_")[0] == expected
+
+
+def test_run_directory_names_sort_chronologically() -> None:
+    """PLAN step 9. `ls` is how an operator finds the latest run, so name order is time order."""
+    early = cli.run_directory_name(Path("c.pcap"), datetime(2026, 8, 13, 9, 5, 0, 0, tzinfo=UTC))
+    late = cli.run_directory_name(Path("c.pcap"), datetime(2026, 8, 13, 10, 5, 0, 0, tzinfo=UTC))
+
+    assert early < late
+    # The trap this guards: a non-zero-padded hour would sort "10:05" before "9:05".
+    assert "T090500" in early
+
+
+# --- end to end, with the real toolchain ------------------------------------------------------
+
+
+@pytest.mark.requires_tools
+def test_offline_over_the_benign_canary_writes_a_complete_run_directory(
+    tmp_path: Path, rules_dir: Path, no_network: None
+) -> None:
+    """PLAN step 9's headline test, and the first time the whole pipeline runs as one thing."""
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_SUCCESS
+    rundir = only_run_dir(output)
+    assert (rundir / "zeek").is_dir()
+    assert (rundir / "zeek" / "conn.log").is_file()
+    assert (rundir / "labels.json").is_file()
+    assert (rundir / "run.json").is_file()
+    assert (rundir / "NOTICE").is_file()
+
+
+@pytest.mark.requires_tools
+def test_the_end_to_end_run_labels_the_flow_the_rule_matched(
+    tmp_path: Path, rules_dir: Path, no_network: None
+) -> None:
+    """A run directory that exists proves wiring; a label proves the wiring carries meaning.
+
+    **Two labels, not one, and that is the fixture being right rather than the rule being
+    loose.** Both of the canary's flows are cleartext HTTP to port 80 — flow 2 was moved there
+    from 443 in #42, because HTTP on 443 legitimately trips pawpatrules 3300303 and a canary
+    whose value is that zero labels is known-correct must not itself carry anomalous traffic.
+    So the rule matches both, and this asserts consolidation across two flows: one label each,
+    one source entry each, never one label carrying both flows' detections.
+    """
+    output = tmp_path / "out"
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    document = json.loads((only_run_dir(output) / "labels.json").read_text(encoding="utf-8"))
+    assert len(document["labels"]) == 2
+    assert len({label["flow"]["uid"] for label in document["labels"]}) == 2
+    for label in document["labels"]:
+        assert label["verdict"] == "malicious"
+        assert label["best_tier"] == 2
+        assert len(label["sources"]) == 1
+        assert label["sources"][0]["sid"] == MATCHES_CANARY
+        assert label["sources"][0]["ruleset"] == snapshot_id_of(rules_dir)
+        assert label["sources"][0]["label_basis"] == "direct"
+
+    # Spec §10: sorted by (ts_first, uid), so two runs cannot order them differently.
+    keys = [(label["flow"]["ts_first"], label["flow"]["uid"]) for label in document["labels"]]
+    assert keys == sorted(keys)
+
+
+@pytest.mark.requires_tools
+def test_the_end_to_end_notice_attributes_the_source_that_labelled(
+    tmp_path: Path, rules_dir: Path, no_network: None
+) -> None:
+    """NOTICE describes what was *used*, and it is the artifact carrying legal weight."""
+    output = tmp_path / "out"
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    notice = (only_run_dir(output) / "NOTICE").read_text(encoding="utf-8")
+    assert "et/open" in notice
+    assert "MIT" in notice
+
+
+@pytest.mark.requires_tools
+def test_run_json_and_labels_json_carry_the_same_run_block(
+    tmp_path: Path, rules_dir: Path, no_network: None
+) -> None:
+    """One run, one run block. Two assemblies would let `finished_at` differ between the files.
+
+    Not cosmetic: they are two records of one fact, and the copy that drifts is the one a
+    reader trusts.
+    """
+    output = tmp_path / "out"
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    rundir = only_run_dir(output)
+    labels = json.loads((rundir / "labels.json").read_text(encoding="utf-8"))
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))
+    assert labels["run"] == run["run"]
+
+
+@pytest.mark.requires_tools
+def test_rerunning_creates_a_sibling_and_leaves_the_first_untouched(
+    tmp_path: Path, rules_dir: Path, no_network: None
+) -> None:
+    """Spec §13: never overwrite or modify a previous run directory."""
+    output = tmp_path / "out"
+
+    assert cli.main(offline(BENIGN, rules_dir, output)) == EXIT_SUCCESS
+    first = only_run_dir(output)
+    original = (first / "labels.json").read_bytes()
+
+    assert cli.main(offline(BENIGN, rules_dir, output)) == EXIT_SUCCESS
+
+    directories = run_dirs(output)
+    assert len(directories) == 2
+    assert directories == sorted(directories), "run directory names must sort chronologically"
+    assert (first / "labels.json").read_bytes() == original
+
+
+@pytest.mark.requires_tools
+def test_the_end_to_end_run_makes_no_network_call(
+    tmp_path: Path, rules_dir: Path, no_network: None
+) -> None:
+    """Spec §2.2, and the reason Goal 2 is achievable at all.
+
+    Asserted over the real pipeline rather than the stubbed one, because the stubs are exactly
+    the stages that would dial out — `zeek --parse-only` probing for JA4, and Suricata reading
+    a snapshot.
+    """
+    assert cli.main(offline(BENIGN, rules_dir, tmp_path / "out")) == EXIT_SUCCESS
+
+
+@pytest.mark.requires_tools
+def test_the_normalized_capture_does_not_survive_the_run(tmp_path: Path, rules_dir: Path) -> None:
+    """It lives in a per-run temporary directory (spec §10), so it must not be in the output.
+
+    A copy of the operator's capture inside the run directory would also be capture data
+    written outside the one place spec §13 permits it.
+    """
+    output = tmp_path / "out"
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    rundir = only_run_dir(output)
+    assert not list(rundir.rglob("normalized.pcap"))
+
+
+# --- `flabel rules` ---------------------------------------------------------------------------
+
+
+def _one_local_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point `rules update` at one source whose feed is a local file.
+
+    The registry is narrowed to a single source as well as the transport being replaced. Nine
+    copies of one fixture would collide on SID — every feed would claim the same rules — and the
+    resulting `sid_index` failure would be an artifact of the test rather than anything about
+    the code under it.
+    """
+    spec = SourceSpec(
+        name="et/open",
+        url="https://example.invalid/et-open.rules",
+        licence="MIT",
+        source_class="signature",
+        admission_basis="wholesale",
+    )
+    text = SYNTHETIC_RULES.read_text(encoding="utf-8")
+    monkeypatch.setattr(cli, "enabled_sources", lambda path=None: (spec,))
+    monkeypatch.setattr(cli, "fetch_feed", lambda spec, fetcher=None: (text, {}))
+
+
+def test_rules_list_reports_the_snapshots_on_disk(
+    rules_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Spec §12's second subcommand. An operator needs to know what `--ruleset-snapshot` accepts."""
+    code = cli.main(["rules", "list", "--rules-dir", str(rules_dir)])
+
+    assert code == EXIT_SUCCESS
+    assert snapshot_id_of(rules_dir) in capsys.readouterr().out
+
+
+def test_rules_list_on_an_empty_rules_dir_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Zero snapshots is a real answer, not a failure — but silence would look like a broken
+    command."""
+    code = cli.main(["rules", "list", "--rules-dir", str(tmp_path / "empty")])
+
+    assert code == EXIT_SUCCESS
+    assert capsys.readouterr().err != ""
+
+
+def test_rules_update_builds_a_snapshot_from_the_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one network path (spec §2.2), wired end to end with the transport stubbed.
+
+    The feeds themselves are never contacted — spec §2's testing line — so the fetch is replaced
+    and everything downstream of it is the real admission and snapshot code.
+    """
+    _one_local_source(monkeypatch)
+    root = tmp_path / "rules"
+
+    code = cli.main(["rules", "update", "--rules-dir", str(root)])
+
+    assert code == EXIT_SUCCESS
+    snapshots = [path for path in root.iterdir() if path.is_dir()]
+    assert len(snapshots) == 1
+    assert (snapshots[0] / "rules.rules").is_file()
+    assert (snapshots[0] / "manifest.json").is_file()
+    assert (snapshots[0] / "sid_index.json").is_file()
+
+
+def test_rules_update_reports_what_each_source_yielded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Admission drops rules by design, so a silent update hides how much of a feed survived."""
+    _one_local_source(monkeypatch)
+
+    cli.main(["rules", "update", "--rules-dir", str(tmp_path / "rules")])
+
+    err = capsys.readouterr().err
+    assert "et/open" in err
+    assert "admitted" in err
+
+
+def test_rules_is_a_subcommand_not_a_capture_name(tmp_path: Path) -> None:
+    """`flabel rules ...` dispatches to the subcommand, as `git` does with its own.
+
+    Recorded because it is a real ambiguity: a capture file literally named `rules` has to be
+    given as `./rules`. The alternative — inspecting the filesystem to decide what the operator
+    meant — would make the command's behaviour depend on the working directory.
+    """
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["rules"])
+
+    assert raised.value.code == EXIT_USAGE
+
+
+# --- verification round: the failure paths must not lose the failure --------------------------
+#
+# Every finding below was traced through the code by a fresh reviewer and reproduced here before
+# being fixed. The shape they share is the one this project keeps finding: the run *fails*, and
+# the artifact it leaves behind does not say so.
+
+
+def test_an_unexpected_exception_still_writes_run_json(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run.json` is written by EVERY run (#23) — including one that died on a bare ValueError.
+
+    Not hypothetical. `provenance.build_source_entry` raises plain `ValueError` for an empty
+    `threat`, and `suricata.py` checks only that the `signature` *key* exists, not that it has a
+    value — a gap already recorded in docs/status.yaml from an earlier round. A wholesale-admitted
+    feed shipping one rule with `msg:""` would therefore reach correlation, raise, and — before
+    this test — escape `except FlabelError` as a traceback, leaving a run directory holding
+    `zeek/` and `suricata/` and neither `run.json` nor `labels.json`.
+
+    That is the one state spec §13 does not allow: not a complete run directory, and not none.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", _suricata_ok(rules_dir))
+
+    def raises_value_error(*args: object, **kwargs: object) -> None:
+        raise ValueError("threat is empty: a label that names no threat has no content")
+
+    monkeypatch.setattr(cli, "correlate", raises_value_error)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE, "an unforeseen crash is a failure, never a success"
+    rundir = only_run_dir(output)
+    assert (rundir / "run.json").is_file(), "the run directory must never lack its run block"
+    assert not (rundir / "labels.json").exists()
+
+
+def test_the_run_block_records_why_the_run_failed(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `run.json` that reads like a clean run is worse than no `run.json` at all.
+
+    The snapshot-id mismatch is the sharpest case: no tool failed, no detection went unplaced, so
+    `tool_failures[]` is empty, every `loss_conditions` flag is false, and — before this test —
+    nothing anywhere in the document said the run died. The reason went to stderr only, which is
+    exactly what issue #23 rejected: a script would have to parse prose to learn what happened.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", _suricata_ok(rules_dir, snapshot_id="f" * 16))
+    output = tmp_path / "out"
+
+    assert cli.main(offline(BENIGN, rules_dir, output)) == EXIT_FAILURE
+
+    run = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))["run"]
+    assert any("failed" in warning.lower() for warning in run["warnings"]), (
+        "a reader of run.json alone must be able to tell the run did not finish"
+    )
+    assert any("snapshot" in warning.lower() for warning in run["warnings"])
+
+
+def test_a_successful_labelling_run_leaves_stdout_empty(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Spec §12 reserves stdout for the pipeline. `input()` writes its prompt there.
+
+    Verified: `input("...")` sends the prompt to `sys.stdout`, not stderr. So with stdout
+    redirected — `flabel --offline capture.pcap > run.log`, an ordinary thing to do — the
+    shortfall prompt went into the log file and the operator saw a silent terminal and a process
+    that looked wedged. The TTY check closed the CI case and left this one open.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot_id_of(rules_dir))
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+
+    cli.main(offline(BENIGN, rules_dir, tmp_path / "out"))
+
+    captured = capsys.readouterr()
+    assert captured.out == "", "the prompt and every message belong on stderr"
+    assert "did not load" in captured.err
+
+
+def test_the_prompt_is_skipped_when_nobody_could_see_it(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prompt nobody can read is a hang, whichever stream is redirected.
+
+    `stdin.isatty()` alone is not the question — the operator has to *see* the question to answer
+    it. With stderr redirected to a file the prompt is invisible even on an interactive stdin,
+    which is the same wedged process #46 exists to prevent.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot_id_of(rules_dir))
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: False)
+
+    def never(*args: object, **kwargs: object) -> str:
+        raise AssertionError("a prompt nobody can see must never be asked")
+
+    monkeypatch.setattr("builtins.input", never)
+
+    assert cli.main(offline(BENIGN, rules_dir, tmp_path / "out")) == EXIT_SUCCESS
+
+
+def test_interrupting_the_prompt_stops_the_run_cleanly(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C is at least as likely as typing `n`, and the prompt invites it.
+
+    Treated as declining rather than as a crash: the operator answered the question, just not with
+    a keystroke the parser was looking for. A traceback here would leave the run directory with
+    neither file.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot_id_of(rules_dir))
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
+
+    def interrupted(prompt: str = "") -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupted)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert (rundir / "run.json").is_file()
+    assert not (rundir / "labels.json").exists()
+
+
+def test_an_editcap_failure_in_ingest_reports_rather_than_vanishing(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The judgment call in this step, and it was previously untested.
+
+    Spec §12's carve-out names "a missing snapshot, an unreadable capture" as the failures that
+    leave no run directory. An `editcap` failure is neither — the operator's file was readable —
+    so the default applies and the `ToolFailure` records survive on disk.
+    """
+    failure = ToolFailure(
+        tool="editcap",
+        argv=("editcap", "-F", "pcap", "in.pcapng", "out.pcap"),
+        exit_code=2,
+        message="editcap exited non-zero: unsupported encapsulation",
+    )
+
+    def boom(capture: Path, workdir: Path) -> None:
+        raise ToolError("editcap failed", failures=(failure,), run_info=None)
+
+    monkeypatch.setattr(cli, "normalize", boom)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists()
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
+    assert [f["tool"] for f in run["tool_failures"]] == ["editcap"]
+    assert run["tool_failures"][0]["exit_code"] == 2
+    # The stage never ran, so its section is null rather than a zeroed-out claim.
+    assert run["input"]["packets_read"] is None
+
+
+def test_a_suricata_tool_failure_is_reported_like_any_other(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_suricata` records rather than raises, so step 9 restores the one convention.
+
+    This is the path a zero-rule load takes — the case that stays fatal under #46 — and nothing
+    exercised it end to end.
+    """
+    from flabel.models import SuricataRunInfo
+
+    failure = ToolFailure(
+        tool="suricata",
+        argv=("suricata", "-r", "capture.pcap"),
+        exit_code=0,
+        message="suricata loaded none of the snapshot's 2 rules (2 failed, 0 skipped)",
+    )
+
+    def failed(capture: Path, snapshot: Path, outdir: Path):
+        outdir.mkdir(parents=True, exist_ok=True)
+        return [], SuricataRunInfo(
+            version="8.0.6",
+            snapshot_id=snapshot_id_of(rules_dir),
+            rules_loaded=0,
+            alerts_total=0,
+            tool_failures=(failure,),
+        )
+
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", failed)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists()
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
+    assert [f["tool"] for f in run["tool_failures"]] == ["suricata"]
+    assert run["loss_conditions"]["tool_failure"] is True
+
+
+def test_unmatched_detections_is_null_when_correlation_never_ran(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same empty-array-versus-absent mistake this file exists to prevent, one key down.
+
+    A run that died in Zeek measured no detections at all. `"unmatched_detections": []` there
+    reads as "every detection was placed" — spec §2.5's failure mode, and the exact argument
+    issue #23 makes about `labels: []`. `counts.unmatched` is already `null` on that path; these
+    two are the same fact and must not disagree.
+    """
+    zeek_that_dies(monkeypatch, OOM)
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    document = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))
+    assert document["unmatched_detections"] is None
+    assert document["run"]["counts"]["unmatched"] is None
+
+
+def test_a_successful_run_records_no_unmatched_detections_as_an_empty_list(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: correlation ran and placed everything, which is a measurement of zero."""
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", _suricata_ok(rules_dir))
+    output = tmp_path / "out"
+
+    assert cli.main(offline(BENIGN, rules_dir, output)) == EXIT_SUCCESS
+
+    document = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))
+    assert document["unmatched_detections"] == []
+    assert "labels" not in document
+
+
+def test_a_failure_while_writing_notice_leaves_no_labels_and_an_honest_run_json(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`labels.json` is written last, but `run.json` was written first and claimed success.
+
+    `notice.render_notice` raises on a source under two licences or absent from the manifest. If
+    that fires after `run.json` is on disk, the directory is left with a run block reporting
+    labels, no loss conditions and no failures — beside no `labels.json`. That is "report full
+    coverage when a loss condition fired" in the one file left standing.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", _suricata_ok(rules_dir))
+
+    def boom(*args: object, **kwargs: object) -> bytes:
+        raise ValueError("et/open appears under two licences")
+
+    monkeypatch.setattr(cli, "render_notice_bytes", boom)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists()
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
+    assert any("licence" in warning.lower() for warning in run["warnings"]), (
+        "run.json must not survive as a record of a run that succeeded"
+    )

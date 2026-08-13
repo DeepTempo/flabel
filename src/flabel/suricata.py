@@ -389,29 +389,48 @@ def run_suricata(
         rules_skipped=skipped,
         identify_alerts_suppressed=suppressed,
         config_sha256=config_digest,
-        warnings=_load_warnings(failed, skipped),
+        warnings=_load_warnings(loaded, failed, skipped, len(index)),
     )
 
 
-def _load_warnings(failed: int, skipped: int) -> tuple[str, ...]:
-    """What to say when the engine reported rejected rules but the load still reconciled.
+def _load_warnings(loaded: int, failed: int, skipped: int, expected: int) -> tuple[str, ...]:
+    """What to say about rules the engine did not load (spec §11, issue #46).
 
-    `_check_ruleset_loaded` has already failed the run for any *shortfall* against the snapshot,
-    so reaching here with a non-zero `failed` or `skipped` means the engine both rejected rules
-    and reported loading as many as we admitted. The two statements cannot both be complete, and
-    a run that quietly picked one of them would be attesting a ruleset it did not verify.
+    Two different statements, because two different things go wrong.
 
-    Not fatal, because the loaded count is the one that reconciles and every admitted rule is
-    accounted for by it — but not silent either (spec §2.5). Kept as a separate function so the
-    wording is testable without an engine that produces the contradiction on demand.
+    A **shortfall** — fewer rules loaded than the snapshot admitted — is the case that used to
+    fail the run outright. It no longer does (Craig, 2026-08-12): a threshold is a number of
+    labels one is willing to lose in silence, and the measurement gives no evidence for any
+    particular value. At full scale the shortfall is not small, it is *zero* — 85,431 loaded, 0
+    failed, 0 skipped — because the three rules this engine cannot compile are excluded at
+    admission rather than left to fail at load. Zero being the only value ever observed means
+    any threshold would be invented, so the run reports the loss and `cli.py` asks the operator.
+
+    **The percentage is here rather than at the call site** because it is what makes the count
+    answerable: 26 rules lost is a curiosity against 85,431 and a broken snapshot against 40.
+    Composing it once means the sentence an operator reads at the prompt is the same sentence
+    the run block records, rather than two roundings of one fact.
+
+    The second case is a **contradiction**: the engine reported rejected rules *and* a loaded
+    count matching the snapshot exactly. Both cannot describe the whole ruleset, so the coverage
+    of that run is unverified even though nothing is provably missing.
     """
-    if not failed and not skipped:
-        return ()
-    return (
-        f"suricata reported {failed} rules failed and {skipped} rules skipped, yet its loaded "
-        f"count matched the snapshot exactly. The two numbers cannot both describe the whole "
-        f"ruleset, so treat the rule coverage of this run as unverified.",
-    )
+    warnings: list[str] = []
+    missing = expected - loaded
+    if missing > 0:
+        share = (missing / expected * 100) if expected else 0.0
+        warnings.append(
+            f"{missing} of {expected} rules ({share:.2f}%) did not load: {failed} failed, "
+            f"{skipped} skipped. The missing rules never examined the capture, so any label "
+            f"they would have produced is absent from a run that otherwise looks complete."
+        )
+    elif failed or skipped:
+        warnings.append(
+            f"suricata reported {failed} rules failed and {skipped} rules skipped, yet its "
+            f"loaded count matched the snapshot exactly. The two numbers cannot both describe "
+            f"the whole ruleset, so treat the rule coverage of this run as unverified."
+        )
+    return tuple(warnings)
 
 
 def _check_ruleset_loaded(
@@ -430,15 +449,19 @@ def _check_ruleset_loaded(
       rules use a keyword this build lacks, or name a classtype the config does not define. The
       run reported success and the labels those rules would have produced are simply absent.
 
-    The third is a hard failure by decision (Craig, 2026-08-12): "record it, warn above zero,
-    fail above a threshold". Recording now happens — `SuricataRunInfo.rules_failed` and
-    `rules_skipped` carry the engine's own numbers — and the failure stays unconditional, which
-    is the conservative half of that decision and the half that keeps working: a threshold is a
-    number of labels one is willing to lose silently, and nobody has justified one.
+    **The third is no longer a failure** (Craig, 2026-08-12 — issue #46). It used to be, on the
+    conservative reading of "record it, warn above zero, fail above a threshold". Measured at
+    full scale the shortfall is zero — 85,431 admitted, 85,431 loaded — because the rules this
+    engine is known in advance to reject are excluded at admission (§5), so these counters
+    describe *surprises*. Zero being the only value ever observed means no threshold could be
+    derived rather than invented, and an unconditional failure is a threshold of zero chosen by
+    default. It is now reported through `_load_warnings` and `cli.py` puts the decision to the
+    operator, with the count and the share of the ruleset in front of them.
 
-    **Note the consequence:** this fails a run whose feeds contain a rule the engine rejects,
-    which is the intended alarm rather than a surprise. The fix belongs in admission, which
-    should not admit a rule this engine cannot load.
+    The first two stay fatal, and the difference is not a matter of degree. A ruleset that is
+    *attestably incomplete* is evidence an operator can weigh; one that **cannot be attested at
+    all**, or that produced an empty alert set because nothing loaded, is not evidence at all —
+    and zero labels from zero rules is indistinguishable from a clean capture.
     """
     if counts is None:
         return _failure(
@@ -456,14 +479,9 @@ def _check_ruleset_loaded(
             f"suricata loaded none of the snapshot's {expected} rules ({failed} failed, "
             f"{skipped} skipped), so an empty alert set proves nothing about the capture",
         )
-    if loaded != expected:
-        return _failure(
-            argv,
-            exit_code,
-            f"suricata loaded {loaded} of the snapshot's {expected} rules ({failed} failed, "
-            f"{skipped} skipped). The missing rules never examined the capture, so any label "
-            f"they would have produced is absent from a run that otherwise looks complete",
-        )
+    # A shortfall returns None: it is reported by `_load_warnings` and decided by the operator
+    # (#46), not failed here. Loading *more* than admitted is not a shortfall and not possible
+    # from a snapshot, so it is left to the same warning path rather than given a branch.
     return None
 
 
