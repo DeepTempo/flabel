@@ -652,10 +652,15 @@ def _collect_failures(
 def _failure(failure: ToolFailure) -> dict[str, Any]:
     """One `ToolFailure` as JSON.
 
-    `argv` is the full argument vector, including per-run paths. That is deliberate and does
-    not break Goal 2: `run.json` is diagnostic and is not part of the reproducibility
-    comparison, and spec §8 puts the argv here precisely so `ZeekRunInfo.flags` can stay free
-    of paths. `exit_code` is null for a process that was killed rather than exiting — an OOM
+    `argv` is the full argument vector, including per-run paths. That is deliberate and does not
+    break Goal 2 — though not for the reason first recorded here. `run.json` **is** compared
+    (`canonical.DOCUMENTS`); step 10 kept it in rather than out, because a run block that drifts
+    between two runs over one capture is exactly what Goal 2 should catch. What makes the argv
+    safe is that `tool_failures[]` is populated only on a *failed* run, and a failed run writes
+    no `labels.json` — it is not one of the two runs a reproducibility comparison is made
+    between. Spec §8 puts the argv here precisely so `ZeekRunInfo.flags` can stay free of paths.
+
+    `exit_code` is null for a process that was killed rather than exiting — an OOM
     kill arrives as a signal, and reporting it as an exit code would invent one.
     """
     return {

@@ -17,6 +17,12 @@
 #   * Committing a reduced snapshot — a curated subset stops being the standing review for the
 #     ungated rules, which is the entire point.
 #
+# OPERATIONAL CAVEAT, and it is a real one: **GitHub disables `schedule:` triggers after 60 days
+# of repository inactivity.** For a research repo that goes quiet once Phase 1 ships, this review
+# stops running and nothing announces it — the failure mode is indistinguishable from "it keeps
+# passing". If flabel is dormant, re-enable it from the Actions tab, or trigger it by hand with
+# `workflow_dispatch`, before trusting a green history.
+#
 # WHAT THIS BUYS BEYOND THE PR SUITE: it catches feed drift. `abuse.ch/urlhaus` and two of
 # pawpatrules' companion lists (`openphish`, `nrd_phishing_14day`) refresh upstream daily and are
 # inside the `snapshot_id` hash, so the ruleset genuinely changes underneath us between runs. A
@@ -39,6 +45,8 @@ on:
 permissions:
   contents: read
   packages: read
+  # Failure files an issue — see the last step.
+  issues: write
 
 jobs:
   canary:
@@ -100,11 +108,34 @@ jobs:
           print(f"labels     : {run['counts']['labels']}")
 
           # A ruleset that did not load proves nothing: zero labels from zero rules is not a
-          # passing canary, it is an unrun one.
-          if run["counts"]["rules_loaded"] < 1000:
+          # passing canary, it is an unrun one. Compared against what THIS snapshot admitted
+          # rather than a constant — a fixed floor of 1000 would have accepted a 94% collapse of
+          # an 85k ruleset and still printed "Goal 5 passed".
+          admitted = run["ruleset"]["total_admitted"]
+          loaded = run["counts"]["rules_loaded"]
+          if loaded != admitted:
               sys.exit(
-                  f"only {run['counts']['rules_loaded']} rules loaded — far below the ~85k the "
-                  f"nine feeds admit. The canary proves nothing against a ruleset this small."
+                  f"{loaded} of {admitted} rules loaded. The canary reviews only the rules that "
+                  f"ran, so a partial load makes this a weaker review than it reports being."
+              )
+
+          # Measured 2026-08-12 across all nine feeds: 0 failed, 0 skipped. Zero is the only
+          # value ever observed, because rules this engine cannot compile are excluded at
+          # admission (spec §5). Any non-zero here is a surprise worth stopping for.
+          if run["counts"]["rules_failed"] or run["counts"]["rules_skipped"]:
+              sys.exit(
+                  f"{run['counts']['rules_failed']} failed / "
+                  f"{run['counts']['rules_skipped']} skipped at load. Expected zero of each."
+              )
+
+          # The review is only "standing" if every wholesale-admitted source is in it. A feed
+          # dropped upstream, or an `enabled = false` creeping into sources.toml, would silently
+          # shrink what is being reviewed while the gate stayed green.
+          sources = run["ruleset"]["sources"]
+          if len(sources) != 9:
+              sys.exit(
+                  f"{len(sources)} sources in the snapshot, expected 9: "
+                  f"{sorted(entry['name'] for entry in sources)}"
               )
 
           if labels:
@@ -124,6 +155,40 @@ jobs:
 
           print("Goal 5: zero labels on the benign canary against the live ruleset")
           PY
+
+      # A daily gate can be red for weeks with nothing but a badge to say so, and this one is
+      # the only false-positive review the 21,464 ungated pawpatrules rules get. Failure files
+      # an issue so it reaches a person.
+      - name: File an issue if the canary failed
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "Goal 5: the benign canary produced labels against the live ruleset";
+            const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+                        `/actions/runs/${context.runId}`;
+            const body =
+              `The scheduled feeds run failed: ${url}\n\n` +
+              `Either an admitted rule now fires on traffic that is benign by construction, or ` +
+              `the ruleset did not load as expected. The run directory is attached to that run ` +
+              `as an artifact; \`labels.json\` names the source and sid.\n\n` +
+              `Do not resolve this by editing \`tests/fixtures/benign.pcap\` — it is byte-pinned ` +
+              `for that reason. See \`tests/fixtures/README.md\`.`;
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: "open", labels: "goal-5",
+            });
+            if (existing.data.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ["goal-5"],
+              });
+            }
 
       - name: Keep the run directory for diagnosis
         if: always()

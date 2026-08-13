@@ -137,10 +137,21 @@ def test_the_malicious_canary_produces_at_least_one_label(tmp_path: Path):
 
 # --- loss conditions, injected end to end (spec §11) --------------------------------------------
 #
-# Spec §11 is a closed list of nine ways a run can under-report, each with a named field. The
-# field-resolution half is asserted in `tests/test_provenance.py`, which parses §11's table at run
-# time. What is asserted here is the other half: that a real run, with the fault really present,
-# actually sets it. A field that resolves and is never `true` reports nothing.
+# Spec §11 is a closed list of nine ways a run can under-report, each with a named field. Three
+# things check them, and it is worth being exact about which does what — the easy misreading is
+# that this section covers all nine end to end. It does not.
+#
+#   * `tests/test_provenance.py` parses §11's table at run time, asserts every field resolves in
+#     the run block, and unit-tests each flag's derivation against a synthetic run info.
+#   * The stage tests inject each fault where it originates — `test_ingest.py` for the datalink
+#     discard, `test_correlate.py` for the ambiguous match, `test_cli.py` for a tool failure.
+#   * **Here**: the faults reachable through a real end-to-end run — truncation, identify
+#     suppression, a rule the engine cannot compile, a missing snapshot, and an absent ja4
+#     package. Five of the nine.
+#
+# The other four are covered at stage level with their derivations unit-tested; what they lack is
+# a full-pipeline run with the fault present. Recorded rather than glossed, because a docstring
+# claiming "all nine" would be believed.
 
 
 @pytest.mark.requires_tools
@@ -272,6 +283,32 @@ def test_ja4_availability_is_reported_either_way(quiet_snapshot: Path, tmp_path:
     block = run_block(label(quiet_snapshot, tmp_path / "out"))
 
     assert block["tools"]["ja4_status"] in {"present", "not-installed", "probe-failed"}
-    assert block["loss_conditions"]["ja4_unavailable"] is (
-        block["tools"]["ja4_status"] != "present"
+
+
+@pytest.mark.requires_tools
+def test_a_run_without_the_ja4_package_says_so(
+    quiet_snapshot: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """§11 row 9, with the fault actually injected (PLAN step 10: "the `ja4` package absent").
+
+    The obvious assertion here is a tautology, and was one until this test replaced it:
+    `loss_conditions.ja4_unavailable` is *computed* from `tools.ja4_status`, so asserting the two
+    agree restates `provenance.py` rather than testing it. Worse, CI runs `--strict-toolchain`,
+    which requires the package present — so the `True` branch of the flag was never reached by
+    any end-to-end run at all.
+
+    What matters is the consequence: a null `ja4` on a flow means "no TLS here" when the package
+    is present and "never computed" when it is absent, and a consumer training on the output
+    cannot tell those apart unless the run says which.
+    """
+    from flabel import zeek
+
+    monkeypatch.setattr(
+        zeek, "_ja4_status", lambda binary: ("not-installed", "ja4 package not installed")
     )
+
+    block = run_block(label(quiet_snapshot, tmp_path / "out"))
+
+    assert block["tools"]["ja4_status"] == "not-installed"
+    assert block["loss_conditions"]["ja4_unavailable"] is True
+    assert any("ja4" in warning.lower() for warning in block["warnings"])

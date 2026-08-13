@@ -78,6 +78,7 @@ src/flabel/
   labels.py         build labels, canonical serialisation (pure)
   provenance.py     build SourceEntry values; assemble the run block (pure)
   notice.py         emit NOTICE attribution (pure)
+  canonical.py      canonical comparison of run directories — Goal 2's primitive (pure)
   cli.py            argument parsing, orchestration, exit codes
   data/
     sources.toml          the source registry (shipped with the package)
@@ -94,7 +95,7 @@ wheel. Corrected in step 2; the original diagram placed `data/` alongside `src/`
 
 **`models.py` is a refinement of the approved layout.** Every module codes against shared dataclasses rather than each owning its own, which is what allows steps 4–7 to be built in parallel without importing one another.
 
-**Pure modules** (`models`, `errors`, `config`, `admit`, `correlate`, `labels`, `provenance`, `notice`) must not import `subprocess`, `urllib`, or `socket`. Enforced by a test that greps the module sources — a cheap architectural guard that survives refactoring.
+**Pure modules** (`models`, `errors`, `config`, `admit`, `correlate`, `labels`, `provenance`, `notice`, `canonical`) must not import `subprocess`, `urllib`, or `socket`. Enforced by a test that greps the module sources — a cheap architectural guard that survives refactoring.
 
 ---
 
@@ -957,8 +958,12 @@ there asserts that every detection was placed, which is §2.5's failure mode in 
 exists to prevent it. `counts.unmatched` is already `null` on that path, and the two are records
 of one fact.
 The cost is that a successful run serialises the array twice; both come from one
-`CorrelationResult` in one call, so they cannot disagree, and `run.json` is excluded from the
-Goal 2 comparison either way.
+`CorrelationResult` in one call, so they cannot disagree.
+
+`run.json` **is** part of the Goal 2 comparison (step 10). An earlier draft of this section said
+it was excluded; it is not, and including it is the safer reading — a run block that drifts
+between two runs over one capture is precisely what Goal 2 exists to catch. The wall-clock fields
+inside it are excluded by field, exactly as `labels.json`'s are.
 
 **`labels` is absent, never `[]`.** That is the same distinction the file exists to make: an
 empty array reads as "nothing malicious was found" when the pipeline died, and a consumer
