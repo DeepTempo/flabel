@@ -512,6 +512,40 @@ def _zeek_ok(outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]:
     return {}, ZeekRunInfo(version="8.0.9", flags=("-C", "-D"), log_dir=outdir)
 
 
+def _total_admitted(rules_dir: Path) -> int:
+    """What the snapshot says it admitted, read from the manifest rather than assumed.
+
+    A literal here would agree with the fixture by construction and stop agreeing the moment the
+    fixture gained a rule — which is how a stub starts reporting a shortfall nobody intended.
+    """
+    manifest = json.loads(
+        (rules_dir / snapshot_id_of(rules_dir) / "manifest.json").read_text(encoding="utf-8")
+    )
+    return manifest["total_admitted"]
+
+
+def _suricata_ok(rules_dir: Path, snapshot_id: str | None = None):
+    """A Suricata stage that loaded the whole snapshot cleanly and found nothing.
+
+    `snapshot_id` overrides the real one, which is how the mid-run `rules update` is simulated.
+    """
+    from flabel.models import SuricataRunInfo
+
+    resolved = snapshot_id or snapshot_id_of(rules_dir)
+    loaded = _total_admitted(rules_dir)
+
+    def run(capture: Path, snapshot: Path, outdir: Path):
+        outdir.mkdir(parents=True, exist_ok=True)
+        return [], SuricataRunInfo(
+            version="8.0.6",
+            snapshot_id=resolved,
+            rules_loaded=loaded,
+            alerts_total=0,
+        )
+
+    return run
+
+
 # --- the rules shortfall: warn, quantify, and never block a non-TTY (#46) ---------------------
 
 
@@ -622,6 +656,7 @@ def test_declining_the_prompt_stops_the_run_and_claims_no_verdict(
     monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
     suricata_with_shortfall(monkeypatch, snapshot)
     monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt="": "n")
     output = tmp_path / "out"
 
@@ -642,6 +677,7 @@ def test_the_prompt_defaults_to_yes(
     monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
     suricata_with_shortfall(monkeypatch, snapshot)
     monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt="": answer)
 
     code = cli.main(offline(BENIGN, two_rule_snapshot, tmp_path / "out"))
@@ -683,6 +719,7 @@ def test_no_shortfall_asks_nothing(
 
     monkeypatch.setattr("builtins.input", never)
     monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
 
     assert cli.main(offline(BENIGN, rules_dir, tmp_path / "out")) == EXIT_SUCCESS
 
@@ -950,3 +987,277 @@ def test_rules_is_a_subcommand_not_a_capture_name(tmp_path: Path) -> None:
         cli.main(["rules"])
 
     assert raised.value.code == EXIT_USAGE
+
+
+# --- verification round: the failure paths must not lose the failure --------------------------
+#
+# Every finding below was traced through the code by a fresh reviewer and reproduced here before
+# being fixed. The shape they share is the one this project keeps finding: the run *fails*, and
+# the artifact it leaves behind does not say so.
+
+
+def test_an_unexpected_exception_still_writes_run_json(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run.json` is written by EVERY run (#23) — including one that died on a bare ValueError.
+
+    Not hypothetical. `provenance.build_source_entry` raises plain `ValueError` for an empty
+    `threat`, and `suricata.py` checks only that the `signature` *key* exists, not that it has a
+    value — a gap already recorded in docs/status.yaml from an earlier round. A wholesale-admitted
+    feed shipping one rule with `msg:""` would therefore reach correlation, raise, and — before
+    this test — escape `except FlabelError` as a traceback, leaving a run directory holding
+    `zeek/` and `suricata/` and neither `run.json` nor `labels.json`.
+
+    That is the one state spec §13 does not allow: not a complete run directory, and not none.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", _suricata_ok(rules_dir))
+
+    def raises_value_error(*args: object, **kwargs: object) -> None:
+        raise ValueError("threat is empty: a label that names no threat has no content")
+
+    monkeypatch.setattr(cli, "correlate", raises_value_error)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE, "an unforeseen crash is a failure, never a success"
+    rundir = only_run_dir(output)
+    assert (rundir / "run.json").is_file(), "the run directory must never lack its run block"
+    assert not (rundir / "labels.json").exists()
+
+
+def test_the_run_block_records_why_the_run_failed(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `run.json` that reads like a clean run is worse than no `run.json` at all.
+
+    The snapshot-id mismatch is the sharpest case: no tool failed, no detection went unplaced, so
+    `tool_failures[]` is empty, every `loss_conditions` flag is false, and — before this test —
+    nothing anywhere in the document said the run died. The reason went to stderr only, which is
+    exactly what issue #23 rejected: a script would have to parse prose to learn what happened.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", _suricata_ok(rules_dir, snapshot_id="f" * 16))
+    output = tmp_path / "out"
+
+    assert cli.main(offline(BENIGN, rules_dir, output)) == EXIT_FAILURE
+
+    run = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))["run"]
+    assert any("failed" in warning.lower() for warning in run["warnings"]), (
+        "a reader of run.json alone must be able to tell the run did not finish"
+    )
+    assert any("snapshot" in warning.lower() for warning in run["warnings"])
+
+
+def test_a_successful_labelling_run_leaves_stdout_empty(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Spec §12 reserves stdout for the pipeline. `input()` writes its prompt there.
+
+    Verified: `input("...")` sends the prompt to `sys.stdout`, not stderr. So with stdout
+    redirected — `flabel --offline capture.pcap > run.log`, an ordinary thing to do — the
+    shortfall prompt went into the log file and the operator saw a silent terminal and a process
+    that looked wedged. The TTY check closed the CI case and left this one open.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot_id_of(rules_dir))
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+
+    cli.main(offline(BENIGN, rules_dir, tmp_path / "out"))
+
+    captured = capsys.readouterr()
+    assert captured.out == "", "the prompt and every message belong on stderr"
+    assert "did not load" in captured.err
+
+
+def test_the_prompt_is_skipped_when_nobody_could_see_it(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prompt nobody can read is a hang, whichever stream is redirected.
+
+    `stdin.isatty()` alone is not the question — the operator has to *see* the question to answer
+    it. With stderr redirected to a file the prompt is invisible even on an interactive stdin,
+    which is the same wedged process #46 exists to prevent.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot_id_of(rules_dir))
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: False)
+
+    def never(*args: object, **kwargs: object) -> str:
+        raise AssertionError("a prompt nobody can see must never be asked")
+
+    monkeypatch.setattr("builtins.input", never)
+
+    assert cli.main(offline(BENIGN, rules_dir, tmp_path / "out")) == EXIT_SUCCESS
+
+
+def test_interrupting_the_prompt_stops_the_run_cleanly(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C is at least as likely as typing `n`, and the prompt invites it.
+
+    Treated as declining rather than as a crash: the operator answered the question, just not with
+    a keystroke the parser was looking for. A traceback here would leave the run directory with
+    neither file.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    suricata_with_shortfall(monkeypatch, snapshot_id_of(rules_dir))
+    monkeypatch.setattr(cli, "stdin_is_a_tty", lambda: True)
+    monkeypatch.setattr(cli, "prompt_is_visible", lambda: True)
+
+    def interrupted(prompt: str = "") -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupted)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert (rundir / "run.json").is_file()
+    assert not (rundir / "labels.json").exists()
+
+
+def test_an_editcap_failure_in_ingest_reports_rather_than_vanishing(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The judgment call in this step, and it was previously untested.
+
+    Spec §12's carve-out names "a missing snapshot, an unreadable capture" as the failures that
+    leave no run directory. An `editcap` failure is neither — the operator's file was readable —
+    so the default applies and the `ToolFailure` records survive on disk.
+    """
+    failure = ToolFailure(
+        tool="editcap",
+        argv=("editcap", "-F", "pcap", "in.pcapng", "out.pcap"),
+        exit_code=2,
+        message="editcap exited non-zero: unsupported encapsulation",
+    )
+
+    def boom(capture: Path, workdir: Path) -> None:
+        raise ToolError("editcap failed", failures=(failure,), run_info=None)
+
+    monkeypatch.setattr(cli, "normalize", boom)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists()
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
+    assert [f["tool"] for f in run["tool_failures"]] == ["editcap"]
+    assert run["tool_failures"][0]["exit_code"] == 2
+    # The stage never ran, so its section is null rather than a zeroed-out claim.
+    assert run["input"]["packets_read"] is None
+
+
+def test_a_suricata_tool_failure_is_reported_like_any_other(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_suricata` records rather than raises, so step 9 restores the one convention.
+
+    This is the path a zero-rule load takes — the case that stays fatal under #46 — and nothing
+    exercised it end to end.
+    """
+    from flabel.models import SuricataRunInfo
+
+    failure = ToolFailure(
+        tool="suricata",
+        argv=("suricata", "-r", "capture.pcap"),
+        exit_code=0,
+        message="suricata loaded none of the snapshot's 2 rules (2 failed, 0 skipped)",
+    )
+
+    def failed(capture: Path, snapshot: Path, outdir: Path):
+        outdir.mkdir(parents=True, exist_ok=True)
+        return [], SuricataRunInfo(
+            version="8.0.6",
+            snapshot_id=snapshot_id_of(rules_dir),
+            rules_loaded=0,
+            alerts_total=0,
+            tool_failures=(failure,),
+        )
+
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", failed)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists()
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
+    assert [f["tool"] for f in run["tool_failures"]] == ["suricata"]
+    assert run["loss_conditions"]["tool_failure"] is True
+
+
+def test_unmatched_detections_is_null_when_correlation_never_ran(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same empty-array-versus-absent mistake this file exists to prevent, one key down.
+
+    A run that died in Zeek measured no detections at all. `"unmatched_detections": []` there
+    reads as "every detection was placed" — spec §2.5's failure mode, and the exact argument
+    issue #23 makes about `labels: []`. `counts.unmatched` is already `null` on that path; these
+    two are the same fact and must not disagree.
+    """
+    zeek_that_dies(monkeypatch, OOM)
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    document = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))
+    assert document["unmatched_detections"] is None
+    assert document["run"]["counts"]["unmatched"] is None
+
+
+def test_a_successful_run_records_no_unmatched_detections_as_an_empty_list(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: correlation ran and placed everything, which is a measurement of zero."""
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", _suricata_ok(rules_dir))
+    output = tmp_path / "out"
+
+    assert cli.main(offline(BENIGN, rules_dir, output)) == EXIT_SUCCESS
+
+    document = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))
+    assert document["unmatched_detections"] == []
+    assert "labels" not in document
+
+
+def test_a_failure_while_writing_notice_leaves_no_labels_and_an_honest_run_json(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`labels.json` is written last, but `run.json` was written first and claimed success.
+
+    `notice.render_notice` raises on a source under two licences or absent from the manifest. If
+    that fires after `run.json` is on disk, the directory is left with a run block reporting
+    labels, no loss conditions and no failures — beside no `labels.json`. That is "report full
+    coverage when a loss condition fired" in the one file left standing.
+    """
+    monkeypatch.setattr(cli, "run_zeek", lambda capture, outdir: _zeek_ok(outdir))
+    monkeypatch.setattr(cli, "run_suricata", _suricata_ok(rules_dir))
+
+    def boom(*args: object, **kwargs: object) -> bytes:
+        raise ValueError("et/open appears under two licences")
+
+    monkeypatch.setattr(cli, "render_notice_bytes", boom)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, rules_dir, output))
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists()
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
+    assert any("licence" in warning.lower() for warning in run["warnings"]), (
+        "run.json must not survive as a record of a run that succeeded"
+    )

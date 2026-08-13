@@ -929,6 +929,14 @@ The array is present on every run, not only failed ones, so the document has one
 run where it matters most — the correlation gate firing — there is no `labels.json` to carry it,
 and `counts.unmatched` gives only the scale of the loss: `no_flow_match` is a tuple-normalisation
 fault and `ambiguous_flow_match` is port reuse, which are different bugs in different modules.
+
+**`unmatched_detections` is `null` when correlation never ran, and `[]` when it ran and placed
+everything.** The key is always present — that is what "one shape" means — but its *value*
+carries the same distinction as every field in the run block: `null` is "not measured", `[]` is
+"measured as none". A run that died in Zeek examined no detections at all, and an empty array
+there asserts that every detection was placed, which is §2.5's failure mode in the document that
+exists to prevent it. `counts.unmatched` is already `null` on that path, and the two are records
+of one fact.
 The cost is that a successful run serialises the array twice; both come from one
 `CorrelationResult` in one call, so they cannot disagree, and `run.json` is excluded from the
 Goal 2 comparison either way.

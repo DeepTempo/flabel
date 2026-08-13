@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -319,9 +320,16 @@ def _run_document(run: dict[str, Any], progress: _Progress) -> dict[str, Any]:
     (a tuple-normalisation fault) and `ambiguous_flow_match` (port reuse) are different bugs in
     different modules.
     """
-    unmatched = progress.correlation.unmatched if progress.correlation else ()
-    document = build_document(run=run, labels=(), unmatched=unmatched)
+    document = build_document(
+        run=run, labels=(), unmatched=progress.correlation.unmatched if progress.correlation else ()
+    )
     del document["labels"]
+    if progress.correlation is None:
+        # `null`, not `[]`, when correlation never ran — the same distinction as the key above,
+        # one line down. A run that died in Zeek measured no detections at all, and an empty array
+        # there asserts that every detection was placed. `counts.unmatched` is already `null` on
+        # that path; these are two records of one fact and must not disagree.
+        document["unmatched_detections"] = None
     return document
 
 
@@ -330,11 +338,37 @@ def _write_run_json(rundir: Path, document: dict[str, Any]) -> None:
 
 
 def _fail(rundir: Path, started_at: str, progress: _Progress, exc: FlabelError) -> int:
-    """Report a run that died: `run.json`, no `labels.json`, and the exception's exit code."""
+    """Report a run that died: `run.json`, no `labels.json`, and the exception's exit code.
+
+    **The reason is recorded in the run block, not only printed.** Found in verification: for a
+    tool failure or a correlation breach the evidence travels in `tool_failures[]` or
+    `unmatched_detections[]`, so the document spoke for itself — but a snapshot-id mismatch or a
+    declined prompt left a `run.json` with no failures, no unplaced detections and every
+    `loss_conditions` flag false. It read exactly like a clean run, and the only statement to the
+    contrary was prose on stderr. That is what issue #23 rejected: a script should not have to
+    parse a log to learn that the artifact beside it is not a result.
+    """
     print(f"flabel: {exc}", file=sys.stderr)
+    progress.warnings = (*progress.warnings, f"the run failed and wrote no labels: {exc}")
     _write_run_json(rundir, _run_document(_run_block(started_at, progress), progress))
     print(f"flabel: run details in {rundir / RUN_NAME}; no labels were written", file=sys.stderr)
     return exit_code_for(exc)
+
+
+def _unexpected(exc: BaseException) -> FlabelError:
+    """Wrap an unforeseen crash so it still leaves a run block behind.
+
+    `errors.py` already says an exception that is not a `FlabelError` maps to failure, but before
+    this nothing routed one there: `_label` caught `FlabelError` alone, so a bare `ValueError`
+    escaped as a traceback and the run directory kept `zeek/` and `suricata/` with neither
+    `run.json` nor `labels.json` — the one state spec §13 forbids, being neither a complete run
+    directory nor none.
+
+    Not hypothetical. `provenance.build_source_entry` raises plain `ValueError` for an empty
+    `threat`, and §8 checks only that the `signature` *key* exists, so a wholesale-admitted feed
+    shipping one rule with `msg:""` reaches correlation and raises.
+    """
+    return FlabelError(f"unexpected {type(exc).__name__}: {exc}")
 
 
 # --- the rule-load shortfall (#46) -----------------------------------------------------------
@@ -349,6 +383,20 @@ def stdin_is_a_tty() -> bool:
     try:
         return bool(sys.stdin is not None and sys.stdin.isatty())
     except (AttributeError, ValueError):  # a detached or closed stdin is not a terminal
+        return False
+
+
+def prompt_is_visible() -> bool:
+    """Whether the question would actually reach the person expected to answer it.
+
+    `stdin.isatty()` is not the whole test. A prompt nobody can read is a hang, and the operator
+    has to *see* the question — so the stream the prompt is written to has to be a terminal too.
+    With `flabel --offline capture.pcap 2> run.log` on an interactive shell, stdin is a terminal
+    and the question is in a file, which is the same wedged process #46 exists to prevent.
+    """
+    try:
+        return bool(sys.stderr is not None and sys.stderr.isatty())
+    except (AttributeError, ValueError):
         return False
 
 
@@ -384,17 +432,30 @@ def _confirm_shortfall(info: SuricataRunInfo, manifest: SnapshotManifest) -> boo
     for warning in info.warnings:
         print(f"flabel: {warning}", file=sys.stderr)
 
-    if not stdin_is_a_tty():
+    if not (stdin_is_a_tty() and prompt_is_visible()):
         print(
-            "flabel: continuing (stdin is not a terminal, so the default answer applies)",
+            "flabel: continuing (no terminal to ask, so the default answer applies)",
             file=sys.stderr,
         )
         return True
 
+    # The prompt goes to **stderr**, and `input()` is called bare. `input(prompt)` writes its
+    # argument to stdout, which spec §12 reserves — and redirecting stdout is an ordinary thing
+    # to do, so the question would land in the operator's log file while their terminal sat
+    # silent in front of a process that looked wedged. Verified, not assumed.
+    print(
+        "flabel: label this capture with the rules that did load? [Y/n] ", end="", file=sys.stderr
+    )
+    sys.stderr.flush()
     try:
-        answer = input("flabel: label this capture with the rules that did load? [Y/n] ")
+        answer = input()
     except EOFError:
         return True
+    except KeyboardInterrupt:
+        # Ctrl-C at a prompt is an answer, not a crash — and the likeliest one, since the prompt
+        # invites it. Letting it escape would leave a run directory with no `run.json`.
+        print("", file=sys.stderr)
+        return False
     return not answer.strip().lower().startswith("n")
 
 
@@ -456,18 +517,6 @@ def _label(args: argparse.Namespace) -> int:
                     run_info=progress.suricata,
                 )
 
-            if _shortfall(progress.suricata, manifest) and not _confirm_shortfall(
-                progress.suricata, manifest
-            ):
-                # `FlabelError` itself, not `UsageError`: declining is a deliberate stop, and
-                # spec §12 reserves exit 2 for an invocation argparse could not express. The
-                # operator invoked flabel correctly and then judged the ruleset too incomplete
-                # to label against, which is exit 1 — a run that wrote no labels.
-                raise FlabelError(
-                    "stopped at the operator's request: the ruleset was incomplete, so no "
-                    "labels were written"
-                )
-
             # The manifest handed to `correlate` must be the one Suricata ran (spec §9).
             # `run_suricata` loads a manifest and returns only the id, so this is the second
             # load — and with `--ruleset-snapshot` defaulting to "newest available", a
@@ -481,12 +530,36 @@ def _label(args: argparse.Namespace) -> int:
                     f"landed mid-run, and every label would cite rules that never ran"
                 )
 
+            # **After** the assertion above, not before it. `_shortfall` compares the engine's
+            # loaded count against *this* manifest's `total_admitted`, so if the two snapshots
+            # ever disagree the percentage put to the operator is computed from mismatched
+            # inputs — and declining would report "the ruleset was incomplete" in place of the
+            # real diagnosis. Order the cheap certainty first.
+            if _shortfall(progress.suricata, manifest) and not _confirm_shortfall(
+                progress.suricata, manifest
+            ):
+                # `FlabelError` itself, not `UsageError`: declining is a deliberate stop, and
+                # spec §12 reserves exit 2 for an invocation argparse could not express. The
+                # operator invoked flabel correctly and then judged the ruleset too incomplete
+                # to label against, which is exit 1 — a run that wrote no labels.
+                raise FlabelError(
+                    "stopped at the operator's request: the ruleset was incomplete, so no "
+                    "labels were written"
+                )
+
             progress.correlation = correlate(detections, flows, manifest, args.unmatched_threshold)
+
+            # Inside the `try`, so a failure while rendering NOTICE or serialising is reported
+            # like any other. Outside it, such a failure escaped past the handler and left the
+            # `run.json` written moments earlier standing as a record of a successful run —
+            # complete, plausible, and describing a run that did not finish.
+            return _write_output(rundir, started_at, progress, manifest)
         except FlabelError as exc:
             _absorb(progress, exc)
             return _fail(rundir, started_at, progress, exc)
-
-        return _write_output(rundir, started_at, progress, manifest)
+        except Exception as exc:  # noqa: BLE001 — deliberately broad; see `_unexpected`
+            traceback.print_exc()
+            return _fail(rundir, started_at, progress, _unexpected(exc))
 
 
 def _write_output(
@@ -613,7 +686,14 @@ def main(argv: list[str] | None = None) -> int:
         return _label(args)
     except FlabelError as exc:
         # Every deliberate failure inherits from `FlabelError`, so this one clause covers them
-        # all. Anything else is an unforeseen crash and is left to escape as a traceback rather
-        # than being flattened into an exit code that would imply flabel understood it.
+        # all.
         print(f"flabel: {exc}", file=sys.stderr)
+        return exit_code_for(exc)
+    except Exception as exc:  # noqa: BLE001 — a CLI owns its exit code
+        # An unforeseen crash still has to exit deliberately. Letting it escape gave exit 1 by
+        # accident of the interpreter rather than by decision, and `errors.exit_code_for` already
+        # says what a non-`FlabelError` means. The traceback is still printed, because a crash
+        # here is a defect and swallowing it would make it harder to fix, not less real.
+        traceback.print_exc()
+        print(f"flabel: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
         return exit_code_for(exc)
