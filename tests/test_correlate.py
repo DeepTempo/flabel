@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import struct
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
+from flabel import correlate as correlate_module
 from flabel.correlate import ICMPV4_COUNTERPART, ICMPV6_COUNTERPART, correlate
 from flabel.errors import CorrelationError, SnapshotError, exit_code_for
 from flabel.models import (
@@ -1052,3 +1054,149 @@ def test_the_ordinary_thresholds_survive_the_guard():
     """The guard must not reject real values, including the documented default and an int."""
     assert correlate([make_detection()], by_uid(make_flow()), make_manifest(), 0.01).labels
     assert correlate([make_detection()], by_uid(make_flow()), make_manifest(), 1).labels
+
+
+# --- the index against the scan it replaced ---------------------------------------------------
+#
+# #56 replaced an O(detections x flows) scan with a lookup. The scan's predicate, `_same_tuple`,
+# is deliberately kept: it is the readable definition of "this detection could be this flow",
+# and it is what the index is checked against. A performance change that alters which flows are
+# candidates is a correctness change wearing a performance change's clothes.
+
+
+def _brute_force(detection: Detection, flows: dict[str, Flow]) -> set[str]:
+    """Candidates the way the pre-#56 scan found them."""
+    return {flow.uid for flow in flows.values() if correlate_module._same_tuple(detection, flow)}
+
+
+def _indexed(detection: Detection, flows: dict[str, Flow]) -> set[str]:
+    index = correlate_module.index_flows(flows)
+    return {flow.uid for flow in correlate_module._candidates(detection, index)}
+
+
+def _population() -> dict[str, Flow]:
+    """Flows spanning every case the two implementations could disagree on.
+
+    Deliberately includes the awkward ones: both orientations of one conversation, a symmetric
+    tuple whose two keys collide, ICMP flows whose responder column holds a counterpart type and
+    others where it holds a code, and IPv6 alongside IPv4.
+    """
+    flows = [
+        make_flow(uid="C01"),
+        make_flow(uid="C02", src_ip=SERVER, src_port=80, dst_ip=CLIENT, dst_port=51234),
+        make_flow(uid="C03", src_port=51235),
+        make_flow(uid="C04", proto="udp", src_port=53, dst_port=53),
+        make_flow(uid="C05", proto="udp", src_ip=CLIENT, src_port=9, dst_ip=CLIENT, dst_port=9),
+        make_flow(uid="C06", proto="icmp", src_port=8, dst_port=0),
+        make_flow(uid="C07", proto="icmp", src_port=0, dst_port=8),
+        make_flow(uid="C08", proto="icmp", src_port=3, dst_port=1),
+        make_flow(uid="C09", proto="icmp", src_port=3, dst_port=4),
+        make_flow(
+            uid="C10",
+            proto="icmp",
+            src_ip="fd00::a1",
+            dst_ip="fd00::b2",
+            src_port=135,
+            dst_port=136,
+        ),
+        make_flow(
+            uid="C11", proto="icmp", src_ip="fd00::a1", dst_ip="fd00::b2", src_port=1, dst_port=7
+        ),
+        make_flow(uid="C12", proto="tcp", src_ip="fd00::a1", dst_ip="fd00::b2", dst_port=443),
+    ]
+    return by_uid(*flows)
+
+
+@pytest.mark.parametrize(
+    "detection",
+    [
+        pytest.param(make_detection(), id="forward"),
+        pytest.param(
+            make_detection(src_ip=SERVER, src_port=80, dst_ip=CLIENT, dst_port=51234), id="reverse"
+        ),
+        pytest.param(make_detection(src_port=51235), id="other-port"),
+        pytest.param(make_detection(dst_port=8080), id="no-match"),
+        pytest.param(make_detection(proto="udp", src_port=53, dst_port=53), id="udp"),
+        pytest.param(
+            make_detection(proto="udp", src_ip=CLIENT, src_port=9, dst_ip=CLIENT, dst_port=9),
+            id="symmetric-tuple",
+        ),
+        pytest.param(make_detection(proto="icmp", src_port=8, dst_port=0), id="icmp-echo-request"),
+        pytest.param(make_detection(proto="icmp", src_port=0, dst_port=0), id="icmp-echo-reply"),
+        pytest.param(make_detection(proto="icmp", src_port=3, dst_port=1), id="icmp-code"),
+        pytest.param(
+            make_detection(
+                proto="icmp", src_ip="fd00::a1", dst_ip="fd00::b2", src_port=135, dst_port=0
+            ),
+            id="icmpv6-neighbour-solicit",
+        ),
+        pytest.param(
+            make_detection(
+                proto="icmp", src_ip="fd00::a1", dst_ip="fd00::b2", src_port=1, dst_port=7
+            ),
+            id="icmpv6-unpaired",
+        ),
+        pytest.param(
+            make_detection(proto="tcp", src_ip="fd00::a1", dst_ip="fd00::b2", dst_port=443),
+            id="ipv6-tcp",
+        ),
+        pytest.param(make_detection(proto="icmp", src_port=200, dst_port=7), id="icmp-no-table"),
+    ],
+)
+def test_the_index_agrees_with_the_predicate_it_replaced(detection):
+    """The index must select exactly the flows the scan did — no more, and no fewer.
+
+    Selecting *more* is the dangerous direction: a detection with two candidates where it used
+    to have one stops being matched at all and becomes `ambiguous_flow_match`, so a speedup
+    would silently start losing labels.
+    """
+    flows = _population()
+
+    assert _indexed(detection, flows) == _brute_force(detection, flows)
+
+
+def test_a_flow_whose_orientations_collide_is_not_a_double_candidate():
+    """Same address and port on both sides: one flow, indexed twice, still one candidate.
+
+    Without de-duplication it would arrive as two, and two candidates go to the clock — turning
+    a flow that matches exactly into a possible `ambiguous_flow_match`.
+    """
+    flow = make_flow(proto="udp", src_ip=CLIENT, src_port=9, dst_ip=CLIENT, dst_port=9)
+    detection = make_detection(proto="udp", src_ip=CLIENT, src_port=9, dst_ip=CLIENT, dst_port=9)
+
+    index = correlate_module.index_flows(by_uid(flow))
+
+    assert [candidate.uid for candidate in correlate_module._candidates(detection, index)] == [
+        "CFlow00000000000001"
+    ]
+
+
+def test_correlation_stays_fast_at_capture_scale():
+    """The regression #56 fixed, pinned so it cannot come back unnoticed.
+
+    50,000 flows and 5,000 detections is well inside what `docs/prd.md` anticipates. Under the
+    old scan that is 2.5x10^8 tuple comparisons — tens of seconds at best. Indexed, it is
+    5,000 dict lookups.
+
+    The assertion is deliberately loose: it is a guard against reintroducing an O(n*m) scan, not
+    a benchmark, and a tight bound would be flaky on shared CI. A quadratic implementation misses
+    it by orders of magnitude, which is the only distinction that matters here.
+    """
+    flows = by_uid(
+        *(
+            make_flow(
+                uid=f"CBulk{index:014d}", src_port=1024 + index % 60000, ts_last=1_700_000_010.0
+            )
+            for index in range(50_000)
+        )
+    )
+    detections = [make_detection(sid=index, src_port=1024 + index) for index in range(5_000)]
+
+    started = time.perf_counter()
+    result = correlate(detections, flows, make_manifest(), threshold=NO_GATE)
+    elapsed = time.perf_counter() - started
+
+    assert result.detections_total == 5_000
+    assert elapsed < 5.0, (
+        f"correlation took {elapsed:.1f}s — the O(detections x flows) scan is back"
+    )
