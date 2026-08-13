@@ -492,7 +492,16 @@ def write_snapshot(root: Path, admitted: Mapping[str, list[str]],
                    admissions: Sequence[SourceAdmission]) -> SnapshotManifest
 def load_snapshot(root: Path, snapshot_id: str | None) -> tuple[Path, SnapshotManifest]
 def list_snapshots(root: Path) -> list[SnapshotManifest]
+
+def load_sid_index(directory: Path) -> dict[int, str]
+def load_address_indicators(directory: Path) -> frozenset[int] | None
 ```
+
+The two readers are as much a part of this section's contract as the writers: §8 resolves an
+alert's source through the first, and a label's `label_basis` will be refined by the second.
+`load_address_indicators` returns **`None` when the snapshot recorded no classification** —
+distinct from an empty set, which records that no rule is an address indicator. Conflating them
+would label every rule `direct` and say nothing (§2.5).
 
 - `rules.rules` is written **sorted by (source, sid)** so the id depends on content, not fetch order.
 - `load_snapshot(root, None)` returns the most recently created snapshot.
@@ -568,6 +577,17 @@ labels already emitted name that id as the ruleset that produced them.
 **`raw/` is deliberately outside the hash.** It is the as-fetched audit copy, not what the engine
 reads: hashing it would change the id — and orphan every label pointing at the old one — whenever
 upstream edited a comment header, while changing nothing about which rules match.
+
+**`snapshot_id` is a function of flabel's code as well as of the feeds.** The id is a hash over
+the directory's contents, and `sid_index.json` is one of them — so the same nine feeds fetched at
+the same instant produce **different ids under different flabel versions** whenever the index
+format or the classification changes. It has happened twice already (schema 1 → 2 → 3).
+
+This does not weaken Goal 2, and it is worth being exact about why. Reproducibility is defined
+over *a retained snapshot directory*: two runs against the same snapshot produce the same labels,
+and that is what a label citing an id needs. It is **re-derivation from the feeds** that is not
+promised — and never was, since `abuse.ch/urlhaus` and two pawpatrules companion lists refresh
+upstream daily (§6). Stated because "content-addressed" invites the stronger reading.
 
 **`manifest.json` carries a `manifest_version`.** Reading a manifest hard-fails on any key it does
 not recognise, which is the right default when a manifest is the provenance of a label. Without a

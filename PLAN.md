@@ -22,6 +22,8 @@ Step 2  models, errors, config  ── blocks everything downstream
 Step 9  cli (integration)
    │
 Step 10 canaries + reproducibility gates
+   │
+Step 11 per-rule label basis   ── post-Phase 1 (#75)
 ```
 
 **Parallel groups:** {3, 4, 5, 6} and {7, 8}. Cap at 2–3 worktrees at a time. Every other step is sequential.
@@ -38,6 +40,7 @@ Step 10 canaries + reproducibility gates
 | 8 Labels | [#22](https://github.com/DeepTempo/flabel/issues/22) | ⟂ |
 | 9 CLI | [#23](https://github.com/DeepTempo/flabel/issues/23) | |
 | 10 Canaries | [#24](https://github.com/DeepTempo/flabel/issues/24) | |
+| 11 Per-rule label basis | [#75](https://github.com/DeepTempo/flabel/issues/75) | *post-Phase 1* |
 
 **Why step 1 is first:** the testing decision is *tools real, network stubbed* — Zeek, Suricata, and `editcap` are invoked for real in tests. Until CI can run them, **nothing else is testable**, so this is a hard prerequisite rather than scaffolding to do later.
 
@@ -270,6 +273,75 @@ The canonicalizer is a shared primitive, not test-local: step 5's `reproducible_
 filter is the knowingly-incomplete stopgap it replaces.
 
 **Depends on:** 9. **Note:** the malicious canary is the one unresolved input (spec §14); if it slips, the benign canary and reproducibility gates land without it and the sensitivity test follows.
+
+---
+
+## Step 11 — Per-rule label basis (#75)
+
+**Not part of Phase 1.** Phase 1's ten steps are merged and its Definition of Done is met; this is
+remediation of a defect that only became visible once the pipeline ran against real traffic, and
+it is written here because its last step touches files three earlier steps deliberately fenced off.
+
+**The defect.** Measured 2026-08-13: 23 captures of ordinary protocol traffic against the real
+nine-feed snapshot produced **100 malicious labels, 138 source entries, every one from
+`pawpatrules`**. `source_class` classifies a *feed*, and `pawpatrules` is one feed carrying both
+direct detections and policy observations, so no per-source setting can separate them. Full
+decomposition on issue #75.
+
+| Sub-step | Change | State |
+| :-: | :-- | :-- |
+| 11a | `[admission] exclude_classtypes` in the registry, with its own exclusion counter | **merged** (#78) |
+| 11b | Address-indicator classification recorded in `sid_index.json` | **merged** (#78, corrected in #79) |
+| 11c | `build_source_entry` consumes it for `label_basis` | **not started** |
+| 11d | The benign corpus against the real ruleset, in `feeds.yml` | **not started** |
+
+### 11c — the one that needs care
+
+**Files:** `src/flabel/provenance.py`, `src/flabel/models.py`, `src/flabel/correlate.py`,
+`tests/test_provenance.py`
+
+`provenance.build_source_entry` is **the single place a `Detection` becomes provenance**. It was
+pre-placed on `main` before steps 7 and 8 started (#44) precisely so two parallel worktrees could
+not each invent their own `label_basis`, and both of those steps are written against its current
+signature. It is the most load-bearing function in the package and the one this plan is least
+willing to see changed casually.
+
+**The rule, and it composes rather than replaces:**
+
+> A `SourceEntry` is `indicator-reference` if **either** the source's `source_class` says so
+> (`ioc-name`) **or** the rule is an address indicator.
+
+Both halves are needed and neither is redundant. `abuse.ch/urlhaus` is the canonical `ioc-name`
+source and scores **0%** on the per-rule test, because a domain-name indicator is matched in
+payload content; `pawpatrules` declares itself `signature` and holds **16,064** address
+indicators. Feed-level and rule-level answers each see what the other cannot.
+
+**Test that proves it:** a `signature`-class source whose rule is an address indicator yields
+`indicator-reference`; the same source's content-matching rule yields `direct`; an `ioc-name`
+source yields `indicator-reference` regardless of shape; and an `identify` source still raises.
+
+**The hard part is not the derivation, it is the absence.** `load_address_indicators` returns
+`None` for a snapshot that recorded no classification — schema 1, or the schema 2 written by the
+definition #79 corrected. `build_source_entry` must not read that as "no rule is an indicator",
+which would emit `direct` for ~16,000 address-list rules and say nothing. Spec §2.5: absence is
+never a signal. Either the run refuses to label against an unclassified snapshot, or it records
+the fact in the run block's `warnings[]` — **decide before writing the code**, and note that the
+first option strands every snapshot built before #79.
+
+**Depends on:** 11b. **Blocks:** 11d.
+
+### 11d — the gate that closes the loop
+
+**Files:** `.github/workflows/feeds.yml`
+
+Run `tests/fixtures/benign-corpus/` against the freshly-fetched nine-feed snapshot and fail on any
+label. Deliberately **not** written before 11a-c land: the assertion depends on the policy in
+force, and a gate written against an expectation already known to be false is a gate written to
+fail. With 11a alone the corpus still produces 21 source entries — the residue #75 attributes to a
+structurally broken rule, a loose regex, and #77's directionality loss — so the expectation is
+"zero" only once those are settled too.
+
+**Depends on:** 11c, and a decision on the three residual causes in #75.
 
 ---
 
