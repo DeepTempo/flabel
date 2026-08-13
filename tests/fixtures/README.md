@@ -14,6 +14,18 @@ deliberately narrow exception for this directory only — the broad `*.pcap` / `
 | `benign.pcap` | **Synthesized** by `make_canary.py` | **Zero labels.** Any label is a false positive by construction and fails the build | ✅ gated on every scheduled feeds run |
 | `malicious.pcap` | **Sourced** — small, publicly-published, documented | **At least one label**, from a rule in an admitted source | ⏳ not yet sourced (issue #24) |
 
+### The two benign fixtures
+
+| Fixture | Role |
+| --- | --- |
+| `benign.pcap` | the **narrow** review — 14 synthetic packets, zero labels known-correct *by construction* |
+| `benign-corpus/` | the **broad** review — 17 real protocol captures (MIT, from suricata-verify) |
+
+The corpus exists because the canary, while correct, is narrow: it carries two cleartext HTTP
+flows and can only ever exercise the rules that could match them. Measured 2026-08-13 (#75), 23
+realistic captures against the real nine-feed snapshot produced 100 labels — all from
+`pawpatrules` — while `benign.pcap` produced zero and was right to. See `benign-corpus/README.md`.
+
 ### Where each canary is gated
 
 | Gate | Runs | Against |
