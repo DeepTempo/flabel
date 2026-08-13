@@ -66,14 +66,6 @@ JSON_LOGS = (CONN_JSON, SSL_JSON)
 #: spec §8 supports as partial input), legitimately produces no conn log at all.
 CONN_TSV = "conn.log"
 
-#: Logs that are not byte-identical across two runs of the same capture, and so are excluded
-#: from reproducibility comparison. `packet_filter.log` records Zeek's wall-clock start time; it
-#: carries no analytic content, and it is retained rather than deleted because deleting a log
-#: Zeek wrote would misrepresent the run.
-#:
-#: This is a filename filter, which is the wrong shape for the whole problem and is knowingly
-#: incomplete — see `reproducible_logs` and the note raised on PR #30.
-NON_REPRODUCIBLE_LOGS = frozenset({"packet_filter.log"})
 
 #: Version string used when the version probe itself is what failed.
 UNKNOWN_VERSION = "unknown"
@@ -247,22 +239,6 @@ def run_zeek(capture: Path, outdir: Path) -> tuple[dict[str, Flow], ZeekRunInfo]
         warnings=warnings,
     )
     return flows, info
-
-
-def reproducible_logs(info: ZeekRunInfo) -> tuple[str, ...]:
-    """The retained logs whose *records* two runs over one capture must produce identically.
-
-    Records, not bytes. Every Zeek TSV log carries `#open` and `#close` wall-clock header lines,
-    so no log is byte-identical across runs and a byte comparison would fail on all of them; the
-    caller must compare non-`#` lines, as `test_zeek.py` does. Naming the excluded logs by
-    filename is the wrong shape for this and is knowingly incomplete — `reporter.log` is
-    reproducible for messages raised while reading packets and *not* for messages raised during
-    startup, which carry wall-clock time even under `-D` (verified). A canonicalizer that drops
-    the wall-clock parts is the right primitive; raised on PR #30 with spec §10 pending.
-
-    `packet_filter.log` is excluded outright because it is nothing but a wall-clock stamp.
-    """
-    return tuple(name for name in info.retained_logs if name not in NON_REPRODUCIBLE_LOGS)
 
 
 # --- invocation ---------------------------------------------------------------------------

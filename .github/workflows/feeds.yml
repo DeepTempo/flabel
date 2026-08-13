@@ -1,0 +1,134 @@
+# Goal 5 against the real nine-feed ruleset — the standing false-positive review.
+#
+# WHY THIS IS NOT PART OF CI (Craig, 2026-08-12 — issue #24)
+#
+# The benign canary's whole value is that *zero labels is known-correct by construction*, and it
+# is the only review the wholesale-admitted sources get: `pawpatrules` alone contributes 21,464
+# rules through no per-rule false-positive gate. To be that review it has to run against the real
+# feeds — but the test suite may never contact a rule feed (docs/spec.md §2.2), and a real
+# snapshot is 124 MB (42 MB of `rules.rules` alone), far too large to commit.
+#
+# So it runs here, on a schedule, outside the PR path. Two alternatives were rejected and the
+# reasons matter more than the choice:
+#
+#   * Caching a CI-built snapshot for the PR path — puts a network fetch in the PR critical path,
+#     and a cache miss means either a slow fetch or a silently skipped gate. "A skipped suite
+#     looks like a passing one" is the exact failure `--require-tool-tests` exists to prevent.
+#   * Committing a reduced snapshot — a curated subset stops being the standing review for the
+#     ungated rules, which is the entire point.
+#
+# WHAT THIS BUYS BEYOND THE PR SUITE: it catches feed drift. `abuse.ch/urlhaus` and two of
+# pawpatrules' companion lists (`openphish`, `nrd_phishing_14day`) refresh upstream daily and are
+# inside the `snapshot_id` hash, so the ruleset genuinely changes underneath us between runs. A
+# rule added upstream today that fires on ordinary HTTP is exactly what this is watching for.
+#
+# WHEN IT FAILS, IT IS USUALLY THE FEED — NOT THE CANARY. The fixture is byte-pinned by
+# `test_the_benign_canary_fixture_is_the_one_the_gate_was_measured_against`. Read the label's
+# `sources[]` to find the sid and source, then decide whether the rule is wrong or the fixture
+# is. Do not "fix" this by editing the canary; that was already wrong once (#42, sid 3300303,
+# where the fixture *was* at fault and was corrected on its own merits, not to make CI green).
+name: feeds
+
+on:
+  schedule:
+    # 04:17 UTC daily. Off the hour because GitHub's scheduler is heavily contended on it, and
+    # after the abuse.ch feeds' own daily refresh so the snapshot reflects the current day.
+    - cron: "17 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  canary:
+    name: benign canary vs the live nine-feed ruleset
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      # The same digest-pinned toolchain CI uses: this gate is only meaningful against the
+      # engine the labels would really be produced by.
+      image: ghcr.io/deeptempo/flabel-toolchain@sha256:52bd9f7cf2784a6f22fcabde851387eb0cb44e20ebdd8af31dcf145ee6ac313b
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain the image ships
+        run: cat /etc/flabel-toolchain.json
+
+      - run: uv sync --locked --dev
+
+      # The one network step in the whole project (spec §2.2). Everything after it is offline.
+      - name: Fetch the nine feeds and build a real snapshot
+        run: uv run flabel rules update --rules-dir .flabel/rules
+
+      - name: Record what was admitted
+        run: uv run flabel rules list --rules-dir .flabel/rules
+
+      - name: Label the benign canary
+        run: |
+          uv run flabel --offline tests/fixtures/benign.pcap \
+            --rules-dir .flabel/rules --output-dir canary-run
+
+      - name: Goal 5 — any label is a false positive and fails the build
+        run: |
+          uv run python - <<'PY'
+          import json, pathlib, sys
+
+          runs = sorted(pathlib.Path("canary-run").iterdir())
+          if not runs:
+              sys.exit("no run directory was produced — the canary did not run")
+          rundir = runs[-1]
+
+          labels_path = rundir / "labels.json"
+          if not labels_path.exists():
+              # No labels.json means the run died (issue #23); run.json says why. That is a
+              # failure of the pipeline, not a Goal 5 result, and must not read as "zero labels".
+              run = json.loads((rundir / "run.json").read_text())
+              sys.exit(f"the run wrote no labels.json — it failed. run block: {run['run']}")
+
+          document = json.loads(labels_path.read_text())
+          run = document["run"]
+          labels = document["labels"]
+
+          print(f"snapshot   : {run['ruleset']['snapshot_id']}")
+          print(f"rules      : {run['counts']['rules_loaded']} loaded, "
+                f"{run['counts']['rules_failed']} failed, {run['counts']['rules_skipped']} skipped")
+          print(f"detections : {run['counts']['detections']}")
+          print(f"labels     : {run['counts']['labels']}")
+
+          # A ruleset that did not load proves nothing: zero labels from zero rules is not a
+          # passing canary, it is an unrun one.
+          if run["counts"]["rules_loaded"] < 1000:
+              sys.exit(
+                  f"only {run['counts']['rules_loaded']} rules loaded — far below the ~85k the "
+                  f"nine feeds admit. The canary proves nothing against a ruleset this small."
+              )
+
+          if labels:
+              for label in labels:
+                  for source in label["sources"]:
+                      print(
+                          f"FALSE POSITIVE: {source['source']} sid {source['sid']} "
+                          f"rev {source['rev']} — {source['threat']}",
+                          file=sys.stderr,
+                      )
+              sys.exit(
+                  f"{len(labels)} label(s) on the benign canary. Every wholesale-admitted source "
+                  f"passes through no per-rule gate, and this is their standing review — read "
+                  f"the sids above and decide whether the rule or the fixture is at fault. Do "
+                  f"not edit the canary to make this pass."
+              )
+
+          print("Goal 5: zero labels on the benign canary against the live ruleset")
+          PY
+
+      - name: Keep the run directory for diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-run
+          path: canary-run/
+          retention-days: 14

@@ -37,6 +37,7 @@ PURE_MODULES = (
     "labels.py",
     "provenance.py",
     "notice.py",
+    "canonical.py",
     "rules/admit.py",
 )
 

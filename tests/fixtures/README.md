@@ -11,8 +11,27 @@ deliberately narrow exception for this directory only — the broad `*.pcap` / `
 
 | Fixture | Origin | Expected result | Status |
 | --- | --- | --- | --- |
-| `benign.pcap` | **Synthesized** by `make_canary.py` | **Zero labels.** Any label is a false positive by construction and fails the build | ✅ generator landed |
-| malicious capture | **Sourced** — small, publicly-published, documented | **At least one label**, from a rule in an admitted source | ⏳ to be sourced |
+| `benign.pcap` | **Synthesized** by `make_canary.py` | **Zero labels.** Any label is a false positive by construction and fails the build | ✅ gated on every scheduled feeds run |
+| `malicious.pcap` | **Sourced** — small, publicly-published, documented | **At least one label**, from a rule in an admitted source | ⏳ not yet sourced (issue #24) |
+
+### Where each canary is gated
+
+| Gate | Runs | Against |
+| --- | --- | --- |
+| `tests/integration/test_canaries.py` | every PR | a small real snapshot built from `rules/synthetic.rules` — proves the pipeline invents no labels |
+| `.github/workflows/feeds.yml` | daily, and on demand | the **live nine-feed ruleset**, ~85k rules — the actual Goal 5 review |
+
+The PR suite cannot do the second: spec §2.2 forbids the test suite contacting rule feeds, and a
+real snapshot is 124 MB. Neither gate is sufficient alone — the scheduled one could pass forever
+against a canary someone had quietly emptied, which is why `benign.pcap` is byte-pinned by
+`test_the_benign_canary_fixture_is_the_one_the_gate_was_measured_against`.
+
+**`benign.pcap` sha256:** `7aa343087a8743a73ced055b4af2c743de8e96a1a7112e127c1d97499f522ab1`
+
+Measured against snapshot `8c9e8d58af0a8d64` (85,431 rules, all nine feeds, 2026-08-12):
+**0 detections.** If the fixture is ever regenerated, that measurement has to be retaken — the
+digest in the test is not a formality, it is what stops the gate being made to pass by editing
+the thing it measures.
 
 ### Why the benign canary is synthesized rather than sourced
 
@@ -30,7 +49,36 @@ review, and it runs on every build.
 
 Because the test needs a rule to genuinely fire. Hand-crafting traffic that trips a
 specific rule tests the rule you targeted, not the pipeline against realistic traffic.
-When it is added, record its origin, licence, and what it is expected to trigger.
+
+### What the malicious canary must satisfy
+
+Still unsourced (issue #24). `tests/integration/test_canaries.py::test_the_malicious_canary_produces_at_least_one_label`
+skips while `malicious.pcap` is absent and activates itself the moment it lands, so the gap stays
+visible in test output rather than disappearing from it.
+
+The bar it has to clear, in order of how likely each is to be the thing that blocks a candidate:
+
+1. **A licence that permits redistribution in a public repo.** This repo is public and currently
+   carries no LICENSE of its own. A capture that may be downloaded but not redistributed cannot
+   live here — that is a licence breach, not a technicality.
+2. **No real personal or customer data.** Malware captures routinely carry real victim addresses,
+   credentials in cleartext, and payloads. "Publicly published" is not the same as "safe to
+   redistribute", and this is the criterion most candidates fail.
+3. **Small.** Single-digit MB at most; it is fetched on every scheduled run.
+4. **It must fire a rule in an *admitted* source** — one of the nine in `docs/spec.md` §5, after
+   admission. A capture that only trips a rule ET Open's metadata filter excludes proves nothing
+   about this pipeline.
+5. **Documented here**: origin URL, licence, publication date, and *which* sid it is expected to
+   trigger. A canary whose expected outcome is "something, probably" cannot detect a sensitivity
+   regression — it can only detect a total outage.
+
+Point 5 is what makes the pair meaningful. Zero labels on the benign canary proves specificity
+and nothing else: a pipeline that had silently stopped labelling **anything** would pass it every
+single time. The malicious canary is the only test that would catch that.
+
+Candidate sources worth checking against points 1 and 2: Netresec's published captures, the
+Stratosphere IPS datasets, and malware-traffic-analysis.net — each has its own terms, and the
+terms are the part to read first.
 
 ## Regenerating the benign canary
 
@@ -70,3 +118,8 @@ record-for-record across three consecutive runs. See `docs/prd.md` §6.2.
 One caveat when writing golden-file tests: `packet_filter.log` carries Zeek's wall-clock
 start time and is **never** reproducible. It holds no analytic content — exclude it from
 comparison.
+
+Do not hand-roll that comparison. `flabel.canonical` is the shared primitive (step 10), and it
+knows about four things a naive `#`-stripping comparison gets wrong — `reporter.log`'s wall-clock
+`ts` column, Suricata's per-run `flow_id`, the `flow.reason` race, and eve record ordering. Each
+was measured; see that module's docstrings for the numbers.

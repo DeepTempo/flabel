@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from flabel import zeek
+from flabel import canonical, zeek
 from flabel.errors import ToolError
 from flabel.models import Flow, ZeekRunInfo
 
@@ -529,8 +529,14 @@ def test_a_broken_ja4_probe_is_distinguished_from_an_absent_package(
     assert "some other catastrophe" in recorded
 
 
-def test_reproducible_logs_excludes_the_wall_clock_log():
-    """`packet_filter.log` can never match across runs, so it is never compared."""
+def test_the_wall_clock_log_is_retained_and_never_compared():
+    """`packet_filter.log` can never match across runs, so it is never compared.
+
+    The *rule* moved to `canonical.py` in step 10 — `zeek.reproducible_logs` was a filename
+    filter, which cannot express "this file is reproducible except for one column", which is
+    what `reporter.log` turned out to need. What stays this module's job is retaining the log:
+    deleting one Zeek wrote would misrepresent the run.
+    """
     info = ZeekRunInfo(
         version="8.0.4",
         flags=("-C", "-D"),
@@ -538,8 +544,8 @@ def test_reproducible_logs_excludes_the_wall_clock_log():
         retained_logs=("conn.log", "http.log", "packet_filter.log"),
     )
 
-    assert zeek.reproducible_logs(info) == ("conn.log", "http.log")
     assert "packet_filter.log" in info.retained_logs, "it is retained, just not compared"
+    assert "zeek/packet_filter.log" in canonical.EXCLUDED_FILES
 
 
 # --- the real toolchain ---------------------------------------------------------------------
@@ -690,20 +696,22 @@ def test_packet_filter_log_is_retained_but_never_reproducible(tmp_path: Path):
     _, second = zeek.run_zeek(BENIGN, tmp_path / "two")
 
     assert "packet_filter.log" in first.retained_logs
-    assert "packet_filter.log" not in zeek.reproducible_logs(first)
 
     stamp = [(info.log_dir / "packet_filter.log").read_text() for info in (first, second)]
     assert stamp[0] != stamp[1], (
         "packet_filter.log was identical across two runs. If Zeek stopped stamping wall-clock "
-        "time, the exclusion in NON_REPRODUCIBLE_LOGS is no longer needed — check before "
+        "time, the exclusion in canonical.EXCLUDED_FILES is no longer needed — check before "
         "relaxing it."
     )
 
-    # Zeek's TSV logs carry `#open`/`#close` wall-clock header lines of their own, so the
-    # comparison is over records. Reproducibility of the *content* is what Goal 2 needs.
-    for name in zeek.reproducible_logs(first):
+    # Compared through step 10's canonicalizer rather than by re-implementing the `#`-stripping
+    # here: this test and the Goal 2 gate must agree about what "the same log" means, and two
+    # copies of that rule is how they stop agreeing.
+    for name in first.retained_logs:
+        if f"zeek/{name}" in canonical.EXCLUDED_FILES:
+            continue
         records = [
-            [line for line in (info.log_dir / name).read_text().splitlines() if line[:1] != "#"]
+            canonical.canonical_records((info.log_dir / name).read_text())
             for info in (first, second)
         ]
         assert records[0] == records[1], f"{name} is not reproducible across runs"
