@@ -62,14 +62,19 @@ worst thing this project can ship.
 
 ## Status
 
-**Build stage, 8 of 10 steps complete.** The pipeline stages are built and tested; the CLI that
-wires them together is not, so **there is no working end-to-end command yet.** `flabel --help`
-runs and everything else is a stub.
+**Build stage, 9 of 10 steps complete.** `flabel --offline <capture>` runs the whole Tier 2
+pipeline and writes a run directory. What is still missing is the CI gates that would let you
+trust it unattended: the canary and reproducibility checks of step 10.
 
 | | |
 | :-- | :-- |
-| Built | ingest, ruleset fetch/admission/snapshots, Zeek, Suricata, correlation, labels, provenance, NOTICE |
-| Not yet built | the CLI orchestration (step 9) and the canary + reproducibility gates (step 10) |
+| Built | ingest, ruleset fetch/admission/snapshots, Zeek, Suricata, correlation, labels, provenance, NOTICE, and the CLI that wires them together |
+| Not yet built | the canary and reproducibility gates (step 10) |
+
+```
+flabel rules update                    # fetch the nine sources, write a ruleset snapshot
+flabel --offline capture.pcap          # label it
+```
 
 **Phase 1 is open-source screening only** (Suricata and Zeek reading the capture file). A second
 tier — a PANW next-generation firewall seeing the traffic via replay — is designed but deferred

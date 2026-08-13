@@ -864,30 +864,40 @@ def test_a_ruleset_the_engine_rejects_is_a_tool_failure(tmp_path):
 
 
 @pytest.mark.requires_tools
-def test_a_partial_rule_load_is_a_failure_not_a_thinner_run(tmp_path):
-    """Some rules loaded, one rejected: the failure that actually happens with real feeds.
+def test_a_partial_rule_load_is_reported_and_not_fatal(tmp_path):
+    """Some rules loaded, one rejected: the loss that actually happens with real feeds.
 
     A snapshot of two rules where one uses an unknown keyword loads *one*, alerts normally, and
     exits 0 — so the run looks complete while the labels the rejected rule would have produced
     are simply absent. 26 pawpatrules rules were measured failing to load against Suricata 8, so
     this is the ordinary case, not the exotic one.
 
-    Hard failure by decision (Craig, 2026-08-12: record, warn above zero, fail above a
-    threshold). Recording now happens — `rules_failed` and `rules_skipped` are on
-    `SuricataRunInfo` — and the failure stays unconditional, because a threshold is a number of
-    labels one is willing to lose in silence and nobody has justified one. **This fails a real
-    run whose feeds contain a rule the engine rejects**, which is the intended alarm; the fix is
-    in admission, not here.
+    **This stage no longer fails the run over it** (Craig, 2026-08-12 — issue #46). It used to,
+    on the conservative reading of "record it, warn above zero, fail above a threshold". At full
+    scale the shortfall is *zero* — 85,431 admitted, 85,431 loaded — because the rules this
+    engine cannot compile are excluded at admission, so no nonzero value was ever observed and
+    any threshold would have been invented. An unconditional failure is a threshold of zero
+    chosen by default, which is the same invention with the number hidden.
+
+    So this stage reports and `cli.py` asks the operator. What must survive here is the
+    *evidence*: the engine's own counts, and a warning carrying them into the run block. The
+    detections are kept rather than discarded — they are real alerts from rules that really
+    loaded, and the operator decides whether a ruleset this incomplete is worth labelling from.
     """
     snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID, UNLOADABLE_SID]})
 
     detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
-    assert detections == [], "a partial ruleset must not produce labels that look complete"
-    assert len(info.tool_failures) == 1
-    message = info.tool_failures[0].message
-    assert "loaded 1 of the snapshot's 2 rules" in message
-    assert "1 failed" in message
+    assert info.tool_failures == (), "a shortfall is a reported loss, not a tool failure (#46)"
+    assert info.rules_loaded == 1
+    assert info.rules_failed == 1
+    assert detections, "the rules that did load still examined the capture"
+
+    # The count and the share, in one sentence, so the prompt and the run block cannot round
+    # the same fact two ways.
+    (warning,) = info.warnings
+    assert "1 of 2 rules" in warning
+    assert "50.00%" in warning
 
 
 @pytest.mark.requires_tools
@@ -899,17 +909,21 @@ def test_the_engine_really_does_reject_a_rule_that_negates_home_net(tmp_path):
     untrue — a Suricata release resolving the negation differently, a change to flabel's config —
     the exclusion would be deleting rules for no reason, and only a real invocation can say.
 
-    Asserted through the run's own failure path rather than by grepping `suricata.log`, because
-    that is the consequence that matters: one such rule in a snapshot costs *every* label in the
-    run, not one rule's worth.
+    Asserted through the engine's own load counts rather than by grepping `suricata.log`,
+    because the count is what the rest of the pipeline reads. Since #46 a shortfall no longer
+    fails the run, so the cost of *not* excluding these rules at admission is no longer "every
+    label in the run" — it is a prompt on every run against a real snapshot, which an operator
+    would learn to answer without reading. That is a weaker consequence and the same conclusion:
+    a rule the engine can never load does not belong in a snapshot.
     """
     snapshot = make_snapshot(tmp_path, {"pawpatrules": [HTTP_SID, HOME_NET_NEGATED_SID]})
 
     detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
 
-    assert detections == [], "one unloadable rule costs the whole run — hence the exclusion"
-    assert len(info.tool_failures) == 1
-    assert "loaded 1 of the snapshot's 2 rules" in info.tool_failures[0].message
+    assert info.rules_loaded == 1, "the engine refused the rule that negates a HOME_NET of any"
+    assert info.rules_failed == 1
+    assert info.warnings, "a rule that never loaded is never silent (spec §2.5)"
+    assert detections, "the loadable rule still fired"
     # And the other half: admission would never have handed this rule over in the first place.
     assert negates_home_net(RULES[HOME_NET_NEGATED_SID])
     assert not negates_home_net(RULES[HTTP_SID])
@@ -932,24 +946,43 @@ def test_a_run_whose_rule_count_cannot_be_determined_fails(tmp_path):
     assert agreed is None, "a ruleset that loaded in full is not a failure"
 
 
-def test_rejected_rules_alongside_a_reconciling_load_are_a_warning():
+def test_a_clean_load_says_nothing():
+    """Spec §9's habit: silence means nothing was lost, so a warning always means something was."""
+    assert suricata._load_warnings(3, 0, 0, 3) == ()
+
+
+def test_a_shortfall_reports_the_count_and_the_share():
+    """ "N rules failed" alone does not tell an operator whether to care (#46).
+
+    26 of 85,431 is a curiosity; 26 of 40 is a broken snapshot. The percentage is what makes the
+    count answerable, and it is composed here — not at the prompt — so the sentence the operator
+    reads is the sentence the run block records rather than two roundings of one fact.
+    """
+    (warning,) = suricata._load_warnings(85_405, 26, 0, 85_431)
+    assert "26 of 85431 rules" in warning
+    assert "0.03%" in warning
+    assert "26 failed" in warning
+
+    (small,) = suricata._load_warnings(14, 26, 0, 40)
+    assert "65.00%" in small, "the same 26 rules, and a completely different decision"
+
+
+def test_rejected_rules_alongside_a_reconciling_load_are_still_a_warning():
     """The engine says it loaded everything *and* that it rejected rules. Both cannot be whole.
 
-    `_check_ruleset_loaded` has already failed the run for any shortfall, so this is the one
-    remaining shape: loaded matches the snapshot, yet `failed` or `skipped` is non-zero. Not
-    fatal — every admitted rule is accounted for by the count that reconciles — but not silent
-    either (spec §2.5), because the run's rule coverage is then unverified.
+    A distinct shape from a shortfall: nothing is provably missing, because the count that
+    reconciles accounts for every admitted rule — but the two numbers contradict each other, so
+    the run's rule coverage is unverified rather than verified-incomplete. Not fatal, not silent
+    (spec §2.5).
 
     Tested directly because no engine produces the contradiction on demand, and the alternative
     to testing it here is not testing it.
     """
-    assert suricata._load_warnings(0, 0) == ()
-
-    (warning,) = suricata._load_warnings(2, 1)
+    (warning,) = suricata._load_warnings(3, 2, 1, 3)
     assert "2 rules failed" in warning and "1 rules skipped" in warning
     assert "unverified" in warning
 
-    assert suricata._load_warnings(0, 4) != (), "skipped alone is still a contradiction"
+    assert suricata._load_warnings(3, 0, 4, 3) != (), "skipped alone is still a contradiction"
 
 
 def test_a_failed_run_still_reports_the_config_it_attempted(tmp_path, monkeypatch):

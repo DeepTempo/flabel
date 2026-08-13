@@ -909,6 +909,34 @@ lookup rather than by reconstructing §11's rules from six scattered numbers.
 `tool_failures[]` with each failure's argv, exit code, and whether the tool was killed rather than
 exited.
 
+**`run.json` is the `labels.json` document minus `labels`** (Craig, 2026-08-13, in step 9):
+
+```json
+{
+  "schema_version": "1.0",
+  "run": { "...as above..." },
+  "unmatched_detections": [ "...UnmatchedDetection..." ]
+}
+```
+
+Settled in step 9 because §9 and this section disagreed. §9 says the `UnmatchedDetection`
+records "go in `run.json` on a failed run" and `CorrelationError` carries them for exactly that
+purpose — but the run block's key set is fixed by the literal above and asserted against it, so
+they cannot go *inside* it. They therefore sit beside it, in the same position and the same
+order they occupy in `labels.json`, rendered by the same code.
+
+The array is present on every run, not only failed ones, so the document has one shape. On the
+run where it matters most — the correlation gate firing — there is no `labels.json` to carry it,
+and `counts.unmatched` gives only the scale of the loss: `no_flow_match` is a tuple-normalisation
+fault and `ambiguous_flow_match` is port reuse, which are different bugs in different modules.
+The cost is that a successful run serialises the array twice; both come from one
+`CorrelationResult` in one call, so they cannot disagree, and `run.json` is excluded from the
+Goal 2 comparison either way.
+
+**`labels` is absent, never `[]`.** That is the same distinction the file exists to make: an
+empty array reads as "nothing malicious was found" when the pipeline died, and a consumer
+training on the output cannot tell it from a clean capture.
+
 This resolves a genuine tension between two requirements rather than working around either. §11
 requires a tool failure recorded in `tool_failures[]`; §13 forbids writing a partial `labels.json`
 on a hard failure. The array therefore belongs to a document that must not exist — so it moves to
