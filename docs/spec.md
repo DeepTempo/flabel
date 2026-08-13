@@ -809,7 +809,26 @@ lines, which is where Zeek puts every wall-clock value; what remains is the anal
 | `run.input.path` | The operator's own file path (see below). |
 | `zeek/packet_filter.log` | Nothing but a wall-clock start time, and no analytic content to compare. Retained rather than deleted — deleting a log Zeek wrote would misrepresent the run. |
 | `suricata/suricata.log` | Wall-clock timestamp *and* pid on every line. Nothing in it is analytic output. |
-| `stats` records within `suricata/eve.json` | Wall-clock counters. **Only** the `stats` records: `alert` and `flow` records are byte-stable, and they are exactly what a reproducibility gate should be comparing. Excluding the file wholesale would exclude the alerts. |
+| `stats` records within `suricata/eve.json` | Wall-clock counters. **Only** the `stats` records — excluding the file wholesale would exclude the alerts, which are exactly what a reproducibility gate should be comparing. |
+| `flow_id` on every `suricata/eve.json` record | Suricata's internal per-run key joining an alert to its flow record. flabel never reads it (§9 correlates by 5-tuple and time). |
+| `flow.reason` on `suricata/eve.json` flow records | Whether the flow manager timed a flow out before end-of-pcap or flushed it at shutdown — a race against wall-clock. |
+
+**Three corrections measured in step 10, when the gate was first built and run.** This section
+claimed `alert` and `flow` records are byte-stable and defined canonicalisation as dropping
+`#`-prefixed header lines. Both were too strong, and Goal 2 failed on all three before they were
+found. Each is now a rule in `flabel.canonical` with its measurement in the docstring.
+
+| Corrected | Measured | Why it is not analytic content |
+| :-- | :-- | :-- |
+| `reporter.log`'s `ts` column | two runs 1.4s apart wrote `1786644711.886324` and `1786644713.298930` for the same `zeek_init` message | A message raised in `zeek_init` carries **wall-clock** time even under `-D`; one raised while reading packets carries **network** time and is stable. The two are interleaved and indistinguishable from content, so the column goes and level, message and location stay. |
+| `flow_id` | the same alert on the same packet carried `1464040180` and `1271398021` | An engine-internal join key for one run. flabel correlates by 5-tuple and time and never reads it. |
+| `flow.reason` | 14 consecutive runs: 13 × `("shutdown", "shutdown")`, 1 × `("shutdown", "timeout")` | A ~7% flake rate, which is worse for a gate than a value that always differs: it passes often enough to look sound, then fails unreproducibly, and a gate that cries wolf gets switched off. |
+
+**`eve.json` records are compared as a multiset, not in file order.** Measured: the two `flow`
+records for the benign canary's two connections appear in one order in one run and the reverse in
+the next, so a positional comparison reported four fields differing when nothing had changed.
+This is the same reasoning this section already applies to `labels` and `unmatched_detections`.
+Sorting cannot hide a lost or duplicated record, because the multiset still counts.
 
 **Canonicalised, not excluded: `zeek/reporter.log`.** It is *conditionally* non-reproducible, which
 is why the filename list could not express it. A message raised in `zeek_init` carries wall-clock
