@@ -69,9 +69,58 @@ JA4_KEYWORD = "ja4.hash"
 #: looked up by name, so it varies by machine and is empty for any classtype the file omits.
 CLASSTYPE = re.compile(r"\bclasstype\s*:\s*([A-Za-z0-9._-]+)\s*;")
 
-#: Keywords that make a rule inspect the packet's *contents*. A rule with none of these decides
-#: purely from the header tuple — see `is_ioc_shaped`.
-PAYLOAD_KEYWORDS = ("content:", "pcre:", "ja3.hash", "ja4.hash", "dataset:")
+#: Rule options that carry **no detection logic**: bookkeeping, output, and flow/rate qualifiers.
+#: Everything else in Suricata's option vocabulary inspects something.
+#:
+#: An allowlist, and the inversion is the whole point. The first cut of this was a *blocklist* of
+#: payload keywords — `content`, `pcre`, `ja3.hash`, `ja4.hash`, `dataset` — and it was wrong by
+#: 588 rules, because Suricata has dozens of matching keywords that touch no payload buffer:
+#: `stamus/lateral` detects specific RPC calls with `dcerpc.iface`/`dcerpc.opnum`, and
+#: `pawpatrules` reads certificate state with `tls_cert_expired`. A blocklist of everything that
+#: inspects is unbounded and cannot be verified; a list of the handful that do not is both.
+NON_DETECTING_OPTIONS = frozenset(
+    {
+        # bookkeeping and output
+        "msg",
+        "sid",
+        "rev",
+        "gid",
+        "classtype",
+        "reference",
+        "metadata",
+        "priority",
+        "rem",
+        "target",
+        "noalert",
+        # flow and rate qualifiers: they restrict *when* a rule may fire, not *what* it matches
+        "flow",
+        "threshold",
+        "detection_filter",
+        "tag",
+    }
+)
+
+#: `flowbits` and `xbits` are deliberately **not** in the set above, because the option *name* does
+#: not determine what the option *does* — one keyword covers both a side effect and a condition:
+#:
+#:     flowbits:set,seen_c2      records a bit. Does not change what this rule matches.
+#:     flowbits:isset,seen_c2    fires ONLY IF a prior rule set it. A condition on other traffic.
+#:
+#: A rule gated on `isset` is not an address indicator: whether it fires depends on traffic
+#: elsewhere in the capture, not on the address in front of it. So the operation is read rather
+#: than the keyword.
+#:
+#: Nothing in the nine feeds uses either form on an otherwise-bare rule today. That is not a
+#: reason to allow it: "no feed does this yet" is a property of this week's data, not of the
+#: definition, and the definition is what will decide `label_basis`.
+STATEFUL_BIT_OPTIONS = frozenset({"flowbits", "xbits", "hostbits"})
+
+#: The `flowbits`/`xbits` operations that only *record* state. Everything else — `isset`,
+#: `isnotset` — is a condition on traffic this rule is not itself looking at.
+BIT_RECORDING_OPERATIONS = frozenset({"set", "unset", "toggle", "noalert"})
+
+#: The name at the head of a rule option, e.g. `content` in `content:"GET"`.
+OPTION_NAME = re.compile(r"^\s*([a-z0-9_.]+)\s*(?::|$)", re.IGNORECASE)
 
 #: A rule continued on the next physical line. Read line by line, such a rule is truncated at
 #: the backslash and what reaches the snapshot is a fragment Suricata refuses to load. See
@@ -271,31 +320,100 @@ def classtype_of(rule: str) -> str | None:
     return match.group(1) if match else None
 
 
-def is_ioc_shaped(rule: str) -> bool:
-    """Whether a rule decides purely from the header tuple, with no payload inspection.
+def rule_options(rule: str) -> list[str]:
+    """The option clauses of a rule, split on `;` outside quoted values."""
+    return _parse_options(rule)[0]
 
-    **This is the definition that separates "this flow *is* the malicious activity" from "this
-    flow touched a known-bad indicator"**, and it is applied per rule because the existing
-    `source_class` applies per feed. Measured 2026-08-13: 16,667 of 85,431 admitted rules are
-    IOC-shaped (19.5%), and **16,067 of those declare `classtype: trojan-activity`** — so the
-    declared classtype cannot be used to find them. The shape has to be read off the rule.
 
-    The test is the absence of every keyword that inspects content: `content`, `pcre`, the JA3/JA4
-    hash matches, and `dataset` lookups. What remains matches on addresses, ports, protocol and
-    flow state — which is exactly what an indicator is.
+def _parse_options(rule: str) -> tuple[list[str], bool]:
+    """The option clauses, and whether the rule parsed cleanly.
 
-    Why the distinction earns its keep: an IOC rule cannot be *wrong about the traffic*. It can
-    only be wrong about whether the indicator is still bad, which is a different failure mode with
-    a different half-life, and it is the failure mode behind the stale `127.0.0.1` rule in #75.
+    A naive `split(";")` is wrong: `content:"a;b"` and `pcre:"/x;y/"` carry semicolons inside
+    quotes, and `content:"say \\"hi\\""` carries an escaped quote. Splitting badly would invent
+    option names out of the fragments.
 
-    **First cut, and deliberately conservative.** It counts a TLS-SNI or DNS-name match as
-    IOC-shaped, which is right — a name is an indicator. It does not attempt to distinguish a
-    single-address rule from one matching a large network, and it says nothing about whether the
-    indicator is fresh. Before this drives `label_basis` (step 3 of #75) a sample of the 16,667
-    should be read by hand, because it moves the meaning of a label on a fifth of the ruleset.
+    The second element is what makes the failure safe. A rule with **unbalanced quotes** collapses
+    everything after the stray quote into one clause, and if that clause happens to begin with an
+    allowlisted name the rule reads as inspecting nothing:
+
+        alert ip any any -> 1.2.3.4 any (msg:"unterminated; content:"evil"; sid:1;)
+
+    parses as a single clause named `msg`, hiding the `content:` entirely. The parser knows this
+    happened — `quoted` is still set at the end — so it says so rather than discarding it.
     """
-    body = rule.split("(", 1)[1] if "(" in rule else ""
-    return not any(keyword in body for keyword in PAYLOAD_KEYWORDS)
+    body = rule.split("(", 1)[1].rsplit(")", 1)[0] if "(" in rule else ""
+    clauses: list[str] = []
+    buffer: list[str] = []
+    quoted = escaped = False
+    for character in body:
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == '"':
+            quoted = not quoted
+        elif character == ";" and not quoted:
+            clauses.append("".join(buffer))
+            buffer = []
+            continue
+        buffer.append(character)
+    clauses.append("".join(buffer))
+    return [clause.strip() for clause in clauses if clause.strip()], not quoted
+
+
+def is_address_indicator(rule: str) -> bool:
+    """Whether a rule fires on the **address tuple alone**, inspecting nothing else.
+
+    Measured 2026-08-13 across the nine feeds: **16,079 of 85,431 rules (18.8%)**, and **99.9% of
+    them name a literal IP address as their destination**. They look like this:
+
+        alert ip  any any -> 49.234.45.27 any    Connection to IP flagged at Cobalt Strike C2
+        alert tcp $HOME_NET any -> [162.243.103.246] 8080   Feodo Tracker: Emotet CnC
+
+    **The name matters and an earlier one was wrong.** This was called `is_ioc_shaped`, which
+    invited the reading that it identifies indicator-based rules in general. It does not, and the
+    error is instructive: `abuse.ch/urlhaus` is the canonical `ioc-name` source and scores **0%**
+    here, because a domain-name indicator is matched in payload content. What this finds is the
+    narrower thing — an address list — and "address indicator" is what it should be called.
+
+    The two classifications therefore **compose rather than compete**: `source_class` covers name
+    and URL indicators at the feed level, and this covers address indicators buried inside a
+    `signature`-class feed. `pawpatrules` holds 16,064 of them while declaring itself a signature
+    source, which is why the feed-level answer alone is not enough.
+
+    Why the distinction earns its keep: an address-list rule cannot be wrong about the traffic. It
+    can only be wrong about whether the address is still bad — a different failure mode with a
+    different half-life, and the one behind the stale `127.0.0.1` rule in #75.
+    """
+    options, well_formed = _parse_options(rule)
+    # A rule that did not parse, or that carries no options at all, is *not* classified. `all([])`
+    # is `True`, so without this the most consequential answer would be the one a parse failure
+    # falls into — and `is_address_indicator` is public, so a later caller need not have come
+    # through the snapshot writer's own validation.
+    if not well_formed or not options:
+        return False
+    return all(not _option_detects(option) for option in options)
+
+
+def _option_detects(option: str) -> bool:
+    """Whether one rule option constrains what traffic matches.
+
+    An unrecognised option counts as detecting. That is the safe direction: Suricata has hundreds
+    of matching keywords and a handful of bookkeeping ones, so an option this module has never
+    heard of is far more likely to be the former — and treating it as detecting leaves a rule
+    merely unclassified rather than claiming something false about it.
+    """
+    match = OPTION_NAME.match(option)
+    if match is None:
+        return True
+    name = match.group(1).lower()
+
+    if name in STATEFUL_BIT_OPTIONS:
+        _, _, arguments = option.partition(":")
+        operation = arguments.split(",")[0].strip().lower()
+        return operation not in BIT_RECORDING_OPERATIONS
+
+    return name not in NON_DETECTING_OPTIONS
 
 
 def negates_home_net(rule: str) -> bool:

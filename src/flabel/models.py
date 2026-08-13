@@ -165,6 +165,8 @@ class AdmissionPolicy:
     #: `classtype:` values whose rules are never admitted. A rule declaring one of these is
     #: excluded at admission rather than filtered later, so `snapshot_id` describes exactly the
     #: ruleset that ran and a label's terms cannot disagree with what produced it.
+    #: Stored casefolded, so the comparison in `excludes` cannot depend on how the registry or
+    #: the feed happened to capitalise. `config.load_admission_policy` casefolds on the way in.
     exclude_classtypes: frozenset[str] = frozenset()
 
     def excludes(self, classtype: str | None) -> bool:
@@ -173,8 +175,15 @@ class AdmissionPolicy:
         A rule with no `classtype:` is never excluded by this policy. 10,949 of 85,431 admitted
         rules declare none, so treating absence as a match would silently drop 12.8% of the
         ruleset on a policy that never named it.
+
+        **Compared case-insensitively.** `admit.CLASSTYPE` reads `[A-Za-z0-9._-]+` from the rule
+        while `config.CLASSTYPE_NAME` forbids uppercase in the registry, so a feed shipping
+        `classtype:Policy-Violation;` could never be excluded *and* the operator could not write a
+        policy that matched it — the registry would load, the setting would read as in force, and
+        the rules would keep labelling. `_metadata_verdict` casefolds for exactly this reason and
+        says so: a capitalisation change upstream must not silently change what a run admits.
         """
-        return classtype is not None and classtype in self.exclude_classtypes
+        return classtype is not None and classtype.casefold() in self.exclude_classtypes
 
 
 # --- ruleset snapshot ---------------------------------------------------------------------

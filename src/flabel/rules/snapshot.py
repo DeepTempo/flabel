@@ -49,7 +49,7 @@ from flabel import models
 from flabel.errors import SnapshotError
 from flabel.models import SnapshotManifest, SourceAdmission
 from flabel.rules import utc_now
-from flabel.rules.admit import is_ioc_shaped
+from flabel.rules.admit import is_address_indicator
 
 MANIFEST_NAME = "manifest.json"
 RULES_NAME = "rules.rules"
@@ -66,12 +66,23 @@ RAW_DIR = "raw"
 MANIFEST_VERSION = 1
 
 #: Schema of `sid_index.json`, versioned separately: step 6 reads that file and nothing else.
-#: Bumped to 2 in #75, when `ioc_shaped` was added. A schema-1 index is still readable: it simply
-#: recorded no shape, so `load_ioc_shaped` returns an empty set for it and a label from that
-#: snapshot keeps the per-source `label_basis` it always had. That graceful path is the entire
-#: reason this file carries a version separate from the manifest's (spec §7).
-SID_INDEX_SCHEMA = 2
-SID_INDEX_SCHEMA_WITHOUT_SHAPE = 1
+#: 3 since the address-indicator correction. The history is worth keeping visible:
+#:
+#: * **1** — sources only.
+#: * **2** — added `ioc_shaped`, computed by a *blocklist* of payload keywords. Measured wrong by
+#:   588 rules: it counted `stamus/lateral`'s `dcerpc.iface` detections and `pawpatrules`'
+#:   `tls_cert_expired` as indicators, because neither uses `content`.
+#: * **3** — `address_indicator`, computed by an allowlist of non-detecting options.
+#:
+#: **Schemas 1 and 2 both read as "no classification recorded".** For 1 that is literally true.
+#: For 2 it is a judgement: the data is there but was computed by a definition since measured to
+#: be wrong, and trusting it would put a known-bad classification behind a label's `label_basis`.
+#: Re-run `flabel rules update` to get a schema-3 index. This graceful path is the entire reason
+#: the file carries a version separate from the manifest's (spec §7).
+SID_INDEX_SCHEMA = 3
+READABLE_SID_INDEX_SCHEMAS = (1, 2, 3)
+#: Schemas whose classification is trusted. See above for why 2 is not among them.
+CLASSIFIED_SID_INDEX_SCHEMAS = (3,)
 
 #: Both re-exported from `models`, which owns the shape of a snapshot id so that this module
 #: (which resolves an id to a directory) and `provenance.py` (which refuses to write an
@@ -137,7 +148,8 @@ def render_rules(admitted: Mapping[str, Sequence[str]]) -> bytes:
 
 
 def render_sid_index(admitted: Mapping[str, Sequence[str]]) -> bytes:
-    """The exact bytes of `sid_index.json`: `{"schema": 1, "sources": {name: [sid, ...]}}`.
+    """The exact bytes of `sid_index.json`:
+    `{"schema": 3, "sources": {name: [sid, ...]}, "address_indicator": [sid, ...]}`.
 
     This is how step 6 resolves an alert's sid back to the source that admitted it, since
     `eve.json` does not carry the source. Three conditions are hard failures, because each makes
@@ -190,13 +202,17 @@ def render_sid_index(admitted: Mapping[str, Sequence[str]]) -> bytes:
     # leaving `rules.rules` untouched. Recorded in `manifest.json` it would sit outside the hash
     # (issue #48), and two snapshots sharing an id could then produce labels with different
     # bases, which is precisely the guarantee the id exists to give.
-    ioc_shaped = sorted(
+    address_indicator = sorted(
         sid
         for source in sorted(admitted)
         for rule in admitted[source]
-        if (sid := _sid_or_none(rule)) is not None and is_ioc_shaped(rule)
+        if (sid := _sid_or_none(rule)) is not None and is_address_indicator(rule)
     )
-    document = {"schema": SID_INDEX_SCHEMA, "sources": index, "ioc_shaped": ioc_shaped}
+    document = {
+        "schema": SID_INDEX_SCHEMA,
+        "sources": index,
+        "address_indicator": address_indicator,
+    }
     return (json.dumps(document, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode(
         "utf-8"
     )
@@ -355,10 +371,10 @@ def load_sid_index(directory: Path) -> dict[int, str]:
         raise SnapshotError(f"{path} is not valid JSON: {exc}") from exc
 
     schema = document.get("schema") if isinstance(document, dict) else None
-    if schema not in (SID_INDEX_SCHEMA, SID_INDEX_SCHEMA_WITHOUT_SHAPE):
+    if schema not in READABLE_SID_INDEX_SCHEMAS:
         raise SnapshotError(
-            f"{path} is not a readable sid index: expected schema "
-            f"{SID_INDEX_SCHEMA_WITHOUT_SHAPE} or {SID_INDEX_SCHEMA}, found {schema!r}"
+            f"{path} is not a readable sid index: expected schema one of "
+            f"{list(READABLE_SID_INDEX_SCHEMAS)}, found {schema!r}"
         )
     sources = document.get("sources")
     if not isinstance(sources, dict):
@@ -380,18 +396,25 @@ def load_sid_index(directory: Path) -> dict[int, str]:
     return index
 
 
-def load_ioc_shaped(directory: Path) -> frozenset[int]:
-    """The sids in a snapshot whose rules decide purely from the header tuple (#75).
+def load_address_indicators(directory: Path) -> frozenset[int] | None:
+    """The sids in a snapshot whose rules fire on the address tuple alone (#75).
 
-    An IOC-shaped rule establishes that a flow *touched a known-bad indicator*, not that the flow
+    An address-list rule establishes that a flow *reached a known-bad address*, not that the flow
     *is* the malicious activity — the difference `label_basis` already names as
-    `indicator-reference` versus `direct`. Today that distinction is drawn per **source**, so the
-    16,067 IOC-shaped rules measured inside `et/open` — a `signature`-class feed — all label
-    `direct`. This is what lets it be drawn per rule instead.
+    `indicator-reference` versus `direct`. Today that is decided per **source**, so the 16,064
+    address-list rules measured inside `pawpatrules` — a `signature`-class feed — all label
+    `direct`. This is what lets it be decided per rule as well.
 
-    **A schema-1 snapshot returns an empty set, and that is correct rather than a fallback.** It
-    recorded no shape, so nothing about it is known; claiming otherwise would invent provenance
-    for labels already emitted. Those snapshots keep the per-source basis they were written with.
+    **`None` means the snapshot recorded no classification; an empty set means it recorded that
+    no rule is an address indicator.** Those are different facts and must not share an answer: a
+    caller handed `frozenset()` for a schema-2 snapshot would label ~16,000 address-list rules
+    `direct` — the exact defect #75 exists to fix — with nothing anywhere saying so. `None` forces
+    the decision to be taken rather than defaulted (spec §2.5: absence is never a signal).
+
+    Schema 1 recorded no classification at all; schema 2 recorded one computed by a definition
+    since measured wrong, and reading it would put a known-bad answer behind a label's basis. Both
+    stay readable for sid->source attribution, so no label already traced to such a snapshot is
+    stranded. The remedy is a re-run of `flabel rules update`, not a fallback.
     """
     path = Path(directory) / SID_INDEX_NAME
     try:
@@ -401,14 +424,26 @@ def load_ioc_shaped(directory: Path) -> frozenset[int]:
     except (OSError, json.JSONDecodeError) as exc:
         raise SnapshotError(f"could not read {path}: {exc}") from exc
 
-    shaped = document.get("ioc_shaped", [])
-    if not isinstance(shaped, list):
-        raise SnapshotError(f"{path}: `ioc_shaped` is not a list")
-    for sid in shaped:
+    if not isinstance(document, dict):
+        raise SnapshotError(f"{path} is not a JSON object")
+    if document.get("schema") not in CLASSIFIED_SID_INDEX_SCHEMAS:
+        return None
+
+    # Schema 3 always writes this key, so its absence means the file was truncated or hand-edited
+    # — which must not read as "no rule is an indicator".
+    if "address_indicator" not in document:
+        raise SnapshotError(
+            f"{path} declares schema {document.get('schema')} but has no `address_indicator` "
+            f"key. A schema-3 index always writes it, so this file is incomplete."
+        )
+    sids = document["address_indicator"]
+    if not isinstance(sids, list):
+        raise SnapshotError(f"{path}: `address_indicator` is not a list")
+    for sid in sids:
         # `bool` is an `int` in Python, and `true` in JSON must not become sid 1.
         if not isinstance(sid, int) or isinstance(sid, bool):
-            raise SnapshotError(f"{path}: {sid!r} in `ioc_shaped` is not an integer sid")
-    return frozenset(shaped)
+            raise SnapshotError(f"{path}: {sid!r} in `address_indicator` is not an integer sid")
+    return frozenset(sids)
 
 
 def list_snapshots(root: Path) -> list[SnapshotManifest]:
