@@ -1208,6 +1208,8 @@ flabel rules list  [--rules-dir <d>]
 | Code | Meaning |
 | :-: | :-- |
 | 0 | Success. Labels written. Covers both complete and partial input — `run.input.input_status` distinguishes them. **Partial means partial *data*, not zero data**: a capture with no readable packets is a `CaptureError` (issue #85), because `input_status: partial` on a file with nothing in it asserts a coverage figure over an empty set. |
+
+**A rejected capture leaves no run directory, and that is deliberate** (Craig, 2026-08-14). Issue #23 argued that a script must not have to parse a log to learn that the artifact beside it is not a result — but that argument is about a run which *started* and then died, where `run.json` records what was lost. A capture flabel cannot read never starts a run: §8 step 4 has made an unreadable header a `CaptureError` with no output since step 3, and step 9's zero-packet case is the same category, not a new one. The exit code and the stderr message are the contract every `CaptureError` has. A batch caller distinguishes "this capture was rejected" from "flabel died mid-run" by whether a run directory exists at all, which is the same signal §13 already relies on.
 | 1 | Failure. **No `labels.json`** — but the run directory exists and holds `run.json` with `tool_failures[]` (§10), unless the failure occurred before a run directory could be created (a missing snapshot, an unreadable capture). |
 | 2 | Usage error (argparse). |
 | 3 | Not implemented — the Phase 1 default path only. |
