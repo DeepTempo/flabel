@@ -174,7 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=unmatched_threshold,
         default=DEFAULT_THRESHOLD,
         metavar="FLOAT",
-        help=f"fail above this share of unplaced detections (default: {DEFAULT_THRESHOLD})",
+        help=(
+            f"fail above this share of unplaced *correlatable* detections "
+            f"(default: {DEFAULT_THRESHOLD}). Detections on a transport Zeek cannot name are "
+            f"reported but not counted here — see counts.unmatched_unsupported_transport"
+        ),
     )
     parser.add_argument("--version", action="version", version=f"flabel {__version__}")
     return parser

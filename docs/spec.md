@@ -724,7 +724,7 @@ inside the hashed snapshot, and it is what the feed actually asserted. A rule wi
 yields `None`, which is ordinary: 10,949 of 85,545 admitted rules declare none.
 
 **Tuple normalisation — Suricata's 5-tuple is translated into Zeek's spelling.** §9 correlates by
-comparing the two tools' tuples field by field, and they disagree on three things. Every rule here
+comparing the two tools' tuples field by field, and they disagree on four things. Every rule here
 was measured against real Zeek output, not inferred:
 
 | Disagreement | Normalisation | Why |
@@ -733,6 +733,7 @@ was measured against real Zeek output, not inferred:
 | ICMP ports | mirror `icmp_type`/`icmp_code` into the port columns | Suricata omits ports for ICMP; Zeek writes the ICMP type in `id.orig_p` and, in `id.resp_p`, either a counterpart type or — for most types — the code (see the residual below). Recording `(0, 0)` would make every ICMP detection unmatchable, and ET Open ships plenty of ICMP rules — 3 such alerts in 150 detections is enough to trip §9's 1% gate and fail a good run, with the run block blaming correlation. |
 | `IPv6-ICMP` | maps to `icmp` | Zeek's `transport_proto` holds only tcp/udp/icmp/unknown_transport, so it writes `icmp` for ICMPv6 too. Lowercasing alone would leave `ipv6-icmp` against `icmp`. The IP version is still readable from the addresses, so nothing is lost. |
 | IPv6 address form | canonicalise (compressed) | Suricata expands (`fd00:0000:...:00a1`), Zeek compresses (`fd00::a1`). Correlation compares strings, so without this every IPv6 detection is uncorrelatable. |
+| Anything not TCP/UDP/ICMP | **none — not normalisable** | Zeek writes `unknown_transport` and zeroes both port columns; Suricata reports the real protocol, and for SCTP the real ports. There is no spelling that makes these tuples equal, so §9 step 0 reports the detection as `unsupported_transport` instead of translating it (issue #84). |
 
 **Residual, owned by step 7 — and wider than this section first said.** A single alert record
 carries only its own packet's type and code, so mirroring produces `(type, code)`. Zeek writes the
@@ -848,6 +849,7 @@ function to the left. Correlation's own job remains attaching detections to flow
 
 Pure. For each detection:
 
+0. **The protocol is one Zeek can name** — `tcp`, `udp` or `icmp`, compared case-insensitively — or the detection is `UnmatchedDetection(reason="unsupported_transport")` and no candidate is looked up. Zeek's `transport_proto` has no other values and it zeroes the port columns for anything else, so there is no tuple to compare; ESP and SCTP arrive here in full; for GRE only the alerts Suricata attributes to the tunnel do, since Zeek decapsulates it and the inner TCP conversation correlates normally. **Two such conversations between one host pair are written with identical 5-tuples** (`10.0.0.5 0 10.0.0.200 0 unknown_transport`, measured with different `uid`s), which is why this reports rather than falling through to a lookup that could only guess between them. Zeek *does* record the difference, in `conn.log`'s `ip_proto` column — 50 for ESP, 132 for SCTP — but `Flow` does not carry it, so the limit is flabel's rather than Zeek's and correlating these properly is issue #96. Excluded from the gate's denominator — see §10's note on `unmatched_ratio`. The case-insensitivity is confined to *this* test: an un-normalised `TCP` is a step 6 regression, not an unsupported transport, and must stay inside the gate as `no_flow_match`.
 1. Candidate flows are those matching the 5-tuple in either direction.
 2. **Zero candidates** → `UnmatchedDetection(reason="no_flow_match")`.
 3. **One candidate** → matched.
@@ -855,7 +857,9 @@ Pure. For each detection:
 
 Then consolidate: one `Label` per flow, `sources` sorted, `best_tier = min(tier)`.
 
-**Gate:** zero unmatched is silent; any unmatched warns; unmatched / total detections above `threshold` (default `0.01`) fails the run. Phase 2 configures its own, looser threshold rather than relaxing this default.
+**Gate:** zero unmatched is silent; any unmatched warns; **correlatable** unmatched over **correlatable** detections above `threshold` (default `0.01`) fails the run. Phase 2 configures its own, looser threshold rather than relaxing this default.
+
+Correlatable excludes the step 0 detections, on both sides of the ratio (issue #84) — they were never going to be placed, so counting them would fail a run on ordinary IPsec traffic, and counting enough of them would drag a genuine tuple-normalisation defect below the threshold. An **empty** protocol is deliberately *not* excluded: that is a parse failure rather than a protocol Zeek cannot name, and nothing licenses tolerating a loss that was never measured. §10 publishes the ratio and the excluded count separately.
 
 **Failing raises `CorrelationError`, carrying the `CorrelationResult`.** The gate fires *because*
 detections went unplaced, so the `UnmatchedDetection` records — each with the reason it could not
@@ -983,7 +987,8 @@ or normalise**: the same capture labelled from two directories would otherwise d
             "ja4_status": "present|not-installed|probe-failed" | None,
             "suricata_config_sha256": str},
   "counts": {"flows": int, "detections": int, "labels": int,
-             "unmatched": int, "unmatched_ratio": float,
+             "unmatched": int, "unmatched_unsupported_transport": int,
+             "unmatched_ratio": float,
              "identify_alerts_suppressed": int,
              "rules_loaded": int, "rules_failed": int, "rules_skipped": int},
   "loss_conditions": {...},               # §11
@@ -1048,7 +1053,18 @@ order they occupy in `labels.json`, rendered by the same code.
 The array is present on every run, not only failed ones, so the document has one shape. On the
 run where it matters most — the correlation gate firing — there is no `labels.json` to carry it,
 and `counts.unmatched` gives only the scale of the loss: `no_flow_match` is a tuple-normalisation
-fault and `ambiguous_flow_match` is port reuse, which are different bugs in different modules.
+fault, `ambiguous_flow_match` is port reuse, and `unsupported_transport` is not a bug at all —
+they are different causes in different modules.
+
+**`unmatched_ratio` is the number the gate acted on, and it is not `unmatched / detections`**
+(issue #84). Detections on a protocol Zeek cannot express are excluded from *both* sides of it:
+they were never going to correlate, so counting them would fail a run on ordinary IPsec traffic,
+and counting enough of them would drag a genuine tuple-normalisation defect below the threshold
+and silence the gate. `counts.unmatched` still counts every unmatched detection and
+`counts.unmatched_unsupported_transport` says how many of them were of this kind, so the
+descriptive share stays recoverable — but a consumer recomputing `unmatched / detections` will
+not reproduce `unmatched_ratio` whenever that count is non-zero. Zero correlatable detections
+yields `0.0`.
 
 **`unmatched_detections` is `null` when correlation never ran, and `[]` when it ran and placed
 everything.** The key is always present — that is what "one shape" means — but its *value*
@@ -1111,6 +1127,7 @@ Each has a field and exactly one fault-injection test. This closed list is what 
 | Multi-datalink discard | `input.discarded_link_types`, `discarded_packets` | fixture with two link types |
 | Detection uncorrelatable | `counts.unmatched`, `unmatched_detections[]` | detection with a tuple absent from `conn.log` |
 | Ambiguous flow match | `unmatched_detections[].reason` | two flows, same tuple, detection outside both windows |
+| Unsupported transport | `counts.unmatched_unsupported_transport` | capture carrying ESP, SCTP or GRE with an `alert ip` rule loaded |
 | Tool non-zero exit / OOM | `tool_failures[]` | point at a non-existent binary |
 | Snapshot missing | hard failure, exit 1 | `--ruleset-snapshot nonexistent` |
 | `identify` alert suppressed | `counts.identify_alerts_suppressed` | rule from an `identify` source that fires |
@@ -1119,6 +1136,12 @@ Each has a field and exactly one fault-injection test. This closed list is what 
 
 **Two rows added in steps 5 and 6.** Both are losses the tools report and then exit 0 over, which
 is the shape §2.5 exists to catch.
+
+**A third added in step 12 (issue #84).** `unsupported_transport` needs its own row precisely
+because it is *excluded from the gate*: `detection_uncorrelatable` reports `no_flow_match`, so
+without this row a run that discarded every detection in an IPsec capture would report a clean
+`loss_conditions` block with every flag false. A loss that is deliberately not failed is still a
+loss, and §2.5 does not make an exception for the ones we decided to tolerate.
 
 **Rules failed or skipped at load: record always, warn on any shortfall, and let the operator
 decide** (Craig, 2026-08-12 — issue #46). Suricata loads what it can and exits 0, so a snapshot of
@@ -1200,6 +1223,15 @@ flabel **must never**:
 - report full coverage when any loss condition fired;
 - contact the PANW device (Phase 1 has no Tier 1 code path beyond the stub);
 - commit, transmit, or copy capture data anywhere outside the run directory.
+
+**And a consumer must never read an empty `labels[]` as "nothing malicious was found."** Since
+step 12 (issue #84) a run can succeed while structurally withholding a detection that *did*
+fire: an all-IPsec capture tripping a C2 rule exits 0 with `labels[]` empty, because the
+detection could not be attached to a flow and this project does not guess. The evidence is in
+`unmatched_detections[]` and `loss_conditions.unsupported_transport`, and nothing forces a
+consumer to look. This is the first case where zero labels is not the same claim as zero
+findings, and it is a property of the output rather than a rule flabel can enforce — which is
+why it is written here, next to the things that must never happen, rather than left implicit.
 
 ---
 

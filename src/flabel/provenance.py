@@ -538,6 +538,12 @@ def _counts_section(
         "detections": correlation.detections_total if correlation else None,
         "labels": len(correlation.labels) if correlation else None,
         "unmatched": len(correlation.unmatched) if correlation else None,
+        # Of those, the ones on a protocol Zeek cannot express (issue #84). Published so the
+        # descriptive share stays recoverable: `unmatched_ratio` below is the gate's number and
+        # excludes these, so `unmatched / detections` no longer reproduces it.
+        "unmatched_unsupported_transport": (
+            correlation.unsupported_transport_total if correlation else None
+        ),
         # The model's own derivation, not a second division that can round differently.
         "unmatched_ratio": correlation.unmatched_ratio if correlation else None,
         "identify_alerts_suppressed": suricata.identify_alerts_suppressed if suricata else None,
@@ -581,7 +587,7 @@ def _loss_conditions(
     # reached by a refactor. `_JA4_STATUS_VALUES` above uses `get_args` for the same reason;
     # this asserts the names still exist rather than trusting two spellings to stay in step.
     known_reasons = set(get_args(UnmatchedReason))
-    assert {"no_flow_match", "ambiguous_flow_match"} <= known_reasons, (
+    assert {"no_flow_match", "ambiguous_flow_match", "unsupported_transport"} <= known_reasons, (
         f"UnmatchedReason changed to {sorted(known_reasons)}; the loss_conditions rows below "
         f"name reasons that no longer exist and would silently report no loss"
     )
@@ -593,6 +599,12 @@ def _loss_conditions(
         ),
         "ambiguous_flow_match": (
             None if unmatched_reasons is None else "ambiguous_flow_match" in unmatched_reasons
+        ),
+        # Its own row because it is the one loss the gate deliberately does not fail (#84).
+        # `detection_uncorrelatable` reports `no_flow_match` only, so without this an IPsec
+        # capture whose every detection was discarded would report a clean block of falses.
+        "unsupported_transport": (
+            None if unmatched_reasons is None else "unsupported_transport" in unmatched_reasons
         ),
         # Known on every run: the caller passes what it caught, and no stage having failed is
         # itself an observation rather than an absence.
