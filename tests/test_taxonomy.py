@@ -554,3 +554,41 @@ def test_a_schema_3_index_missing_the_key_is_a_hard_failure(tmp_path: Path):
 
     with pytest.raises(SnapshotError, match="address_indicator"):
         load_address_indicators(directory)
+
+
+def test_a_port_only_rule_is_classified_and_the_definition_says_why():
+    """Issue #93: the classifier reads the whole header tuple, not only the addresses.
+
+    The field is named `address_indicator` and 16,074 of the 16,075 rules in the live snapshot do
+    name a literal address — but one constrains only a destination port range. Measured, not
+    assumed; it is sid 3500023, THL's Hysteria v2 operator-port rule.
+
+    Craig's call (2026-08-14) was to keep the behaviour and fix the documentation, because
+    narrowing the definition to require an address would send that rule to `label_basis: direct`
+    — asserting that traffic to a port range *is* the cryptojacker, which is the overclaim #75
+    exists to remove. This pins the behaviour so the name cannot later be read as the spec.
+    """
+    port_only = (
+        "alert udp $HOME_NET any -> any 14433:14444 "
+        '(msg:"THL GHOST operator ports"; '
+        "threshold:type threshold,track by_src,count 5,seconds 60; "
+        "classtype:trojan-activity; sid:3500023; rev:1;)"
+    )
+
+    assert is_address_indicator(port_only), (
+        "a rule deciding from the header tuple alone is an indicator whichever field it uses"
+    )
+
+
+def test_a_rule_that_inspects_payload_is_not_an_indicator_however_narrow_its_header():
+    """The other half of the same boundary: a literal address does not make a rule an indicator.
+
+    Guarded because #93's fix was documentation rather than code, and a reader who takes the field
+    name literally might later "correct" the classifier toward the addresses.
+    """
+    content_rule = (
+        'alert tcp any any -> 1.2.3.4 443 (msg:"named address but inspects payload"; '
+        'content:"evil"; classtype:trojan-activity; sid:9100001; rev:1;)'
+    )
+
+    assert not is_address_indicator(content_rule)
