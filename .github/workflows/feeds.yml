@@ -81,7 +81,9 @@ jobs:
             --rules-dir .flabel/rules --output-dir canary-run
 
       - name: Goal 5 — any label is a false positive and fails the build
+        id: canary
         run: |
+          set -euo pipefail
           uv run python - <<'PY'
           import json, pathlib, sys
 
@@ -156,24 +158,82 @@ jobs:
           print("Goal 5: zero labels on the benign canary against the live ruleset")
           PY
 
+      # --- the broad review (PLAN step 11d, issue #75) ----------------------------------------
+      #
+      # The canary above is 14 synthetic packets carrying two cleartext HTTP flows, so it can only
+      # ever exercise the rules that could match those. That narrowness is what let #75 hide: 23
+      # captures of ORDINARY protocol traffic produced 100 malicious labels against the same
+      # ruleset the canary called clean, every one of them from pawpatrules.
+      #
+      # This runs the committed corpus — 17 real protocol captures, MIT, from suricata-verify —
+      # and fails on any source entry that is not already known and argued for in
+      # tests/fixtures/benign-corpus/tolerated.json.
+      - name: Label the benign corpus
+        id: corpus_label
+        run: |
+          # Explicit rather than inherited: Actions defaults to `bash -e` on Linux, so a failing
+          # capture already aborts the loop — but the abort is load-bearing (it is what stops the
+          # gate reviewing a partial corpus) and a default that changes underneath is not a
+          # contract. `pipefail` matters because the loop body may grow a pipe.
+          set -euo pipefail
+          for capture in tests/fixtures/benign-corpus/*.pcap*; do
+            echo "--- $capture"
+            uv run flabel --offline "$capture" \
+              --rules-dir .flabel/rules --output-dir corpus-runs
+          done
+
+      # The decision lives in `tests/integration/corpus_gate.py`, not in this heredoc, and
+      # `tests/integration/test_corpus_gate.py` proves it FAILS on a new offender. A gate whose
+      # logic exists only inside a scheduled workflow is one nothing can prove is able to fail —
+      # which is how the Goal 2 gate came to be hollowed out with CI green (#74), and how three of
+      # step 13's fixes shipped with tests that passed against the unfixed code (#98).
+      - name: Goal 5 broad — a new false positive on ordinary traffic fails the build
+        id: corpus
+        run: uv run python tests/integration/corpus_gate.py corpus-runs
+
       # A daily gate can be red for weeks with nothing but a badge to say so, and this one is
       # the only false-positive review the 21,464 ungated pawpatrules rules get. Failure files
       # an issue so it reaches a person.
-      - name: File an issue if the canary failed
+      - name: File an issue if either review failed
         if: failure()
         uses: actions/github-script@v7
+        env:
+          # Which review failed, so the issue body names the right cause and the right file. A
+          # step that did not run reports no outcome, so the fallbacks order themselves.
+          FAILED_STEP: >-
+            ${{ steps.corpus.outcome == 'failure' && 'corpus'
+              || steps.canary.outcome == 'failure' && 'canary'
+              || 'pipeline' }}
         with:
           script: |
-            const title = "Goal 5: the benign canary produced labels against the live ruleset";
+            // Which step failed decides the diagnosis, and getting it wrong is worse than
+            // saying nothing: before this, a corpus false positive or a mid-run pipeline error
+            // filed an issue telling the operator not to edit benign.pcap — wrong file, wrong
+            // instruction, for a failure that had nothing to do with the canary.
+            const failed = process.env.FAILED_STEP || "unknown";
+            const title = "Goal 5: the scheduled false-positive review failed";
             const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
                         `/actions/runs/${context.runId}`;
+            const diagnosis = {
+              canary:
+                "An admitted rule fires on the NARROW canary — 14 synthetic packets that are " +
+                "benign by construction, so any label is a false positive. Do not resolve this " +
+                "by editing `tests/fixtures/benign.pcap`: it is byte-pinned for that reason.",
+              corpus:
+                "An admitted rule fires on ordinary protocol traffic that " +
+                "`tests/fixtures/benign-corpus/tolerated.json` does not account for. This is " +
+                "issue #75 recurring. The step log names the capture, source and sid. If the " +
+                "label is fair, add it to that file WITH A REASON — do not delete a capture.",
+              pipeline:
+                "The run did not complete, so neither review reached its verdict. This is a " +
+                "pipeline or ruleset failure rather than a false positive — read the failing " +
+                "step's log before reading anything into the labels.",
+            }[failed] || "The scheduled run failed before either review reported.";
             const body =
               `The scheduled feeds run failed: ${url}\n\n` +
-              `Either an admitted rule now fires on traffic that is benign by construction, or ` +
-              `the ruleset did not load as expected. The run directory is attached to that run ` +
-              `as an artifact; \`labels.json\` names the source and sid.\n\n` +
-              `Do not resolve this by editing \`tests/fixtures/benign.pcap\` — it is byte-pinned ` +
-              `for that reason. See \`tests/fixtures/README.md\`.`;
+              `**Failing step: ${failed}.** ${diagnosis}\n\n` +
+              `Both run directories are attached to that run as an artifact; \`labels.json\` ` +
+              `names the source and sid, and \`run.json\` says what the run lost.`;
             const existing = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
               state: "open", labels: "goal-5",
@@ -190,10 +250,14 @@ jobs:
               });
             }
 
-      - name: Keep the run directory for diagnosis
+      # Both reviews' output, because a failure names sids and the next question is always
+      # "which flow, in which capture" — which only the run directory answers.
+      - name: Keep the run directories for diagnosis
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: canary-run
-          path: canary-run/
+          name: feeds-runs
+          path: |
+            canary-run/
+            corpus-runs/
           retention-days: 14
