@@ -109,6 +109,18 @@ and a `run` block recording the input, the ruleset, the tool versions and every 
 and it cannot be misread: an empty `labels` array would say "nothing malicious was found" when in
 fact the pipeline died.
 
+**An empty `labels` array is not the same claim as "nothing was found."** A run can succeed while
+withholding a detection that did fire. The case today is a capture whose traffic uses a transport
+Zeek cannot name — ESP, SCTP, or the outer layer of a GRE tunnel: Suricata may alert on it, but
+there is no flow to attach the alert to, and flabel does not guess. Those detections are reported
+in `unmatched_detections[]` and counted in `counts.unmatched_unsupported_transport`, with
+`loss_conditions.unsupported_transport` set.
+
+So a consumer building training data should read `loss_conditions` before treating `labels` as
+complete. An all-IPsec capture that tripped a C2 rule exits 0 with no labels — correctly, because
+the flow identity a label needs does not exist — but a pipeline that reads only `labels` cannot
+tell that from a quiet capture.
+
 ## Develop
 
 Requires [uv](https://docs.astral.sh/uv/) and the Zeek/Suricata/Wireshark toolchain — the tests

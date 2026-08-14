@@ -548,6 +548,23 @@ class CorrelationResult:
     flows_total: int
     detections_total: int
 
+    def __post_init__(self) -> None:
+        """The counts and the records they summarise have to agree (issue #84's review).
+
+        `Label` and `SnapshotManifest` both enforce this class of agreement already, on the
+        argument that two fields which can disagree are a flaw in an artifact whose whole value
+        is provenance. The step 12 derivations were the first pair exempt, and the exemption was
+        reachable: `detections_total=0` with two unmatched records gives `correlatable_total`
+        of -1 and a ratio of -1.0, which is below any threshold — a negative percentage that
+        passes the gate. `correlate()` cannot build that, so this is a guard on the model rather
+        than a fix to a live path.
+        """
+        if self.detections_total < len(self.unmatched):
+            raise ValueError(
+                f"CorrelationResult claims {self.detections_total} detections but carries "
+                f"{len(self.unmatched)} unmatched ones; every unmatched detection is a detection"
+            )
+
     @property
     def unsupported_transport_total(self) -> int:
         """Unmatched detections on a protocol Zeek cannot express at all (issue #84)."""

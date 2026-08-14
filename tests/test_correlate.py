@@ -1362,3 +1362,23 @@ def test_an_unnormalised_protocol_name_is_a_step_6_regression_not_an_unsupported
     assert [record.reason for record in result.unmatched] == ["no_flow_match"] * 10
     assert result.correlatable_total == 10, "an unknown spelling must not leave the denominator"
     assert result.unmatched_ratio == 1.0
+
+
+def test_an_empty_protocol_is_a_parse_failure_and_stays_inside_the_gate():
+    """`suricata.py` yields `""` for an eve alert record with no `proto` key (its line 735).
+
+    An empty protocol is not a protocol Zeek cannot express — it is a measurement that did not
+    happen. Classifying it as `unsupported_transport` would remove it from the gate's
+    denominator, so a parser regression that blanked every protocol would report 0.00% unmatched
+    while nothing correlated at all. The allow-list defends against case; this defends against
+    absence, which is the same failure by a different route.
+    """
+    detections = [make_detection(sid=index, proto="") for index in range(10)]
+
+    with pytest.raises(CorrelationError) as raised:
+        correlate(detections, by_uid(make_flow()), make_manifest())
+
+    result = raised.value.result
+    assert [record.reason for record in result.unmatched] == ["no_flow_match"] * 10
+    assert result.correlatable_total == 10, "an unmeasured protocol must not leave the denominator"
+    assert result.unsupported_transport_total == 0

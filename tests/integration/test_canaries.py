@@ -43,6 +43,9 @@ if str(FIXTURES) not in sys.path:
 
 from make_awkward import (  # noqa: E402  (needs the path entry above)
     write_esp_pcap,
+    write_gre_pcap,
+    write_mixed_transport_pcap,
+    write_sctp_pcap,
     write_two_unsupported_transports_pcap,
 )
 
@@ -153,9 +156,9 @@ def test_the_malicious_canary_produces_at_least_one_label(tmp_path: Path):
 
 # --- loss conditions, injected end to end (spec §11) --------------------------------------------
 #
-# Spec §11 is a closed list of nine ways a run can under-report, each with a named field. Three
+# Spec §11 is a closed list of ten ways a run can under-report, each with a named field. Three
 # things check them, and it is worth being exact about which does what — the easy misreading is
-# that this section covers all nine end to end. It does not.
+# that this section covers all ten end to end. It does not.
 #
 #   * `tests/test_provenance.py` parses §11's table at run time, asserts every field resolves in
 #     the run block, and unit-tests each flag's derivation against a synthetic run info.
@@ -163,11 +166,12 @@ def test_the_malicious_canary_produces_at_least_one_label(tmp_path: Path):
 #     discard, `test_correlate.py` for the ambiguous match, `test_cli.py` for a tool failure.
 #   * **Here**: the faults reachable through a real end-to-end run — truncation, identify
 #     suppression, a rule the engine cannot compile, a missing snapshot, and an absent ja4
-#     package. Five of the nine.
+#     package, and — since step 12 — a capture on a transport Zeek cannot express. Six of the
+#     ten, the last of them arriving with its own fixture rather than a monkeypatch.
 #
 # The other four are covered at stage level with their derivations unit-tested; what they lack is
 # a full-pipeline run with the fault present. Recorded rather than glossed, because a docstring
-# claiming "all nine" would be believed.
+# claiming "all ten" would be believed.
 
 
 @pytest.mark.requires_tools
@@ -202,6 +206,7 @@ def test_a_clean_run_reports_no_loss_it_did_not_have(quiet_snapshot: Path, tmp_p
     assert conditions["multi_datalink_discard"] is False
     assert conditions["detection_uncorrelatable"] is False
     assert conditions["ambiguous_flow_match"] is False
+    assert conditions["unsupported_transport"] is False
     assert conditions["tool_failure"] is False
     assert conditions["snapshot_missing"] is False
     assert conditions["rules_failed_or_skipped"] is False
@@ -341,6 +346,7 @@ def esp_snapshot(tmp_path: Path) -> Path:
     return root
 
 
+@pytest.mark.requires_tools
 def test_a_capture_that_is_entirely_esp_completes_instead_of_failing(tmp_path: Path):
     """Issue #84's headline: this exact capture used to exit 1 with no labels.json at all.
 
@@ -363,6 +369,7 @@ def test_a_capture_that_is_entirely_esp_completes_instead_of_failing(tmp_path: P
     assert {record["detection"]["proto"] for record in document["unmatched_detections"]} == {"esp"}
 
 
+@pytest.mark.requires_tools
 def test_the_loss_is_reported_even_though_the_run_succeeded(tmp_path: Path):
     """The row exists *because* the gate tolerates this one (spec §2.5, §11).
 
@@ -380,6 +387,7 @@ def test_the_loss_is_reported_even_though_the_run_succeeded(tmp_path: Path):
     assert conditions["tool_failure"] is False
 
 
+@pytest.mark.requires_tools
 def test_zeek_writes_one_tuple_for_two_such_conversations_and_one_field_apart(tmp_path: Path):
     """The measurement the design rests on, re-taken by the suite rather than remembered.
 
@@ -412,4 +420,115 @@ def test_zeek_writes_one_tuple_for_two_such_conversations_and_one_field_apart(tm
     assert len({r["uid"] for r in rows}) == 2
     assert {r["ip_proto"] for r in rows} == {"50", "132"}, (
         "Zeek does distinguish them; flabel's Flow carries no ip_proto (issue #96)"
+    )
+
+
+@pytest.mark.requires_tools
+def test_gre_keeps_the_inner_flow_labelled_while_the_tunnel_is_excluded(tmp_path: Path):
+    """The mixed population, and the end-to-end version of the anti-gate-suppression test.
+
+    ESP and SCTP are all-or-nothing captures: excluding their detections empties the numerator
+    trivially. GRE is the case where both kinds coexist, because **Zeek decapsulates the
+    tunnel** — so the inner TCP conversation is an ordinary correlatable flow while Suricata
+    additionally alerts on the tunnel itself. This is therefore the only one of #84's three
+    protocols where the run could still have died after the fix, and the only one that shows
+    the gate continuing to judge what it can place.
+
+    Measured: 6 detections, 5 `gre` and 1 inner `tcp`; 1 flow; 1 label; 0 of 1 correlatable
+    unmatched. Before this step the same capture exited 1.
+    """
+    capture = write_gre_pcap(tmp_path / "gre.pcap")
+    rundir = label(esp_snapshot(tmp_path), tmp_path / "out", capture)
+
+    counts = run_block(rundir)["counts"]
+    document = json.loads((rundir / "labels.json").read_text(encoding="utf-8"))
+    reasons = {record["reason"] for record in document["unmatched_detections"]}
+    protos = {record["detection"]["proto"] for record in document["unmatched_detections"]}
+
+    assert len(document["labels"]) == 1, "the decapsulated inner flow is ordinary and labellable"
+    assert counts["unmatched"] == counts["unmatched_unsupported_transport"] == 5
+    assert reasons == {"unsupported_transport"} and protos == {"gre"}
+    assert counts["unmatched_ratio"] == 0.0, "the one correlatable detection was placed"
+
+
+@pytest.mark.requires_tools
+def test_sctp_reports_the_same_way_though_it_carries_real_ports(tmp_path: Path):
+    """The second half of #84: for SCTP the tuples disagree on the ports too, not just protocol.
+
+    Zeek zeroes both port columns for anything it cannot name; Suricata reads SCTP's header and
+    reports 40000 -> 80. Two fields out rather than one, and still one answer.
+    """
+    capture = write_sctp_pcap(tmp_path / "sctp.pcap")
+    rundir = label(esp_snapshot(tmp_path), tmp_path / "out", capture)
+
+    document = json.loads((rundir / "labels.json").read_text(encoding="utf-8"))
+    assert document["labels"] == []
+    assert [record["reason"] for record in document["unmatched_detections"]] == [
+        "unsupported_transport"
+    ]
+    assert {record["detection"]["proto"] for record in document["unmatched_detections"]} == {"sctp"}
+
+
+@pytest.mark.requires_tools
+def test_ordinary_tcp_is_still_labelled_in_a_capture_that_also_carries_esp(tmp_path: Path):
+    """One capture, both populations: the ESP detections leave, the TCP ones stay and label.
+
+    The failure this guards is the fix quietly swallowing correlatable traffic alongside the
+    traffic it was meant to exclude — which no ESP-only fixture could show.
+    """
+    capture = write_mixed_transport_pcap(tmp_path / "mixed.pcap")
+    root = tmp_path / "rules-mixed"
+    build_snapshot(root, {"et/open": [MATCHES_CANARY, ANY_IP_PROTOCOL]})
+    rundir = label(root, tmp_path / "out", capture)
+
+    counts = run_block(rundir)["counts"]
+    assert counts["labels"] >= 1, "the canary's TCP flows are ordinary and must still label"
+    assert counts["unmatched_unsupported_transport"] >= 1, "the ESP detections still leave"
+    assert counts["unmatched_ratio"] == 0.0
+
+
+def test_every_integration_test_declares_that_it_needs_the_tools():
+    """The marker is load-bearing and its absence is invisible in CI (found reviewing step 12).
+
+    Three of step 12's tests shipped without `@pytest.mark.requires_tools`. Both workflows run
+    inside the pinned toolchain container with `--require-tool-tests`, so the tools are always
+    present and nothing failed — while on a laptop without them `uv run pytest -q`, the command
+    `CLAUDE.md` documents, turned three clean skips into three failures reporting an exit code
+    rather than a missing tool.
+
+    Read with `ast` rather than by pattern: decorators here span several lines, and a text
+    search also matches the call names written inside this test's own assertion message. The
+    first draft of this guard did exactly that and reported four tests that were fine — a gate
+    that cries wolf is one somebody deletes.
+    """
+    import ast
+
+    def drives_pipeline(function: ast.FunctionDef) -> bool:
+        return any(
+            isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "label")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "main")
+            )
+            for node in ast.walk(function)
+        )
+
+    def marked(function: ast.FunctionDef) -> bool:
+        return any("requires_tools" in ast.dump(node) for node in function.decorator_list)
+
+    offenders = []
+    for path in sorted(Path(__file__).resolve().parent.glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name.startswith("test_")
+                and drives_pipeline(node)
+                and not marked(node)
+            ):
+                offenders.append(f"{path.name}::{node.name}")
+
+    assert not offenders, (
+        f"these tests drive the real pipeline without @pytest.mark.requires_tools, so they "
+        f"fail instead of skipping on a machine with no toolchain: {offenders}"
     )

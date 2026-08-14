@@ -857,7 +857,9 @@ Pure. For each detection:
 
 Then consolidate: one `Label` per flow, `sources` sorted, `best_tier = min(tier)`.
 
-**Gate:** zero unmatched is silent; any unmatched warns; unmatched / total detections above `threshold` (default `0.01`) fails the run. Phase 2 configures its own, looser threshold rather than relaxing this default.
+**Gate:** zero unmatched is silent; any unmatched warns; **correlatable** unmatched over **correlatable** detections above `threshold` (default `0.01`) fails the run. Phase 2 configures its own, looser threshold rather than relaxing this default.
+
+Correlatable excludes the step 0 detections, on both sides of the ratio (issue #84) — they were never going to be placed, so counting them would fail a run on ordinary IPsec traffic, and counting enough of them would drag a genuine tuple-normalisation defect below the threshold. An **empty** protocol is deliberately *not* excluded: that is a parse failure rather than a protocol Zeek cannot name, and nothing licenses tolerating a loss that was never measured. §10 publishes the ratio and the excluded count separately.
 
 **Failing raises `CorrelationError`, carrying the `CorrelationResult`.** The gate fires *because*
 detections went unplaced, so the `UnmatchedDetection` records — each with the reason it could not
@@ -1221,6 +1223,15 @@ flabel **must never**:
 - report full coverage when any loss condition fired;
 - contact the PANW device (Phase 1 has no Tier 1 code path beyond the stub);
 - commit, transmit, or copy capture data anywhere outside the run directory.
+
+**And a consumer must never read an empty `labels[]` as "nothing malicious was found."** Since
+step 12 (issue #84) a run can succeed while structurally withholding a detection that *did*
+fire: an all-IPsec capture tripping a C2 rule exits 0 with `labels[]` empty, because the
+detection could not be attached to a flow and this project does not guess. The evidence is in
+`unmatched_detections[]` and `loss_conditions.unsupported_transport`, and nothing forces a
+consumer to look. This is the first case where zero labels is not the same claim as zero
+findings, and it is a property of the output rather than a rule flabel can enforce — which is
+why it is written here, next to the things that must never happen, rather than left implicit.
 
 ---
 

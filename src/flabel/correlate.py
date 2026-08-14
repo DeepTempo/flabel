@@ -286,7 +286,13 @@ def _place(detection: Detection, index: TupleIndex) -> tuple[Flow | None, Unmatc
     # regression, which must stay visible as `no_flow_match` and stay inside the gate. Matching
     # exactly here would classify every detection as unsupported the moment step 6 broke, empty
     # the gate's denominator, and switch the gate off exactly when it was needed.
-    if detection.proto.casefold() not in CORRELATABLE_PROTOCOLS:
+    #
+    # An *empty* protocol is excluded from the exclusion for the same reason. `suricata.py`
+    # yields `""` when an eve alert record carries no `proto` key at all, and that is a parse
+    # failure, not an ESP packet. Calling it unsupported would take it out of the gate, which
+    # is precisely backwards: nothing was measured, so nothing licenses tolerating the loss.
+    proto = detection.proto.casefold()
+    if proto and proto not in CORRELATABLE_PROTOCOLS:
         return None, "unsupported_transport"
 
     candidates = _candidates(detection, index)

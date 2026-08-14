@@ -33,7 +33,7 @@ import struct
 import sys
 from pathlib import Path
 
-from make_canary import LINKTYPE_ETHERNET, build_packets, ethernet, ipv4, write_pcap
+from make_canary import LINKTYPE_ETHERNET, build_packets, ethernet, ipv4, tcp, write_pcap
 
 #: pcap file header, then a 16-byte header per record (spec §8's "record headers").
 PCAP_HEADER_BYTES = 24
@@ -452,6 +452,17 @@ def write_all(outdir: Path) -> dict[str, Path]:
     )
     written["corrupt.pcap.gz"] = write_corrupt_gzip(outdir / "corrupt.pcap.gz")
 
+    # Protocols Zeek cannot name (issue #84). Registered here rather than built inline by the
+    # tests that use them, so `main` and the suite produce the same set and their claimed
+    # byte-determinism is covered by the same round-trip check as every other writer.
+    written["esp.pcap"] = write_esp_pcap(outdir / "esp.pcap")
+    written["sctp.pcap"] = write_sctp_pcap(outdir / "sctp.pcap")
+    written["gre.pcap"] = write_gre_pcap(outdir / "gre.pcap")
+    written["two_unsupported_transports.pcap"] = write_two_unsupported_transports_pcap(
+        outdir / "two_unsupported_transports.pcap"
+    )
+    written["mixed_transport.pcap"] = write_mixed_transport_pcap(outdir / "mixed_transport.pcap")
+
     for name in ("plain.pcap", "plain.pcapng", "truncated.pcap", "truncated.pcapng"):
         written[f"{name}.gz"] = write_gzipped(written[name], outdir / f"{name}.gz")
 
@@ -468,6 +479,7 @@ def write_all(outdir: Path) -> dict[str, Path]:
 #: IP protocol numbers. ESP is the one that matters most in practice: IPsec is ordinary in
 #: enterprise captures, and a reputation rule written `alert ip` fires on it.
 IPPROTO_ESP = 50
+IPPROTO_GRE = 47
 IPPROTO_SCTP = 132
 
 
@@ -512,6 +524,47 @@ def sctp_packets(
         frame = ethernet(ipv4(src, dst, body, proto=IPPROTO_SCTP, ident=100 + index))
         packets.append((first_ts + index, frame))
     return packets
+
+
+def gre_packets(
+    outer_src: str = "10.0.0.5",
+    outer_dst: str = "10.0.0.200",
+    inner_src: str = "192.168.50.10",
+    inner_dst: str = "192.168.50.20",
+    first_ts: float = 1700000200.0,
+) -> list[tuple[float, bytes]]:
+    """A TCP conversation tunnelled inside GRE — IP protocol 47 outside, IPv4/TCP inside.
+
+    The mixed case, and the only one of the three worth the extra frame builder: **Zeek
+    decapsulates GRE**, so the inner conversation becomes an ordinary correlatable flow while
+    Suricata additionally alerts on the tunnel itself. One capture therefore holds both
+    populations, which is what makes it the end-to-end proof that the gate keeps judging the
+    traffic it can place while excluding the traffic it cannot.
+
+    Measured: 6 detections — 5 `gre`, 1 inner `tcp` — 1 flow, 1 label, ratio 0 of 1 correlatable.
+    """
+    handshake = [
+        (0x02, b""),
+        (0x12, b""),
+        (0x10, b""),
+        (0x18, b"GET / HTTP/1.0\r\n\r\n"),
+        (0x10, b""),
+    ]
+    packets = []
+    for index, (flags, payload) in enumerate(handshake):
+        segment = tcp(51000, 80, 1000 + index, 1, flags, inner_src, inner_dst, payload)
+        inner = ipv4(inner_src, inner_dst, segment, proto=6, ident=200 + index)
+        # GRE header: no flags, version 0, protocol type 0x0800 (IPv4).
+        tunnel = struct.pack("!HH", 0, 0x0800) + inner
+        frame = ethernet(ipv4(outer_src, outer_dst, tunnel, proto=IPPROTO_GRE, ident=300 + index))
+        packets.append((first_ts + index, frame))
+    return packets
+
+
+def write_gre_pcap(path: Path) -> Path:
+    """TCP inside GRE: correlatable and uncorrelatable detections in one capture."""
+    write_pcap(str(path), gre_packets())
+    return path
 
 
 def write_esp_pcap(path: Path) -> Path:

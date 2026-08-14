@@ -1052,6 +1052,19 @@ def test_the_loss_condition_summary_covers_every_row_of_the_spec_table(tmp_path)
             id="ambiguous",
         ),
         pytest.param(
+            "unsupported_transport",
+            lambda tmp_path: {
+                "correlation": make_correlation(
+                    unmatched=(
+                        UnmatchedDetection(
+                            detection=make_detection(proto="esp"), reason="unsupported_transport"
+                        ),
+                    )
+                )
+            },
+            id="unsupported-transport",
+        ),
+        pytest.param(
             "tool_failure",
             lambda tmp_path: {
                 "tool_failures": (

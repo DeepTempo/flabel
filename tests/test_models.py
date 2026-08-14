@@ -211,7 +211,7 @@ def test_correlation_result_reports_zero_loss_when_there_were_no_detections():
     assert result.unmatched_ratio == 0.0
 
 
-def test_correlation_result_ratio_is_unmatched_over_detections():
+def test_correlation_result_ratio_is_correlatable_unmatched_over_correlatable():
     result = CorrelationResult(
         labels=(),
         unmatched=(UnmatchedDetection(detection=make_detection(), reason="no_flow_match"),),
@@ -461,3 +461,49 @@ def test_sources_by_name_cannot_silently_drop_an_entry():
         make_admission(name="oisf/trafficid", source_class="identify"),
     )
     assert len(manifest.sources_by_name) == len(manifest.sources)
+
+
+def test_the_ratio_excludes_unsupported_transports_from_both_sides():
+    """Renamed from `..._is_unmatched_over_detections`, which stopped being true in step 12.
+
+    The old name was the formula a future reader would have "fixed" the code to match. Three of
+    four detections here are unsupported and one ordinary detection went unplaced: the ratio is
+    1/1, not 4/4 and not 1/4.
+    """
+    detection = make_detection()
+    result = CorrelationResult(
+        labels=(),
+        unmatched=(
+            UnmatchedDetection(detection=detection, reason="no_flow_match"),
+            *(
+                UnmatchedDetection(detection=detection, reason="unsupported_transport")
+                for _ in range(3)
+            ),
+        ),
+        flows_total=1,
+        detections_total=4,
+    )
+
+    assert result.unsupported_transport_total == 3
+    assert result.correlatable_total == 1
+    assert result.unmatched_ratio == 1.0
+
+
+def test_a_correlation_result_cannot_claim_fewer_detections_than_it_carries():
+    """The negative-ratio case: `correlatable_total` of -1 passes any threshold (#84 review).
+
+    Every unmatched detection is a detection, so `detections_total` can never be smaller than
+    `len(unmatched)`. Without this the model publishes a negative percentage that is below the
+    gate by arithmetic rather than by measurement.
+    """
+    detection = make_detection()
+    with pytest.raises(ValueError, match="every unmatched detection is a detection"):
+        CorrelationResult(
+            labels=(),
+            unmatched=(
+                UnmatchedDetection(detection=detection, reason="unsupported_transport"),
+                UnmatchedDetection(detection=detection, reason="no_flow_match"),
+            ),
+            flows_total=1,
+            detections_total=0,
+        )

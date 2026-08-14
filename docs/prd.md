@@ -197,7 +197,8 @@ Phase 2 requires **two hosts** — a PANW VM-Series in virtual-wire configuratio
 - **The unmatched count is a gate, not just a signal** (resolves Q9). In Phase 1 both Zeek and Suricata read identical bytes, so any unmatched detection is anomalous:
   - zero unmatched — silent;
   - any unmatched — **warn**, run still succeeds;
-  - above a configurable threshold (**default 1%** of detections) — **fail the run**, because a systemic correlation break would otherwise produce a quietly incomplete label set.
+  - above a configurable threshold (**default 1%** of *correlatable* detections) — **fail the run**, because a systemic correlation break would otherwise produce a quietly incomplete label set.
+  - *Amended 2026-08-13 (issue #84):* detections on a transport Zeek cannot name — ESP, SCTP, GRE — are excluded from both sides of that share, reported in `unmatched_detections[]` and counted in `counts.unmatched_unsupported_transport`. They could never correlate, so including them failed runs on ordinary tunnelled traffic. See spec §9 step 0.
   - Phase 2 will need a looser threshold, since Tier 1 correlation is inherently harder; it is configured separately rather than by relaxing the Phase 1 default.
 
 ### 6.6 Output & Provenance — *Phase 1*
@@ -519,7 +520,7 @@ Each criterion is marked **[CI]** (testable in continuous integration) or **[LAB
 | 6 | Is there a maximum supported capture size, and what happens beyond it? | Craig | — | **Resolved 2026-08-11:** no enforced ceiling. Build establishes a tested known-good size and documents it; an OOM-killed Zeek is an enumerated loss condition (`tool_failures[]`) so a truncated label set is never silent |
 | 7 | Exact bounded-`receive_time` filter syntax, and does the threat log need a settling delay? | TBD | Phase 2 spike | Open |
 | 8 | What fixture strategy provides test captures without real traffic — including the Goal 5 benign and malicious canaries? | Craig | — | **Resolved 2026-08-11:** benign canary synthesized (so zero labels is known-correct, not empirical); malicious canary is a small publicly-published capture with origin and licence recorded (§10) |
-| 9 | Should `unmatched_detections[]` have a failure threshold rather than being reported without a target? | Craig | — | **Resolved 2026-08-11:** warn on any unmatched; fail above a configurable threshold, default 1% of detections (§6.5). Phase 2 gets its own looser threshold |
+| 9 | Should `unmatched_detections[]` have a failure threshold rather than being reported without a target? | Craig | — | **Resolved 2026-08-11:** warn on any unmatched; fail above a configurable threshold, default 1% of detections (§6.5). Phase 2 gets its own looser threshold. **Amended 2026-08-13 (#84):** the share is over *correlatable* detections |
 | 10 | What are the review dates for the success metrics? | Craig | TBD | Open |
 | 11 | Where do captures come from (customer / internal / public), and does that constrain using them to train a product model? | Craig | — | **Resolved 2026-08-11:** Phase 1 processes **publicly-published captures only**, with origin and licence documented. This sidesteps the contractual question while the pipeline is built. Pointing flabel at internal or customer traffic requires answering it first — recorded as a gate, not a blocker |
 | 12 | PANW licensing model and estimated monthly lab cost; and does that change the ET Pro decision? | Craig | Before Phase 2 planning | Open |
