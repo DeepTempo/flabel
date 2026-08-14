@@ -156,10 +156,36 @@ jobs:
           print("Goal 5: zero labels on the benign canary against the live ruleset")
           PY
 
+      # --- the broad review (PLAN step 11d, issue #75) ----------------------------------------
+      #
+      # The canary above is 14 synthetic packets carrying two cleartext HTTP flows, so it can only
+      # ever exercise the rules that could match those. That narrowness is what let #75 hide: 23
+      # captures of ORDINARY protocol traffic produced 100 malicious labels against the same
+      # ruleset the canary called clean, every one of them from pawpatrules.
+      #
+      # This runs the committed corpus — 17 real protocol captures, MIT, from suricata-verify —
+      # and fails on any source entry that is not already known and argued for in
+      # tests/fixtures/benign-corpus/tolerated.json.
+      - name: Label the benign corpus
+        run: |
+          for capture in tests/fixtures/benign-corpus/*.pcap; do
+            echo "--- $capture"
+            uv run flabel --offline "$capture" \
+              --rules-dir .flabel/rules --output-dir corpus-runs
+          done
+
+      # The decision lives in `tests/integration/corpus_gate.py`, not in this heredoc, and
+      # `tests/integration/test_corpus_gate.py` proves it FAILS on a new offender. A gate whose
+      # logic exists only inside a scheduled workflow is one nothing can prove is able to fail —
+      # which is how the Goal 2 gate came to be hollowed out with CI green (#74), and how three of
+      # step 13's fixes shipped with tests that passed against the unfixed code (#98).
+      - name: Goal 5 broad — a new false positive on ordinary traffic fails the build
+        run: uv run python tests/integration/corpus_gate.py corpus-runs
+
       # A daily gate can be red for weeks with nothing but a badge to say so, and this one is
       # the only false-positive review the 21,464 ungated pawpatrules rules get. Failure files
       # an issue so it reaches a person.
-      - name: File an issue if the canary failed
+      - name: File an issue if either review failed
         if: failure()
         uses: actions/github-script@v7
         with:
@@ -190,10 +216,14 @@ jobs:
               });
             }
 
-      - name: Keep the run directory for diagnosis
+      # Both reviews' output, because a failure names sids and the next question is always
+      # "which flow, in which capture" — which only the run directory answers.
+      - name: Keep the run directories for diagnosis
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: canary-run
-          path: canary-run/
+          name: feeds-runs
+          path: |
+            canary-run/
+            corpus-runs/
           retention-days: 14

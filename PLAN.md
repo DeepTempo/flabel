@@ -297,7 +297,7 @@ decomposition on issue #75.
 | 11a | `[admission] exclude_classtypes` in the registry, with its own exclusion counter | **merged** (#78) |
 | 11b | Address-indicator classification recorded in `sid_index.json` | **merged** (#78, corrected in #79) |
 | 11c | `build_source_entry` consumes it for `label_basis` | **merged** |
-| 11d | The benign corpus against the real ruleset, in `feeds.yml` | **not started** |
+| 11d | The benign corpus against the real ruleset, in `feeds.yml` | **merged** |
 
 ### 11c — the one that needs care
 
@@ -369,7 +369,27 @@ fail. With 11a alone the corpus still produces 21 source entries — the residue
 structurally broken rule, a loose regex, and #77's directionality loss — so the expectation is
 "zero" only once those are settled too.
 
-**Depends on:** 11c, and a decision on the three residual causes in #75.
+**Superseded by measurement, 2026-08-14.** This step was deferred on the reasoning that "the
+expectation is 'zero' only once those are settled too" — waiting on #77, a broken upstream rule and
+a loose pcre. That reasoning is out of date: the residue was measured at **12 labels / 21 source
+entries against two different rulesets** (84,995 rules from the mirror and 85,302 fetched live),
+with the same three sids in the same proportions. Stability across a 307-rule difference is what
+lets the gate pin the known residue instead of waiting for a zero that needs three other fixes.
+
+So it fails on any source entry whose `(source, sid, label_basis)` is not in
+`tests/fixtures/benign-corpus/tolerated.json`, each entry carrying its reason. Counts are not
+asserted — upstream text changes daily and a tolerated rule that stops firing is an improvement,
+which the gate reports so the list can be shrunk deliberately. `label_basis` is part of the key
+because a tolerated sid claiming `direct` where it claimed `indicator-reference` is #75 returning
+under a sid already on the list.
+
+**The decision lives in `tests/integration/corpus_gate.py`, not in the workflow's YAML**, and
+`test_corpus_gate.py` proves it fails. A gate whose logic exists only inside a scheduled workflow
+is unprovable by construction — which is how the Goal 2 gate came to be hollowed out with CI green
+(#74) and how three of step 13's fixes shipped with tests that passed against the unfixed code
+(#98).
+
+**Depends on:** 11c.
 
 ---
 

@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Source entries the benign corpus is KNOWN to produce against the live nine-feed ruleset,",
+    "and the reason each is tolerated (PLAN step 11d, issue #75).",
+    "",
+    "The scheduled feeds workflow fails on any source entry whose (source, sid, label_basis)",
+    "triple is not listed here. It does NOT assert the counts: upstream rule text changes daily,",
+    "and a tolerated rule that stops firing is an improvement, not a regression — the workflow",
+    "prints what no longer fires so this file can be shrunk deliberately.",
+    "",
+    "Adding an entry here is the moment to argue that a label on benign traffic is acceptable.",
+    "That argument belongs in a reviewed diff, which is why this is a committed file rather than",
+    "a list inside the workflow. An entry with no reason is not an entry.",
+    "",
+    "label_basis is part of the key on purpose. A tolerated rule that starts claiming `direct`",
+    "where it claimed `indicator-reference` is asserting that ordinary traffic IS an attack, and",
+    "that is a regression even though the sid is unchanged."
+  ],
+  "measured_against": [
+    "8c9e8d58af0a8d64 — 2026-08-12 mirror, 84,995 admitted",
+    "40cac3960114e1b4 — 2026-08-14 live fetch, 85,302 admitted"
+  ],
+  "measured_note": [
+    "Both rulesets produced the same 12 labels and the same 21 source entries, with the same",
+    "three sids in the same proportions. That stability across a 307-rule difference in the",
+    "underlying feeds is why this gate can pin the residue rather than wait for zero."
+  ],
+  "entries": [
+    {
+      "source": "pawpatrules",
+      "sid": 3317444,
+      "label_basis": "indicator-reference",
+      "count_when_measured": 19,
+      "reason": "Structurally broken rule: its destination address is literally 127.0.0.1, so it fires on loopback-bound traffic in any capture. Not a taxonomy problem and not fixable by admission policy — the rule is wrong at the source. Since step 11c it publishes indicator-reference rather than direct, which is the honest claim: the flow reached a flagged address. Upstream fix would remove this entry."
+    },
+    {
+      "source": "pawpatrules",
+      "sid": 3321290,
+      "label_basis": "direct",
+      "count_when_measured": 1,
+      "reason": "A loose FormBook pcre that matches ordinary HTTP. Correctly labelled `direct` — it does inspect payload — so the defect is the rule's precision, not flabel's provenance. Tolerated because the alternative is excluding a real malware signature on the strength of one benign match."
+    },
+    {
+      "source": "pawpatrules",
+      "sid": 3300140,
+      "label_basis": "direct",
+      "count_when_measured": 1,
+      "reason": "Directionality loss from HOME_NET: any (issue #77). With no inside/outside distinction the rule matches a flow it was not written for. Tracked separately because the fix is a configuration change with a 61% blast radius across the ruleset, not a per-rule decision."
+    }
+  ]
+}
