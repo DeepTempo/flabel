@@ -21,7 +21,7 @@ import json
 import re
 import socket
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1321,3 +1321,42 @@ def test_the_temporary_is_named_so_the_reproducibility_gate_ignores_it(tmp_path:
     assert seen == [".labels.json.partial"], f"unexpected write sequence: {seen}"
     assert (tmp_path / "labels.json").read_bytes() == b"{}"
     assert not (tmp_path / ".labels.json.partial").exists()
+
+
+@pytest.mark.requires_tools
+def test_a_clock_stepping_backwards_still_writes_run_json(
+    rules_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Issue #62's actual cost was the file, so the file is what this asserts.
+
+    `_duration` raised on a negative elapsed time, and `build_run_block` raises while the report
+    is being assembled — so an NTP step or a VM resume during a run left a directory with no
+    `run.json`, the one thing spec §10 says every run writes. A unit test on the block would have
+    passed throughout: the block was never the thing that went missing.
+
+    The clock is stepped between the run's two `datetime.now(UTC)` calls, which is exactly where a
+    correction lands in the field.
+    """
+    import flabel.cli as cli_module
+
+    real_now = datetime.now
+    calls = {"n": 0}
+
+    def stepping_now(tz=None):
+        calls["n"] += 1
+        stamp = real_now(tz)
+        # First call is started_at; every later one is after the step correction.
+        return stamp if calls["n"] == 1 else stamp - timedelta(seconds=90)
+
+    monkeypatch.setattr(cli_module, "datetime", type("D", (), {"now": staticmethod(stepping_now)}))
+
+    code = cli_module.main(offline(BENIGN, rules_dir, tmp_path / "out"))
+
+    rundir = only_run_dir(tmp_path / "out")
+    assert (rundir / "run.json").is_file(), (
+        "a backwards clock cost the whole report — this is issue #62 returning"
+    )
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
+    assert run["duration_seconds"] is None
+    assert any("clock went backwards" in warning for warning in run["warnings"])
+    assert code == EXIT_SUCCESS, "the run itself was fine; only the duration was unknowable"

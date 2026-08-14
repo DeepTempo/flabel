@@ -910,7 +910,7 @@ lines, which is where Zeek puts every wall-clock value; what remains is the anal
 
 | Excluded | Why |
 | :-- | :-- |
-| `run.started_at`, `run.finished_at`, `run.duration_seconds` | Wall-clock by definition. |
+| `run.started_at`, `run.finished_at`, `run.duration_seconds` | Wall-clock by definition. `duration_seconds` is `null` when the clock stepped backwards mid-run, with a warning naming both timestamps (issue #62) — an NTP correction or a VM resume must not cost the report. |
 | `run.input.path` | The operator's own file path (see below). |
 | `zeek/packet_filter.log` | Nothing but a wall-clock start time, and no analytic content to compare. Retained rather than deleted — deleting a log Zeek wrote would misrepresent the run. |
 | `suricata/suricata.log` | Wall-clock timestamp *and* pid on every line. Nothing in it is analytic output. |
@@ -971,7 +971,7 @@ or normalise**: the same capture labelled from two directories would otherwise d
 ```python
 {
   "flabel_version": str, "schema_version": "1.0",
-  "started_at": str, "finished_at": str, "duration_seconds": float,
+  "started_at": str, "finished_at": str, "duration_seconds": float | None,
   "mode": "offline",                      # Phase 1 is always this
   "tiers_attempted": [2], "tiers_unavailable": [1],
   "input": {"path": str, "sha256": str, "format": "pcap|pcapng|pcap.gz|pcapng.gz",

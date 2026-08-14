@@ -1164,10 +1164,27 @@ def test_the_duration_is_derived_from_the_two_timestamps(tmp_path):
     assert isinstance(block["duration_seconds"], float)
 
 
-def test_a_finish_before_the_start_is_refused(tmp_path):
-    """A negative duration is a mis-wired caller, and it would ship as a plausible number."""
-    with pytest.raises(ValueError, match="duration"):
-        full_run(tmp_path, started_at=FINISHED, finished_at=STARTED)
+def test_a_backwards_clock_costs_the_duration_and_nothing_else(tmp_path):
+    """It used to raise, and the raise cost the whole report (issue #62).
+
+    This asserted a refusal until 2026-08-14, on the argument that a negative duration means a
+    mis-wired caller. But the caller is `datetime.now(UTC)` at two points in real time, so an NTP
+    step, a VM resume or a container clock adjustment makes it legitimately negative — and
+    `build_run_block` then raised while step 9 was assembling the report, leaving a run directory
+    with **no `run.json` at all**. A programming error and an environmental one were treated
+    identically, and only the environmental one was reachable in the field.
+
+    So: `null` for the fact that could not be established, a warning naming both timestamps, and
+    both stamps still reported as read. The third defect of this exact shape, after
+    `UnicodeDecodeError` escaping `read_toolchain` and `snapshot_missing` inference.
+    """
+    block = full_run(tmp_path, started_at=FINISHED, finished_at=STARTED)
+
+    assert block["duration_seconds"] is None
+    assert block["started_at"] == FINISHED and block["finished_at"] == STARTED
+    assert any("clock went backwards" in warning for warning in block["warnings"]), (
+        f"the loss must be reported, not merely tolerated: {block['warnings']}"
+    )
 
 
 def test_a_non_canonical_timestamp_is_refused(tmp_path):
