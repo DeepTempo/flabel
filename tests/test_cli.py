@@ -1261,3 +1261,63 @@ def test_a_failure_while_writing_notice_leaves_no_labels_and_an_honest_run_json(
     assert any("licence" in warning.lower() for warning in run["warnings"]), (
         "run.json must not survive as a record of a run that succeeded"
     )
+
+
+# --- atomic output (issue #70, PLAN step 13b) ----------------------------------------------
+
+
+def test_a_failed_write_leaves_no_artifact_and_no_temporary(tmp_path: Path):
+    """Spec §13: either a complete run directory exists or none does.
+
+    A plain `write_bytes` interrupted part-way leaves a truncated JSON document, which parses as
+    neither a valid result nor an absent one — the single state §13 names. Since the *absence* of
+    `labels.json` is what a consumer reads as "this run did not finish" (issue #23), a
+    half-written one is worse than no file.
+
+    Injected at the boundary rather than by killing a process: `serialise_bytes` has already
+    produced the payload, so the failure is in the write itself, which is the case that matters.
+    """
+    from flabel import cli as cli_module
+
+    target = tmp_path / "labels.json"
+    original = Path.write_bytes
+
+    def explode(self: Path, payload: bytes) -> int:
+        if self.name.endswith(".partial"):
+            original(self, payload[: len(payload) // 2])
+            raise OSError(28, "No space left on device")
+        return original(self, payload)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "write_bytes", explode)
+        with pytest.raises(OSError, match="No space left"):
+            cli_module._write_atomic(target, b'{"schema_version": 1}')
+
+    assert not target.exists(), "a failed write must not leave a partial document behind"
+    assert list(tmp_path.iterdir()) == [], (
+        "the temporary must be cleaned up, or a later reader mistakes it for state"
+    )
+
+
+def test_the_temporary_is_named_so_the_reproducibility_gate_ignores_it(tmp_path: Path):
+    """`canonical` compares the documents a run claims; a leftover temporary is not one.
+
+    Asserted on the name rather than trusting the cleanup above, because the cleanup cannot run
+    if the process is killed outright — which is the failure this whole change is about.
+    """
+    from flabel import cli as cli_module
+
+    seen: list[str] = []
+    original = Path.write_bytes
+
+    def record(self: Path, payload: bytes) -> int:
+        seen.append(self.name)
+        return original(self, payload)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "write_bytes", record)
+        cli_module._write_atomic(tmp_path / "labels.json", b"{}")
+
+    assert seen == [".labels.json.partial"], f"unexpected write sequence: {seen}"
+    assert (tmp_path / "labels.json").read_bytes() == b"{}"
+    assert not (tmp_path / ".labels.json.partial").exists()

@@ -595,3 +595,29 @@ def test_a_packet_time_reporter_message_is_reproducible(tmp_path: Path):
         "would then carry no stable value at all, and reporter.log should be excluded outright "
         "rather than canonicalised."
     )
+
+
+def test_an_interrupted_write_is_not_compared_as_an_artifact(tmp_path: Path):
+    """A temporary left by a killed process must not read as a reproducibility failure (#70).
+
+    `canonicalise` walks the directory with `rglob`, which *does* return dotfiles — so before this
+    was fixed a leftover `.labels.json.partial` was canonicalised like any other file. Two runs
+    where only one had been interrupted then differed on a file neither run meant to publish,
+    reporting a crash as a Goal 2 failure and naming the wrong cause.
+
+    The first draft of `cli._write_atomic`'s docstring asserted the gate already ignored it. It did
+    not — measured, then fixed. This is the assertion that makes the claim true.
+    """
+    first, second = tmp_path / "a", tmp_path / "b"
+    for rundir in (first, second):
+        rundir.mkdir()
+        (rundir / "labels.json").write_text('{"schema_version": 1}', encoding="utf-8")
+
+    assert canonical.differences(first, second) == []
+
+    (first / ".labels.json.partial").write_text('{"schema_ver', encoding="utf-8")
+
+    assert ".labels.json.partial" not in canonical.canonicalise(first)
+    assert canonical.differences(first, second) == [], (
+        "an in-progress write was compared as though the run had published it"
+    )

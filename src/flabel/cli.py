@@ -21,6 +21,7 @@ puts a decision back to a person, and only when there is a person there to take 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import traceback
 from collections.abc import Sequence
@@ -52,6 +53,7 @@ from flabel.models import (
     SuricataRunInfo,
     ToolFailure,
     ZeekRunInfo,
+    partial_name,
 )
 from flabel.notice import render_notice_bytes
 from flabel.provenance import build_run_block
@@ -337,8 +339,35 @@ def _run_document(run: dict[str, Any], progress: _Progress) -> dict[str, Any]:
     return document
 
 
+def _write_atomic(path: Path, payload: bytes) -> None:
+    """Write `path` so that it either does not exist or is complete (issue #70).
+
+    Spec §13: either a complete run directory exists or none does. A plain `write_bytes` breaks
+    that on a kill, a full disk or an OOM part-way through — the file is left truncated, and a
+    truncated JSON document parses as neither a valid result nor an absent one, which is the
+    single state §13 names. The absence of `labels.json` is load-bearing here (issue #23), so a
+    half-written one is worse than no file at all.
+
+    `os.replace` is atomic within a filesystem, and the temporary lives in the run directory
+    rather than the system temp dir so the rename can never cross a device. Its name comes from
+    `models.partial_name`, which `canonical` also reads: a temporary left behind by a *killed*
+    process — the case the cleanup below cannot cover — must not be compared by the
+    reproducibility gate, or a crash surfaces as a Goal 2 failure naming a file neither run meant
+    to publish.
+    """
+    temporary = path.with_name(partial_name(path.name))
+    try:
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+    except OSError:
+        # A failed write must not leave the temporary behind to be mistaken for state, and must
+        # not mask the original error with one from the cleanup.
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def _write_run_json(rundir: Path, document: dict[str, Any]) -> None:
-    (rundir / RUN_NAME).write_bytes(serialise_bytes(document))
+    _write_atomic(rundir / RUN_NAME, serialise_bytes(document))
 
 
 def _fail(rundir: Path, started_at: str, progress: _Progress, exc: FlabelError) -> int:
@@ -585,11 +614,12 @@ def _write_output(
 
     run = _run_block(started_at, progress)
     _write_run_json(rundir, _run_document(run, progress))
-    (rundir / NOTICE_NAME).write_bytes(
-        render_notice_bytes(result.labels, manifest, result.unmatched)
+    _write_atomic(
+        rundir / NOTICE_NAME, render_notice_bytes(result.labels, manifest, result.unmatched)
     )
-    (rundir / LABELS_NAME).write_bytes(
-        serialise_bytes(build_document(run=run, labels=result.labels, unmatched=result.unmatched))
+    _write_atomic(
+        rundir / LABELS_NAME,
+        serialise_bytes(build_document(run=run, labels=result.labels, unmatched=result.unmatched)),
     )
 
     print(

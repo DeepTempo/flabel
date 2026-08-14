@@ -63,6 +63,25 @@ InputStatus = Literal["complete", "partial"]
 #: correlated, and excluded from the gate's denominator — see `CorrelationResult`.
 UnmatchedReason = Literal["no_flow_match", "ambiguous_flow_match", "unsupported_transport"]
 
+#: In-progress output files, written under this name and `os.replace`d into place (issue #70).
+#:
+#: Defined here rather than in `cli.py` because two modules need the one convention and they sit
+#: on opposite sides of the purity line: `cli` writes these, and `canonical` must not compare them
+#: — a temporary left behind by a killed process is not an artifact the run claims, and comparing
+#: it turns a crash into a misreported Goal 2 failure. Same argument that moved `SNAPSHOT_ID` here.
+PARTIAL_SUFFIX = ".partial"
+
+
+def partial_name(name: str) -> str:
+    """The in-progress name for an output file: hidden, and suffixed."""
+    return f".{name}{PARTIAL_SUFFIX}"
+
+
+def is_partial(name: str) -> bool:
+    """Whether a path name is an in-progress output file rather than a finished artifact."""
+    return Path(name).name.endswith(PARTIAL_SUFFIX)
+
+
 #: The protocols Zeek can name in `transport_proto`, and so the only ones a detection can be
 #: correlated on. Anything else is `unknown_transport` on Zeek's side, with the port columns
 #: zeroed — not a tuple that can be compared, whatever Suricata reported.

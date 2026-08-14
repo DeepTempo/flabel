@@ -33,6 +33,8 @@ from typing import Any
 #: than deleted — deleting a log the tool wrote would misrepresent the run — and simply never
 #: compared. Kept small and justified per name: an exclusion list that can be appended to without
 #: argument is how a failing gate gets made to pass.
+from flabel.models import is_partial
+
 EXCLUDED_FILES = frozenset({"zeek/packet_filter.log", "suricata/suricata.log"})
 
 #: Canonicalised by its own rule rather than excluded — see `canonical_reporter_records`.
@@ -207,6 +209,11 @@ def canonicalise(rundir: Path) -> dict[str, Any]:
             continue
         name = path.relative_to(rundir).as_posix()
         if name in EXCLUDED_FILES:
+            continue
+        # An in-progress write left behind by a killed process (issue #70). Not an artifact
+        # the run claims, so comparing it would report a difference for a file neither run
+        # meant to publish — a crash surfacing as a reproducibility failure.
+        if is_partial(name):
             continue
         canonicalised[name] = _canonical_file(name, path)
 
