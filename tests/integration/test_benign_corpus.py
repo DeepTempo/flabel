@@ -24,7 +24,7 @@ import json
 from pathlib import Path
 
 import pytest
-from gates import MISSES_CANARY, build_snapshot, offline, only_run_dir
+from gates import ANY_IP_PROTOCOL, MISSES_CANARY, build_snapshot, offline, only_run_dir
 
 from flabel import cli
 from flabel.errors import EXIT_SUCCESS
@@ -55,6 +55,31 @@ def corpus_run(request, tmp_path_factory) -> tuple[Path, Path]:
 
     assert cli.main(offline(capture, snapshot, output)) == EXIT_SUCCESS, (
         f"{capture.name} did not complete a labelling run"
+    )
+    return capture, only_run_dir(output)
+
+
+@pytest.fixture(scope="module", params=CAPTURES, ids=lambda p: p.stem)
+def loud_corpus_run(request, tmp_path_factory) -> tuple[Path, Path]:
+    """The same captures against a snapshot that actually fires, so tuples get compared (#87).
+
+    A second module-scoped run per capture, and the cost is deliberate. `corpus_run` above uses
+    `MISSES_CANARY` — three rules needing UDP/53 with literal `flabel-test`, ICMPv4 echo or
+    ICMPv6 echo — and the corpus carries none of those. Measured: **0 detections across all 17
+    captures**, which made the correlation assertion below `0 == 0` and blind to exactly the
+    class of defect #84 turned out to be.
+
+    `ANY_IP_PROTOCOL` is `alert ip any any -> any any`: it fires on every flow in every capture,
+    so Suricata's 5-tuple meets Zeek's for real across HTTP/1.x, HTTP/2, FTP, DNS, MQTT, DCERPC,
+    Kerberos and SMB — the protocols `benign.pcap` cannot reach.
+    """
+    capture = request.param
+    output = tmp_path_factory.mktemp(f"loud-{capture.stem}") / "out"
+    snapshot = tmp_path_factory.mktemp(f"loudrules-{capture.stem}") / "rules"
+    build_snapshot(snapshot, {"et/open": [ANY_IP_PROTOCOL]})
+
+    assert cli.main(offline(capture, snapshot, output)) == EXIT_SUCCESS, (
+        f"{capture.name} did not complete a labelling run against the loud ruleset"
     )
     return capture, only_run_dir(output)
 
@@ -106,19 +131,30 @@ def test_every_capture_produces_a_complete_run_directory(corpus_run: tuple[Path,
     assert (rundir / "NOTICE").is_file()
 
 
-def test_no_detection_goes_unreported(corpus_run: tuple[Path, Path]):
+def test_no_detection_goes_unreported(loud_corpus_run: tuple[Path, Path]):
     """Spec §2.5 across the corpus: whatever happened, the run block says what.
 
     The unmatched gate is the specific risk. Correlation joins Suricata's 5-tuple to Zeek's, and
-    §8 records three ways they disagree — protocol case, ICMP ports, IPv6 address form — each
-    found by measurement rather than inference. A protocol this corpus carries and `benign.pcap`
-    does not could expose a fourth, and it would surface as detections that cannot be placed.
+    §8 records four ways they disagree — protocol case, ICMP ports, IPv6 address form, and the
+    transports Zeek cannot name — each found by measurement rather than inference. A protocol this
+    corpus carries and `benign.pcap` does not could expose a fifth, and it would surface as
+    detections that cannot be placed.
+
+    **Runs against the loud ruleset, and asserts detections exist before asserting none were
+    lost** (#87). Until 2026-08-14 this used `corpus_run`, whose snapshot cannot match anything in
+    this corpus: measured 0 detections in all 17 captures, so `unmatched == 0` was `0 == 0` and no
+    tuple was ever compared. The docstring claimed the stronger property for weeks. The
+    `detections > 0` assertion is the half that stops it quietly reverting.
     """
-    capture, rundir = corpus_run
+    capture, rundir = loud_corpus_run
 
     run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
     counts = run["counts"]
 
+    assert counts["detections"] > 0, (
+        f"{capture.name}: the loud ruleset produced no detection, so this test compared no "
+        f"tuples. That is the #87 failure returning — fix the fixture, not the assertion."
+    )
     assert counts["unmatched"] == 0, (
         f"{capture.name}: {counts['unmatched']} of {counts['detections']} detections could not "
         f"be attached to a flow. If the tuples disagree on a protocol benign.pcap does not "
