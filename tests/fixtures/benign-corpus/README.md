@@ -56,9 +56,14 @@ Two need explaining, because "benign" is doing real work here and a reader shoul
 take it on trust.
 
 **`ftp-epsv` sends an FTP password in clear text.** That is poor hygiene and it is not malicious.
-`pawpatrules` sid 3300337 flags it, correctly as an *observation* — the defect is flabel promoting
-that observation to `"verdict": "malicious"` with `"label_basis": "direct"`, which asserts the flow
-*is* the attack. See #75.
+`pawpatrules` sid 3300337 flagged it, correctly as an *observation* — the defect was flabel
+promoting that observation to `"verdict": "malicious"` with `"label_basis": "direct"`, which asserts
+the flow *is* the attack.
+
+**Resolved 2026-08-14, and this capture no longer produces a label.** Step 11a excludes
+`classtype: policy-violation` at admission (436 rules, 0.51% of the ruleset), which removes that
+sid — so it is *not* in `tolerated.json`, and an operator triaging a gate failure should not go
+looking for it. What survives on this corpus is three sids, listed there with a reason each.
 
 **`smb-eicar-file-segmentation-random` carries an EICAR test file.** EICAR is the industry-standard
 "every scanner must detect this" string — deliberately harmless, and by design not malware. It is
