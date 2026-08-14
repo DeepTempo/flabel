@@ -362,7 +362,22 @@ def _parse_options(rule: str) -> tuple[list[str], bool]:
 
 
 def is_address_indicator(rule: str) -> bool:
-    """Whether a rule fires on the **address tuple alone**, inspecting nothing else.
+    """Whether a rule fires on the **header tuple alone**, inspecting no payload.
+
+    The header tuple is protocol, addresses and ports — so this is slightly wider than the name
+    says, and issue #93 is the record of measuring how much wider. **Of 16,075 such rules in the
+    live nine-feed snapshot, 16,074 name a literal address and exactly one does not**: sid 3500023
+    constrains only a destination port range (`alert udp $HOME_NET any -> any 14433:14444`, THL's
+    Hysteria v2 operator ports). The name was kept because renaming the field costs a
+    `sid_index.json` schema bump that would invalidate every existing snapshot for one rule in
+    sixteen thousand — but what the function *means* is written here rather than implied by its
+    name (Craig, 2026-08-14).
+
+    That rule is classified correctly for the same reason the address ones are: it establishes
+    that a flow reached a known-bad **port**, not that the flow *is* the malicious activity. Same
+    distinction, a different field of the tuple. Narrowing the definition to require an address
+    would send it to `direct` instead, asserting that traffic to a port range *is* the
+    cryptojacker — the overclaim issue #75 exists to remove.
 
     Measured 2026-08-13 across the nine feeds: **16,079 of 85,431 rules (18.8%)**, and **99.9% of
     them name a literal IP address as their destination**. They look like this:

@@ -527,7 +527,7 @@ source is sid 2011465?", so the mapping has to be stored. It is a file rather th
 per source do not belong in every output file. It is versioned separately from the manifest
 because step 6 reads this file and nothing else in the snapshot.
 
-**`address_indicator` records which rules fire on the address tuple alone** (issue #75, schema 3).
+**`address_indicator` records which rules fire on the header tuple alone** (issue #75, schema 3) — protocol, addresses and ports, inspecting no payload. **Wider than the field name says, and measured rather than assumed** (issue #93): of 16,075 such rules in the live snapshot, 16,074 name a literal address and exactly one is port-only (sid 3500023, `alert udp $HOME_NET any -> any 14433:14444`). The name was kept because renaming it costs a `sid_index.json` schema bump — invalidating every existing snapshot — for one rule in sixteen thousand. The port-only rule is classified correctly for the same reason the others are: it establishes that a flow reached a known-bad *port*, not that the flow *is* the malicious activity.
 Such a rule establishes that a flow *reached a known-bad address*, not that the flow *is* the
 malicious activity — the distinction `label_basis` already names. Re-measured 2026-08-13 against
 a snapshot built with `exclude_classtypes` in force: **16,075 of 84,995 admitted rules (18.9%)**,
@@ -805,8 +805,13 @@ Order of operations:
 ```python
 def correlate(detections: Sequence[Detection], flows: Mapping[str, Flow],
               manifest: SnapshotManifest,
-              threshold: float = 0.01) -> CorrelationResult
+              threshold: float = 0.01,
+              address_indicators: frozenset[int] | None = None) -> CorrelationResult
 ```
+
+**`address_indicators` was added in step 11c** (issue #75): the sids whose rules fire on the header tuple alone, read from the snapshot's `sid_index.json`. A `SourceEntry` is `indicator-reference` if **either** the source's class says so **or** the rule is one of these — the two compose, and neither half is redundant. `abuse.ch/urlhaus` is the canonical `ioc-name` source and scores 0% on the per-rule test because a domain indicator is matched in payload content, while `pawpatrules` declares itself `signature` and holds 16,061 of them.
+
+**`None` means the snapshot recorded no classification**, which is a different fact from `frozenset()` — "it recorded that no rule is an indicator". Absence takes the *weaker* claim: every basis becomes `indicator-reference` and `warnings[]` says so once for the run, naming the snapshot to rebuild. Reading `None` as "not an indicator" would publish `direct` for ~16,000 rules and say nothing, which is §2.5's failure mode in the field the whole file exists to get right.
 
 **`manifest` was added to this signature in #44.** The original three arguments cannot produce
 the declared return type: `CorrelationResult.labels` is `tuple[Label, ...]`, a `Label` requires

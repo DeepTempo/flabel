@@ -273,18 +273,38 @@ def test_label_basis_is_derived_from_the_source_class(source_class, expected):
 
     Reporting that as `direct` would overstate what was observed. This is the derivation both
     steps 7 and 8 would otherwise have written separately.
+
+    **`address_indicator=False` is now required to see the feed-level answer alone** (PLAN 11c).
+    The rule composes: the per-rule half can only ever move an entry *toward*
+    `indicator-reference`, so isolating the feed half means stating that this rule is not one.
     """
     entry = build_source_entry(
-        make_detection(), make_admission(source_class=source_class), SNAPSHOT_ID
+        make_detection(),
+        make_admission(source_class=source_class),
+        SNAPSHOT_ID,
+        address_indicator=False,
     )
     assert entry.label_basis == expected
 
 
 def test_label_basis_is_taken_from_the_shared_derivation_not_recomputed():
-    """One derivation, not two that must agree."""
+    """One derivation, not two that must agree — for the feed-level half."""
     admission = make_admission(source_class="ioc-name")
-    entry = build_source_entry(make_detection(), admission, SNAPSHOT_ID)
+    entry = build_source_entry(make_detection(), admission, SNAPSHOT_ID, address_indicator=False)
     assert entry.label_basis == label_basis(admission.source_class)
+
+
+def test_omitting_the_rule_shape_takes_the_weaker_claim_not_the_stronger_one():
+    """The default is `None`, and `None` downgrades (PLAN 11c).
+
+    Deliberate: a caller that has not been taught about the per-rule classification must not
+    silently acquire `direct` for a signature-class source, which is the #75 defect. The safe
+    direction costs an understated basis; the unsafe one asserts ordinary traffic is an attack.
+    """
+    entry = build_source_entry(
+        make_detection(), make_admission(source_class="signature"), SNAPSHOT_ID
+    )
+    assert entry.label_basis == "indicator-reference"
 
 
 # --- spec §2.8: an identify source can never produce a label -------------------------------
@@ -1423,4 +1443,92 @@ def test_a_count_measured_before_the_failure_survives_it(tmp_path):
     assert block["counts"]["rules_loaded"] is None, "and what it never measured stays null"
     assert block["loss_conditions"]["identify_alert_suppressed"] is True, (
         "a measured suppression is a loss that occurred, failure or not"
+    )
+
+
+# --- per-rule label basis (issue #75, PLAN step 11c) ------------------------------------------
+#
+# The rule COMPOSES rather than replaces: a SourceEntry is `indicator-reference` if EITHER the
+# source's class says so OR the rule itself is an indicator. Both halves are load-bearing and
+# neither is redundant — `abuse.ch/urlhaus` is the canonical `ioc-name` source and scores 0% on
+# the per-rule test (a domain indicator is matched in payload content), while `pawpatrules`
+# declares itself `signature` and holds 16,061 header-tuple indicators.
+
+
+def test_a_signature_source_firing_an_indicator_rule_labels_indicator_reference(tmp_path):
+    """The half that #75 is about: 16,061 such rules sit inside a signature-class feed.
+
+    Before this, every one of them published `direct` — asserting the flow *is* the malicious
+    activity when what was established is that it reached a known-bad address.
+    """
+    entry = build_source_entry(
+        make_detection(source="pawpatrules", sid=3300140),
+        make_admission(name="pawpatrules", source_class="signature"),
+        SNAPSHOT_ID,
+        address_indicator=True,
+    )
+
+    assert entry.label_basis == "indicator-reference"
+
+
+def test_the_same_source_firing_a_content_rule_still_labels_direct(tmp_path):
+    """The composition has to cut both ways or it is just a per-source setting again."""
+    entry = build_source_entry(
+        make_detection(source="pawpatrules", sid=3321290),
+        make_admission(name="pawpatrules", source_class="signature"),
+        SNAPSHOT_ID,
+        address_indicator=False,
+    )
+
+    assert entry.label_basis == "direct"
+
+
+def test_an_ioc_name_source_labels_indicator_reference_whatever_the_rule_shape(tmp_path):
+    """The feed-level half, which the per-rule test cannot see.
+
+    `abuse.ch/urlhaus` scores 0% on `is_address_indicator` because a domain-name indicator is
+    matched in payload content — so a per-rule answer alone would publish `direct` for the
+    canonical indicator feed.
+    """
+    entry = build_source_entry(
+        make_detection(source="abuse.ch/urlhaus", sid=1000001),
+        make_admission(name="abuse.ch/urlhaus", source_class="ioc-name"),
+        SNAPSHOT_ID,
+        address_indicator=False,
+    )
+
+    assert entry.label_basis == "indicator-reference"
+
+
+def test_an_identify_source_still_raises_whatever_the_rule_shape(tmp_path):
+    """Spec §2.8 and §13: an identify-class source can never label. Unchanged by 11c."""
+    with pytest.raises(ValueError, match="identify-class"):
+        build_source_entry(
+            make_detection(source="oisf/trafficid", sid=300000),
+            make_admission(name="oisf/trafficid", source_class="identify"),
+            SNAPSHOT_ID,
+            address_indicator=True,
+        )
+
+
+def test_an_unclassified_snapshot_downgrades_rather_than_overclaiming(tmp_path):
+    """DECIDED (Craig, 2026-08-13): warn and downgrade, never refuse and never assume.
+
+    `load_address_indicators` returns `None` for a snapshot that recorded no classification —
+    schema 1, or the schema 2 written by the definition #79 corrected. Reading that as "no rule
+    is an indicator" would publish `direct` for ~16,000 header-tuple rules and say nothing,
+    which is the #75 defect restored by a default (spec §2.5: absence is never a signal).
+
+    So absence takes the *weaker* claim. The error this risks is understating a genuine `direct`
+    detection, which is wrong in the safer direction for a file that is training data.
+    """
+    entry = build_source_entry(
+        make_detection(source="pawpatrules", sid=3321290),
+        make_admission(name="pawpatrules", source_class="signature"),
+        SNAPSHOT_ID,
+        address_indicator=None,
+    )
+
+    assert entry.label_basis == "indicator-reference", (
+        "an unclassified snapshot must not be read as 'no rule is an indicator'"
     )

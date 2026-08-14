@@ -118,12 +118,20 @@ def correlate(
     flows: Mapping[str, Flow],
     manifest: SnapshotManifest,
     threshold: float = DEFAULT_THRESHOLD,
+    address_indicators: frozenset[int] | None = None,
 ) -> CorrelationResult:
     """Attach each detection to the one flow it fired on, and consolidate to one label per flow.
 
     `manifest` is the snapshot Suricata actually ran — spec §12's orchestration asserts that
     its `snapshot_id` equals `SuricataRunInfo.snapshot_id`, because a `rules update` landing
     between the two loads would otherwise have every label cite a ruleset whose rules never ran.
+
+    `address_indicators` is the snapshot's per-rule classification — the sids whose rules fire
+    on the header tuple alone (issue #75), from `rules.snapshot.load_address_indicators`. **`None`
+    means the snapshot recorded none**, and every `label_basis` then takes the weaker
+    `indicator-reference` with a warning on the result; see `provenance.build_source_entry`. The
+    warning is emitted here rather than per label because this is the one place that knows the
+    fact once for the whole run.
 
     Raises `SnapshotError` for a detection from a source the snapshot does not describe,
     `ValueError` for anything `build_source_entry` refuses (an `identify` source, an
@@ -137,13 +145,24 @@ def correlate(
     # Read once into a local, because the property rebuilds the mapping on every access.
     admissions = manifest.sources_by_name
 
+    # Reported once for the run, not once per label (issue #75, PLAN 11c). Spec §2.5: the
+    # downgrade is a decision taken in the absence of a fact, so the absence has to be stated.
+    unclassified: tuple[str, ...] = ()
+    if address_indicators is None and detections:
+        unclassified = (
+            f"snapshot {manifest.snapshot_id} recorded no per-rule indicator classification, so "
+            f"every label_basis in this run is indicator-reference rather than direct. Rebuild "
+            f"the snapshot with `flabel rules update` for per-rule bases.",
+        )
+
     # Every entry is built *before* any matching, so the guards inside `build_source_entry` run
     # over the whole detection set rather than over the subset that happened to correlate. An
     # identify-class alert on an uncorrelatable tuple is the same mis-wired pipeline as one on
     # a tuple that matches, and a snapshot id no reader can resolve is broken whether or not
     # this particular capture produced a label from it.
     entries = [
-        (detection, _entry(detection, admissions, manifest.snapshot_id)) for detection in detections
+        (detection, _entry(detection, admissions, manifest.snapshot_id, address_indicators))
+        for detection in detections
     ]
 
     matched: dict[str, list[SourceEntry]] = {}
@@ -174,7 +193,7 @@ def correlate(
     )
     # The gate both warns and, past the threshold, raises. Its warnings belong in the result so
     # they reach `run.warnings[]`, so it returns them rather than only printing them (issue #57).
-    return replace(result, warnings=_gate(result, threshold))
+    return replace(result, warnings=unclassified + _gate(result, threshold))
 
 
 # --- finding the candidates --------------------------------------------------------------------
@@ -368,7 +387,10 @@ def _counterparts(address: str) -> Mapping[int, int]:
 
 
 def _entry(
-    detection: Detection, admissions: Mapping[str, SourceAdmission], snapshot_id: str
+    detection: Detection,
+    admissions: Mapping[str, SourceAdmission],
+    snapshot_id: str,
+    address_indicators: frozenset[int] | None = None,
 ) -> SourceEntry:
     """This detection's provenance, built from the snapshot's record of its source.
 
@@ -390,7 +412,10 @@ def _entry(
             f"{snapshot_id} does not describe (it has {sorted(admissions)}): its label would "
             f"cite an origin the snapshot cannot account for"
         ) from None
-    return build_source_entry(detection, admission, snapshot_id)
+    # `None` stays `None` — "the snapshot recorded nothing" is not the same fact as "this sid
+    # is not an indicator", and `build_source_entry` treats them differently on purpose.
+    shape = None if address_indicators is None else detection.sid in address_indicators
+    return build_source_entry(detection, admission, snapshot_id, shape)
 
 
 # --- consolidation ---------------------------------------------------------------------------
