@@ -723,6 +723,8 @@ inventing on the feed's behalf. The rule itself says `classtype:trojan-activity`
 inside the hashed snapshot, and it is what the feed actually asserted. A rule with no `classtype:`
 yields `None`, which is ordinary: 10,949 of 85,545 admitted rules declare none.
 
+**Zero readable packets is refused by the walk, before Zeek or Suricata are invoked** (issue #85). A valid-but-empty pcap, a pcapng carrying only SHB+IDB, and a pcap truncated before its first whole record all reach this state. Zeek handles all three — "zero connections writes no conn.log" above — but Suricata cannot read them and spends its full 60-second thread-start budget first, so the run took a measured **63.1 s** to fail and then reported a thread that failed to start, blaming the tool for the input. Amends §12's exit-0 promise, deliberately: see that table.
+
 **Tuple normalisation — Suricata's 5-tuple is translated into Zeek's spelling.** §9 correlates by
 comparing the two tools' tuples field by field, and they disagree on four things. Every rule here
 was measured against real Zeek output, not inferred:
@@ -1202,7 +1204,7 @@ flabel rules list  [--rules-dir <d>]
 
 | Code | Meaning |
 | :-: | :-- |
-| 0 | Success. Labels written. Covers both complete and partial input — `run.input.input_status` distinguishes them. |
+| 0 | Success. Labels written. Covers both complete and partial input — `run.input.input_status` distinguishes them. **Partial means partial *data*, not zero data**: a capture with no readable packets is a `CaptureError` (issue #85), because `input_status: partial` on a file with nothing in it asserts a coverage figure over an empty set. |
 | 1 | Failure. **No `labels.json`** — but the run directory exists and holds `run.json` with `tool_failures[]` (§10), unless the failure occurred before a run directory could be created (a missing snapshot, an unreadable capture). |
 | 2 | Usage error (argparse). |
 | 3 | Not implemented — the Phase 1 default path only. |
