@@ -8,8 +8,8 @@ prd_gdoc_url: "https://docs.google.com/document/d/1WwKukQ71L6JQWkSpKvoR4lgwB96w3
 # STALE: the Doc above is PRD v0.2; docs/prd.md is v0.4. Regenerate it (Drive MCP cannot edit in
 # place, so it means creating a new Doc and updating this URL). Also: the superseded v0.1 Doc
 # 1q_muS6AmCuvcNva4C1WtRE3_KXArJPxnapttsU6UQIE needs deleting by hand — no delete tool exists.
-current_stage: verify
-next_action: "GCP: stand flabel up in a cloud environment and do a test run on real capture data (Craig, 2026-08-14). SCOPE NEEDS SETTLING FIRST — running the Phase 1 offline pipeline on a VM at scale is a different exercise from the Phase 2 PANW reachability spike (PRD §13 Q16), and CLAUDE.md says do not plan Phase 2 before that spike. The previous GCP environment was torn down; its manifests are in the gitignored archive/. Phase 1 sign-off is still formally open: steps 12 and 13 both landed after the Definition of Done was met, and docs/status.yaml records what the two verify passes found."
+current_stage: complete
+next_action: "PHASE 1 IS SIGNED OFF (2026-08-14). Nothing is in flight. The next unit of work is a choice, not a queue: (a) the Phase 2 PANW reachability spike, PRD §13 Q16 — can a cloud VM-Series see replayed traffic at all? CLAUDE.md says do not plan Phase 2 before it; (b) the five recorded deviations below, of which #89 and #90 are documentation and #88 is a cheap liveness check; (c) #77, directionality from HOME_NET: any, the largest remaining label-quality item at 61% blast radius. Read phase_1_signoff before choosing."
 blocked_on:
   - "NOT BLOCKING SIGN-OFF ANY MORE — DECIDED (Craig, 2026-08-13): the malicious canary gap is ACCEPTED for Phase 1. The PRD success criterion ships explicitly not met, #24 stays open, and the skipif stays as the visible marker rather than being removed. Residual risk, to be named in the verify report: the SCHEDULED Goal 5 gate (feeds.yml) has only a negative control, so nothing in the scheduled path proves the live 85k ruleset can still produce a label at all. The PR suite does cover that — test_canaries.py labels end to end against a small real snapshot every PR — so a total labelling outage is caught, just not by the gate whose job it is."
   - "PRD Q1/Q2/Q10: stakeholders, target release, success-metric review dates. Left TBD deliberately, not invented."
@@ -26,6 +26,41 @@ known_gaps:
   - "ci.yml's toolchain digest is updated by hand after the toolchain workflow publishes, so it can silently lag behind Dockerfile.toolchain — CI would keep running an older toolchain with every test passing, because the pins and the old image still agree. Known weak link, not an oversight."
   - "No LICENSE file. Deliberate (Craig's call, 2026-08-12) while JA4+ licensing is with Legal — the repo is public but unlicensed. Not a scaffold defect; do not re-flag."
   - "RESOLVED 2026-08-12: README rewritten in full (Craig asked for a real pass, not a patch). It had claimed Pre-research with no working code, an unsettled labels.json schema, and — the worst of it — that detections come from replaying the capture past inline inspection and from matching JA3/JA4 fingerprints against high-trust feeds. The first is Phase 2 and unbuilt; the second was explicitly rejected in research and is now spec §2.6, a computed fingerprint is never a verdict. Its `there is no working end-to-end command yet` line was corrected in step 9, which made it false."
+# --- Phase 1 sign-off, 2026-08-14 -------------------------------------------------------------
+# Craig's call, recorded rather than implied. Sign-off asserts TWO things and not a third:
+#   1. Phase 1's scope is delivered — PLAN.md's Definition of Done is met.
+#   2. The known gaps are recorded and owned, not silently absent.
+# It does NOT assert the code is defect-free. Five review rounds ran on 2026-08-14 and every one
+# found real defects that CI could not see; a sign-off conditioned on "no more defects" would
+# never happen, and the backlog is the correct home for what remains.
+phase_1_signoff:
+  date: "2026-08-14"
+  by: "Craig"
+  main: "606c6a6"
+  tests: "928 passed, 5 skipped locally; CI green on main"
+  definition_of_done:
+    - "All ten steps merged, each behind a green /project:verify — yes."
+    - "CI green on main in the toolchain container, EXECUTING requires_tools rather than skipping — yes."
+    - "Goals 1-5 each have a passing automated test — yes, with the deviations below."
+    - "flabel --offline labels a real public capture end to end — yes, proved on 17 real protocol captures against a live 85,302-rule snapshot."
+    - "The default path prints Coming Soon (TM) and exits 3 — yes."
+    - "Issue #11 closed with real admitted-rule counts — yes."
+  # No third whole-project pass was run, deliberately. The 2026-08-13 pass graded main at 9e66bef
+  # and four substantive steps landed after it (12, 13, 11c, 11d) — but each had its own
+  # fresh-agent review, and between them those reviews produced ~30 findings fixed before merge.
+  # A third pass would re-grade PRD criteria that have not moved.
+  deviations:
+    - "#24 — the malicious canary is unsourced, so GOAL 5's SENSITIVITY HALF IS NOT MET. A pipeline that silently stopped labelling anything would pass every gate. Accepted explicitly (Craig, 2026-08-13) after the most promising candidate was ruled out by measurement: ET Open is the only feed of nine carrying any EICAR rule and none of the three enabled ones detects EICAR as such."
+    - "#90 — US-14's JA4 cross-check is a [CI] acceptance criterion that is unimplemented and has no field in spec §10. Zero impact today because no ja4.hash rules exist upstream (#13); latent the day content appears."
+    - "#89 — PRD §6.6 lists classtype as REQUIRED where the code and spec §4 make it nullable, justified by 10,949 of 84,995 rules declaring none. So READ LITERALLY, GOAL 1 IS NOT MET. The decision is right; the PRD was never amended."
+    - "#94 — four of ten §11 loss conditions have no end-to-end fault injection. Every field is present and spec-parsed and the faults are asserted at stage level, but not through the assembled pipeline."
+    - "#88 — Goal 5's REAL review runs only on a schedule GitHub disables after 60 days of repository quiet, and nothing fails if it stops. PRD §6.3 claims it runs on every build, which is true only of the narrow 3-rule canary."
+  what_phase_1_actually_does:
+    - "pcap in -> Zeek logs + labels.json of malicious-flow verdicts, each carrying tier, source, sid, rev, ruleset snapshot id, admission basis, licence, classtype and label_basis."
+    - "Nine open-source rule feeds, content-addressed into an immutable snapshot: 115,991 fetched -> 84,995 admitted (73.3%) with exclude_classtypes in force."
+    - "Reproducible over canonicalised records, gated in CI by a comparison proved able to fail."
+    - "One label per flow, joined to Zeek by uid; identify-class sources can never label; a computed fingerprint is never a verdict."
+
 # NOTE: issue numbers are not in stage order. Two creates hit a transient TLS
 # error and were retried, and GitHub never reuses issue numbers. This mapping is
 # authoritative — trust it over the numeric order in the GitHub issue list.
@@ -39,7 +74,7 @@ stages:
   # Steps 11 and 12 are post-Phase-1 remediation, not part of the 10/10 above. Counted here
   # so the tracker does not read as "nothing has been built since".
   post_phase_1: { steps_done: 4, steps_total: 5, detail: "11a, 11b, 12 (#84) and 13 (#85 #86 #70 #57 #62 #87) merged; 11c, 11d not started" }
-  verify:     { status: in_progress, issue: 5, artifact: null, completed: null }
+  verify:     { status: completed, issue: 5, artifact: "docs/status.yaml phase_1_signoff", completed: "2026-08-14" }
 log:
   - "2026-08-13 /project:verify (final whole-project pass) found 3 High defects, none visible from CI. The sharpest: the #75 admission policy had been built, tested, documented in spec §6 and described in PR #78 as shipped, but sources.toml never received the [admission] table — untouched since step 2. So the mechanism was inert and every real run still admitted the 436 policy-violation rules. The test that should have caught it was PINNING it: test_a_registry_with_no_admission_table_is_permissive asserted the permissive default against the SHIPPED registry, so its name read as a unit test of the absent-table default while what it asserted was that the product excludes nothing. Fixed in #83; measured after: 84,995 admitted (436 fewer, exactly the excluded count) and the 17-capture corpus at 12 labels / 21 source entries, the residue being exactly the three causes #75 predicted"
   - "2026-08-13 the EICAR route to the malicious canary was measured DEAD before Craig was asked to accept the gap, which turned the question into a straight accept-or-block. ET Open is the only feed of nine carrying any EICAR rule and none of the three enabled ones detects EICAR as such — two need a Symantec MIME name-overflow shape, one needs an x-powered-by: Kaspersky Labs header, all three are HTTP, and the committed fixture is SMB. The metadata filter was never the blocker"

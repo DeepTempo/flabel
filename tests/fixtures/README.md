@@ -31,10 +31,19 @@ realistic captures against the real nine-feed snapshot produced 100 labels — a
 | Gate | Runs | Against |
 | --- | --- | --- |
 | `tests/integration/test_canaries.py` | every PR | a small real snapshot built from `rules/synthetic.rules` — proves the pipeline invents no labels |
-| `.github/workflows/feeds.yml` | daily, and on demand | the **live nine-feed ruleset**, ~85k rules — the actual Goal 5 review |
+| `.github/workflows/feeds.yml` — narrow | daily, and on demand | `benign.pcap` against the **live nine-feed ruleset**, ~85k rules. Zero tolerance: any label fails |
+| `.github/workflows/feeds.yml` — broad | daily, and on demand | the **17-capture corpus** against the same snapshot. Fails on any source entry not in `benign-corpus/tolerated.json` (PLAN 11d) |
 
-The PR suite cannot do the second: spec §2.2 forbids the test suite contacting rule feeds, and a
-real snapshot is 124 MB. Neither gate is sufficient alone — the scheduled one could pass forever
+**`tolerated.json` is the load-bearing part of the broad review**, and the file to read first when
+it fails. It lists every source entry the corpus is known to produce — three, as of 2026-08-14 —
+with the argument for tolerating each. The gate fails on anything else, on a tolerated sid that
+claims a *stronger* basis than recorded, and on any entry firing more than ten times its measured
+count. The list is capped at three entries so a fourth is a deliberate edit rather than an append,
+and `tests/integration/corpus_gate.py` holds the decision so `test_corpus_gate.py` can prove it
+fails.
+
+The PR suite cannot do either of the scheduled reviews: spec §2.2 forbids the test suite contacting
+rule feeds, and a real snapshot is 124 MB. Neither gate is sufficient alone — the scheduled one could pass forever
 against a canary someone had quietly emptied, which is why `benign.pcap` is byte-pinned by
 `test_the_benign_canary_fixture_is_the_one_the_gate_was_measured_against`.
 
