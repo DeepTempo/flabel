@@ -266,3 +266,32 @@ def test_zeek_loads_ja4_package(strict_toolchain):
         f"authority for the value carried on a label (docs/prd.md §9), so the container "
         f"must ship it. Zeek said:\n{parse.stderr}"
     )
+
+
+def test_the_scheduled_workflow_still_runs_both_false_positive_reviews():
+    """The same argument as `test_ci_still_passes_the_toolchain_flags`, for `feeds.yml`.
+
+    Everything the broad review guarantees rests on one line of YAML. Delete the "Goal 5 broad"
+    step, add `continue-on-error: true`, or append `|| true`, and every test in this repo still
+    passes while the only false-positive review the 21,464 ungated `pawpatrules` rules get quietly
+    stops existing. Found reviewing #101, which shipped the gate without this.
+
+    Two adjacent tampering routes already fail loudly and are not asserted here: deleting the
+    labelling loop leaves `corpus-runs` absent, and renaming the output directory does the same —
+    `corpus_gate.verify` refuses a missing run directory.
+    """
+    feeds = (REPO_ROOT / ".github/workflows/feeds.yml").read_text(encoding="utf-8")
+
+    assert "flabel rules update" in feeds, "feeds.yml no longer builds a real snapshot"
+    assert "tests/fixtures/benign.pcap" in feeds, "feeds.yml no longer labels the narrow canary"
+    assert "tests/integration/corpus_gate.py" in feeds, (
+        "feeds.yml no longer runs the broad corpus review — the gate that would catch issue #75 "
+        "recurring on ordinary protocol traffic"
+    )
+    assert "--output-dir corpus-runs" in feeds, (
+        "the corpus labelling step no longer writes where corpus_gate.py reads"
+    )
+    assert "continue-on-error" not in feeds, (
+        "a review that cannot fail the workflow is not a review"
+    )
+    assert "|| true" not in feeds, "a step whose failure is swallowed is not a gate"

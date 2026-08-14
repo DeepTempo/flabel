@@ -297,7 +297,7 @@ decomposition on issue #75.
 | 11a | `[admission] exclude_classtypes` in the registry, with its own exclusion counter | **merged** (#78) |
 | 11b | Address-indicator classification recorded in `sid_index.json` | **merged** (#78, corrected in #79) |
 | 11c | `build_source_entry` consumes it for `label_basis` | **merged** |
-| 11d | The benign corpus against the real ruleset, in `feeds.yml` | **merged** |
+| 11d | The benign corpus against the real ruleset, in `feeds.yml` | in review (PR #101) |
 
 ### 11c — the one that needs care
 
@@ -360,7 +360,9 @@ exactly once.
 
 ### 11d — the gate that closes the loop
 
-**Files:** `.github/workflows/feeds.yml`
+**Files:** `.github/workflows/feeds.yml`, `tests/integration/corpus_gate.py`,
+`tests/integration/test_corpus_gate.py`, `tests/fixtures/benign-corpus/tolerated.json`,
+`tests/test_toolchain.py`
 
 Run `tests/fixtures/benign-corpus/` against the freshly-fetched nine-feed snapshot and fail on any
 label. Deliberately **not** written before 11a-c land: the assertion depends on the policy in
@@ -369,12 +371,26 @@ fail. With 11a alone the corpus still produces 21 source entries — the residue
 structurally broken rule, a loose regex, and #77's directionality loss — so the expectation is
 "zero" only once those are settled too.
 
-**Superseded by measurement, 2026-08-14.** This step was deferred on the reasoning that "the
-expectation is 'zero' only once those are settled too" — waiting on #77, a broken upstream rule and
-a loose pcre. That reasoning is out of date: the residue was measured at **12 labels / 21 source
-entries against two different rulesets** (84,995 rules from the mirror and 85,302 fetched live),
-with the same three sids in the same proportions. Stability across a 307-rule difference is what
-lets the gate pin the known residue instead of waiting for a zero that needs three other fixes.
+**Reshaped 2026-08-14 — and the reason is a design argument, not a measurement.** This step was
+deferred on the reasoning that "the expectation is 'zero' only once those are settled too", waiting
+on #77, a broken upstream rule and a loose pcre. The better shape is to **pin the known residue
+now**: a gate that catches a *new* false positive today beats a perfect gate blocked on three other
+fixes, and #75 was found by exactly the traffic this reviews.
+
+**The corroborating measurement is weaker than it first looks, and is recorded honestly because a
+reader would otherwise take it as proof.** The residue was 12 labels / 21 source entries against
+both the 2026-08-12 mirror (84,995 rules) and a 2026-08-14 live fetch (85,302) — same three sids,
+same proportions. But 307 rules is **0.36%** of the ruleset, from two samples of the same nine feeds
+two days apart. That is evidence that two nearly identical rulesets behave nearly identically; it is
+not evidence of stability under drift, and this very workflow exists because `abuse.ch/urlhaus` and
+two pawpatrules companion lists refresh *daily*.
+
+So the design stands on its own merits and the gate is built to survive the residue being less
+stable than hoped: the allowlist is capped at three entries, each entry has an
+order-of-magnitude count ceiling, and a stale entry is reported on stderr. **If the first weeks
+produce a stream of new offenders, the answer is to fix or exclude the rules — not to append.**
+Worth sizing deliberately: trigger `workflow_dispatch` on five to seven consecutive days and count
+the distinct `(source, sid, label_basis)` triples that appear.
 
 So it fails on any source entry whose `(source, sid, label_basis)` is not in
 `tests/fixtures/benign-corpus/tolerated.json`, each entry carrying its reason. Counts are not

@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 import pytest
-from corpus_gate import TOLERATED, load_tolerated, review, unaccounted
+from corpus_gate import TOLERATED, load_tolerated, review, unaccounted, verify
 
 KNOWN_INDICATOR = {
     "source": "pawpatrules",
@@ -34,15 +34,41 @@ KNOWN_DIRECT = {
 }
 
 
-def write_run(root: Path, name: str, *sources: dict) -> Path:
-    """A run directory holding one label carrying `sources`, or none if empty."""
+def write_run(
+    root: Path,
+    name: str,
+    *sources: dict,
+    loaded: int = 85302,
+    status: str = "complete",
+) -> Path:
+    """A run directory holding one label carrying `sources`, or none if empty.
+
+    Writes a *sound* `run.json` by default — full ruleset, complete input — because `review`
+    refuses a run that reviewed less than it claims to have. `loaded` and `status` are the knobs
+    for testing that refusal.
+    """
     rundir = root / name
     rundir.mkdir(parents=True)
     labels = [{"sources": list(sources)}] if sources else []
     (rundir / "labels.json").write_text(
         json.dumps({"schema_version": 1, "run": {}, "labels": labels}), encoding="utf-8"
     )
+    (rundir / "run.json").write_text(
+        json.dumps(
+            {
+                "run": {
+                    "counts": {"rules_loaded": loaded},
+                    "ruleset": {"total_admitted": 85302},
+                    "input": {"input_status": status},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     return rundir
+
+
+ONE_CAPTURE = [Path("only.pcap")]
 
 
 @pytest.fixture
@@ -144,4 +170,123 @@ def test_a_reasonless_entry_is_refused(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="no reason"):
+        load_tolerated(path)
+
+
+# --- verify() is what the workflow's exit code comes from (found reviewing #101) --------------
+#
+# The first version of this module put every guard inside `main`, where no test reached it:
+# changing its `return 1` to `return 0` left all eight tests below green and the daily gate
+# permanently so. Same shape as #74 and #98, one level up. These are the tests that hold it.
+
+
+def test_verify_fails_on_an_offender(tmp_path: Path, tolerated):
+    """The exit code the workflow acts on, for the case the gate exists for."""
+    newcomer = {**KNOWN_DIRECT, "sid": 9999999, "threat": "ET MALWARE Something Plausible"}
+    write_run(tmp_path, "only", KNOWN_INDICATOR, newcomer)
+
+    assert verify(tmp_path, ONE_CAPTURE, tolerated) == 1
+
+
+def test_verify_passes_on_the_known_residue(tmp_path: Path, tolerated):
+    write_run(tmp_path, "only", KNOWN_INDICATOR, KNOWN_DIRECT)
+
+    assert verify(tmp_path, ONE_CAPTURE, tolerated) == 0
+
+
+def test_verify_refuses_an_empty_corpus(tmp_path: Path, tolerated):
+    """A gate measuring nothing must not report success — the failure mode of the whole session."""
+    assert verify(tmp_path, [], tolerated) == 1
+
+
+def test_verify_refuses_a_missing_run_directory(tmp_path: Path, tolerated):
+    """Reachable for real: the labelling step failed before writing anything.
+
+    Previously this raised `FileNotFoundError` out of `iterdir` — a traceback where the codebase's
+    own rule is that a malformed input is a reason, never a stack trace.
+    """
+    assert verify(tmp_path / "never-created", ONE_CAPTURE, tolerated) == 1
+
+
+def test_verify_refuses_when_a_capture_produced_no_run(tmp_path: Path, tolerated):
+    """One capture, no run directories: this gate did not review what it claims to have."""
+    (tmp_path / "not-a-dir.txt").write_text("x", encoding="utf-8")
+
+    assert verify(tmp_path, ONE_CAPTURE, tolerated) == 1
+
+
+def test_verify_refuses_a_run_that_loaded_a_partial_ruleset(tmp_path: Path, tolerated):
+    """`_confirm_shortfall` proceeds when stdin is not a TTY, which CI never is.
+
+    So a run that loaded 40 of 85,302 rules produces zero source entries and would otherwise have
+    this gate print "no unaccounted-for label on 17 real protocol captures" — a sentence stronger
+    than anything that was measured.
+    """
+    write_run(tmp_path, "only", loaded=40)
+
+    assert verify(tmp_path, ONE_CAPTURE, tolerated) == 1
+
+
+def test_verify_refuses_a_run_that_ingested_only_part_of_its_capture(tmp_path: Path, tolerated):
+    """Same argument one field over: a partial capture is a partial review."""
+    write_run(tmp_path, "only", status="partial")
+
+    assert verify(tmp_path, ONE_CAPTURE, tolerated) == 1
+
+
+def test_verify_fails_when_a_tolerated_entry_blows_up(tmp_path: Path, tolerated):
+    """A new defect wearing a known sid.
+
+    sid 3317444's destination is literally 127.0.0.1. If upstream broadens it, one tolerated entry
+    could swallow the whole corpus — and with counts unbounded the gate would print the hits and
+    exit 0. The ceiling is an order of magnitude, so ordinary churn still passes.
+    """
+    write_run(tmp_path, "only", *([KNOWN_INDICATOR] * 200))
+
+    assert verify(tmp_path, ONE_CAPTURE, tolerated) == 1
+
+
+def test_the_allowlist_cannot_grow_by_appending(tmp_path: Path):
+    """A fourth entry has to raise the ceiling deliberately rather than ride along in a list."""
+    path = tmp_path / "tolerated.json"
+    entry = {"source": "x", "sid": 1, "label_basis": "direct", "reason": "why"}
+    path.write_text(
+        json.dumps({"entries": [{**entry, "sid": n} for n in range(1, 6)]}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="over the 3 this gate allows"):
+        load_tolerated(path)
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        pytest.param({"sid": "3317444"}, "not an integer", id="sid-as-a-string"),
+        pytest.param({"label_basis": "Direct"}, "label_basis", id="basis-miscased"),
+        pytest.param({"reason": 7}, "no reason", id="reason-not-a-string"),
+    ],
+)
+def test_an_unusable_tolerated_entry_is_refused(tmp_path: Path, entry, expected):
+    """Each of these would otherwise make the entry unmatchable — so the false positive reads as
+    new *and* the entry reads as stale. Two wrong answers from one typo."""
+    path = tmp_path / "tolerated.json"
+    base = {"source": "pawpatrules", "sid": 1, "label_basis": "direct", "reason": "why"}
+    path.write_text(json.dumps({"entries": [{**base, **entry}]}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=expected):
+        load_tolerated(path)
+
+
+def test_a_duplicated_tolerated_entry_is_refused(tmp_path: Path):
+    """Last-wins would have a reviewer read one reason and the gate apply the other (cf. #49)."""
+    path = tmp_path / "tolerated.json"
+    entry = {"source": "pawpatrules", "sid": 1, "label_basis": "direct"}
+    path.write_text(
+        json.dumps(
+            {"entries": [{**entry, "reason": "first"}, {**entry, "reason": "contradictory"}]}
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="appears twice"):
         load_tolerated(path)
