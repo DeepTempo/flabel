@@ -805,8 +805,13 @@ Order of operations:
 ```python
 def correlate(detections: Sequence[Detection], flows: Mapping[str, Flow],
               manifest: SnapshotManifest,
-              threshold: float = 0.01) -> CorrelationResult
+              threshold: float = 0.01,
+              address_indicators: frozenset[int] | None = None) -> CorrelationResult
 ```
+
+**`address_indicators` was added in step 11c** (issue #75): the sids whose rules fire on the header tuple alone, read from the snapshot's `sid_index.json`. A `SourceEntry` is `indicator-reference` if **either** the source's class says so **or** the rule is one of these — the two compose, and neither half is redundant. `abuse.ch/urlhaus` is the canonical `ioc-name` source and scores 0% on the per-rule test because a domain indicator is matched in payload content, while `pawpatrules` declares itself `signature` and holds 16,061 of them.
+
+**`None` means the snapshot recorded no classification**, which is a different fact from `frozenset()` — "it recorded that no rule is an indicator". Absence takes the *weaker* claim: every basis becomes `indicator-reference` and `warnings[]` says so once for the run, naming the snapshot to rebuild. Reading `None` as "not an indicator" would publish `direct` for ~16,000 rules and say nothing, which is §2.5's failure mode in the field the whole file exists to get right.
 
 **`manifest` was added to this signature in #44.** The original three arguments cannot produce
 the declared return type: `CorrelationResult.labels` is `tuple[Label, ...]`, a `Label` requires

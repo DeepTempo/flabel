@@ -676,7 +676,10 @@ def test_each_detection_gets_the_admission_for_its_own_source():
         make_detection(source="abuse.ch/urlhaus", sid=3000001),
     ]
 
-    result = correlate(detections, by_uid(make_flow()), manifest)
+    # `frozenset()` — the snapshot recorded a classification and neither rule is an indicator —
+    # which is a different fact from `None`, "the snapshot recorded nothing" (PLAN 11c). Passing
+    # `None` here would downgrade both entries and hide the feed-level distinction under test.
+    result = correlate(detections, by_uid(make_flow()), manifest, address_indicators=frozenset())
 
     terms = {entry.source: (entry.licence, entry.label_basis) for entry in result.labels[0].sources}
     assert terms == {
@@ -1415,3 +1418,54 @@ def test_the_failed_run_carries_the_warning_too_which_is_the_path_that_matters()
     assert any("this run has failed" in warning for warning in warnings), (
         f"the failed run's own report would not say why: {warnings}"
     )
+
+
+# --- per-rule label basis threaded through (issue #75, PLAN step 11c) ------------------------
+
+
+def test_the_rule_shape_follows_the_sid_not_the_source():
+    """Two detections from one signature feed, one an indicator and one not.
+
+    This is the whole of #75: `pawpatrules` carries both, so no per-source setting can separate
+    them. The classification has to be looked up per sid.
+    """
+    manifest = make_manifest(make_admission(name="pawpatrules", source_class="signature"))
+    detections = [
+        make_detection(source="pawpatrules", sid=3300140),
+        make_detection(source="pawpatrules", sid=3321290),
+    ]
+
+    result = correlate(
+        detections, by_uid(make_flow()), manifest, address_indicators=frozenset({3300140})
+    )
+
+    bases = {entry.sid: entry.label_basis for entry in result.labels[0].sources}
+    assert bases == {3300140: "indicator-reference", 3321290: "direct"}
+
+
+def test_an_unclassified_snapshot_warns_once_and_downgrades_every_basis():
+    """Spec §2.5: the downgrade is a decision taken in the absence of a fact, so state it.
+
+    Once for the run, not once per label — a warning repeated per entry trains a reader to
+    ignore `warnings[]`, which is the failure the run block exists to avoid.
+    """
+    manifest = make_manifest(make_admission(name="pawpatrules", source_class="signature"))
+    detections = [make_detection(source="pawpatrules", sid=3300140 + n) for n in range(5)]
+
+    result = correlate(detections, by_uid(make_flow()), manifest, address_indicators=None)
+
+    bases = {entry.label_basis for entry in result.labels[0].sources}
+    assert bases == {"indicator-reference"}, "absence must not be read as 'not an indicator'"
+
+    notices = [w for w in result.warnings if "no per-rule indicator classification" in w]
+    assert len(notices) == 1, f"expected exactly one notice for the run, got {notices}"
+    assert manifest.snapshot_id in notices[0], "the warning must name the snapshot to rebuild"
+
+
+def test_a_run_with_no_detections_does_not_warn_about_a_classification_it_never_needed():
+    """Silence at zero is what makes the warning worth reading (the §2.5 argument, both ways)."""
+    manifest = make_manifest(make_admission(name="pawpatrules", source_class="signature"))
+
+    result = correlate([], by_uid(make_flow()), manifest, address_indicators=None)
+
+    assert result.warnings == ()

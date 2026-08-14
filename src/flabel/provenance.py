@@ -32,6 +32,7 @@ from __future__ import annotations
 from flabel.models import (
     SNAPSHOT_ID,
     Detection,
+    LabelBasis,
     SourceAdmission,
     SourceEntry,
     label_basis,
@@ -46,7 +47,10 @@ KNOWN_TIERS = (1, 2)
 
 
 def build_source_entry(
-    detection: Detection, admission: SourceAdmission, snapshot_id: str
+    detection: Detection,
+    admission: SourceAdmission,
+    snapshot_id: str,
+    address_indicator: bool | None = None,
 ) -> SourceEntry:
     """The one place a `Detection` becomes a label's provenance.
 
@@ -61,6 +65,11 @@ def build_source_entry(
     stage failed to do its job, and `cli.py` maps anything unrecognised to exit 1. The one
     genuinely operator-facing case — a detection whose source is not in the snapshot at all —
     belongs to the caller, and spec §9 makes it a typed `SnapshotError` there.
+
+    `address_indicator` is this rule's own shape, from the snapshot's `sid_index.json` (issue
+    #75). `True` or `False` when the snapshot recorded a classification; **`None` when it
+    recorded none** — schema 1, or the schema 2 written by the definition #79 corrected. It
+    defaults to `None` so an existing caller cannot silently acquire the stronger claim.
     """
     # The type hint is not the guard. `SourceSpec` carries all five attributes this function
     # reads off an admission — `name`, `url`, `licence`, `source_class`, `admission_basis` — so
@@ -139,10 +148,28 @@ def build_source_entry(
                 f"that is missing it looks complete and asserts nothing"
             )
 
-    basis = label_basis(admission.source_class)
+    # The two classifications COMPOSE rather than replace (issue #75, PLAN 11c). A source entry
+    # is `indicator-reference` if EITHER the feed's class says so OR this rule is an indicator,
+    # and both halves see what the other cannot: `abuse.ch/urlhaus` is the canonical `ioc-name`
+    # source and scores 0% on the per-rule test, because a domain indicator is matched in payload
+    # content; `pawpatrules` declares itself `signature` and holds 16,061 header-tuple
+    # indicators, which is the whole of #75.
+    feed_basis = label_basis(admission.source_class)
     # Unreachable while `may_label` is checked above; asserted so the two cannot drift apart
     # silently if a class is ever added that may label without a basis.
-    assert basis is not None
+    assert feed_basis is not None
+
+    if feed_basis == "indicator-reference" or address_indicator is not False:
+        # `is not False` rather than a truth test, because `None` must take this branch too.
+        # DECIDED (Craig, 2026-08-13): an unclassified snapshot WARNS AND DOWNGRADES. Reading
+        # `None` as "not an indicator" would publish `direct` for ~16,000 rules and say nothing,
+        # which is the #75 defect restored by a default — and spec §2.5 says absence is never a
+        # signal. The weaker claim is the safe direction: understating a genuine `direct`
+        # detection is wrong, but it does not assert that ordinary traffic *is* an attack. The
+        # run block carries the warning; `correlate` emits it once, not once per label.
+        basis: LabelBasis = "indicator-reference"
+    else:
+        basis = "direct"
 
     return SourceEntry(
         # From the detection: what the engine actually observed.

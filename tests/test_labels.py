@@ -701,6 +701,11 @@ def test_the_label_basis_of_each_source_class_reaches_labels_json(source_class, 
     Built through `build_source_entry` rather than by handing `SourceEntry` the answer, so the
     assertion covers the derivation and the serialisation together — a test constructing the
     entry with `label_basis=expected` would prove only that a string survives a dict copy.
+
+    `address_indicator=False` states that this rule is not a header-tuple indicator, which is
+    what isolates the feed-level answer (PLAN 11c). The per-rule half can only move an entry
+    toward `indicator-reference`, so without this the `signature` and `ioc-dest` cases would take
+    the downgrade that an unclassified snapshot gets.
     """
     from flabel.provenance import build_source_entry
 
@@ -708,7 +713,7 @@ def test_the_label_basis_of_each_source_class_reaches_labels_json(source_class, 
     admission = make_admission(
         name="abuse.ch/urlhaus", source_class=source_class, admission_basis="wholesale"
     )
-    entry = build_source_entry(detection, admission, SNAPSHOT_ID)
+    entry = build_source_entry(detection, admission, SNAPSHOT_ID, address_indicator=False)
 
     decoded = json.loads(serialise(document(labels=(make_label(None, entry),))))
     assert decoded["labels"][0]["sources"][0]["label_basis"] == expected

@@ -60,7 +60,12 @@ from flabel.provenance import build_run_block
 from flabel.rules import utc_now
 from flabel.rules.admit import admit
 from flabel.rules.fetch import fetch_feed
-from flabel.rules.snapshot import list_snapshots, load_snapshot, write_snapshot
+from flabel.rules.snapshot import (
+    list_snapshots,
+    load_address_indicators,
+    load_snapshot,
+    write_snapshot,
+)
 from flabel.suricata import run_suricata
 from flabel.zeek import run_zeek
 
@@ -590,7 +595,17 @@ def _label(args: argparse.Namespace) -> int:
                     "labels were written"
                 )
 
-            progress.correlation = correlate(detections, flows, manifest, args.unmatched_threshold)
+            # Read from the snapshot that Suricata actually ran, after the id assertion above
+            # (issue #75, PLAN 11c). `None` means this snapshot recorded no per-rule
+            # classification — schema 1, or the schema 2 the definition in #79 corrected — and
+            # `correlate` then downgrades every basis and says so once in `run.warnings[]`.
+            # Deliberately not defaulted to an empty set: "recorded nothing" and "recorded that
+            # no rule is an indicator" are different facts about the ruleset.
+            indicators = load_address_indicators(snapshot_dir)
+
+            progress.correlation = correlate(
+                detections, flows, manifest, args.unmatched_threshold, indicators
+            )
 
             # Inside the `try`, so a failure while rendering NOTICE or serialising is reported
             # like any other. Outside it, such a failure escaped past the handler and left the

@@ -296,7 +296,7 @@ decomposition on issue #75.
 | :-: | :-- | :-- |
 | 11a | `[admission] exclude_classtypes` in the registry, with its own exclusion counter | **merged** (#78) |
 | 11b | Address-indicator classification recorded in `sid_index.json` | **merged** (#78, corrected in #79) |
-| 11c | `build_source_entry` consumes it for `label_basis` | **not started** |
+| 11c | `build_source_entry` consumes it for `label_basis` | **merged** |
 | 11d | The benign corpus against the real ruleset, in `feeds.yml` | **not started** |
 
 ### 11c — the one that needs care
