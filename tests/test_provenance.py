@@ -480,6 +480,10 @@ def make_suricata_info(**overrides) -> SuricataRunInfo:
         "snapshot_id": SNAPSHOT_ID,
         "rules_loaded": 85519,
         "alerts_total": 3,
+        # Stated rather than defaulted: this helper models a *completed* pass, and a completed
+        # pass always took this measurement. The field defaults to None precisely so a caller
+        # that never looked cannot assert zero suppressions (issue #86 review).
+        "identify_alerts_suppressed": 0,
         "config_sha256": "9f" * 32,
     }
     return SuricataRunInfo(**{**fields, **overrides})

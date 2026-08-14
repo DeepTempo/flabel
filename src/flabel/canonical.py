@@ -26,6 +26,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from flabel.models import is_partial
+
 #: Excluded outright, because neither file has any analytic content to compare.
 #:
 #: `zeek/packet_filter.log` is nothing but a wall-clock start time. `suricata/suricata.log`
@@ -33,8 +35,6 @@ from typing import Any
 #: than deleted — deleting a log the tool wrote would misrepresent the run — and simply never
 #: compared. Kept small and justified per name: an exclusion list that can be appended to without
 #: argument is how a failing gate gets made to pass.
-from flabel.models import is_partial
-
 EXCLUDED_FILES = frozenset({"zeek/packet_filter.log", "suricata/suricata.log"})
 
 #: Canonicalised by its own rule rather than excluded — see `canonical_reporter_records`.

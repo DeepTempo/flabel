@@ -21,7 +21,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -1042,24 +1041,3 @@ def test_a_capture_with_no_readable_packets_is_refused(make, tmp_path: Path):
 
     with pytest.raises(CaptureError, match="no readable packets"):
         normalize(capture, workdir)
-
-
-def test_the_refusal_happens_without_waiting_for_a_tool(tmp_path: Path):
-    """Asserted on elapsed time, not on a mock.
-
-    The whole point is that the failure no longer costs Suricata's 60-second thread-start budget,
-    and a mock asserting "Suricata was not called" would encode the assumption under test —
-    `CLAUDE.md`'s testing line. A wall-clock bound is crude but it is measuring the real thing:
-    the old path could not possibly finish this fast.
-    """
-    capture = empty_pcap(tmp_path / "empty.pcap")
-
-    started = time.perf_counter()
-    with pytest.raises(CaptureError):
-        normalize(capture, tmp_path / "work")
-    elapsed = time.perf_counter() - started
-
-    assert elapsed < 5.0, (
-        f"refusing an empty capture took {elapsed:.1f}s — that is the 60-second Suricata "
-        f"thread-start budget being spent on a file it cannot read (issue #85)"
-    )

@@ -723,7 +723,7 @@ inventing on the feed's behalf. The rule itself says `classtype:trojan-activity`
 inside the hashed snapshot, and it is what the feed actually asserted. A rule with no `classtype:`
 yields `None`, which is ordinary: 10,949 of 85,545 admitted rules declare none.
 
-**Zero readable packets is refused by the walk, before Zeek or Suricata are invoked** (issue #85). A valid-but-empty pcap, a pcapng carrying only SHB+IDB, and a pcap truncated before its first whole record all reach this state. Zeek handles all three — "zero connections writes no conn.log" above — but Suricata cannot read them and spends its full 60-second thread-start budget first, so the run took a measured **63.1 s** to fail and then reported a thread that failed to start, blaming the tool for the input. Amends §12's exit-0 promise, deliberately: see that table.
+**Zero readable packets never reaches Suricata** — refused during ingest, §8 step 9 (issue #85). Zeek handles such a capture happily; Suricata cannot read it and burns its 60-second thread-start budget first.
 
 **Tuple normalisation — Suricata's 5-tuple is translated into Zeek's spelling.** §9 correlates by
 comparing the two tools' tuples field by field, and they disagree on four things. Every rule here
@@ -790,10 +790,13 @@ Order of operations:
 2. Decompress gzip to a temporary file.
 3. **Validate by walking record headers** — flabel's own walk, because no tool in the dependency set reports a truncation offset. Yields `packets_read` and, if the final record is short, `truncated_at_offset`.
 4. **Unreadable header** → `CaptureError`, hard failure, no output directory.
-5. **Truncated pcap** → proceed; `input_status = "partial"`.
+5. **Truncated pcap** → proceed; `input_status = "partial"` — *provided at least one whole record survives*. See step 9.
 6. **Truncated pcapng** → hard failure telling the operator to repair with `editcap`; a partial pcapng block cannot be converted safely.
 7. **pcapng** → `editcap -F pcap`. If it reports multiple link types, determine the dominant type by packet count, split with `editcap`, keep only the dominant, and record `discarded_link_types` and `discarded_packets` with `input_status = "partial"`.
 8. Record every transformation in provenance.
+9. **Zero usable packets** → `CaptureError`, hard failure, no output directory (issue #85). A valid-but-empty pcap, a pcapng carrying only SHB+IDB, and a pcap truncated before its first complete record all reach this state, and none of them is labellable: `input_status: partial` on a file with nothing in it asserts a coverage figure over an empty set. **Amends §12's exit-0 promise**, deliberately — exit 0 covers partial *data*, not zero data.
+
+   The check runs after conversion rather than at the walk, so `editcap` may already have been invoked; it is Zeek and Suricata it precedes, which is where the cost was. Measured before it existed: **63.1 s** to fail, because Suricata cannot read such a file and spends its full 60-second thread-start budget first, then blames a thread that failed to start.
 
 ---
 

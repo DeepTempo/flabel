@@ -352,10 +352,20 @@ def test_the_suricata_run_info_counts_rules_the_engine_rejected():
 
 
 def test_the_suricata_run_info_defaults_the_new_fields():
-    """Every field added for the run block has a default, so no existing call site breaks."""
+    """Every field added for the run block has a default, so no existing call site breaks.
+
+    `rules_failed` and `rules_skipped` default to **zero** and `identify_alerts_suppressed` to
+    **None**, and the asymmetry is the point (issue #86 review). The first two come off the same
+    line of Suricata's output as the loaded count, so a run that has a loaded count has all three
+    — zero is a measurement. The third is taken by the eve pass and is independent of it, so zero
+    would be an *assertion* that nothing was suppressed by a caller that never looked.
+    """
     info = SuricataRunInfo(version="8.0.6", snapshot_id="x", rules_loaded=1, alerts_total=0)
 
     assert (info.rules_failed, info.rules_skipped) == (0, 0)
+    assert info.identify_alerts_suppressed is None, (
+        "a suppression count nobody took must not read as zero suppressions"
+    )
     assert info.config_sha256 is None
     assert info.warnings == ()
 

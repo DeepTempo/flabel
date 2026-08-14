@@ -440,7 +440,17 @@ def _shortfall(info: SuricataRunInfo, manifest: SnapshotManifest) -> bool:
     build cannot parse, `rules_skipped` is one dropped for duplicating another's SID, and a
     `rules_loaded` below `total_admitted` is rules that went missing without the engine saying
     which counter they belong to.
+
+    **`None` means the pass never established the count, and there is no shortfall to report**
+    (issue #86 made these nullable). Guarded explicitly rather than relied upon: today every
+    `None` comes from `_failed()`, which always attaches a `ToolFailure`, so `_label` raises
+    before reaching here — but that invariant lives in another function a hundred lines away with
+    nothing asserting it. `None < int` raises `TypeError`, and a `TypeError` here escapes into run
+    assembly and **costs `run.json`**, which is issue #62's shape in the step that exists to stop
+    it. `bool(None or None)` would be `False`, which is right by accident and wrong by reasoning.
     """
+    if info.rules_loaded is None:
+        return False
     return bool(
         info.rules_failed or info.rules_skipped or info.rules_loaded < manifest.total_admitted
     )

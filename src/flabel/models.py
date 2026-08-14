@@ -552,7 +552,13 @@ class SuricataRunInfo:
     rules_failed: int | None = 0
     rules_skipped: int | None = 0
     #: Alerts dropped because their source may not label (spec §2.8). Counted, never silent.
-    identify_alerts_suppressed: int | None = 0
+    #:
+    #: Defaults to `None`, unlike the two above (issue #86 review). Their zero default is
+    #: defensible — they come off the same line of Suricata's output as the loaded count, so a run
+    #: with a loaded count has all three — but this one is measured by the eve pass and is
+    #: independent of it. A zero default here would have any caller that omits it *assert* that
+    #: nothing was suppressed, which is the defect this field's own docstring forbids.
+    identify_alerts_suppressed: int | None = None
     #: sha256 over flabel's own Suricata configuration, in `suricata.config_files()` order. A
     #: run is only reproducible against a *known* config: `HOME_NET` decides whether a whole
     #: class of rule can fire, and the eve selection decides what is recorded at all.
