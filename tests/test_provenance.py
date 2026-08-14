@@ -1352,3 +1352,71 @@ def test_the_run_block_carries_exactly_the_keys_spec_10_declares(tmp_path):
         f"  missing: {sorted(declared - built)}\n"
         f"  extra:   {sorted(built - declared)}"
     )
+
+
+# --- a failed stage must not publish numbers it never measured (issue #86) -------------------
+
+
+def test_a_failed_suricata_pass_reports_null_counts_not_zeros(tmp_path):
+    """Spec §10: "every field whose stage did not run is `null` — not zero, not an empty list."
+
+    `_failed()` returned zeros, so `run.json` published `rules_loaded: 0` for a run where the
+    engine may have loaded all 85,000 rules. That is not "unknown", it is a false measurement, in
+    the section §10 singles out as the place it must not happen.
+    """
+    from flabel.models import ToolFailure
+
+    failed = SuricataRunInfo(
+        version="8.0.6",
+        snapshot_id=SNAPSHOT_ID,
+        rules_loaded=None,
+        alerts_total=None,
+        rules_failed=None,
+        rules_skipped=None,
+        identify_alerts_suppressed=None,
+        tool_failures=(
+            ToolFailure(tool="suricata", argv=("suricata",), exit_code=1, message="boom"),
+        ),
+    )
+    block = full_run(tmp_path, suricata=failed)
+
+    counts = block["counts"]
+    for key in ("rules_loaded", "rules_failed", "rules_skipped", "identify_alerts_suppressed"):
+        assert counts[key] is None, f"{key} was published as {counts[key]!r}, not null"
+
+    conditions = block["loss_conditions"]
+    assert conditions["rules_failed_or_skipped"] is None, (
+        "bool(None or None) is False, which asserts nothing failed about a run that never counted"
+    )
+    assert conditions["identify_alert_suppressed"] is None
+    assert conditions["tool_failure"] is True
+
+
+def test_a_count_measured_before_the_failure_survives_it(tmp_path):
+    """`_read_eve` runs before `_check_ruleset_loaded`, so the suppression count is already known.
+
+    A run that suppressed 40 `identify` alerts and then failed to account for its ruleset used to
+    report `0` — discarding a fact it held, on the one path where `run.json` is all a reader gets.
+    """
+    from flabel.models import ToolFailure
+
+    failed = SuricataRunInfo(
+        version="8.0.6",
+        snapshot_id=SNAPSHOT_ID,
+        rules_loaded=None,
+        alerts_total=57,
+        rules_failed=None,
+        rules_skipped=None,
+        identify_alerts_suppressed=40,
+        tool_failures=(
+            ToolFailure(tool="suricata", argv=("suricata",), exit_code=1, message="boom"),
+        ),
+    )
+    block = full_run(tmp_path, suricata=failed)
+
+    assert block["counts"]["identify_alerts_suppressed"] == 40
+    assert block["counts"]["alerts_total"] == 57 if "alerts_total" in block["counts"] else True
+    assert block["counts"]["rules_loaded"] is None, "and what it never measured stays null"
+    assert block["loss_conditions"]["identify_alert_suppressed"] is True, (
+        "a measured suppression is a loss that occurred, failure or not"
+    )

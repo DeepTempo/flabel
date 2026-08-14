@@ -537,15 +537,22 @@ class SuricataRunInfo:
 
     version: str
     snapshot_id: str
-    rules_loaded: int
-    alerts_total: int
+    #: `None` where the pass failed before establishing the number, never `0` (issue #86).
+    #:
+    #: Spec §10: "every field whose stage did not run is `null` — not zero, not an empty list."
+    #: These used to be plain `int`s that a failure filled with zeros, so `run.json` published
+    #: `rules_loaded: 0` for a run where the engine may have loaded all 85,000 rules, and
+    #: `loss_conditions` then reported `rules_failed_or_skipped: false` — a zero load reading as
+    #: a clean load. A count that was genuinely measured before a later failure survives.
+    rules_loaded: int | None
+    alerts_total: int | None
     #: Rules the engine rejected, and rules it declined to load. Recorded rather than only
     #: compared against the snapshot's count: a rule that never loaded never examined the
     #: capture, so a run that looks complete is missing every label it would have produced.
-    rules_failed: int = 0
-    rules_skipped: int = 0
+    rules_failed: int | None = 0
+    rules_skipped: int | None = 0
     #: Alerts dropped because their source may not label (spec §2.8). Counted, never silent.
-    identify_alerts_suppressed: int = 0
+    identify_alerts_suppressed: int | None = 0
     #: sha256 over flabel's own Suricata configuration, in `suricata.config_files()` order. A
     #: run is only reproducible against a *known* config: `HOME_NET` decides whether a whole
     #: class of rule can fire, and the eve selection decides what is recorded at all.

@@ -991,13 +991,16 @@ or normalise**: the same capture labelled from two directories would otherwise d
   "counts": {"flows": int, "detections": int, "labels": int,
              "unmatched": int, "unmatched_unsupported_transport": int,
              "unmatched_ratio": float,
-             "identify_alerts_suppressed": int,
-             "rules_loaded": int, "rules_failed": int, "rules_skipped": int},
+             "identify_alerts_suppressed": int | None,
+             "rules_loaded": int | None, "rules_failed": int | None,
+             "rules_skipped": int | None},
   "loss_conditions": {...},               # §11
   "tool_failures": [ ... ],
   "warnings": [str]
 }
 ```
+
+The four `int | None` counts are Suricata's, and they are `null` whenever that pass failed before establishing the number (issue #86) — including the case where the pass failed *after* establishing some of them, which are then reported as measured. `loss_conditions.rules_failed_or_skipped` and `identify_alert_suppressed` are `null` on the same condition, because `bool(None or None)` is `False` and would assert that nothing failed about a run that never counted.
 
 **The types above describe a completed run.** In the `run.json` of a run that failed part-way,
 every field of `input`, `ruleset`, `tools` and `counts` whose stage did not run is `null` — not

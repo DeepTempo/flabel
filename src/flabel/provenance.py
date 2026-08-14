@@ -574,6 +574,23 @@ def _counts_section(
 # --- loss conditions (spec §11) -----------------------------------------------------------
 
 
+def _positive(count: int | None) -> bool | None:
+    """Whether a count is above zero, or `None` if it was never established (issue #86)."""
+    return None if count is None else count > 0
+
+
+def _either_positive(first: int | None, second: int | None) -> bool | None:
+    """Whether either count is above zero. `None` unless at least one was established.
+
+    Deliberately not `bool(first or second)`: with both `None` that is `False`, which asserts
+    that nothing failed to load about a run that never counted. If one side is known and positive
+    the answer is `True` regardless of the other, because the loss did occur.
+    """
+    if first is None and second is None:
+        return None
+    return bool(first) or bool(second)
+
+
 def _loss_conditions(
     capture: NormalizedCapture | None,
     zeek: ZeekRunInfo | None,
@@ -637,11 +654,18 @@ def _loss_conditions(
         "snapshot_missing": snapshot_resolved
         if snapshot_resolved is None
         else not snapshot_resolved,
-        "identify_alert_suppressed": (
-            None if suricata is None else suricata.identify_alerts_suppressed > 0
+        # `None` when the count itself is `None` — the stage ran but never established the
+        # number (issue #86). Two distinct traps here, both live:
+        #   * `None > 0` raises TypeError, which would escape `build_run_block` and cost
+        #     `run.json` on a failure path — the same shape as issue #62.
+        #   * `bool(None or None)` is `False`, which asserts "no rule failed to load" about a run
+        #     that never counted. That is the zero-as-measurement defect one field over.
+        "identify_alert_suppressed": _positive(
+            None if suricata is None else suricata.identify_alerts_suppressed
         ),
-        "rules_failed_or_skipped": (
-            None if suricata is None else bool(suricata.rules_failed or suricata.rules_skipped)
+        "rules_failed_or_skipped": _either_positive(
+            None if suricata is None else suricata.rules_failed,
+            None if suricata is None else suricata.rules_skipped,
         ),
         "ja4_unavailable": (
             None if zeek is None or zeek.ja4_status is None else zeek.ja4_status != "present"
