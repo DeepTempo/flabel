@@ -1382,3 +1382,36 @@ def test_an_empty_protocol_is_a_parse_failure_and_stays_inside_the_gate():
     assert [record.reason for record in result.unmatched] == ["no_flow_match"] * 10
     assert result.correlatable_total == 10, "an unmeasured protocol must not leave the denominator"
     assert result.unsupported_transport_total == 0
+
+
+# --- the gate's warnings must reach the result (issue #57, PLAN 13d) -------------------------
+
+
+def test_a_tolerated_loss_is_carried_on_the_result_not_only_printed():
+    """`CorrelationResult.warnings` is what reaches `run.warnings[]`; stderr is not kept."""
+    detections = many_detections(10, unmatched=1)
+
+    result = correlate(detections, by_uid(make_flow()), make_manifest(), threshold=NO_GATE)
+
+    assert any("could not be attached" in warning for warning in result.warnings), (
+        f"the loss reached stderr and nothing else: {result.warnings}"
+    )
+
+
+def test_the_failed_run_carries_the_warning_too_which_is_the_path_that_matters():
+    """On the raising path there is no `labels.json`, so `run.json` is the only artifact.
+
+    This is the assertion the fix was missing. `_gate` puts the message on the result the
+    exception carries, and the caller writes `run.json` from that result — so deleting the
+    `replace(...)` in `_gate` sends a failed run's report back to saying nothing, while every
+    other test stays green. Verified by sabotage: doing exactly that left all 889 passing.
+    """
+    detections = many_detections(100, unmatched=50)
+
+    with pytest.raises(CorrelationError) as raised:
+        correlate(detections, by_uid(make_flow()), make_manifest())
+
+    warnings = raised.value.result.warnings
+    assert any("this run has failed" in warning for warning in warnings), (
+        f"the failed run's own report would not say why: {warnings}"
+    )

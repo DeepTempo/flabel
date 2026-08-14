@@ -38,7 +38,7 @@ from flabel import suricata
 from flabel.errors import SnapshotError, ToolError
 from flabel.models import SourceAdmission
 from flabel.rules.admit import negates_home_net
-from flabel.rules.snapshot import snapshot_id_for, write_snapshot
+from flabel.rules.snapshot import load_snapshot, snapshot_id_for, write_snapshot
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 BENIGN = FIXTURES / "benign.pcap"
@@ -1291,3 +1291,65 @@ def test_an_existing_eve_log_is_never_appended_to(tmp_path):
 
     with pytest.raises(ToolError, match="eve.json"):
         suricata.run_suricata(BENIGN, snapshot, outdir)
+
+
+# --- a failed pass must not publish counts it never took (issue #86, PLAN 13e) --------------
+
+
+def test_a_failed_pass_reports_null_counts_not_zeros(tmp_path, monkeypatch):
+    """The producer side of #86, which nothing tested — reverting the fix left CI green.
+
+    `_failed()` used to return `rules_loaded=0, rules_failed=0, rules_skipped=0`, so `run.json`
+    published a measurement of zero for a run where the engine may have loaded all 85,000 rules,
+    and `loss_conditions.rules_failed_or_skipped` then read `false` off the back of it. Spec §10:
+    "every field whose stage did not run is `null` — not zero, not an empty list."
+
+    The two tests added with the fix assert that `build_run_block` *renders* `None` as `null` —
+    they test the reader. This asserts the producer, which is where the zeros came from. Verified
+    by sabotage: restoring the zeros makes this fail and nothing else.
+
+    Not marked `requires_tools` for the reason the sibling above gives: it works by emptying
+    `PATH`, so counting it toward "a tool test ran" would let a toolchain-less CI look green.
+    """
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+
+    _, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+    assert info.tool_failures, "precondition: this is the failure path"
+    assert info.rules_loaded is None, "a load count that was never taken is null, not zero"
+    assert info.rules_failed is None
+    assert info.rules_skipped is None
+    assert info.snapshot_id == snapshot.name, "and provenance still survives"
+
+
+def test_a_count_measured_before_the_failure_is_handed_on_not_discarded(tmp_path):
+    """The second half of #86, tested on `_failed` directly — and here is why.
+
+    `_read_eve` runs *before* `_check_ruleset_loaded`, so a pass that measured alerts and then
+    failed the load check already holds those numbers. It used to discard them and report `0`.
+
+    **Measured while writing this: the end-to-end path is much narrower than the fix implied.**
+    A load-check failure means either `rules_loaded == 0` — in which case nothing could have
+    fired, so the suppression count is genuinely zero — or `counts is None`, meaning neither the
+    eve stats nor `suricata.log` yielded a load count while rules did load and did fire. Only the
+    second reaches this code with a non-zero count, and it needs Suricata to stop reporting its
+    load count in both places at once, which no committed fixture can arrange.
+
+    So the threading is right and worth keeping — it costs nothing and it is correct if that
+    branch is ever taken — but it is guarded here rather than end to end, and the reachability is
+    recorded instead of implied. My commit message called this the worse of #86's two wrongs; on
+    the evidence the null-counts half is the one that was actually reachable.
+    """
+    failure = suricata._failure(("suricata", "-r", "x.pcap"), 0, "no load count anywhere")
+    snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
+    _, manifest = load_snapshot(snapshot.parent, snapshot.name)
+
+    info = suricata._failed(
+        manifest, failure, version="8.0.6", alerts_total=57, identify_alerts_suppressed=40
+    )
+
+    assert info.identify_alerts_suppressed == 40, "a measured count must survive a later failure"
+    assert info.alerts_total == 57
+    assert info.rules_loaded is None, "and what was never established stays null"
+    assert info.rules_failed is None and info.rules_skipped is None

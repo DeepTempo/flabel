@@ -376,7 +376,17 @@ def run_suricata(
 
     failure = _check_ruleset_loaded(counts, expected=len(index), argv=argv, exit_code=0)
     if failure is not None:
-        return [], _failed(manifest, failure, version=version, config_sha256=config_digest)
+        # The eve pass above already established these, so they are handed on rather than
+        # discarded (issue #86). A run that suppressed alerts and then failed to account for its
+        # ruleset still knows how many it suppressed, and `run.json` is all a reader gets.
+        return [], _failed(
+            manifest,
+            failure,
+            version=version,
+            config_sha256=config_digest,
+            alerts_total=alerts_total,
+            identify_alerts_suppressed=suppressed,
+        )
 
     # `counts` is not None here: `_check_ruleset_loaded` returns a failure when it is.
     loaded, failed, skipped = counts if counts else (0, 0, 0)
@@ -942,6 +952,9 @@ def _failed(
     failure: ToolFailure,
     version: str = "unknown",
     config_sha256: str | None = None,
+    *,
+    alerts_total: int | None = None,
+    identify_alerts_suppressed: int | None = None,
 ) -> SuricataRunInfo:
     """A run info carrying nothing but the failure — the snapshot id, and the config digest.
 
@@ -949,13 +962,25 @@ def _failed(
     attempted; a failed run that cannot say what it tried is a worse artifact than one that
     reports both. The config digest survives for the same reason: `HOME_NET` and the eve
     selection decide what could have fired, so a failure is only diagnosable against them.
+
+    **Everything else is `None`, not `0`** (issue #86). Spec §10: every field whose stage did not
+    run is `null`. Zeros here published measurements that never happened — `rules_loaded: 0` for a
+    run where the engine may have loaded all of them, and `loss_conditions` reporting
+    `rules_failed_or_skipped: false` off the back of it, a zero load reading as a clean load.
+
+    `alerts_total` and `identify_alerts_suppressed` are accepted rather than assumed, because
+    `_read_eve` runs *before* `_check_ruleset_loaded` and does establish them. A run that
+    suppressed 40 `identify` alerts and then failed used to throw that number away and report
+    `0` — discarding a fact it held, on the one path where the record is all there is.
     """
     return SuricataRunInfo(
         version=version,
         snapshot_id=manifest.snapshot_id,
-        rules_loaded=0,
-        alerts_total=0,
-        identify_alerts_suppressed=0,
+        rules_loaded=None,
+        alerts_total=alerts_total,
+        rules_failed=None,
+        rules_skipped=None,
+        identify_alerts_suppressed=identify_alerts_suppressed,
         config_sha256=config_sha256,
         tool_failures=(failure,),
     )

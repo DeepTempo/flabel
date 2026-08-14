@@ -25,6 +25,7 @@ Step 10 canaries + reproducibility gates
    │
 Step 11 per-rule label basis   ── post-Phase 1 (#75)
 Step 12 unsupported transports ── post-Phase 1 (#84), independent of 11
+Step 13 hardening: six ways the output can lie ── post-Phase 1, blocks sign-off
 ```
 
 **Parallel groups:** {3, 4, 5, 6} and {7, 8}. Cap at 2–3 worktrees at a time. Every other step is sequential.
@@ -43,6 +44,7 @@ Step 12 unsupported transports ── post-Phase 1 (#84), independent of 11
 | 10 Canaries | [#24](https://github.com/DeepTempo/flabel/issues/24) | |
 | 11 Per-rule label basis | [#75](https://github.com/DeepTempo/flabel/issues/75) | *post-Phase 1* |
 | 12 Unsupported transports | [#84](https://github.com/DeepTempo/flabel/issues/84) | *post-Phase 1* |
+| 13 Hardening: the output must not lie | [#85](https://github.com/DeepTempo/flabel/issues/85) +5 | *post-Phase 1* |
 
 **Why step 1 is first:** the testing decision is *tools real, network stubbed* — Zeek, Suricata, and `editcap` are invoked for real in tests. Until CI can run them, **nothing else is testable**, so this is a hard prerequisite rather than scaffolding to do later.
 
@@ -458,6 +460,138 @@ like its siblings, so they can be regenerated and byte-compared.
 **Depends on:** nothing outstanding. **Related, deliberately not folded in:** #68 (the run block
 does not record the `--unmatched-threshold` the gate used) and #87 (the corpus correlation test is
 vacuous, and would have caught this on day one).
+
+---
+
+## Step 13 — Hardening: the output must not lie (#85, #86, #70, #57, #62, #87)
+
+**Not part of Phase 1**, and not a feature. Six issues from the two `/project:verify` passes,
+grouped because they are **one defect in six places**: the run loses something, or fails, and the
+artifact it leaves reads clean. That is what spec §2.5 and §13 exist to forbid, and it is the one
+property the whole project is arguing for — a label nobody can trust the provenance of is worse
+than no label.
+
+Craig's call, 2026-08-14, after the whole-project assessment: take these six now, then sign off
+Phase 1 with the remaining backlog tracked. The other 24 open issues are enhancements, known
+deferrals, or test hardening that does not change what a consumer receives.
+
+| Sub-step | Issue | Change |
+| :-: | :-: | :-- |
+| 13a | #87 | The benign-corpus correlation assertion is vacuous — 0 detections measured across all 17 captures, so it asserts `0 == 0` |
+| 13b | #70 | `labels.json` / `run.json` written non-atomically, so a partial one is still possible — §13 forbids exactly that |
+| 13c | #62 | A wall clock stepping backwards raises, and **no `run.json` is written at all** |
+| 13d | #57 | `CorrelationResult` has no `warnings` field, so a correlation loss never reaches `run.warnings[]` |
+| 13e | #86 | A failed Suricata run writes measured-looking **zeros** where §10 demands `null` — and discards a suppression count it had already measured |
+| 13f | #85 | A capture with zero readable packets fails after **63 s**, and for truncated input contradicts §12 |
+
+### 13a — the vacuous assertion (#87)
+
+**Files:** `tests/integration/test_benign_corpus.py`
+
+`test_no_detection_goes_unreported` claims it would surface a fourth tuple disagreement "as
+detections that cannot be placed". Its snapshot holds three rules needing UDP/53 with literal
+`flabel-test`, ICMPv4 echo, or ICMPv6 echo; the corpus is HTTP/1.x, HTTP/2, FTP, DNS, MQTT,
+DCERPC, Kerberos and SMB. **Measured: 0 detections across all 17 captures.** No tuple is ever
+compared.
+
+A second module-scoped fixture with a *loud* snapshot fixes it. Measured with `alert tcp …
+flow:established` + `alert udp` + `alert icmp`: **693 detections across the 17 captures, 0
+unmatched** — including HTTP/2 (123 over 5 flows), SMB (281), Kerberos (33 over 6 flows), FTP
+(109). Costs one extra pipeline run per capture; taken deliberately, because this is the test that
+would have caught #84 on day one.
+
+**Test that proves it:** the loud run asserts `detections > 0` per capture *and* `unmatched == 0`.
+The first half is what stops it silently reverting to `0 == 0`.
+
+### 13b — atomic output (#70)
+
+**Files:** `src/flabel/labels.py` or `src/flabel/cli.py`, `tests/test_cli.py`
+
+Write to a temporary file in the run directory, `os.replace` into place. §13 says either a complete
+run directory exists or none does; a process killed mid-write currently leaves a truncated JSON
+document that parses as neither.
+
+**Test that proves it:** a write interrupted after the temporary file exists leaves **no**
+`labels.json`, and the temporary file is not mistaken for one by the reproducibility gate's
+directory scan.
+
+### 13c — a backwards clock must not cost the report (#62)
+
+**Files:** `src/flabel/provenance.py`, `docs/spec.md` §10, `tests/test_provenance.py`
+
+`_duration()` raises when `finished_at < started_at`. The caller is `datetime.now(UTC)` at two
+points in real time, so an NTP step, a VM resume or a container clock adjustment makes that
+legitimately negative — and `build_run_block` then raises while step 9 is assembling the report,
+losing `run.json` entirely. On a long run, which is when a correction is most likely and when
+losing the report costs most.
+
+`duration_seconds` becomes `null` with a warning in `warnings[]` — this module's own convention for
+a fact it could not establish. **A programming error and an environmental one were being treated
+identically**, and the environmental one cost the file.
+
+**Test that proves it:** a backwards pair yields `duration_seconds: null`, a warning naming both
+timestamps, and a **written** `run.json`. This is the third defect of this exact shape (after
+`UnicodeDecodeError` escaping `read_toolchain` and `snapshot_missing` inference); the assertion is
+that the file exists, not merely that no exception escaped.
+
+### 13d — correlation losses must reach the run block (#57)
+
+**Files:** `src/flabel/models.py`, `src/flabel/correlate.py`, `src/flabel/cli.py`,
+`docs/spec.md` §9/§10, `tests/test_correlate.py`
+
+Every sibling stage returns warnings; `CorrelationResult` does not, so the gate's own warning
+reaches stderr and nothing else. An operator reading `run.json` after the fact — the normal case,
+since stderr is not kept — cannot see that anything was warned about.
+
+**Test that proves it:** a run with unmatched detections below the threshold carries the warning in
+`run.warnings[]`, not only on stderr. Redirect stderr in the test so passing by accident is
+impossible.
+
+### 13e — a failed stage must not publish numbers it never measured (#86)
+
+**Files:** `src/flabel/models.py`, `src/flabel/suricata.py`, `src/flabel/provenance.py`,
+`tests/test_suricata.py`
+
+`_failed()` returns `rules_loaded=0, alerts_total=0, identify_alerts_suppressed=0`, so `counts`
+publishes zeros and `loss_conditions` reports `rules_failed_or_skipped: false` and
+`identify_alert_suppressed: false`. §10: *"every field whose stage did not run is `null` — not
+zero, not an empty list."*
+
+Two distinct wrongs, and the second is worse: `_read_eve` runs **before** `_check_ruleset_loaded`
+and does compute `suppressed`, so a run that suppressed 40 `identify` alerts throws that measured
+number away and reports `0`. The count fields become `int | None`; a measured value survives a
+later failure.
+
+**Test that proves it:** a Suricata failure after eve parsing preserves the suppression count it
+measured, and reports `null` — not `0` — for what it never established. Asserted through
+`run.json`, because the existing test asserts only `loss_conditions.tool_failure is True`.
+
+### 13f — zero readable packets (#85)
+
+**Files:** `src/flabel/ingest.py`, `docs/spec.md` §8/§12, `tests/test_ingest.py`,
+`tests/integration/test_canaries.py`
+
+Three inputs reach this state — a valid empty pcap, a pcapng with only SHB+IDB, and a pcap
+truncated before its first complete record. Zeek handles all three (§8 blesses "zero connections
+writes no conn.log"); Suricata cannot read them and burns its **60-second** thread-start budget
+first. Measured: 63.1 s to failure, `run.duration_seconds` 63.04.
+
+**DECIDED (Craig, 2026-08-14): a hard failure, before any tool runs.** `ingest` raises
+`CaptureError` on zero usable packets — exit 1, no run directory, a message naming the capture and
+the count, in about 0.1 s. Consistent with the unreadable-header case §8 already makes a
+`CaptureError`, and with US-05's "writes no labels".
+
+**This amends §12 in writing**, so it is recorded rather than assumed: exit 0 covers partial
+*data*, not *zero* data. A capture with no readable packets is not one flabel can label, and
+`input_status: partial` on a file with nothing in it asserts a coverage figure over an empty set.
+§8 gains the rule that the packet walk decides this before Zeek or Suricata are invoked.
+
+**Test that proves it:** each of the three inputs raises `CaptureError` and creates no run
+directory; the failure happens **without invoking Suricata**, asserted on elapsed time being far
+below the 60-second budget rather than on a mock, since a mock would encode the assumption under
+test.
+
+**Depends on:** nothing. **Blocks:** Phase 1 sign-off.
 
 ---
 

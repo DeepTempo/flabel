@@ -986,3 +986,58 @@ def test_gzip_fixtures_store_no_mtime(tmp_path):
     assert struct.unpack("<I", compressed.read_bytes()[4:8])[0] == 0
     with gzip.open(compressed, "rb") as handle:
         assert handle.read() == BENIGN.read_bytes()
+
+
+# --- zero readable packets (issue #85, PLAN step 13f) ----------------------------------------
+
+
+def empty_pcap(path: Path) -> Path:
+    """A structurally valid pcap file header with no records after it.
+
+    `write_pcap` with an empty packet list is exactly that, so the header layout has one
+    definition rather than a second copy here that could drift from it.
+    """
+    canary.write_pcap(str(path), [])
+    return path
+
+
+def headers_only_pcapng(path: Path) -> Path:
+    """A pcapng carrying a section header and one interface description, and no packet blocks."""
+    path.write_bytes(
+        awkward.section_header_block()
+        + awkward.interface_description_block(awkward.LINKTYPE_ETHERNET)
+    )
+    return path
+
+
+def truncated_before_first_record(path: Path) -> Path:
+    """A pcap whose very first record header is incomplete, so no whole packet exists."""
+    awkward.write_truncated_pcap(path, keep=0, missing=8)
+    return path
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(empty_pcap, id="valid-pcap-no-records"),
+        pytest.param(headers_only_pcapng, id="pcapng-shb-idb-only"),
+        pytest.param(truncated_before_first_record, id="truncated-before-first-record"),
+    ],
+)
+def test_a_capture_with_no_readable_packets_is_refused(make, tmp_path: Path):
+    """DECIDED (Craig, 2026-08-14, issue #85) — a hard failure, before any tool runs.
+
+    Zeek handles all three of these; spec §8 explicitly blesses "zero connections writes no
+    conn.log". Suricata cannot read them and burns its full 60-second thread-start budget first,
+    so the run took **63.1 s** to fail and then reported a thread that failed to start — blaming
+    the tool for the input.
+
+    This AMENDS spec §12, which promised exit 0 for partial input: exit 0 covers partial *data*,
+    not zero data. `input_status: partial` on a file with nothing in it asserts a coverage figure
+    over an empty set.
+    """
+    capture = make(tmp_path / f"empty-{make.__name__}")
+    workdir = tmp_path / "work"
+
+    with pytest.raises(CaptureError, match="no readable packets"):
+        normalize(capture, workdir)

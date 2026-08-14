@@ -20,8 +20,10 @@ from __future__ import annotations
 import json
 import re
 import socket
+import sys
+import time
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -48,6 +50,12 @@ from flabel.models import (
 from flabel.rules.snapshot import write_snapshot
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+if str(FIXTURES) not in sys.path:
+    sys.path.insert(0, str(FIXTURES))
+
+import make_awkward as awkward  # noqa: E402  (needs the path entry above)
+import make_canary as canary  # noqa: E402
+
 BENIGN = FIXTURES / "benign.pcap"
 SYNTHETIC_RULES = FIXTURES / "rules" / "synthetic.rules"
 
@@ -78,6 +86,10 @@ RULES = rule_lines()
 #: The rule that matches the benign canary's HTTP flow (10.0.0.5:49152 -> 10.0.0.200:80), so a
 #: run over `benign.pcap` produces exactly one label and a NOTICE with content in it.
 MATCHES_CANARY = 9000001
+
+#: `alert ip any any -> any any` — fires on any IP protocol, including the ones Zeek cannot
+#: name in `transport_proto` (issue #84). Used here to produce a *tolerated* correlation loss.
+ANY_IP_PROTOCOL = 9000010
 
 
 def make_snapshot(root: Path, contents: Mapping[str, Sequence[int]]) -> Path:
@@ -1260,4 +1272,225 @@ def test_a_failure_while_writing_notice_leaves_no_labels_and_an_honest_run_json(
     run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
     assert any("licence" in warning.lower() for warning in run["warnings"]), (
         "run.json must not survive as a record of a run that succeeded"
+    )
+
+
+# --- atomic output (issue #70, PLAN step 13b) ----------------------------------------------
+
+
+def test_a_failed_write_leaves_no_artifact_and_no_temporary(tmp_path: Path):
+    """Spec §13: either a complete run directory exists or none does.
+
+    A plain `write_bytes` interrupted part-way leaves a truncated JSON document, which parses as
+    neither a valid result nor an absent one — the single state §13 names. Since the *absence* of
+    `labels.json` is what a consumer reads as "this run did not finish" (issue #23), a
+    half-written one is worse than no file.
+
+    Injected at the boundary rather than by killing a process: `serialise_bytes` has already
+    produced the payload, so the failure is in the write itself, which is the case that matters.
+    """
+    from flabel import cli as cli_module
+
+    target = tmp_path / "labels.json"
+    original = Path.write_bytes
+
+    def explode(self: Path, payload: bytes) -> int:
+        if self.name.endswith(".partial"):
+            original(self, payload[: len(payload) // 2])
+            raise OSError(28, "No space left on device")
+        return original(self, payload)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "write_bytes", explode)
+        with pytest.raises(OSError, match="No space left"):
+            cli_module._write_atomic(target, b'{"schema_version": 1}')
+
+    assert not target.exists(), "a failed write must not leave a partial document behind"
+    assert list(tmp_path.iterdir()) == [], (
+        "the temporary must be cleaned up, or a later reader mistakes it for state"
+    )
+
+
+def test_the_temporary_is_named_so_the_reproducibility_gate_ignores_it(tmp_path: Path):
+    """`canonical` compares the documents a run claims; a leftover temporary is not one.
+
+    Asserted on the name rather than trusting the cleanup above, because the cleanup cannot run
+    if the process is killed outright — which is the failure this whole change is about.
+    """
+    from flabel import cli as cli_module
+
+    seen: list[str] = []
+    original = Path.write_bytes
+
+    def record(self: Path, payload: bytes) -> int:
+        seen.append(self.name)
+        return original(self, payload)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "write_bytes", record)
+        cli_module._write_atomic(tmp_path / "labels.json", b"{}")
+
+    assert seen == [".labels.json.partial"], f"unexpected write sequence: {seen}"
+    assert (tmp_path / "labels.json").read_bytes() == b"{}"
+    assert not (tmp_path / ".labels.json.partial").exists()
+
+
+@pytest.mark.requires_tools
+def test_a_clock_stepping_backwards_still_writes_run_json(
+    rules_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Issue #62's actual cost was the file, so the file is what this asserts.
+
+    `_duration` raised on a negative elapsed time, and `build_run_block` raises while the report
+    is being assembled — so an NTP step or a VM resume during a run left a directory with no
+    `run.json`, the one thing spec §10 says every run writes. A unit test on the block would have
+    passed throughout: the block was never the thing that went missing.
+
+    The clock is stepped between the run's two `datetime.now(UTC)` calls, which is exactly where a
+    correction lands in the field.
+    """
+    import flabel.cli as cli_module
+
+    real_now = datetime.now
+    calls = {"n": 0}
+
+    def stepping_now(tz=None):
+        calls["n"] += 1
+        stamp = real_now(tz)
+        # First call is started_at; every later one is after the step correction.
+        return stamp if calls["n"] == 1 else stamp - timedelta(seconds=90)
+
+    monkeypatch.setattr(cli_module, "datetime", type("D", (), {"now": staticmethod(stepping_now)}))
+
+    code = cli_module.main(offline(BENIGN, rules_dir, tmp_path / "out"))
+
+    rundir = only_run_dir(tmp_path / "out")
+    assert (rundir / "run.json").is_file(), (
+        "a backwards clock cost the whole report — this is issue #62 returning"
+    )
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
+    assert run["duration_seconds"] is None
+    assert any("clock went backwards" in warning for warning in run["warnings"])
+    assert code == EXIT_SUCCESS, "the run itself was fine; only the duration was unknowable"
+
+
+@pytest.mark.requires_tools
+def test_a_tolerated_correlation_loss_reaches_the_run_block_not_only_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """Issue #57: `CorrelationResult` had no `warnings`, alone among the stages.
+
+    So the gate's warning went to stderr and stopped there. stderr is not kept — an operator
+    reading the run directory afterwards is the normal case, and `run.json` is the artifact issue
+    #23 exists to make authoritative. A loss that only ever appeared on a terminal is a loss the
+    record does not show.
+
+    Asserted on the file *and* on stderr, in that order: the file is the new requirement, and
+    checking stderr too proves the warning was not simply moved rather than added.
+    """
+    make_snapshot(tmp_path / "rules", {"et/open": [ANY_IP_PROTOCOL]})
+    capture = awkward.write_esp_pcap(tmp_path / "esp.pcap")
+
+    assert cli.main(offline(capture, tmp_path / "rules", tmp_path / "out")) == EXIT_SUCCESS
+
+    run = json.loads((only_run_dir(tmp_path / "out") / "run.json").read_text(encoding="utf-8"))
+    warnings = run["run"]["warnings"]
+
+    assert any("could not be attached to exactly one flow" in w for w in warnings), (
+        f"the correlation loss never reached run.warnings[]: {warnings}"
+    )
+    assert "could not be attached" in capsys.readouterr().err, "and it must still reach stderr"
+
+
+@pytest.mark.requires_tools
+def test_an_empty_capture_is_refused_fast_and_leaves_nothing_behind(
+    rules_dir: Path, tmp_path: Path
+):
+    """Issue #85 at the level where the 63 seconds actually happened.
+
+    The first version of this assertion lived on `normalize()`, which never invoked Suricata under
+    any version of the code — so `elapsed < 5.0` passed against the unfixed code too. It measured
+    nothing. The 63.1s was a property of `cli.main`, so the bound belongs here.
+
+    Three assertions, because PLAN 13f promised all three: the exit code, that **no run directory
+    is created**, and that it happens far inside Suricata's 60-second thread-start budget.
+    """
+    capture = tmp_path / "empty.pcap"
+    canary.write_pcap(str(capture), [])
+    output = tmp_path / "out"
+
+    started = time.perf_counter()
+    code = cli.main(offline(capture, rules_dir, output))
+    elapsed = time.perf_counter() - started
+
+    assert code == EXIT_FAILURE
+    assert not output.exists() or list(output.iterdir()) == [], (
+        "a refused capture must leave no run directory (PLAN 13f, spec §13)"
+    )
+    assert elapsed < 5.0, (
+        f"refusing an empty capture took {elapsed:.1f}s — that is Suricata's 60-second "
+        f"thread-start budget being spent on a file it cannot read (issue #85)"
+    )
+
+
+def test_every_output_artifact_goes_through_the_atomic_write(tmp_path: Path):
+    """13b's fix is in the call sites, and nothing asserted they use it.
+
+    `_write_atomic` had two tests, both calling it directly — so reverting `_write_output` to
+    `write_bytes` left the suite green and the non-atomic write back. Verified by sabotage.
+
+    Spies on the helper rather than on `Path.write_bytes`, because the question is not "was a
+    write attempted" but "did every artifact route through the thing that makes it atomic".
+    """
+    import flabel.cli as cli_module
+
+    routed: list[str] = []
+    original = cli_module._write_atomic
+
+    def spy(path: Path, payload: bytes) -> None:
+        routed.append(path.name)
+        return original(path, payload)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cli_module, "_write_atomic", spy)
+        make_snapshot(tmp_path / "rules", {"et/open": [MATCHES_CANARY]})
+        assert cli.main(offline(BENIGN, tmp_path / "rules", tmp_path / "out")) == EXIT_SUCCESS
+
+    assert set(routed) == {"run.json", "NOTICE", "labels.json"}, (
+        f"an artifact bypassed the atomic write: routed {routed}"
+    )
+
+
+def test_the_shortfall_check_survives_counts_that_were_never_taken():
+    """`None < int` raises TypeError, and here that would cost `run.json` (#86 review).
+
+    Unreachable today — every `None` count comes from `_failed()`, which always attaches a
+    `ToolFailure`, so `_label` raises before the shortfall is computed. But that invariant lives
+    in another function with nothing asserting it, and this is the last arithmetic on the
+    nullable counts. A `TypeError` inside run assembly is issue #62's failure shape, in the step
+    that exists to stop it.
+    """
+    import flabel.cli as cli_module
+    from flabel.models import SnapshotManifest, SuricataRunInfo
+
+    info = SuricataRunInfo(
+        version="8.0.6",
+        snapshot_id="8a39182c18a3c9d3",
+        rules_loaded=None,
+        alerts_total=None,
+        rules_failed=None,
+        rules_skipped=None,
+        identify_alerts_suppressed=None,
+    )
+    manifest = SnapshotManifest(
+        snapshot_id="8a39182c18a3c9d3",
+        created_at="2026-08-12T00:00:00.000000Z",
+        flabel_version="0.0.0",
+        sources=(),
+        total_admitted=85_431,
+        total_ja4_admitted=0,
+    )
+
+    assert cli_module._shortfall(info, manifest) is False, (
+        "an unestablished count is not a shortfall — and must not raise"
     )

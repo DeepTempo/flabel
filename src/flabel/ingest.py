@@ -615,6 +615,25 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
         # Hashing and sizing are inside the try on purpose: `capture` is a file on someone
         # else's filesystem, and if it vanishes or turns unreadable in this window the failure
         # must take `normalized.pcap` with it rather than leave output behind for a failed run.
+        usable = walked.packets - discarded_packets
+        if usable <= 0:
+            # Decided by Craig, 2026-08-14 (issue #85), and it AMENDS spec §12: exit 0 covers
+            # partial *data*, not zero data. A capture with no readable packets is not one flabel
+            # can label, and `input_status: partial` on a file with nothing in it asserts a
+            # coverage figure over an empty set.
+            #
+            # Raised here, before Zeek or Suricata are invoked, for a measured reason: Suricata
+            # cannot read such a file and spends its full 60-second thread-start budget first,
+            # so the run took 63.1s to fail and then blamed a thread. Three inputs reach this —
+            # a valid empty pcap, a pcapng with only SHB+IDB, and a pcap truncated before its
+            # first complete record.
+            raise CaptureError(
+                f"{capture} holds no readable packets ({walked.packets} complete record(s), "
+                f"{discarded_packets} discarded), so there is nothing to label. A capture "
+                f"truncated before its first whole record reads this way too — check it with "
+                f"`capinfos {capture}`."
+            )
+
         partial = walked.truncated_at_offset is not None or discarded_packets > 0
         return NormalizedCapture(
             path=output,

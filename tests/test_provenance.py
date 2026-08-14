@@ -480,6 +480,10 @@ def make_suricata_info(**overrides) -> SuricataRunInfo:
         "snapshot_id": SNAPSHOT_ID,
         "rules_loaded": 85519,
         "alerts_total": 3,
+        # Stated rather than defaulted: this helper models a *completed* pass, and a completed
+        # pass always took this measurement. The field defaults to None precisely so a caller
+        # that never looked cannot assert zero suppressions (issue #86 review).
+        "identify_alerts_suppressed": 0,
         "config_sha256": "9f" * 32,
     }
     return SuricataRunInfo(**{**fields, **overrides})
@@ -1164,10 +1168,27 @@ def test_the_duration_is_derived_from_the_two_timestamps(tmp_path):
     assert isinstance(block["duration_seconds"], float)
 
 
-def test_a_finish_before_the_start_is_refused(tmp_path):
-    """A negative duration is a mis-wired caller, and it would ship as a plausible number."""
-    with pytest.raises(ValueError, match="duration"):
-        full_run(tmp_path, started_at=FINISHED, finished_at=STARTED)
+def test_a_backwards_clock_costs_the_duration_and_nothing_else(tmp_path):
+    """It used to raise, and the raise cost the whole report (issue #62).
+
+    This asserted a refusal until 2026-08-14, on the argument that a negative duration means a
+    mis-wired caller. But the caller is `datetime.now(UTC)` at two points in real time, so an NTP
+    step, a VM resume or a container clock adjustment makes it legitimately negative — and
+    `build_run_block` then raised while step 9 was assembling the report, leaving a run directory
+    with **no `run.json` at all**. A programming error and an environmental one were treated
+    identically, and only the environmental one was reachable in the field.
+
+    So: `null` for the fact that could not be established, a warning naming both timestamps, and
+    both stamps still reported as read. The third defect of this exact shape, after
+    `UnicodeDecodeError` escaping `read_toolchain` and `snapshot_missing` inference.
+    """
+    block = full_run(tmp_path, started_at=FINISHED, finished_at=STARTED)
+
+    assert block["duration_seconds"] is None
+    assert block["started_at"] == FINISHED and block["finished_at"] == STARTED
+    assert any("clock went backwards" in warning for warning in block["warnings"]), (
+        f"the loss must be reported, not merely tolerated: {block['warnings']}"
+    )
 
 
 def test_a_non_canonical_timestamp_is_refused(tmp_path):
@@ -1334,4 +1355,72 @@ def test_the_run_block_carries_exactly_the_keys_spec_10_declares(tmp_path):
         f"run block does not match spec §10.\n"
         f"  missing: {sorted(declared - built)}\n"
         f"  extra:   {sorted(built - declared)}"
+    )
+
+
+# --- a failed stage must not publish numbers it never measured (issue #86) -------------------
+
+
+def test_a_failed_suricata_pass_reports_null_counts_not_zeros(tmp_path):
+    """Spec §10: "every field whose stage did not run is `null` — not zero, not an empty list."
+
+    `_failed()` returned zeros, so `run.json` published `rules_loaded: 0` for a run where the
+    engine may have loaded all 85,000 rules. That is not "unknown", it is a false measurement, in
+    the section §10 singles out as the place it must not happen.
+    """
+    from flabel.models import ToolFailure
+
+    failed = SuricataRunInfo(
+        version="8.0.6",
+        snapshot_id=SNAPSHOT_ID,
+        rules_loaded=None,
+        alerts_total=None,
+        rules_failed=None,
+        rules_skipped=None,
+        identify_alerts_suppressed=None,
+        tool_failures=(
+            ToolFailure(tool="suricata", argv=("suricata",), exit_code=1, message="boom"),
+        ),
+    )
+    block = full_run(tmp_path, suricata=failed)
+
+    counts = block["counts"]
+    for key in ("rules_loaded", "rules_failed", "rules_skipped", "identify_alerts_suppressed"):
+        assert counts[key] is None, f"{key} was published as {counts[key]!r}, not null"
+
+    conditions = block["loss_conditions"]
+    assert conditions["rules_failed_or_skipped"] is None, (
+        "bool(None or None) is False, which asserts nothing failed about a run that never counted"
+    )
+    assert conditions["identify_alert_suppressed"] is None
+    assert conditions["tool_failure"] is True
+
+
+def test_a_count_measured_before_the_failure_survives_it(tmp_path):
+    """`_read_eve` runs before `_check_ruleset_loaded`, so the suppression count is already known.
+
+    A run that suppressed 40 `identify` alerts and then failed to account for its ruleset used to
+    report `0` — discarding a fact it held, on the one path where `run.json` is all a reader gets.
+    """
+    from flabel.models import ToolFailure
+
+    failed = SuricataRunInfo(
+        version="8.0.6",
+        snapshot_id=SNAPSHOT_ID,
+        rules_loaded=None,
+        alerts_total=57,
+        rules_failed=None,
+        rules_skipped=None,
+        identify_alerts_suppressed=40,
+        tool_failures=(
+            ToolFailure(tool="suricata", argv=("suricata",), exit_code=1, message="boom"),
+        ),
+    )
+    block = full_run(tmp_path, suricata=failed)
+
+    assert block["counts"]["identify_alerts_suppressed"] == 40
+    assert block["counts"]["alerts_total"] == 57 if "alerts_total" in block["counts"] else True
+    assert block["counts"]["rules_loaded"] is None, "and what it never measured stays null"
+    assert block["loss_conditions"]["identify_alert_suppressed"] is True, (
+        "a measured suppression is a loss that occurred, failure or not"
     )

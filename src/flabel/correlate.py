@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 
 from flabel.errors import CorrelationError, SnapshotError
 from flabel.models import (
@@ -171,8 +172,9 @@ def correlate(
         flows_total=len(flows),
         detections_total=len(detections),
     )
-    _gate(result, threshold)
-    return result
+    # The gate both warns and, past the threshold, raises. Its warnings belong in the result so
+    # they reach `run.warnings[]`, so it returns them rather than only printing them (issue #57).
+    return replace(result, warnings=_gate(result, threshold))
 
 
 # --- finding the candidates --------------------------------------------------------------------
@@ -453,16 +455,21 @@ def _check_threshold(threshold: float) -> None:
         )
 
 
-def _gate(result: CorrelationResult, threshold: float) -> None:
+def _gate(result: CorrelationResult, threshold: float) -> tuple[str, ...]:
     """Spec §9: silent at zero unmatched, a warning above zero, a failed run above `threshold`.
 
     Silence at zero is what makes the warning worth reading — it always means something was
     lost. The failure is a `CorrelationError` (exit 1, no `labels.json`), because past the
     threshold the labels no longer describe the capture and a file that says otherwise is worse
     than none.
+
+    Returns the warnings it emitted, so they reach `run.warnings[]` as well as stderr (issue
+    #57). On the raising path the exception carries the result and the caller writes `run.json`
+    from it, so the message has to be on the result *before* the raise — which is why the
+    warning is built once and used for both.
     """
     if not result.unmatched:
-        return
+        return ()
 
     # Reported apart from the ratio, because they are not in it (issue #84). Folding them into
     # one percentage would print a numerator and a denominator drawn from different populations
@@ -482,21 +489,26 @@ def _gate(result: CorrelationResult, threshold: float) -> None:
         # Warned as well as raised. The exception carries the result, so the caller can write
         # `unmatched_detections[]` into `run.json` (spec §10) — but the warning reaches an
         # operator watching the run, who is not reading a file that does not exist yet.
-        _warn(f"{summary}; above the {threshold:.2%} threshold, so this run has failed")
+        failed = f"{summary}; above the {threshold:.2%} threshold, so this run has failed"
+        _warn(failed)
         raise CorrelationError(
             f"{summary}, above the unmatched threshold of {threshold}: the labels would not "
             f"describe this capture. Raise --unmatched-threshold to accept the loss, or check "
             f"that Zeek and Suricata read the same capture.",
-            result=result,
+            # Carries the warning too, so `run.json` on the failed path says what stderr said.
+            result=replace(result, warnings=(failed,)),
         )
 
-    _warn(f"{summary}; they are reported in unmatched_detections[] and carry no label")
+    tolerated = f"{summary}; they are reported in unmatched_detections[] and carry no label"
+    _warn(tolerated)
+    return (tolerated,)
 
 
 def _warn(message: str) -> None:
     """Print a non-fatal loss on stderr (spec §12), in `zeek.py`'s wording.
 
-    stdout is reserved (spec §12), and `CorrelationResult` has no `warnings` field — the
-    unmatched detections themselves are what the run block reports (spec §11).
+    stdout is reserved (spec §12). The message is *also* carried on
+    `CorrelationResult.warnings` so it reaches `run.warnings[]` (issue #57) — stderr is not kept,
+    and an operator reading the run directory afterwards is the normal case.
     """
     print(f"flabel: warning: {message}", file=sys.stderr)

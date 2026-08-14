@@ -331,6 +331,7 @@ def build_run_block(
     _check_timestamp(started_at, "started_at")
     _check_timestamp(finished_at, "finished_at")
 
+    duration, duration_warnings = _duration(started_at, finished_at)
     versions, toolchain_warnings = read_toolchain(toolchain_path)
     ja4_version, ja4_warnings = _ja4_package_version(zeek, versions)
     failures = _collect_failures(zeek, suricata, tool_failures)
@@ -340,7 +341,7 @@ def build_run_block(
         "schema_version": SCHEMA_VERSION,
         "started_at": started_at,
         "finished_at": finished_at,
-        "duration_seconds": _duration(started_at, finished_at),
+        "duration_seconds": duration,
         "mode": MODE,
         "tiers_attempted": list(TIERS_ATTEMPTED),
         "tiers_unavailable": list(TIERS_UNAVAILABLE),
@@ -356,6 +357,9 @@ def build_run_block(
             *(capture.warnings if capture else ()),
             *(zeek.warnings if zeek else ()),
             *(suricata.warnings if suricata else ()),
+            # Correlation's own losses, which used to reach stderr and nothing else (issue #57).
+            *(correlation.warnings if correlation else ()),
+            *duration_warnings,
             *toolchain_warnings,
             *ja4_warnings,
             *warnings,
@@ -381,21 +385,35 @@ def _check_timestamp(value: str, field: str) -> None:
         )
 
 
-def _duration(started_at: str, finished_at: str) -> float:
-    """Elapsed wall-clock seconds, derived rather than accepted as a third argument.
+def _duration(started_at: str, finished_at: str) -> tuple[float | None, tuple[str, ...]]:
+    """Elapsed wall-clock seconds, or `None` and a warning if the clock went backwards (#62).
 
     Two timestamps and an independently supplied duration are one fact recorded twice, and the
-    copy that drifts is the one a reader trusts. A negative result means the caller wired the
-    two the wrong way round, which would otherwise ship as a plausible number.
+    copy that drifts is the one a reader trusts — so this is derived rather than accepted as a
+    third argument.
+
+    **It used to raise on a negative result**, justified as catching a caller that wired the two
+    the wrong way round. But the caller is `datetime.now(UTC)` at two points in real time, and an
+    NTP step correction, a VM resume or a container clock adjustment makes `finished_at`
+    legitimately earlier. `build_run_block` then raised while the report was being assembled and
+    **no `run.json` was written at all** — on a long run, which is when a correction is most
+    likely and when losing the report costs most.
+
+    A programming error and an environmental one were being treated identically, and only the
+    environmental one was reachable in the field. `None` plus a warning is this module's own
+    convention for a fact it could not establish, and it keeps the report. Spec §10 already says
+    every unestablished field is `null`; this is one more of them, not an exception.
     """
     elapsed = (
         datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)
     ).total_seconds()
     if elapsed < 0:
-        raise ValueError(
-            f"duration is negative: finished_at {finished_at} precedes started_at {started_at}"
+        return None, (
+            f"the clock went backwards during this run: finished_at {finished_at} precedes "
+            f"started_at {started_at}, so duration_seconds could not be established. Both "
+            f"timestamps are reported as read; an NTP step or a VM resume is the usual cause.",
         )
-    return elapsed
+    return elapsed, ()
 
 
 # --- sections -----------------------------------------------------------------------------
@@ -556,6 +574,23 @@ def _counts_section(
 # --- loss conditions (spec §11) -----------------------------------------------------------
 
 
+def _positive(count: int | None) -> bool | None:
+    """Whether a count is above zero, or `None` if it was never established (issue #86)."""
+    return None if count is None else count > 0
+
+
+def _either_positive(first: int | None, second: int | None) -> bool | None:
+    """Whether either count is above zero. `None` unless at least one was established.
+
+    Deliberately not `bool(first or second)`: with both `None` that is `False`, which asserts
+    that nothing failed to load about a run that never counted. If one side is known and positive
+    the answer is `True` regardless of the other, because the loss did occur.
+    """
+    if first is None and second is None:
+        return None
+    return bool(first) or bool(second)
+
+
 def _loss_conditions(
     capture: NormalizedCapture | None,
     zeek: ZeekRunInfo | None,
@@ -619,11 +654,18 @@ def _loss_conditions(
         "snapshot_missing": snapshot_resolved
         if snapshot_resolved is None
         else not snapshot_resolved,
-        "identify_alert_suppressed": (
-            None if suricata is None else suricata.identify_alerts_suppressed > 0
+        # `None` when the count itself is `None` — the stage ran but never established the
+        # number (issue #86). Two distinct traps here, both live:
+        #   * `None > 0` raises TypeError, which would escape `build_run_block` and cost
+        #     `run.json` on a failure path — the same shape as issue #62.
+        #   * `bool(None or None)` is `False`, which asserts "no rule failed to load" about a run
+        #     that never counted. That is the zero-as-measurement defect one field over.
+        "identify_alert_suppressed": _positive(
+            None if suricata is None else suricata.identify_alerts_suppressed
         ),
-        "rules_failed_or_skipped": (
-            None if suricata is None else bool(suricata.rules_failed or suricata.rules_skipped)
+        "rules_failed_or_skipped": _either_positive(
+            None if suricata is None else suricata.rules_failed,
+            None if suricata is None else suricata.rules_skipped,
         ),
         "ja4_unavailable": (
             None if zeek is None or zeek.ja4_status is None else zeek.ja4_status != "present"

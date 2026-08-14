@@ -723,6 +723,8 @@ inventing on the feed's behalf. The rule itself says `classtype:trojan-activity`
 inside the hashed snapshot, and it is what the feed actually asserted. A rule with no `classtype:`
 yields `None`, which is ordinary: 10,949 of 85,545 admitted rules declare none.
 
+**Zero readable packets never reaches Suricata** — refused during ingest, §8 step 9 (issue #85). Zeek handles such a capture happily; Suricata cannot read it and burns its 60-second thread-start budget first.
+
 **Tuple normalisation — Suricata's 5-tuple is translated into Zeek's spelling.** §9 correlates by
 comparing the two tools' tuples field by field, and they disagree on four things. Every rule here
 was measured against real Zeek output, not inferred:
@@ -788,10 +790,13 @@ Order of operations:
 2. Decompress gzip to a temporary file.
 3. **Validate by walking record headers** — flabel's own walk, because no tool in the dependency set reports a truncation offset. Yields `packets_read` and, if the final record is short, `truncated_at_offset`.
 4. **Unreadable header** → `CaptureError`, hard failure, no output directory.
-5. **Truncated pcap** → proceed; `input_status = "partial"`.
+5. **Truncated pcap** → proceed; `input_status = "partial"` — *provided at least one whole record survives*. See step 9.
 6. **Truncated pcapng** → hard failure telling the operator to repair with `editcap`; a partial pcapng block cannot be converted safely.
 7. **pcapng** → `editcap -F pcap`. If it reports multiple link types, determine the dominant type by packet count, split with `editcap`, keep only the dominant, and record `discarded_link_types` and `discarded_packets` with `input_status = "partial"`.
 8. Record every transformation in provenance.
+9. **Zero usable packets** → `CaptureError`, hard failure, no output directory (issue #85). A valid-but-empty pcap, a pcapng carrying only SHB+IDB, and a pcap truncated before its first complete record all reach this state, and none of them is labellable: `input_status: partial` on a file with nothing in it asserts a coverage figure over an empty set. **Amends §12's exit-0 promise**, deliberately — exit 0 covers partial *data*, not zero data.
+
+   The check runs after conversion rather than at the walk, so `editcap` may already have been invoked; it is Zeek and Suricata it precedes, which is where the cost was. Measured before it existed: **63.1 s** to fail, because Suricata cannot read such a file and spends its full 60-second thread-start budget first, then blames a thread that failed to start.
 
 ---
 
@@ -861,6 +866,8 @@ Then consolidate: one `Label` per flow, `sources` sorted, `best_tier = min(tier)
 
 Correlatable excludes the step 0 detections, on both sides of the ratio (issue #84) — they were never going to be placed, so counting them would fail a run on ordinary IPsec traffic, and counting enough of them would drag a genuine tuple-normalisation defect below the threshold. An **empty** protocol is deliberately *not* excluded: that is a parse failure rather than a protocol Zeek cannot name, and nothing licenses tolerating a loss that was never measured. §10 publishes the ratio and the excluded count separately.
 
+`CorrelationResult` carries `warnings` like every sibling stage's run info, and the gate's own message is one of them (issue #57) — stderr is not kept, so a loss that appeared only on a terminal is a loss `run.json` does not record. On the raising path the warning is on the result the exception carries, so the failed run's `run.json` says what stderr said.
+
 **Failing raises `CorrelationError`, carrying the `CorrelationResult`.** The gate fires *because*
 detections went unplaced, so the `UnmatchedDetection` records — each with the reason it could not
 be matched — are the whole content of the failure, and a bare message would discard them at the
@@ -910,7 +917,7 @@ lines, which is where Zeek puts every wall-clock value; what remains is the anal
 
 | Excluded | Why |
 | :-- | :-- |
-| `run.started_at`, `run.finished_at`, `run.duration_seconds` | Wall-clock by definition. |
+| `run.started_at`, `run.finished_at`, `run.duration_seconds` | Wall-clock by definition. `duration_seconds` is `null` when the clock stepped backwards mid-run, with a warning naming both timestamps (issue #62) — an NTP correction or a VM resume must not cost the report. |
 | `run.input.path` | The operator's own file path (see below). |
 | `zeek/packet_filter.log` | Nothing but a wall-clock start time, and no analytic content to compare. Retained rather than deleted — deleting a log Zeek wrote would misrepresent the run. |
 | `suricata/suricata.log` | Wall-clock timestamp *and* pid on every line. Nothing in it is analytic output. |
@@ -971,7 +978,7 @@ or normalise**: the same capture labelled from two directories would otherwise d
 ```python
 {
   "flabel_version": str, "schema_version": "1.0",
-  "started_at": str, "finished_at": str, "duration_seconds": float,
+  "started_at": str, "finished_at": str, "duration_seconds": float | None,
   "mode": "offline",                      # Phase 1 is always this
   "tiers_attempted": [2], "tiers_unavailable": [1],
   "input": {"path": str, "sha256": str, "format": "pcap|pcapng|pcap.gz|pcapng.gz",
@@ -989,13 +996,16 @@ or normalise**: the same capture labelled from two directories would otherwise d
   "counts": {"flows": int, "detections": int, "labels": int,
              "unmatched": int, "unmatched_unsupported_transport": int,
              "unmatched_ratio": float,
-             "identify_alerts_suppressed": int,
-             "rules_loaded": int, "rules_failed": int, "rules_skipped": int},
+             "identify_alerts_suppressed": int | None,
+             "rules_loaded": int | None, "rules_failed": int | None,
+             "rules_skipped": int | None},
   "loss_conditions": {...},               # §11
   "tool_failures": [ ... ],
   "warnings": [str]
 }
 ```
+
+The four `int | None` counts are Suricata's, and they are `null` whenever that pass failed before establishing the number (issue #86) — including the case where the pass failed *after* establishing some of them, which are then reported as measured. `loss_conditions.rules_failed_or_skipped` and `identify_alert_suppressed` are `null` on the same condition, because `bool(None or None)` is `False` and would assert that nothing failed about a run that never counted.
 
 **The types above describe a completed run.** In the `run.json` of a run that failed part-way,
 every field of `input`, `ruleset`, `tools` and `counts` whose stage did not run is `null` — not
@@ -1197,7 +1207,9 @@ flabel rules list  [--rules-dir <d>]
 
 | Code | Meaning |
 | :-: | :-- |
-| 0 | Success. Labels written. Covers both complete and partial input — `run.input.input_status` distinguishes them. |
+| 0 | Success. Labels written. Covers both complete and partial input — `run.input.input_status` distinguishes them. **Partial means partial *data*, not zero data**: a capture with no readable packets is a `CaptureError` (issue #85), because `input_status: partial` on a file with nothing in it asserts a coverage figure over an empty set. |
+
+**A rejected capture leaves no run directory, and that is deliberate** (Craig, 2026-08-14). Issue #23 argued that a script must not have to parse a log to learn that the artifact beside it is not a result — but that argument is about a run which *started* and then died, where `run.json` records what was lost. A capture flabel cannot read never starts a run: §8 step 4 has made an unreadable header a `CaptureError` with no output since step 3, and step 9's zero-packet case is the same category, not a new one. The exit code and the stderr message are the contract every `CaptureError` has. A batch caller distinguishes "this capture was rejected" from "flabel died mid-run" by whether a run directory exists at all, which is the same signal §13 already relies on.
 | 1 | Failure. **No `labels.json`** — but the run directory exists and holds `run.json` with `tool_failures[]` (§10), unless the failure occurred before a run directory could be created (a missing snapshot, an unreadable capture). |
 | 2 | Usage error (argparse). |
 | 3 | Not implemented — the Phase 1 default path only. |
