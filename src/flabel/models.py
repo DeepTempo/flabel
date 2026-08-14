@@ -566,6 +566,13 @@ class CorrelationResult:
     unmatched: tuple[UnmatchedDetection, ...]
     flows_total: int
     detections_total: int
+    #: Non-fatal losses this stage observed, for `run.warnings[]` (issue #57).
+    #:
+    #: Every sibling stage returns these — `NormalizedCapture`, `ZeekRunInfo`, `SuricataRunInfo`
+    #: — and correlation did not, so its gate warning reached stderr and nothing else. An
+    #: operator reading `run.json` after the fact, which is the normal case because stderr is
+    #: not kept, could not see that anything had been warned about.
+    warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """The counts and the records they summarise have to agree (issue #84's review).

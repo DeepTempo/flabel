@@ -357,6 +357,8 @@ def build_run_block(
             *(capture.warnings if capture else ()),
             *(zeek.warnings if zeek else ()),
             *(suricata.warnings if suricata else ()),
+            # Correlation's own losses, which used to reach stderr and nothing else (issue #57).
+            *(correlation.warnings if correlation else ()),
             *duration_warnings,
             *toolchain_warnings,
             *ja4_warnings,

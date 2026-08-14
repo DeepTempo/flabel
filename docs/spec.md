@@ -861,6 +861,8 @@ Then consolidate: one `Label` per flow, `sources` sorted, `best_tier = min(tier)
 
 Correlatable excludes the step 0 detections, on both sides of the ratio (issue #84) — they were never going to be placed, so counting them would fail a run on ordinary IPsec traffic, and counting enough of them would drag a genuine tuple-normalisation defect below the threshold. An **empty** protocol is deliberately *not* excluded: that is a parse failure rather than a protocol Zeek cannot name, and nothing licenses tolerating a loss that was never measured. §10 publishes the ratio and the excluded count separately.
 
+`CorrelationResult` carries `warnings` like every sibling stage's run info, and the gate's own message is one of them (issue #57) — stderr is not kept, so a loss that appeared only on a terminal is a loss `run.json` does not record. On the raising path the warning is on the result the exception carries, so the failed run's `run.json` says what stderr said.
+
 **Failing raises `CorrelationError`, carrying the `CorrelationResult`.** The gate fires *because*
 detections went unplaced, so the `UnmatchedDetection` records — each with the reason it could not
 be matched — are the whole content of the failure, and a bare message would discard them at the

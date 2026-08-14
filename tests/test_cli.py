@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import socket
+import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -48,6 +49,11 @@ from flabel.models import (
 from flabel.rules.snapshot import write_snapshot
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+if str(FIXTURES) not in sys.path:
+    sys.path.insert(0, str(FIXTURES))
+
+import make_awkward as awkward  # noqa: E402  (needs the path entry above)
+
 BENIGN = FIXTURES / "benign.pcap"
 SYNTHETIC_RULES = FIXTURES / "rules" / "synthetic.rules"
 
@@ -78,6 +84,10 @@ RULES = rule_lines()
 #: The rule that matches the benign canary's HTTP flow (10.0.0.5:49152 -> 10.0.0.200:80), so a
 #: run over `benign.pcap` produces exactly one label and a NOTICE with content in it.
 MATCHES_CANARY = 9000001
+
+#: `alert ip any any -> any any` — fires on any IP protocol, including the ones Zeek cannot
+#: name in `transport_proto` (issue #84). Used here to produce a *tolerated* correlation loss.
+ANY_IP_PROTOCOL = 9000010
 
 
 def make_snapshot(root: Path, contents: Mapping[str, Sequence[int]]) -> Path:
@@ -1360,3 +1370,31 @@ def test_a_clock_stepping_backwards_still_writes_run_json(
     assert run["duration_seconds"] is None
     assert any("clock went backwards" in warning for warning in run["warnings"])
     assert code == EXIT_SUCCESS, "the run itself was fine; only the duration was unknowable"
+
+
+@pytest.mark.requires_tools
+def test_a_tolerated_correlation_loss_reaches_the_run_block_not_only_stderr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """Issue #57: `CorrelationResult` had no `warnings`, alone among the stages.
+
+    So the gate's warning went to stderr and stopped there. stderr is not kept — an operator
+    reading the run directory afterwards is the normal case, and `run.json` is the artifact issue
+    #23 exists to make authoritative. A loss that only ever appeared on a terminal is a loss the
+    record does not show.
+
+    Asserted on the file *and* on stderr, in that order: the file is the new requirement, and
+    checking stderr too proves the warning was not simply moved rather than added.
+    """
+    make_snapshot(tmp_path / "rules", {"et/open": [ANY_IP_PROTOCOL]})
+    capture = awkward.write_esp_pcap(tmp_path / "esp.pcap")
+
+    assert cli.main(offline(capture, tmp_path / "rules", tmp_path / "out")) == EXIT_SUCCESS
+
+    run = json.loads((only_run_dir(tmp_path / "out") / "run.json").read_text(encoding="utf-8"))
+    warnings = run["run"]["warnings"]
+
+    assert any("could not be attached to exactly one flow" in w for w in warnings), (
+        f"the correlation loss never reached run.warnings[]: {warnings}"
+    )
+    assert "could not be attached" in capsys.readouterr().err, "and it must still reach stderr"
