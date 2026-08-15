@@ -74,8 +74,14 @@ def imported_modules(path: pathlib.Path) -> set[str]:
 @pytest.mark.parametrize("module", PURE_MODULES)
 def test_pure_modules_perform_no_io(module):
     path = PACKAGE / module
-    if not path.exists():
-        pytest.skip(f"{module} lands in a later step")
+    # Was a skip while modules were landing one step at a time. All ten steps are merged, so a
+    # listed module that is absent now means it was renamed or deleted — and a skip would drop
+    # its I/O guard without a word (#95). `test_pure_modules_are_all_accounted_for` catches a
+    # *new* unclassified module; only this catches a listed one going missing.
+    assert path.exists(), (
+        f"{module} is listed in PURE_MODULES but does not exist. If it was renamed, rename it "
+        f"here too; if it was deleted, remove it here — do not let its purity guard vanish."
+    )
 
     offenders = {
         name

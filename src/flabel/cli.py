@@ -223,10 +223,20 @@ def run_directory_name(capture: Path, when: datetime) -> str:
     while changed:
         changed = False
         for suffix in CAPTURE_SUFFIXES:
-            if len(name) > len(suffix) and name.lower().endswith(suffix):
+            if name.lower().endswith(suffix):
                 name = name[: -len(suffix)]
                 changed = True
                 break
+    # Leading dots go, and the fallback catches what is left (#95). The guard here used to be
+    # `len(name) > len(suffix)`, which left a capture named exactly `.pcap` unstripped and
+    # produced the run directory `.pcap_2026…Z` — hidden from `ls`, so the operator cannot find
+    # their own output. It was also redundant: `or "capture"` already handled the empty case it
+    # was protecting. `..pcap` and `.hidden.pcap` had the same problem one level down.
+    #
+    # The run directory is *our* output, not the operator's file, so a name that hides it is
+    # ours to reject. Dots inside the name are still the operator's naming and are left alone —
+    # `my.capture.2026.pcap` keeps its dots.
+    name = name.lstrip(".")
     return f"{name or 'capture'}_{when.strftime(RUN_DIR_TIMESTAMP)}"
 
 
