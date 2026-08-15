@@ -300,21 +300,39 @@ def write_snapshot(
     return manifest
 
 
-def load_snapshot(root: Path, snapshot_id: str | None) -> tuple[Path, SnapshotManifest]:
-    """The directory and manifest of one snapshot; `None` means the newest.
+def load_snapshot(
+    root: Path, snapshot_id: str | None
+) -> tuple[Path, SnapshotManifest, tuple[str, ...]]:
+    """The directory, manifest and *warnings* of one snapshot; `None` means the newest.
 
     Never falls back to another snapshot when the requested one is missing: labels are only
     reproducible against a known ruleset, so silently substituting a different one would break
     the guarantee the id exists for (spec §7).
+
+    The third element is what #91 added, and it is a returned value rather than a print so that
+    it reaches both readers spec §12 and spec §10 name — the operator watching stderr and
+    whoever reads `run.warnings[]` afterwards. Returning it also means a caller has to unpack it
+    to ignore it, which is visible in a diff; a `print` here would have been invisible to
+    `labels.json` and a silent-by-default hook would have been invisible everywhere.
+
+    Empty whenever an explicit id was given: nothing was skipped to reach it, because the
+    requested snapshot either loads or raises.
     """
+    warnings: tuple[str, ...] = ()
     if snapshot_id is None:
-        available = list_snapshots(root)
+        available, unusable = scan_snapshots(root)
         if not available:
             raise SnapshotError(
                 f"no usable ruleset snapshot found under {root}. Run `flabel rules update` "
                 f"first, or point --rules-dir at the directory holding one."
             )
         snapshot_id = available[-1].snapshot_id
+        warnings = tuple(
+            f"ruleset snapshot {name} was skipped as unreadable, so this run resolved "
+            f"--ruleset-snapshot to {snapshot_id} instead. If {name} was the newer one, these "
+            f"labels are against an older ruleset than the operator expects. Reason: {reason}"
+            for name, reason in unusable
+        )
 
     if not SNAPSHOT_ID.match(snapshot_id):
         # The id becomes a path component under the rules directory and arrives from the command
@@ -346,7 +364,7 @@ def load_snapshot(root: Path, snapshot_id: str | None) -> tuple[Path, SnapshotMa
             f"snapshot {snapshot_id} says total_admitted={manifest.total_admitted} but "
             f"{RULES_NAME} holds {admitted} rules; its manifest does not describe it."
         )
-    return directory, manifest
+    return directory, manifest, warnings
 
 
 def load_sid_index(directory: Path) -> dict[int, str]:
@@ -446,34 +464,54 @@ def load_address_indicators(directory: Path) -> frozenset[int] | None:
     return frozenset(sids)
 
 
-def list_snapshots(root: Path) -> list[SnapshotManifest]:
-    """Every *usable* snapshot under `root`, oldest first.
+def scan_snapshots(root: Path) -> tuple[list[SnapshotManifest], list[tuple[str, str]]]:
+    """Every snapshot under `root`, split into the usable and the unreadable.
+
+    Returns `(manifests oldest-first, [(directory name, why it was skipped)])`.
 
     An absent root is empty rather than an error: `flabel rules list` before the first
     `rules update` is a reasonable thing to run.
 
     A directory whose manifest is missing or unreadable is skipped rather than raised on. One
     damaged snapshot must not make `rules list` — or `load_snapshot(root, None)`, which takes the
-    newest from this list — impossible for every other snapshot on the machine. Skipping is safe
-    *because* nothing is silently substituted: asking for that snapshot by id still fails hard,
-    so a broken snapshot is never used, only omitted from a listing.
+    newest usable one — impossible for every other snapshot on the machine.
+
+    **The second half of the return value is the whole point of this function existing** (#91).
+    Skipping used to be justified as safe because "nothing is silently substituted: asking for
+    that snapshot by id still fails hard". True for the explicit case, false for the default one
+    — which is the case spec §12 makes the default. An operator who ran `flabel rules update`,
+    whose newest snapshot was then corrupted, was labelled against *yesterday's ruleset* with
+    nothing on stderr and nothing in `warnings[]`. Traceable after the fact, because the label
+    cites the older id; but spec §2.5 says absence is never a signal, and this was one.
+
+    Every skipped directory is reported, not only the ones newer than the chosen snapshot. There
+    is no way to report just the newer ones: what makes a directory unusable is that its manifest
+    will not read, and `created_at` is inside that manifest. An unorderable skip is exactly the
+    skip that might have been the newest.
 
     Manifests are read but content is not re-hashed — that is `load_snapshot`'s job, and listing
     should not read every rule of every snapshot to print a table.
     """
     root = Path(root)
     if not root.is_dir():
-        return []
+        return [], []
 
     manifests = []
+    unusable: list[tuple[str, str]] = []
     for entry in sorted(root.iterdir()):
         if not entry.is_dir() or not SNAPSHOT_ID.match(entry.name):
             continue
         try:
             manifests.append(_read_manifest(entry))
-        except SnapshotError:
-            continue
-    return sorted(manifests, key=lambda manifest: (manifest.created_at, manifest.snapshot_id))
+        except SnapshotError as exc:
+            unusable.append((entry.name, str(exc)))
+    manifests.sort(key=lambda manifest: (manifest.created_at, manifest.snapshot_id))
+    return manifests, unusable
+
+
+def list_snapshots(root: Path) -> list[SnapshotManifest]:
+    """Every *usable* snapshot under `root`, oldest first. See `scan_snapshots`."""
+    return scan_snapshots(root)[0]
 
 
 # --- writing --------------------------------------------------------------------------------

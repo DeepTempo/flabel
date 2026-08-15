@@ -61,9 +61,9 @@ from flabel.rules import utc_now
 from flabel.rules.admit import admit
 from flabel.rules.fetch import fetch_feed
 from flabel.rules.snapshot import (
-    list_snapshots,
     load_address_indicators,
     load_snapshot,
+    scan_snapshots,
     write_snapshot,
 )
 from flabel.suricata import run_suricata
@@ -533,9 +533,14 @@ def _label(args: argparse.Namespace) -> int:
     progress = _Progress()
 
     # Before any directory exists: `SnapshotError` propagates to `main` (spec §12).
-    snapshot_dir, manifest = load_snapshot(args.rules_dir, args.ruleset_snapshot)
+    snapshot_dir, manifest, snapshot_warnings = load_snapshot(args.rules_dir, args.ruleset_snapshot)
     progress.manifest = manifest
     progress.snapshot_resolved = True
+    # Both readers, because they are different people (#91): stderr for the operator watching
+    # the run (spec §12), `run.warnings[]` for whoever reads the artifact later (spec §10).
+    for warning in snapshot_warnings:
+        print(f"flabel: warning: {warning}", file=sys.stderr)
+    progress.warnings = (*progress.warnings, *snapshot_warnings)
 
     with TemporaryDirectory(prefix=TEMP_PREFIX) as workdir:
         # The normalized capture lives here and nowhere else (spec §10). Not in the run
@@ -711,7 +716,18 @@ def _rules_update(args: argparse.Namespace) -> int:
 
 def _rules_list(args: argparse.Namespace) -> int:
     """List the snapshots on disk, newest last, so `--ruleset-snapshot` has known arguments."""
-    snapshots = list_snapshots(args.rules_dir)
+    snapshots, unusable = scan_snapshots(args.rules_dir)
+
+    # On stderr, and before the listing, because this is the subcommand an operator reaches for
+    # when a run cited a snapshot id they did not expect (#91). A damaged directory that a
+    # labelling run warns about but `rules list` does not mention sends them looking in the one
+    # place that has decided not to tell them.
+    for name, reason in unusable:
+        print(
+            f"flabel: warning: {name} is not a usable snapshot and is omitted below: {reason}",
+            file=sys.stderr,
+        )
+
     if not snapshots:
         print(
             f"flabel: no ruleset snapshots in {args.rules_dir} — run `flabel rules update`",
@@ -720,7 +736,9 @@ def _rules_list(args: argparse.Namespace) -> int:
         return EXIT_SUCCESS
 
     # stdout, because this subcommand's output *is* data: a caller pipes it to pick an id.
-    # The labelling pipeline leaves stdout alone (spec §12); this is not the pipeline.
+    # The labelling pipeline leaves stdout alone (spec §12); this is not the pipeline. The
+    # warnings above are on stderr for the same reason — a damaged-snapshot note in the middle
+    # of a list of ids is a line some script will try to parse as an id.
     for manifest in sorted(snapshots, key=lambda entry: entry.created_at):
         print(
             f"{manifest.snapshot_id}  {manifest.created_at}  "

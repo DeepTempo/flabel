@@ -1343,7 +1343,7 @@ def test_a_count_measured_before_the_failure_is_handed_on_not_discarded(tmp_path
     """
     failure = suricata._failure(("suricata", "-r", "x.pcap"), 0, "no load count anywhere")
     snapshot = make_snapshot(tmp_path, {"et/open": [HTTP_SID]})
-    _, manifest = load_snapshot(snapshot.parent, snapshot.name)
+    _, manifest, _ = load_snapshot(snapshot.parent, snapshot.name)
 
     info = suricata._failed(
         manifest, failure, version="8.0.6", alerts_total=57, identify_alerts_suppressed=40
