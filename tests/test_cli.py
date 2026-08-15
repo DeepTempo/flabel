@@ -770,6 +770,36 @@ def test_every_capture_suffix_is_stripped_from_the_run_directory_name(
     assert cli.run_directory_name(Path(name), when).split("_")[0] == expected
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        (".pcap", "capture"),  # the whole name is the suffix
+        (".pcapng", "capture"),
+        (".pcap.gz", "capture"),
+        ("..pcap", "capture"),  # stripping leaves a bare dot
+        (".hidden.pcap", "hidden"),  # a genuinely hidden input still gets a findable output
+        ("...pcap", "capture"),
+    ],
+)
+def test_a_run_directory_is_never_hidden_from_ls(name: str, expected: str) -> None:
+    """An operator who cannot find their output has lost it (#95).
+
+    The guard used to be `len(name) > len(suffix)`, so a capture named exactly `.pcap` kept its
+    name and produced `.pcap_2026…Z` — invisible to `ls`, and the run looks like it produced
+    nothing. That guard was also redundant: `or "capture"` already covered the empty case it
+    was protecting against.
+
+    The run directory is flabel's output, not the operator's file, so a name that hides it is
+    ours to reject. Dots *inside* the name stay — see the test above.
+    """
+    when = datetime(2026, 8, 13, 14, 25, 30, 123456, tzinfo=UTC)
+
+    directory = cli.run_directory_name(Path(name), when)
+
+    assert not directory.startswith("."), f"{name!r} produced a hidden run directory: {directory}"
+    assert directory.split("_")[0] == expected
+
+
 def test_run_directory_names_sort_chronologically() -> None:
     """PLAN step 9. `ls` is how an operator finds the latest run, so name order is time order."""
     early = cli.run_directory_name(Path("c.pcap"), datetime(2026, 8, 13, 9, 5, 0, 0, tzinfo=UTC))

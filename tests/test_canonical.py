@@ -621,3 +621,78 @@ def test_an_interrupted_write_is_not_compared_as_an_artifact(tmp_path: Path):
     assert canonical.differences(first, second) == [], (
         "an in-progress write was compared as though the run had published it"
     )
+
+
+# --- undecodable bytes in capture-derived strings (#95) -----------------------------------------
+#
+# Zeek's http.log, dns.log and files.log carry hosts, URIs and filenames straight out of the
+# capture, so a byte that is not valid UTF-8 is something a capture can genuinely contain —
+# `suricata.py:_lines` already treats it that way. `_canonical_file` read strictly, so one such
+# byte raised `UnicodeDecodeError` out of the comparison. Test-only impact today, and exactly the
+# impact that matters: it meant Goal 2 could not be run against a real malicious capture, which
+# is what #103's fixture will be.
+
+#: A lone 0x80 continuation byte — invalid UTF-8 in any position, and the shape a truncated
+#: multi-byte sequence in a hostile URI actually takes.
+BAD_BYTE = b"\x80"
+
+
+def write_run_with_bad_bytes(root: Path, *, host: bytes, **kwargs) -> Path:
+    """A run directory whose `http.log` carries an undecodable host."""
+    run = write_run(root, **kwargs)
+    (run / "zeek" / "http.log").write_bytes(
+        b"#separator \\x09\n#fields\tts\thost\n1700000000.000000\t" + host + b"\n"
+    )
+    return run
+
+
+def base(**overrides):
+    return {
+        "opened": "2026-08-13-11-11-51",
+        "started": "2026-08-13T11:11:51.000000Z",
+        "eve_uptime": 3,
+        "conn": "1700000000.000000\tCabc\t10.0.0.5",
+        **overrides,
+    }
+
+
+def test_an_undecodable_byte_does_not_crash_the_goal_2_comparison(tmp_path: Path):
+    """Before the fix this raised `UnicodeDecodeError` out of `differences`."""
+    first = write_run_with_bad_bytes(
+        tmp_path / "a", host=b"evil" + BAD_BYTE + b".example", **base()
+    )
+    second = write_run_with_bad_bytes(
+        tmp_path / "b", host=b"evil" + BAD_BYTE + b".example", **base()
+    )
+
+    assert canonical.differences(first, second) == []
+
+
+def test_two_runs_differing_only_in_an_undecodable_byte_are_reported_as_different(tmp_path: Path):
+    """The reason for `surrogateescape` rather than `errors="replace"`.
+
+    `replace` maps every undecodable byte onto the same `\ufffd`, so these two files would
+    canonicalise to the same string and the gate would report "identical" — passing for a reason
+    unrelated to what it claims, which is the #74 defect exactly. `surrogateescape` round-trips,
+    so distinct bytes stay distinct.
+    """
+    first = write_run_with_bad_bytes(tmp_path / "a", host=b"host\x80.example", **base())
+    second = write_run_with_bad_bytes(tmp_path / "b", host=b"host\x81.example", **base())
+
+    reported = canonical.differences(first, second)
+
+    assert reported, "two genuinely different logs compared equal"
+    assert any("http.log" in line for line in reported)
+
+
+def test_reporting_that_difference_does_not_itself_raise(tmp_path: Path):
+    """A lone surrogate is unencodable in UTF-8, so a naive repr blows up on the way to stderr.
+
+    The decode fix is worthless if the *report* of the difference raises: that turns "these runs
+    differ here" into a traceback at the moment someone needs the answer.
+    """
+    first = write_run_with_bad_bytes(tmp_path / "a", host=b"host\x80.example", **base())
+    second = write_run_with_bad_bytes(tmp_path / "b", host=b"host\x81.example", **base())
+
+    for line in canonical.differences(first, second):
+        line.encode("utf-8")  # raises UnicodeEncodeError if a raw surrogate escaped
