@@ -1705,3 +1705,60 @@ def test_rules_update_still_accepts_it(tmp_path: Path, capsys: pytest.CaptureFix
 
     assert code != EXIT_USAGE
     assert "source registry not found" in capsys.readouterr().err
+
+
+# --- the run records the gate it was held to (#68) ----------------------------------------------
+
+
+@pytest.mark.requires_tools
+def test_a_run_records_the_threshold_it_was_given(
+    tmp_path: Path, rules_dir: Path, no_network: None
+) -> None:
+    """The call site, not the helper. `build_run_block` accepting the value is not the fix.
+
+    Testing the helper and not the call site is what step 13b shipped (#98), so this drives the
+    real pipeline and reads the artifact.
+    """
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output, "--unmatched-threshold", "0.25"))
+
+    document = json.loads((only_run_dir(output) / "labels.json").read_text(encoding="utf-8"))
+    assert document["run"]["unmatched_threshold"] == 0.25
+
+
+@pytest.mark.requires_tools
+def test_a_run_given_no_threshold_records_the_default(
+    tmp_path: Path, rules_dir: Path, no_network: None
+) -> None:
+    """The default is as much "the rule this artifact was produced under" as an explicit value."""
+    from flabel.correlate import DEFAULT_THRESHOLD
+
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    document = json.loads((only_run_dir(output) / "labels.json").read_text(encoding="utf-8"))
+    assert document["run"]["unmatched_threshold"] == DEFAULT_THRESHOLD
+
+
+def test_a_dead_run_records_the_threshold_in_run_json(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The path where the question is hardest to answer afterwards.
+
+    A run that died writes `run.json` and no `labels.json` (#23). That artifact reports
+    `counts.unmatched: null` — nothing was measured — so "what bar was this held to" cannot be
+    recovered from it at all unless the run says. Threading the value through `_Progress` rather
+    than passing it to `_run_block` from `args` is what makes this path carry it.
+    """
+    zeek_that_dies(monkeypatch, OOM)
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output, "--unmatched-threshold", "0.4"))
+
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists(), "the run must have died, for this to test"
+    run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
+    assert run["counts"]["unmatched"] is None
+    assert run["unmatched_threshold"] == 0.4
