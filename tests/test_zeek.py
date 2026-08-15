@@ -588,6 +588,41 @@ def test_benign_capture_yields_exactly_two_flows(tmp_path: Path):
 
 
 @pytest.mark.requires_tools
+def test_the_missing_script_wording_is_the_real_zeeks_and_not_the_fixtures(tmp_path: Path):
+    """The `not-installed` classifier, checked against the tool instead of against a stub (#92).
+
+    Every other test reaching that branch drives `fake_zeek`, a shell stub echoing exactly
+    `can't find ja4`, or monkeypatches `_ja4_status` wholesale. So the regex separating
+    `not-installed` from `probe-failed` was only ever matched against a string the fixture wrote
+    for it — and CI runs `--strict-toolchain`, which requires the package present, so CI never
+    took the branch. Nothing anywhere saw the real wording.
+
+    What that hides: a Zeek upgrade rewording the message flips every laptop and every non-ja4
+    container from `not-installed` to `probe-failed` — which the spec calls a defect — while CI
+    stays green, because CI is the one environment that never reaches it.
+
+    Uses a script name guaranteed absent rather than `ja4`, so this asserts the same thing
+    whether or not the package is installed. That is what makes it portable enough to run
+    everywhere, which is the entire point of it.
+    """
+    absent = "flabel_definitely_absent_script"
+    probe = subprocess.run(
+        (zeek.executable(), "--parse-only", "-e", f"@load {absent}"),
+        capture_output=True,
+        text=True,
+        timeout=zeek.PROBE_TIMEOUT_SECONDS,
+    )
+
+    assert probe.returncode != 0, "Zeek loaded a script that does not exist"
+    output = f"{probe.stderr}\n{probe.stdout}"
+    assert zeek._missing_script_pattern(absent).search(output), (
+        f'real Zeek no longer says "can\'t find <script>" when a script is absent, so '
+        f"_ja4_status will now classify an ordinary missing package as `probe-failed` — the "
+        f"state spec §10 calls a defect. Its actual output was:\n{output}"
+    )
+
+
+@pytest.mark.requires_tools
 def test_two_runs_produce_identical_uids(tmp_path: Path):
     """**The determinism gate.** Two real invocations, one capture, the same uids.
 

@@ -93,11 +93,29 @@ PROBE_TIMEOUT_SECONDS = 60
 
 _SEMVER = re.compile(r"\d+\.\d+(\.\d+)*")
 
-#: How Zeek says a script is not on ZEEKPATH: `can't find ja4`. Matched so that "the package is
-#: not installed" — the ordinary laptop case — is distinguishable from a probe that failed for
-#: some other reason, such as a broken ZEEKPATH or a half-finished `zkg` install. Both degrade
-#: to no JA4, but only the first is expected, and reporting them as one hides the other.
-_JA4_MISSING = re.compile(rf"can't find {re.escape(JA4_SCRIPT)}\b")
+
+def _missing_script_pattern(script: str) -> re.Pattern[str]:
+    """How Zeek says `script` is not on ZEEKPATH: `can't find <script>`.
+
+    A function of the script name rather than one baked-in constant, so a test can build the
+    same pattern for a name that is *guaranteed* absent and check it against the real Zeek's
+    real wording (#92). Before this, every test reaching the branch used a shell stub echoing
+    `can't find ja4` — the classifier was only ever checked against a string the fixture wrote
+    for it — and CI runs `--strict-toolchain`, which requires the package present, so CI never
+    took the branch at all.
+
+    What that hid: if a Zeek upgrade rewords the message, every laptop and every non-ja4
+    container flips from `not-installed` to `probe-failed` — the state the spec calls a defect —
+    with CI green throughout.
+    """
+    return re.compile(rf"can't find {re.escape(script)}\b")
+
+
+#: Matched so that "the package is not installed" — the ordinary laptop case — is distinguishable
+#: from a probe that failed for some other reason, such as a broken ZEEKPATH or a half-finished
+#: `zkg` install. Both degrade to no JA4, but only the first is expected, and reporting them as
+#: one hides the other.
+_JA4_MISSING = _missing_script_pattern(JA4_SCRIPT)
 
 #: conn.log keys every record must carry for a flow to be built from it. `duration` is not
 #: among them: an unfinished connection legitimately has none.

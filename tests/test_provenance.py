@@ -16,6 +16,8 @@ answer they would otherwise let through, not by the exception type they raise.
 from __future__ import annotations
 
 import dataclasses
+import re
+from pathlib import Path
 from typing import get_args
 
 import pytest
@@ -36,25 +38,51 @@ SNAPSHOT_ID = "8a39182c18a3c9d3"
 #: Derived from the type, not restated, so adding a source class forces a decision here.
 SOURCE_CLASSES = get_args(SourceClass)
 
-#: Every `SourceEntry` field that must carry a real value. `classtype` is the sole legitimate
-#: null — 10,949 of the 85,545 rules in the measured snapshot declare no `classtype:` — so it
-#: is named as the exception rather than left implicit. Hardcoded, so that adding a field to
-#: `SourceEntry` fails `test_the_mandatory_field_set_is_exactly_this` until someone decides
-#: which side of the line it belongs on.
-MANDATORY_FIELDS = frozenset(
-    {
-        "tier",
-        "source",
-        "sid",
-        "rev",
-        "ruleset",
-        "admission_basis",
-        "licence",
-        "label_basis",
-        "threat",
-    }
-)
-NULLABLE_FIELDS = frozenset({"classtype"})
+SPEC = Path(__file__).resolve().parents[1] / "docs" / "spec.md"
+
+
+def spec_source_entry_fields() -> tuple[frozenset[str], frozenset[str]]:
+    """`SourceEntry`'s fields as spec §4 declares them, split mandatory / nullable.
+
+    Read from the spec at test time, the way §10's run block and §11's loss conditions
+    already are, and for the same reason: *a hardcoded copy is a copy that can be trimmed
+    to match the implementation.* This list was the one exception (#89). Hand-written, the
+    guard below compared the implementation against a copy of itself, so it caught a field
+    being **added** — its stated purpose — but not one being removed. Deleting `label_basis`
+    from `SourceEntry` and from the constant in a single change left every Goal 1 test green,
+    including the serialised check in `test_labels.py`, which imports the same constant.
+
+    Nullability comes from the annotation rather than a second list, because §4 already
+    states it exactly: `classtype: str | None` is the sole legitimate null, 10,949 of the
+    84,995 admitted rules declaring no `classtype:`. So the spec cannot say a field is
+    nullable while the code treats it as mandatory without one of them failing.
+
+    Deleting a field is now a `docs/spec.md` edit, which is a reviewed diff — the same bar
+    §10 and §11 already impose.
+    """
+    text = SPEC.read_text(encoding="utf-8")
+    section = text.split("## 4. Data models", 1)[1].split("\n## ", 1)[0]
+    # `class SourceEntry:` up to the blank line that ends its body. The trailing comment on
+    # the class line ("# one asserting detection on a label") is why this anchors on the name
+    # and a colon rather than on a line equal to the declaration.
+    body = re.split(r"^class SourceEntry:.*$", section, maxsplit=1, flags=re.M)[1]
+    body = body.split("\n\n", 1)[0]
+
+    mandatory: set[str] = set()
+    nullable: set[str] = set()
+    for line in body.splitlines():
+        # `name: annotation` or `name: annotation  # comment`, indented inside the class.
+        match = re.match(r"\s+(\w+):\s*([^#]+?)\s*(?:#.*)?$", line)
+        if not match:
+            continue
+        name, annotation = match.group(1), match.group(2)
+        (nullable if "None" in annotation else mandatory).add(name)
+
+    assert mandatory, f"spec §4's SourceEntry parsed to nothing — the parser is broken: {body!r}"
+    return frozenset(mandatory), frozenset(nullable)
+
+
+MANDATORY_FIELDS, NULLABLE_FIELDS = spec_source_entry_fields()
 
 
 def make_admission(**overrides) -> SourceAdmission:
@@ -175,16 +203,37 @@ def test_a_spec_and_an_admission_of_the_same_class_agree(source_class):
 
 
 def test_the_mandatory_field_set_is_exactly_this():
-    """Adding a `SourceEntry` field must be a decision, not a silent pass.
+    """Adding *or removing* a `SourceEntry` field must be a decision, not a silent pass.
 
     Without this, a Phase 2 field (`content_version`, `panos_version`, `device_observed_at`
     per docs/prd.md) added with an empty-string default would sail through the completeness
     check below, which only looks at the fields it already knows about.
+
+    The removal half is what #89 was: the expectation is now spec §4's own declaration, so
+    dropping a field means editing `docs/spec.md` in the same diff and defending it there.
     """
     declared = {field.name for field in dataclasses.fields(SourceEntry)}
     assert declared == MANDATORY_FIELDS | NULLABLE_FIELDS, (
-        "SourceEntry's fields changed. Add each new field to MANDATORY_FIELDS or to "
-        "NULLABLE_FIELDS, and teach build_source_entry where its value comes from."
+        "SourceEntry's fields no longer match spec §4's declaration. Add the field to §4 (or "
+        "remove it there), and teach build_source_entry where its value comes from."
+    )
+
+
+def test_the_spec_and_the_code_agree_on_which_fields_may_be_null():
+    """Goal 1's "no 'where applicable' escape", checked in both directions.
+
+    The field *names* matching is not enough: §4 could declare `licence: str` while the
+    dataclass carries `licence: str | None`, and the completeness test below would still pass
+    because it asserts against whatever `MANDATORY_FIELDS` says. Comparing the annotations
+    closes that, and it is what makes `classtype` the sole null by construction rather than
+    by two lists agreeing.
+    """
+    code_nullable = {
+        field.name for field in dataclasses.fields(SourceEntry) if "None" in str(field.type)
+    }
+    assert code_nullable == NULLABLE_FIELDS, (
+        f"spec §4 says {sorted(NULLABLE_FIELDS)} may be null; SourceEntry says "
+        f"{sorted(code_nullable)}. PRD §6.6 names `classtype` as the one exception and why."
     )
 
 
@@ -441,8 +490,6 @@ def test_building_twice_from_the_same_inputs_gives_equal_entries():
 # stage that never ran reads exactly like a clean run, and nothing downstream can tell.
 
 import json  # noqa: E402
-import re  # noqa: E402
-from pathlib import Path  # noqa: E402
 
 from flabel.labels import SCHEMA_VERSION  # noqa: E402
 from flabel.models import (  # noqa: E402
@@ -462,8 +509,6 @@ from flabel.provenance import (  # noqa: E402
     build_run_block,
     read_toolchain,
 )
-
-SPEC = Path(__file__).resolve().parents[1] / "docs" / "spec.md"
 
 STARTED = "2026-08-12T10:00:00.000000Z"
 FINISHED = "2026-08-12T10:00:01.500000Z"
