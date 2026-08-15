@@ -1494,3 +1494,74 @@ def test_the_shortfall_check_survives_counts_that_were_never_taken():
     assert cli_module._shortfall(info, manifest) is False, (
         "an unestablished count is not a shortfall — and must not raise"
     )
+
+
+# --- --sources is refused on a labelling run, not ignored (#71) ---------------------------------
+
+
+def test_sources_on_a_labelling_run_is_refused(tmp_path: Path, rules_dir: Path) -> None:
+    """The flag was parsed and discarded, so an operator believed something untrue.
+
+    `cli._label` never read it — only `_rules_update` does. The behaviour was right: a label's
+    terms come from the snapshot manifest, never the live registry (spec §4). The interface was
+    not. Spec §5's own argument — "a registry that loads with a setting silently ignored is
+    worse than one that refuses to load" — applied to the CLI instead of the TOML.
+    """
+    registry = tmp_path / "mine.toml"
+    registry.write_text("", encoding="utf-8")
+
+    code = cli.main(offline(BENIGN, rules_dir, tmp_path / "out", "--sources", str(registry)))
+
+    assert code == EXIT_USAGE
+
+
+def test_the_refusal_says_where_the_flag_does_work(
+    tmp_path: Path, rules_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal that does not answer the question the operator was asking is half a refusal."""
+    cli.main(offline(BENIGN, rules_dir, tmp_path / "out", "--sources", str(tmp_path / "m.toml")))
+
+    error = capsys.readouterr().err
+    assert "flabel rules update --sources" in error
+    assert "snapshot carries its own terms" in error
+
+
+def test_the_refusal_happens_before_anything_runs(tmp_path: Path, rules_dir: Path) -> None:
+    """No run directory, no Zeek, no Suricata — the fault was visible in argv (cf. #59).
+
+    Same reasoning as `--unmatched-threshold`: burning a pipeline that issue #56 measured at up
+    to ~35 minutes and then reporting a usage error is the wrong order to do those in.
+    """
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output, "--sources", str(tmp_path / "m.toml")))
+
+    assert not output.exists(), "a refused invocation must not leave a run directory"
+
+
+def test_the_stub_path_refuses_it_too(tmp_path: Path) -> None:
+    """`flabel <capture> --sources f` is the same wrong invocation, and exits 2 rather than 3.
+
+    The usage error wins over "not implemented" because the invocation is wrong either way, and
+    telling someone their flag was ignored is more use than telling them to come back in Phase 2.
+    Phase 2 adds no flags (spec §12), so this stays true when the default path is built.
+    """
+    assert cli.main([str(BENIGN), "--sources", str(tmp_path / "m.toml")]) == EXIT_USAGE
+
+
+def test_an_ordinary_labelling_run_is_unaffected(tmp_path: Path, rules_dir: Path) -> None:
+    """The complement: not passing the flag must not have become a usage error."""
+    assert cli.main(offline(BENIGN, rules_dir, tmp_path / "out")) != EXIT_USAGE
+
+
+def test_rules_update_still_accepts_it(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The flag's real home. Refusing it here too would be the over-fix.
+
+    A missing file is used as the probe, so this reaches `_rules_update`'s own handling without
+    a network fetch: exit 1 with "source registry not found" proves the flag was read, where
+    exit 2 would mean it had been refused.
+    """
+    code = cli.main(["rules", "update", "--sources", str(tmp_path / "absent.toml")])
+
+    assert code != EXIT_USAGE
+    assert "source registry not found" in capsys.readouterr().err

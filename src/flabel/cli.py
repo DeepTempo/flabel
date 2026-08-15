@@ -174,7 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         metavar="FILE",
-        help="source registry (default: the packaged data/sources.toml)",
+        help=(
+            "REFUSED on a labelling run — a snapshot carries its own terms (spec §4). "
+            "Declared here so the refusal can explain itself instead of argparse saying "
+            "'unrecognized arguments'. Use `flabel rules update --sources FILE`."
+        ),
     )
     parser.add_argument(
         "--unmatched-threshold",
@@ -738,6 +742,32 @@ def main(argv: list[str] | None = None) -> int:
             return _rules(arguments[1:])
 
         args = build_parser().parse_args(arguments)
+        if args.sources is not None:
+            # Rejected rather than obeyed, and rejected rather than ignored (#71).
+            #
+            # Obeying it is out of the question: a label's terms — licence, source_class,
+            # admission_basis, url — come from the snapshot manifest, never the live registry
+            # (spec §4). `enabled` describes the registry now, not what was admitted then, and
+            # letting a later registry edit change the reading of an old snapshot would make
+            # labels retroactively unattributable. That decision is settled and is not what
+            # this changes.
+            #
+            # What changes is that the flag used to be parsed and discarded. An operator running
+            # `flabel --offline capture.pcap --sources my-registry.toml` reasonably believed
+            # they had changed which sources may label. They had not, and nothing said so. It is
+            # spec §5's own argument — "a registry that loads with a setting silently ignored is
+            # worse than one that refuses to load" — applied to the CLI instead of the TOML.
+            raise UsageError(
+                "--sources has no effect on a labelling run and is refused rather than ignored. "
+                "A snapshot carries its own terms: the licence, source class and admission basis "
+                "on every label come from the manifest written when the rules were fetched, not "
+                "from the registry as it stands now (spec §4). Choosing a registry is something "
+                "you do when building a snapshot:\n"
+                "\n"
+                "    flabel rules update --sources <file>\n"
+                "\n"
+                "then label against the snapshot it produced, with --ruleset-snapshot <id>."
+            )
         if not args.offline:
             raise NotImplementedInPhase1(
                 f"{STUB_MESSAGE}\n"
