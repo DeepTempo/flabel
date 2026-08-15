@@ -12,8 +12,42 @@ on: [push, pull_request]
 permissions:
   contents: read
   packages: read
+  # feeds-liveness reads this repo's workflow-run history. Read-only, and the narrowest scope
+  # that lets it ask when Goal 5's real review last succeeded.
+  actions: read
 
 jobs:
+  # Goal 5's real false-positive review is .github/workflows/feeds.yml, and it runs on a
+  # `schedule:` that GitHub disables after 60 days of repository inactivity. A workflow that is
+  # not running cannot notice that it is not running, so the check has to live somewhere that
+  # runs on every push — here.
+  #
+  # Cheap and outside the container on purpose: it is one API call and a comparison, it must not
+  # wait on the toolchain image, and it must report separately from `test` so a dark review reads
+  # as a dark review rather than as a test failure.
+  feeds-liveness:
+    name: Goal 5's real review has not gone dark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `--paginate` is deliberately absent: 30 runs of a daily schedule is a month of history,
+      # far more than the threshold needs, and an unbounded page count would turn a cheap check
+      # into a slow one on a repo with years of runs.
+      - name: Ask GitHub when the feeds review last succeeded
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/workflows/feeds.yml/runs?per_page=30" \
+            --jq '[.workflow_runs[] | {conclusion, created_at}]' > feeds-runs.json
+
+      # The decision lives in tests/integration/feeds_liveness.py, not in this step, and
+      # test_feeds_liveness.py proves it FAILS on a stale review, on a review that only ever
+      # failed, and on an API it could not reach. A gate whose logic exists only inside a
+      # workflow is one nothing can prove is able to fail — #74, #98 and #101, three times.
+      - name: Goal 5's real review must have succeeded recently
+        run: python3 tests/integration/feeds_liveness.py feeds-runs.json
+
   lint:
     runs-on: ubuntu-latest
     steps:

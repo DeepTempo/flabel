@@ -19,6 +19,7 @@
 | 2026-08-11 | Craig | 0.3 | JA4 labeling moved into phase one as a first-class Tier 2 capability (US-14, US-15); only JA4 *rule content* remains out of scope |
 | 2026-08-15 | Craig | 0.5 | **Two divergences recorded at Phase 1 sign-off, rather than left implicit.** §6.6: `classtype` is **nullable**, not required — the code and spec §4 always made it so, and read literally that meant Goal 1 was unmet (#89). §6.2 / §9 / §6.6: US-14's **JA4 cross-check is deferred alongside #13** — it shipped unimplemented, and is a precondition for admitting JA4 rule content rather than a Phase 1 gate (#90). Neither is a change of behaviour; both are the document catching up with what was built and argued for. |
 | 2026-08-11 | Craig | 0.4 | **Phased delivery.** Phase 1 is Tier 2 (open-source) screening only; Tier 1 (PANW NGFW) moves to Phase 2 as an immediate follow-on. The CLI contract is fixed now — the NGFW-inclusive default is retained and stubbed with `Coming Soon (TM)`, `--offline` is retained as the Phase 1 working path, and Phase 2 adds no flags. Incorporates `docs/eng-review.md`: ruleset snapshots become first-class artifacts, verdict vs non-verdict source classification, `label_basis`, canonical output form, enumerated loss conditions, specificity canary goal, and per-source licence attribution. `max_tier` renamed `best_tier`. |
+| 2026-08-15 | Craig | 0.6 | **Goal 5's real review is a split, and §6.3 described only the stronger half.** The benign canary that runs on every build is three synthetic rules and reviews none of the wholesale-admitted ruleset; the real review is a daily `schedule:` GitHub disables after 60 days of repository inactivity. §6.3 now states the split, and `ci.yml` refuses a push when that review has not succeeded lately (#88). |
 
 ## Phasing
 
@@ -161,7 +162,16 @@ Phase 2 requires **two hosts** — a PANW VM-Series in virtual-wire configuratio
 
 - **Signature rulesets** (ET Open) are filtered on rule metadata: `confidence == High` **and** `signature_severity in (Major, Critical)`. Rules lacking a `confidence` tag are **excluded** (fail-closed).
 - **IOC feeds and community rulesets without ET-style metadata** (abuse.ch, malsilo, `stamus/lateral`, `the-hunters-ledger`, `pawpatrules`) are admitted **wholesale**, with the feed snapshot date as provenance. Wholesale admission means *no per-rule gate exists* for those sources — hence `admission_basis` being machine-visible.
-- `pawpatrules` is admitted **with its false-positive risk knowingly accepted.** It is the broadest-scope and least-vetted admitted source, and it is share-alike licensed (CC-BY-SA-4.0). **The Goal 5 benign canary is its standing FP review** — it runs on every build, so a noisy source surfaces immediately rather than after a model is trained.
+- `pawpatrules` is admitted **with its false-positive risk knowingly accepted.** It is the broadest-scope and least-vetted admitted source, and it is share-alike licensed (CC-BY-SA-4.0). **The Goal 5 benign canary is its standing FP review.**
+
+  **Amendment, 2026-08-15 (#88): that review does *not* run on every build, and this paragraph claimed it did.** The review is split, and only the weaker half is on the PR path:
+
+  | | Runs | What it reviews |
+  | :-- | :-- | :-- |
+  | `test_the_benign_canary_produces_zero_labels` | every build | **Three synthetic rules** against a 14-packet capture. Its own assertion is `rules_loaded == 3`. It reviews none of the ~85,000 wholesale-admitted rules this risk is about — it proves the labelling path works, not that the ruleset is quiet. |
+  | `.github/workflows/feeds.yml` | daily `schedule:` | The real review: nine feeds fetched live, a real snapshot built, the benign canary **and** the 17-capture benign corpus labelled against it. |
+
+  The scheduled half cannot move onto the PR path — the test suite may never contact a rule feed (spec §2.2) and a real snapshot is 124 MB — and that decision stands (Craig, 2026-08-12, on #24). What was missing is that **GitHub disables `schedule:` triggers after 60 days of repository inactivity**, so the real review can stop with nothing to announce it. `ci.yml`'s `feeds-liveness` job now refuses a push when `feeds` has not succeeded within seven days. So the honest claim is not "it runs on every build" but **"no change can merge while it has been dark"**.
 - Excluded: hunting/anomaly rulesets, self-described aggressive blacklists, and Positive Technologies.
 - The filter is an **inclusion** filter, which `suricata-update`'s subtractive model does not express — flabel parses rule metadata and emits its own filtered rule file.
 
