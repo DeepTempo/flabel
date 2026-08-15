@@ -23,6 +23,13 @@
 # passing". If flabel is dormant, re-enable it from the Actions tab, or trigger it by hand with
 # `workflow_dispatch`, before trusting a green history.
 #
+# SINCE 2026-08-15 SOMETHING DOES ANNOUNCE IT (#88). `ci.yml`'s `feeds-liveness` job fails a push
+# when this workflow has not *succeeded* within `feeds_liveness.MAX_AGE_DAYS`. That does not make
+# the caveat above go away — nothing can assert "the review is running right now" from inside a
+# workflow that is not running — but it does mean the silence ends the moment anybody pushes. The
+# property is "you cannot merge a change while the standing review has been dark", which is the
+# strongest thing available here. Read `tests/integration/feeds_liveness.py` before weakening it.
+#
 # WHAT THIS BUYS BEYOND THE PR SUITE: it catches feed drift. `abuse.ch/urlhaus` and two of
 # pawpatrules' companion lists (`openphish`, `nrd_phishing_14day`) refresh upstream daily and are
 # inside the `snapshot_id` hash, so the ruleset genuinely changes underneath us between runs. A
@@ -47,6 +54,22 @@ permissions:
   packages: read
   # Failure files an issue — see the last step.
   issues: write
+
+# WHY THIS IS HERE, AND WHY IT IS NOT COSMETIC (2026-08-15, issue #88).
+#
+# GitHub defaults a *container* job's steps to `sh -e {0}`, not `bash -e {0}`. On Ubuntu `/bin/sh`
+# is dash, which has no `pipefail`, so step 11d's `set -euo pipefail` aborted at line 1 with
+# "Illegal option -o pipefail" and exit 2. The FIRST scheduled run after 11d merged died there —
+# before the canary reached its verdict, and before the corpus step ran at all. Goal 5's real
+# review was dead for a day and the only reason anyone knew is that the failure path files an
+# issue (#105).
+#
+# It shipped that way because nothing in the PR path executes this file: `ci.yml` runs the test
+# suite, and a workflow's own shell is not something a test can reach. The gate for that gap is
+# the liveness job in `ci.yml`, which refuses a push when this workflow has not succeeded lately.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   canary:
