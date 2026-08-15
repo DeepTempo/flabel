@@ -92,8 +92,17 @@ MATCHES_CANARY = 9000001
 ANY_IP_PROTOCOL = 9000010
 
 
-def make_snapshot(root: Path, contents: Mapping[str, Sequence[int]]) -> Path:
-    """A real snapshot under `root`, from `contents` (source name -> SIDs)."""
+def make_snapshot(
+    root: Path,
+    contents: Mapping[str, Sequence[int]],
+    created_at: str = "2026-08-12T00:00:00.000000Z",
+) -> Path:
+    """A real snapshot under `root`, from `contents` (source name -> SIDs).
+
+    `created_at` is a parameter because `load_snapshot(root, None)` orders by it: a test with two
+    snapshots that shared a timestamp would be resolved by snapshot-id tiebreak, i.e. by content
+    hash, and would pass or fail depending on which random-looking id sorted higher.
+    """
     admitted = {name: [RULES[sid] for sid in sorted(contents[name])] for name in sorted(contents)}
     admissions = [
         SourceAdmission(
@@ -114,7 +123,7 @@ def make_snapshot(root: Path, contents: Mapping[str, Sequence[int]]) -> Path:
         )
         for name, rules in admitted.items()
     ]
-    manifest = write_snapshot(root, admitted, admissions, created_at="2026-08-12T00:00:00.000000Z")
+    manifest = write_snapshot(root, admitted, admissions, created_at=created_at)
     return root / manifest.snapshot_id
 
 
@@ -768,6 +777,36 @@ def test_every_capture_suffix_is_stripped_from_the_run_directory_name(
     when = datetime(2026, 8, 13, 14, 25, 30, 123456, tzinfo=UTC)
 
     assert cli.run_directory_name(Path(name), when).split("_")[0] == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        (".pcap", "capture"),  # the whole name is the suffix
+        (".pcapng", "capture"),
+        (".pcap.gz", "capture"),
+        ("..pcap", "capture"),  # stripping leaves a bare dot
+        (".hidden.pcap", "hidden"),  # a genuinely hidden input still gets a findable output
+        ("...pcap", "capture"),
+    ],
+)
+def test_a_run_directory_is_never_hidden_from_ls(name: str, expected: str) -> None:
+    """An operator who cannot find their output has lost it (#95).
+
+    The guard used to be `len(name) > len(suffix)`, so a capture named exactly `.pcap` kept its
+    name and produced `.pcap_2026…Z` — invisible to `ls`, and the run looks like it produced
+    nothing. That guard was also redundant: `or "capture"` already covered the empty case it
+    was protecting against.
+
+    The run directory is flabel's output, not the operator's file, so a name that hides it is
+    ours to reject. Dots *inside* the name stay — see the test above.
+    """
+    when = datetime(2026, 8, 13, 14, 25, 30, 123456, tzinfo=UTC)
+
+    directory = cli.run_directory_name(Path(name), when)
+
+    assert not directory.startswith("."), f"{name!r} produced a hidden run directory: {directory}"
+    assert directory.split("_")[0] == expected
 
 
 def test_run_directory_names_sort_chronologically() -> None:
@@ -1494,6 +1533,107 @@ def test_the_shortfall_check_survives_counts_that_were_never_taken():
     assert cli_module._shortfall(info, manifest) is False, (
         "an unestablished count is not a shortfall — and must not raise"
     )
+
+
+# --- a damaged newer snapshot must not silently downgrade the run (#91) -------------------------
+
+
+def rules_dir_with_a_damaged_newer_snapshot(tmp_path: Path) -> tuple[Path, str, str]:
+    """A rules root holding a good older snapshot and a newer one whose manifest is corrupt.
+
+    Returns `(root, good id, broken id)`. Both are written by the real `write_snapshot`, then
+    one manifest is truncated — the failure an interrupted write or a bad disk actually leaves,
+    rather than a hand-assembled directory that might not resemble one.
+    """
+    root = tmp_path / "rules"
+    good = make_snapshot(root, {"et/open": [MATCHES_CANARY]}, "2026-08-01T00:00:00.000000Z")
+    broken = make_snapshot(root, {"et/open": [ANY_IP_PROTOCOL]}, "2026-08-11T00:00:00.000000Z")
+    (broken / "manifest.json").write_text("{ truncated", encoding="utf-8")
+    return root, good.name, broken.name
+
+
+@pytest.mark.requires_tools
+def test_a_damaged_newer_snapshot_is_named_in_the_run_block(tmp_path: Path, no_network: None):
+    """The end-to-end half of #91, and the half that matters.
+
+    `load_snapshot` returning the warning is not the fix — `cli.py` recording it is. Testing the
+    helper and not the call site is the mistake step 13b shipped (#98), so this drives the real
+    pipeline and reads the artifact an operator would read.
+
+    The run still succeeds: an older ruleset is a usable ruleset, and refusing would strand every
+    machine with one bad directory. What must not happen is succeeding *quietly*.
+    """
+    root, good, broken = rules_dir_with_a_damaged_newer_snapshot(tmp_path)
+    output = tmp_path / "out"
+
+    code = cli.main(offline(BENIGN, root, output))
+
+    assert code == EXIT_SUCCESS
+    document = json.loads((only_run_dir(output) / "labels.json").read_text(encoding="utf-8"))
+    run = document["run"]
+
+    assert run["ruleset"]["snapshot_id"] == good, "the run should fall back to the usable snapshot"
+    warnings = run["warnings"]
+    assert any(broken in warning for warning in warnings), (
+        f"the run was labelled against {good} because {broken} could not be read, and said "
+        f"nothing about it. warnings[] was {warnings}"
+    )
+
+
+@pytest.mark.requires_tools
+def test_the_operator_watching_the_run_is_told_too(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], no_network: None
+):
+    """stderr as well as the artifact: spec §12's reader and spec §10's are different people.
+
+    stderr specifically, never stdout — spec §12 reserves stdout, and putting this there would
+    corrupt `flabel --offline x.pcap > run.log` the way the shortfall prompt once did.
+    """
+    root, _, broken = rules_dir_with_a_damaged_newer_snapshot(tmp_path)
+
+    cli.main(offline(BENIGN, root, tmp_path / "out"))
+
+    captured = capsys.readouterr()
+    assert broken in captured.err
+    assert broken not in captured.out
+
+
+@pytest.mark.requires_tools
+def test_an_undamaged_store_adds_no_snapshot_warning(
+    tmp_path: Path, rules_dir: Path, no_network: None
+):
+    """A warning on every ordinary run is a warning nobody reads.
+
+    Asserts the absence of *this* warning rather than of all warnings: a laptop without the JA4
+    package legitimately emits one, and `warnings == []` would make this test a statement about
+    the machine it runs on instead of about the snapshot store.
+    """
+    output = tmp_path / "out"
+
+    cli.main(offline(BENIGN, rules_dir, output))
+
+    document = json.loads((only_run_dir(output) / "labels.json").read_text(encoding="utf-8"))
+    offenders = [w for w in document["run"]["warnings"] if "skipped as unreadable" in w]
+    assert offenders == []
+
+
+def test_rules_list_names_a_damaged_snapshot_it_omitted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    """`rules list` is where an operator looks after a run cited an id they did not expect (#91).
+
+    A directory the labelling run warns about, silently missing from the listing, sends them to
+    the one place that has decided not to mention it.
+    """
+    root, good, broken = rules_dir_with_a_damaged_newer_snapshot(tmp_path)
+
+    assert cli.main(["rules", "list", "--rules-dir", str(root)]) == EXIT_SUCCESS
+
+    captured = capsys.readouterr()
+    assert broken in captured.err
+    # stdout stays parseable: a warning among the ids is a line some script reads as an id.
+    assert broken not in captured.out
+    assert good in captured.out
 
 
 # --- --sources is refused on a labelling run, not ignored (#71) ---------------------------------

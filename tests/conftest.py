@@ -34,6 +34,35 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: ``requires_tools`` layer, because a partial toolchain gives partial, misleading results.
 REQUIRED_TOOLS = ("zeek", "suricata", "editcap", "capinfos")
 
+#: `requires_tools` tests allowed to skip under `--require-tool-tests`, by node id, each with the
+#: reason it is expected. Anything else that skips fails the run (#95).
+#:
+#: The gate used to have a floor of *one*: it failed only when zero tool tests passed, and a skip
+#: is not a deselection. So if a shared fixture broke — the `tls_capture` generator, say — half
+#: the integration layer could start skipping and CI would stay green on the strength of one
+#: surviving test. "The suite ran" was proven to a floor of 1 out of ~139.
+#:
+#: An allowlist rather than a blanket ban because one skip is legitimate and permanent-for-now:
+#: the malicious canary has no fixture (#103), and its skip is the deliberate visible marker of
+#: that gap. Naming it here means that when the fixture lands, the entry is removed in the same
+#: diff — and until then, no *other* test can hide behind the same tolerance.
+EXPECTED_TOOL_SKIPS = {
+    "tests/integration/test_canaries.py::test_the_malicious_canary_produces_at_least_one_label": (
+        "the malicious canary is unsourced — issue #103, spec §14. Remove this entry when "
+        "tests/fixtures/malicious.pcap lands."
+    ),
+}
+
+#: A floor on how many `requires_tools` tests must pass under `--require-tool-tests`.
+#:
+#: The skip allowlist above catches tests that *stop running*; this catches tests that stop
+#: *existing*, which no skip is ever reported for. Measured 2026-08-15: 136 pass locally and
+#: three more pass in CI, where `zkg` and the JA4 package are present — so ~139. The floor is set
+#: well below that rather than at it, because a number that has to be edited every time a test is
+#: added is a number people learn to edit without reading. It is high enough to catch the
+#: scenario #95 describes — half the layer going missing — and no tighter.
+MINIMUM_TOOL_TESTS = 100
+
 
 class _ToolGate:
     """Per-session gate state, registered as a plugin.
@@ -46,9 +75,14 @@ class _ToolGate:
     would see zero and the gate would fail closed — safe, but it would look like a bug.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, minimum: int = MINIMUM_TOOL_TESTS) -> None:
         self.passed = 0
         self.deselected: list[str] = []
+        self.skipped: list[str] = []
+        #: Injected rather than read from the constant, so `test_tool_gate.py`'s nested sessions
+        #: — which have one or two tool tests, not a hundred — can drive the floor from both
+        #: sides instead of being exempted from it.
+        self.minimum = minimum
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         """Count tool tests that ran their body **and passed**.
@@ -58,8 +92,14 @@ class _ToolGate:
         satisfy the gate while proving nothing about the toolchain. Marking a broken tool
         test ``xfail`` must not turn CI green. An ``xpass`` does count — it ran and passed.
         """
-        if report.when == "call" and report.passed and "requires_tools" in report.keywords:
+        if "requires_tools" not in report.keywords:
+            return
+        if report.when == "call" and report.passed:
             self.passed += 1
+        # A skip is decided at setup, so `when` is "setup" and there is no "call" report at all —
+        # which is exactly why counting only passes could never see one.
+        elif report.skipped:
+            self.skipped.append(report.nodeid)
 
     def pytest_deselected(self, items: list[pytest.Item]) -> None:
         """Remember tool tests filtered out, so narrowing can't silently shrink coverage.
@@ -83,6 +123,25 @@ class _ToolGate:
                 "zero requires_tools tests executed and passed. A run that skipped the "
                 "integration layer must not look like a passing one (docs/spec.md §2)."
             )
+
+        unexpected = sorted(set(self.skipped) - set(EXPECTED_TOOL_SKIPS))
+        if unexpected:
+            return (
+                f"{len(unexpected)} requires_tools test(s) skipped that are not in "
+                f"EXPECTED_TOOL_SKIPS: {', '.join(unexpected[:5])}. Under --require-tool-tests a "
+                f"tool test that does not run is a gap in the toolchain, not a pass — a broken "
+                f"shared fixture can silence half the integration layer while one surviving test "
+                f"keeps the build green. If the skip is legitimate and permanent, add it to that "
+                f"allowlist with its reason."
+            )
+
+        if self.passed < self.minimum:
+            return (
+                f"only {self.passed} requires_tools tests passed, under the floor of "
+                f"{self.minimum}. Nothing reports a test that stopped existing, so this is "
+                f"the only thing that would notice the integration layer being deleted rather "
+                f"than skipped. If the suite legitimately shrank, lower the floor in the same diff."
+            )
         return None
 
 
@@ -94,17 +153,34 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption(
         "--require-tool-tests",
         action="store_true",
-        help="Fail the run if no requires_tools test executed (a skipped suite is not a pass).",
+        help=(
+            "Fail the run unless the whole requires_tools layer ran: none deselected, none "
+            "skipped outside EXPECTED_TOOL_SKIPS, and at least --min-tool-tests passing. A "
+            "skipped suite is not a pass. Intended with --strict-toolchain inside the toolchain "
+            "container — on a laptop without the JA4 package this correctly fails, because such "
+            "a run does not prove what CI's does."
+        ),
     )
     group.addoption(
         "--strict-toolchain",
         action="store_true",
         help="Assert exact pinned tool versions and require the Zeek JA4 package.",
     )
+    group.addoption(
+        "--min-tool-tests",
+        type=int,
+        default=MINIMUM_TOOL_TESTS,
+        metavar="N",
+        help=(
+            f"Under --require-tool-tests, fail if fewer than N requires_tools tests passed "
+            f"(default: {MINIMUM_TOOL_TESTS}). An option rather than a constant so the value CI "
+            f"runs with is visible in argv, and so the gate's own tests can drive it."
+        ),
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    config.pluginmanager.register(_ToolGate(), _GATE)
+    config.pluginmanager.register(_ToolGate(config.getoption("--min-tool-tests")), _GATE)
     config.addinivalue_line(
         "markers",
         "requires_tools: invokes the real Zeek/Suricata/Wireshark toolchain (docs/spec.md §2)",
@@ -153,10 +229,20 @@ def pytest_terminal_summary(terminalreporter, exitstatus: int, config: pytest.Co
     """Explain the gate failure in the summary block, where a reader actually looks."""
     if not config.getoption("--require-tool-tests"):
         return
-    reason = config.pluginmanager.get_plugin(_GATE).failure()
+    gate = config.pluginmanager.get_plugin(_GATE)
+    reason = gate.failure()
     if reason is not None:
         terminalreporter.section("toolchain gate", red=True, bold=True)
         terminalreporter.write_line(f"FAILED: {reason}")
+
+    # An allowlist entry that no longer skips is not a failure — the test started running, which
+    # is the outcome we wanted. It is worth saying out loud, because an entry nobody removes is
+    # how a tolerance outlives the reason for it. Same argument as corpus_gate's `stale` note.
+    for node, why in sorted(EXPECTED_TOOL_SKIPS.items()):
+        if node not in gate.skipped:
+            terminalreporter.write_line(
+                f"NOTE: {node} no longer skips — remove it from EXPECTED_TOOL_SKIPS ({why})"
+            )
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:

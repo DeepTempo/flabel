@@ -32,6 +32,7 @@ from flabel.rules.snapshot import (
     load_snapshot,
     render_rules,
     render_sid_index,
+    scan_snapshots,
     write_snapshot,
 )
 
@@ -558,7 +559,7 @@ def test_a_snapshot_with_no_rules_at_all_is_rejected(tmp_path: Path):
 def test_load_snapshot_returns_the_directory_and_the_manifest(tmp_path: Path):
     directory, written = one_source(tmp_path, created_at=CREATED_AT)
 
-    loaded_directory, loaded = load_snapshot(tmp_path, written.snapshot_id)
+    loaded_directory, loaded, _ = load_snapshot(tmp_path, written.snapshot_id)
 
     assert loaded_directory == directory
     assert loaded == written
@@ -569,7 +570,7 @@ def test_load_snapshot_with_no_id_returns_the_newest(tmp_path: Path):
     older = one_source(tmp_path, sids=(1, 2), created_at="2026-08-01T00:00:00.000000Z")[1]
     newer = one_source(tmp_path, sids=(3, 4), created_at="2026-08-11T00:00:00.000000Z")[1]
 
-    _, loaded = load_snapshot(tmp_path, None)
+    _, loaded, _ = load_snapshot(tmp_path, None)
 
     assert loaded.snapshot_id == newer.snapshot_id != older.snapshot_id
 
@@ -682,11 +683,100 @@ def test_one_damaged_snapshot_does_not_hide_the_healthy_ones(tmp_path: Path):
     (broken_directory / MANIFEST_NAME).write_text("{ truncated", encoding="utf-8")
 
     assert [entry.snapshot_id for entry in list_snapshots(tmp_path)] == [good.snapshot_id]
-    _, newest = load_snapshot(tmp_path, None)
+    _, newest, _ = load_snapshot(tmp_path, None)
     assert newest.snapshot_id == good.snapshot_id
 
     with pytest.raises(SnapshotError):
         load_snapshot(tmp_path, broken.snapshot_id)
+
+
+# --- the downgrade is reported (#91) ------------------------------------------------------------
+
+
+def test_resolving_the_newest_past_a_damaged_one_says_so(tmp_path: Path):
+    """The silent downgrade #91 is about: yesterday's ruleset, with nothing saying so.
+
+    `load_snapshot(root, None)` is the case spec §12 makes the default, and the docstring that
+    justified skipping — "nothing is silently substituted: asking for that snapshot by id still
+    fails hard" — was true only of the *explicit* case. An operator who ran `flabel rules
+    update`, whose newest snapshot was then corrupted, was labelled against the older one with
+    nothing on stderr and nothing in `warnings[]`. Spec §2.5: absence is never a signal.
+    """
+    good = one_source(tmp_path, sids=(1, 2), created_at="2026-08-01T00:00:00.000000Z")[1]
+    broken_directory, broken = one_source(
+        tmp_path, sids=(3, 4), created_at="2026-08-11T00:00:00.000000Z"
+    )
+    (broken_directory / MANIFEST_NAME).write_text("{ truncated", encoding="utf-8")
+
+    _, resolved, warnings = load_snapshot(tmp_path, None)
+
+    assert resolved.snapshot_id == good.snapshot_id
+    assert len(warnings) == 1
+    # The id of what was skipped and the id actually used, because "a snapshot was skipped" does
+    # not tell an operator whether the labels they are holding are the ones they expected.
+    assert broken.snapshot_id in warnings[0]
+    assert good.snapshot_id in warnings[0]
+
+
+def test_a_clean_store_warns_about_nothing(tmp_path: Path):
+    """The complement: a warning on every run is a warning nobody reads."""
+    one_source(tmp_path, sids=(1, 2), created_at="2026-08-01T00:00:00.000000Z")
+
+    assert load_snapshot(tmp_path, None)[2] == ()
+
+
+def test_asking_by_id_warns_about_nothing_even_with_a_damaged_sibling(tmp_path: Path):
+    """Nothing was skipped to reach an explicitly requested snapshot, so there is nothing to say.
+
+    Worth pinning: the natural over-fix is to warn on every load, which would attach an
+    irrelevant warning to `--ruleset-snapshot <id>` runs and train readers to ignore the field.
+    """
+    good = one_source(tmp_path, sids=(1, 2), created_at="2026-08-01T00:00:00.000000Z")[1]
+    broken_directory, _ = one_source(
+        tmp_path, sids=(3, 4), created_at="2026-08-11T00:00:00.000000Z"
+    )
+    (broken_directory / MANIFEST_NAME).write_text("{ truncated", encoding="utf-8")
+
+    assert load_snapshot(tmp_path, good.snapshot_id)[2] == ()
+
+
+def test_every_damaged_snapshot_is_named_not_just_the_newest(tmp_path: Path):
+    """All of them, because an unreadable manifest is exactly the one whose date is unknown.
+
+    `created_at` lives inside the manifest that will not parse, so a skipped directory cannot be
+    ordered against the chosen one. Reporting only "the newer ones" is not implementable, and
+    guessing would drop the report that mattered.
+    """
+    one_source(tmp_path, sids=(1, 2), created_at="2026-08-01T00:00:00.000000Z")
+    names = []
+    for sids, created in (
+        ((3, 4), "2026-08-02T00:00:00.000000Z"),
+        ((5, 6), "2026-08-11T00:00:00.000000Z"),
+    ):
+        directory, manifest = one_source(tmp_path, sids=sids, created_at=created)
+        (directory / MANIFEST_NAME).write_text("{ truncated", encoding="utf-8")
+        names.append(manifest.snapshot_id)
+
+    warnings = load_snapshot(tmp_path, None)[2]
+
+    assert len(warnings) == 2
+    assert {name for name in names} == {
+        name for name in names if any(name in warning for warning in warnings)
+    }
+
+
+def test_scan_snapshots_reports_why_each_was_skipped(tmp_path: Path):
+    """The reason travels with the name: "unreadable" alone does not tell anyone what to fix."""
+    broken_directory, broken = one_source(tmp_path, sids=(3, 4))
+    (broken_directory / MANIFEST_NAME).write_text("{ truncated", encoding="utf-8")
+
+    manifests, unusable = scan_snapshots(tmp_path)
+
+    assert manifests == []
+    assert len(unusable) == 1
+    name, reason = unusable[0]
+    assert name == broken.snapshot_id
+    assert reason.strip(), "a skipped snapshot with no reason cannot be diagnosed"
 
 
 def test_list_snapshots_is_chronological(tmp_path: Path):

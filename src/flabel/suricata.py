@@ -299,7 +299,9 @@ def run_suricata(
     directory because spec §8 says so, and a snapshot directory is always named by its id, so
     the loader is called with the pair it wants.
     """
-    directory, manifest = load_snapshot(snapshot.parent, snapshot.name)
+    # No warnings to collect: an explicit id was given, so nothing was skipped to reach it.
+    # `cli.py` is where the `None` resolution happens and where its warnings are recorded (#91).
+    directory, manifest, _ = load_snapshot(snapshot.parent, snapshot.name)
     # From the manifest rather than built here: correlation needs the same lookup, and two
     # copies of it carry two copies of the duplicate-name hazard the manifest now rejects.
     sources = manifest.sources_by_name

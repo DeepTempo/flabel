@@ -244,8 +244,23 @@ def differences(first: Path, second: Path) -> list[str]:
 
 
 def _canonical_file(name: str, path: Path) -> Any:
-    """One file's comparable content, by the rule that applies to it."""
-    text = path.read_text(encoding="utf-8")
+    """One file's comparable content, by the rule that applies to it.
+
+    Decoded with ``surrogateescape``, not strictly (#95). Zeek's `http.log`, `dns.log` and
+    `files.log` carry capture-derived strings — hosts, URIs, filenames — that a hostile capture
+    can make invalid UTF-8, and `suricata.py:_lines` already treats that as content rather than
+    as a broken tool. Reading strictly here meant one bad byte in a URI raised `UnicodeDecodeError`
+    out of the Goal 2 comparison, so Goal 2 could not be run against a real malicious capture —
+    which is exactly what #103's fixture will be.
+
+    ``surrogateescape`` rather than ``replace`` because this is a comparison and injectivity is
+    the whole requirement: ``replace`` maps distinct byte sequences onto the same replacement
+    character, so two runs that genuinely differed in an undecodable byte would compare **equal**
+    and the gate would pass for a reason unrelated to what it claims — the #74 defect exactly.
+    ``surrogateescape`` round-trips, so distinct bytes stay distinct. See `_safe` for why the
+    reporting path needs care in return.
+    """
+    text = path.read_text(encoding="utf-8", errors="surrogateescape")
     if name == REPORTER_LOG:
         return canonical_reporter_records(text)
     if name == EVE_LOG:
@@ -259,11 +274,22 @@ def _canonical_file(name: str, path: Path) -> Any:
     return text
 
 
+def _safe(value: Any) -> str:
+    """`repr(value)` that cannot itself raise on the surrogates `_canonical_file` may produce.
+
+    The undecodable-byte fix buys nothing if the *report* of the difference blows up: a lone
+    surrogate is unencodable in UTF-8, so printing this string to a terminal or a log would raise
+    `UnicodeEncodeError` — turning "these two runs differ here" into a traceback at precisely the
+    moment someone needs the answer. Rendered as escapes, so the byte is visible and printable.
+    """
+    return repr(value).encode("utf-8", "backslashreplace").decode("ascii")
+
+
 def _detail(left: Any, right: Any) -> str:
     """The first differing record, when both sides are sequences of them."""
     if not (isinstance(left, tuple) and isinstance(right, tuple)):
         return ""
     for index, (one, other) in enumerate(zip(left, right, strict=False)):
         if one != other:
-            return f" — first at record {index}: {one!r} != {other!r}"
+            return f" — first at record {index}: {_safe(one)} != {_safe(other)}"
     return f" — {len(left)} vs {len(right)} records"

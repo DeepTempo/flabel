@@ -4,7 +4,7 @@
 | :-: | :-: |
 | **Document Title** | flabel — Malicious Flow Labeling for Packet Captures |
 | **Author** | Craig |
-| **Last Updated** | 2026-08-11 |
+| **Last Updated** | 2026-08-15 |
 | **Status** | Draft |
 | **Stakeholders** | TBD — Craig (author/PM). Legal required as approver for the FoxIO License 1.1 / JA4+ question. Remaining reviewers and approvers to be named. |
 | **Target Release** | TBD |
@@ -17,7 +17,9 @@
 | 2026-08-11 | Craig | 0.1 | Initial draft |
 | 2026-08-11 | Craig | 0.2 | Output layout changed to sibling run directories named `{capture-name}_{datetime}`; `latest` pointer removed |
 | 2026-08-11 | Craig | 0.3 | JA4 labeling moved into phase one as a first-class Tier 2 capability (US-14, US-15); only JA4 *rule content* remains out of scope |
+| 2026-08-15 | Craig | 0.5 | **Two divergences recorded at Phase 1 sign-off, rather than left implicit.** §6.6: `classtype` is **nullable**, not required — the code and spec §4 always made it so, and read literally that meant Goal 1 was unmet (#89). §6.2 / §9 / §6.6: US-14's **JA4 cross-check is deferred alongside #13** — it shipped unimplemented, and is a precondition for admitting JA4 rule content rather than a Phase 1 gate (#90). Neither is a change of behaviour; both are the document catching up with what was built and argued for. |
 | 2026-08-11 | Craig | 0.4 | **Phased delivery.** Phase 1 is Tier 2 (open-source) screening only; Tier 1 (PANW NGFW) moves to Phase 2 as an immediate follow-on. The CLI contract is fixed now — the NGFW-inclusive default is retained and stubbed with `Coming Soon (TM)`, `--offline` is retained as the Phase 1 working path, and Phase 2 adds no flags. Incorporates `docs/eng-review.md`: ruleset snapshots become first-class artifacts, verdict vs non-verdict source classification, `label_basis`, canonical output form, enumerated loss conditions, specificity canary goal, and per-source licence attribution. `max_tier` renamed `best_tier`. |
+| 2026-08-15 | Craig | 0.6 | **Goal 5's real review is a split, and §6.3 described only the stronger half.** The benign canary that runs on every build is three synthetic rules and reviews none of the wholesale-admitted ruleset; the real review is a daily `schedule:` GitHub disables after 60 days of repository inactivity. §6.3 now states the split, and `ci.yml` refuses a push when that review has not succeeded lately (#88). |
 
 ## Phasing
 
@@ -136,7 +138,7 @@ Phase 2 requires **two hosts** — a PANW VM-Series in virtual-wire configuratio
   > **Verified empirically, 2026-08-11 (spike 3).** Zeek 8.0.4, 14-packet synthetic capture, two flows. **Default behaviour: UIDs differ on every run** — run A produced `CTCqb34rMyhpo79tSk`, run B produced `Cyh21dwPOqRx2XKui` for the same flow. **With `-D`: byte-identical across three consecutive runs**, and `conn.log`, `files.log`, and `http.log` were fully identical record-for-record. `-G <seed-file>` also works but yields a different stable value set and adds an artifact to manage, so `-D` is preferred. This confirms the review's Critical finding: without this flag Goal 2 would have failed 100% of the time and US-06's cross-run label joins would have been impossible.
   >
   > **`packet_filter.log` remains non-deterministic** — it carries Zeek's wall-clock start time. It contains no analytic content and is excluded from reproducibility comparison.
-- JA4 is computed for every TLS connection via the `zeek/foxio/ja4` package. **The JA4 value carried on a label is always the Zeek-computed one**, so there is a single authority — Suricata computes JA4 independently for matching, and the two implementations are cross-checked (§9, US-14).
+- JA4 is computed for every TLS connection via the `zeek/foxio/ja4` package. **The JA4 value carried on a label is always the Zeek-computed one**, so there is a single authority — Suricata computes JA4 independently for matching. The cross-check that would prove the two agree is **deferred alongside #13** and is a precondition for admitting JA4 rule content, not a Phase 1 gate (§9, US-14, #90).
 - JA4+ (JA4S, JA4H, JA4X, JA4T) is enabled. Licensing: plain JA4 is BSD 3-Clause; the JA4+ suite is FoxIO License 1.1 (non-commercial). JA4+ is **approved for use with Legal's review in progress**; restricting to plain JA4 is the documented contingency if Legal declines (§13 Q3).
 - **A computed fingerprint is an attribute, not a verdict.** Zeek's JA4 output never produces a label by itself. Labels arise only where a fingerprint **matches an admitted rule**, which happens in the Tier 2 path (§6.3).
 - Zeek `uid` is assigned to every flow and becomes the join key between `labels.json` and the Zeek logs.
@@ -160,7 +162,16 @@ Phase 2 requires **two hosts** — a PANW VM-Series in virtual-wire configuratio
 
 - **Signature rulesets** (ET Open) are filtered on rule metadata: `confidence == High` **and** `signature_severity in (Major, Critical)`. Rules lacking a `confidence` tag are **excluded** (fail-closed).
 - **IOC feeds and community rulesets without ET-style metadata** (abuse.ch, malsilo, `stamus/lateral`, `the-hunters-ledger`, `pawpatrules`) are admitted **wholesale**, with the feed snapshot date as provenance. Wholesale admission means *no per-rule gate exists* for those sources — hence `admission_basis` being machine-visible.
-- `pawpatrules` is admitted **with its false-positive risk knowingly accepted.** It is the broadest-scope and least-vetted admitted source, and it is share-alike licensed (CC-BY-SA-4.0). **The Goal 5 benign canary is its standing FP review** — it runs on every build, so a noisy source surfaces immediately rather than after a model is trained.
+- `pawpatrules` is admitted **with its false-positive risk knowingly accepted.** It is the broadest-scope and least-vetted admitted source, and it is share-alike licensed (CC-BY-SA-4.0). **The Goal 5 benign canary is its standing FP review.**
+
+  **Amendment, 2026-08-15 (#88): that review does *not* run on every build, and this paragraph claimed it did.** The review is split, and only the weaker half is on the PR path:
+
+  | | Runs | What it reviews |
+  | :-- | :-- | :-- |
+  | `test_the_benign_canary_produces_zero_labels` | every build | **Three synthetic rules** against a 14-packet capture. Its own assertion is `rules_loaded == 3`. It reviews none of the ~85,000 wholesale-admitted rules this risk is about — it proves the labelling path works, not that the ruleset is quiet. |
+  | `.github/workflows/feeds.yml` | daily `schedule:` | The real review: nine feeds fetched live, a real snapshot built, the benign canary **and** the 17-capture benign corpus labelled against it. |
+
+  The scheduled half cannot move onto the PR path — the test suite may never contact a rule feed (spec §2.2) and a real snapshot is 124 MB — and that decision stands (Craig, 2026-08-12, on #24). What was missing is that **GitHub disables `schedule:` triggers after 60 days of repository inactivity**, so the real review can stop with nothing to announce it. `ci.yml`'s `feeds-liveness` job now refuses a push when `feeds` has not succeeded within seven days. So the honest claim is not "it runs on every build" but **"no change can merge while it has been dark"**.
 - Excluded: hunting/anomaly rulesets, self-described aggressive blacklists, and Positive Technologies.
 - The filter is an **inclusion** filter, which `suricata-update`'s subtractive model does not express — flabel parses rule metadata and emits its own filtered rule file.
 
@@ -232,10 +243,12 @@ my-capture_2026-08-11T213045Z/
 
 **Required provenance fields per source class** — Goal 1 is checked against this table, so there is no "where applicable" ambiguity:
 
-| Source class | Required fields |
-| :-- | :-- |
-| Suricata (signature or IOC) | `tier`, `source`, `sid`, `rev`, `ruleset` (snapshot id), `admission_basis`, `licence`, `classtype`, `label_basis`, `threat` |
-| PANW (Phase 2) | `tier`, `source`, `threat_id`, `threat`, `content_version`, `panos_version`, `device_observed_at`, `label_basis` |
+| Source class | Required fields | Nullable |
+| :-- | :-- | :-- |
+| Suricata (signature or IOC) | `tier`, `source`, `sid`, `rev`, `ruleset` (snapshot id), `admission_basis`, `licence`, `label_basis`, `threat` | `classtype` |
+| PANW (Phase 2) | `tier`, `source`, `threat_id`, `threat`, `content_version`, `panos_version`, `device_observed_at`, `label_basis` | — |
+
+**Amendment, 2026-08-15 (#89): `classtype` is nullable, not required.** It was listed as required above through PRD v0.4, and the code and `docs/spec.md` §4 have always made it `str | None` — so read literally, Goal 1 was not met. The divergence is resolved in favour of the code. **10,949 of the 84,995 admitted rules declare no `classtype:` at all**, so requiring it would mean either refusing to label on 12.9% of the ruleset or inventing a value, and an invented classtype is exactly the untraceable provenance Goal 1 exists to prevent. Spec §4's `classtype: str | None` is the single declaration both the field list and its nullability are now read from at test time; a `""` is still a defect, because §4 provides no empty-string convention the way it provides `"unstated"` for an unknown licence.
 
 **`label_basis`** distinguishes `direct` (this flow is the malicious activity) from `indicator-reference` (this flow merely referenced a malicious indicator). An IOC rule matching a DNS query labels the flow **to your resolver**; an HTTP-URL rule behind a proxy labels the flow **to the proxy**. Both are correct rule matches on benign infrastructure flows, and a model trained on them learns that its own resolver is malicious. The distinction must be machine-visible so a consumer can exclude them.
 
@@ -252,7 +265,7 @@ my-capture_2026-08-11T213045Z/
 | Device rejected sessions as non-SYN | `non_syn_rejected` | 2 |
 | Threat-log query returned fewer records than expected | `tier1_query_status` | 2 |
 
-**Run provenance** additionally records: input identity and status, normalization applied, ruleset snapshot id with per-source detail, Zeek seed, tool versions (flabel, Zeek, Suricata, `editcap`, JA4 package, Suricata JA4 implementation), tiers attempted, and coverage achieved.
+**Run provenance** additionally records: input identity and status, normalization applied, ruleset snapshot id with per-source detail, Zeek seed, tool versions (flabel, Zeek, Suricata, `editcap`, JA4 package — *not* the Suricata JA4 implementation, deferred with #90), tiers attempted, and coverage achieved.
 
 **Label entry shape:**
 
@@ -415,7 +428,7 @@ Each criterion is marked **[CI]** (testable in continuous integration) or **[LAB
 
 ### US-10 / US-14 / US-15: Fingerprints
 - **[CI]** Given a capture with TLS connections, then JA4 values are present on those flows in the Zeek output and on any resulting labels.
-- **[CI]** Given a TLS fixture, then Zeek's computed JA4 and Suricata's computed JA4 for the same flow are equal, and both implementation versions are recorded.
+- **[DEFERRED — 2026-08-15, #90]** ~~Given a TLS fixture, then Zeek's computed JA4 and Suricata's computed JA4 for the same flow are equal, and both implementation versions are recorded.~~ **Deferred alongside #13, and this criterion does not gate Phase 1.** It shipped unimplemented and unrecorded: no test joins a Zeek-computed JA4 to a Suricata-computed one, and spec §10's `tools` block has no field for the Suricata JA4 implementation. Deferring it is safe *only because* no `ja4.hash` rules exist in any admitted source (#13), so Suricata never computes a JA4 that a label could disagree with. **The cross-check is a precondition for closing #13, not an independent nicety** — §6.2's "the JA4 value carried on a label is always the Zeek-computed one" is what makes a divergence dangerous, since a `ja4.hash` rule would fire on Suricata's value while the label records Zeek's. Whoever admits the first JA4 rule content implements this first.
 - **[CI]** Given a synthetic `ja4.hash` rule that matches a fixture flow, then a Tier 2 label is produced, structurally identical to a content-matched label.
 - **[CI]** Given a JA4 value matching no admitted rule, then no label is produced from that fingerprint.
 - **[CI]** Given no admitted source publishes JA4 rules, then run metadata records the JA4 path active with an admitted JA4 rule count of zero.
@@ -552,7 +565,7 @@ Each criterion is marked **[CI]** (testable in continuous integration) or **[LAB
 | 15 | **Known-malicious canary fixture** | **At least one label** | | |
 | 16 | Non-verdict source rule fires | No label references it; appears as enrichment only | | |
 | 17 | IOC rule matching a DNS query | Label carries `label_basis: indicator-reference` | | |
-| 18 | TLS capture | JA4 present in Zeek output and on labels; Zeek and Suricata JA4 agree | | |
+| 18 | TLS capture | JA4 present in Zeek output and on labels. ~~Zeek and Suricata JA4 agree~~ — deferred with #13 (#90) | | |
 | 19 | Synthetic `ja4.hash` rule matches | Tier 2 label produced, structurally identical to a content match | | |
 | 20 | No JA4 rules in snapshot | JA4 path recorded active with admitted count zero | | |
 | 21 | Labelling run | No network connection attempted | | |
