@@ -1202,11 +1202,19 @@ flabel --offline <capture>            Runs the Tier 2 pipeline.
     --ruleset-snapshot <id>           default: newest available
     --output-dir <dir>                default: cwd
     --rules-dir <dir>                 default: ./.flabel/rules
-    --sources <file>                  default: packaged data/sources.toml
+    --sources <file>                  REFUSED here — exit 2. See below.
     --unmatched-threshold <float>     default: 0.01
 flabel rules update [--sources <f>] [--rules-dir <d>]
 flabel rules list  [--rules-dir <d>]
 ```
+
+**`--sources` is refused on the labelling path, not ignored** (2026-08-15, issue #71). It is still *declared* there, so the refusal can explain itself rather than argparse saying `unrecognized arguments`. Passing it exits 2 before any tool runs and before a run directory exists.
+
+The reason is §4's, and the behaviour it protects does not change: a label's terms — `licence`, `source_class`, `admission_basis`, `url` — come from the snapshot manifest written when the rules were fetched, never from the registry as it stands now. `enabled` describes the registry today, not what was admitted then, and letting a later registry edit change the reading of an old snapshot would make labels retroactively unattributable.
+
+What changed is that the flag used to be parsed and discarded. `flabel --offline capture.pcap --sources my-registry.toml` looked like it had changed which sources may label; it had not, and nothing said so. That is §5's own rule — *a registry that loads with a setting silently ignored is worse than one that refuses to load* — applied to the CLI instead of the TOML. Choosing a registry happens at `flabel rules update --sources <file>`, and the resulting snapshot is then named with `--ruleset-snapshot <id>`.
+
+The refusal also applies to the Phase 1 stub path, which exits 2 rather than 3: the invocation is wrong either way, and Phase 2 adds no flags, so this stays true when the default path is built.
 
 **Exit codes**
 
