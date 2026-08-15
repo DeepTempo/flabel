@@ -158,7 +158,7 @@ def main() -> int:
 
     if args.snapshot:
         manifest = write_snapshot(args.snapshot, admitted, admissions, raw=raw, data=data)
-        directory, reloaded = load_snapshot(args.snapshot, manifest.snapshot_id)
+        directory, reloaded, _ = load_snapshot(args.snapshot, manifest.snapshot_id)
         index = load_sid_index(directory)
         print(f"\nsnapshot {manifest.snapshot_id} at {directory}")
         print(f"  rules.rules      {(directory / 'rules.rules').stat().st_size:>12} bytes")
