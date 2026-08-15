@@ -36,6 +36,7 @@ from dataclasses import replace
 from flabel.errors import CorrelationError, SnapshotError
 from flabel.models import (
     CORRELATABLE_PROTOCOLS,
+    DEFAULT_THRESHOLD,
     CorrelationResult,
     Detection,
     Flow,
@@ -48,10 +49,10 @@ from flabel.models import (
 )
 from flabel.provenance import build_source_entry
 
-#: Spec §9's default: past 1% of detections unplaceable, the labels no longer describe the
-#: capture well enough to be training data. Phase 2 configures its own, looser value rather
-#: than relaxing this one.
-DEFAULT_THRESHOLD = 0.01
+#: Re-exported so `from flabel.correlate import DEFAULT_THRESHOLD` keeps working — this is where
+#: readers look for it, next to the gate that applies it. It is *defined* in `models.py` because
+#: `provenance.py` records it in the run block (#68) and `correlate` already imports `provenance`,
+#: so defining it here made that a cycle. Same move, and the same reason, as `SNAPSHOT_ID`.
 
 #: Zeek's spelling for both ICMP and ICMPv6 — its `transport_proto` has only tcp/udp/icmp/
 #: unknown_transport — so the protocol field cannot tell the two families apart and the

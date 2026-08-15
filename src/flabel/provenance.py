@@ -29,12 +29,31 @@ The run block (spec §10) is step 8's to build and lands in this module later.
 
 from __future__ import annotations
 
+import json
+import re
+from collections.abc import Sequence
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, get_args
+
+from flabel import __version__
+from flabel.labels import SCHEMA_VERSION
 from flabel.models import (
+    DEFAULT_THRESHOLD,
     SNAPSHOT_ID,
+    CorrelationResult,
     Detection,
+    Ja4Status,
     LabelBasis,
+    NormalizedCapture,
+    SnapshotManifest,
     SourceAdmission,
     SourceEntry,
+    SuricataRunInfo,
+    ToolFailure,
+    UnmatchedReason,
+    ZeekRunInfo,
     label_basis,
     may_label,
 )
@@ -216,32 +235,6 @@ def build_source_entry(
 # *every* run, so a consumer has one place to look regardless of outcome — which means every
 # stage argument here is optional and none of them may be required to produce a block.
 
-# Imports for the run block sit here rather than at the top of the file because step 8 was
-# scoped to *append* to this module: `build_source_entry` and everything above it was written
-# ahead of steps 7 and 8 (#44) and had to stay byte-stable while both were built in parallel
-# worktrees. Fold them into the top block once both have merged — nothing depends on the
-# placement, and the `noqa` marks the one rule it breaks.
-import json  # noqa: E402
-import re  # noqa: E402
-from collections.abc import Sequence  # noqa: E402
-from dataclasses import asdict  # noqa: E402
-from datetime import datetime  # noqa: E402
-from pathlib import Path  # noqa: E402
-from typing import Any, get_args  # noqa: E402
-
-from flabel import __version__  # noqa: E402
-from flabel.labels import SCHEMA_VERSION  # noqa: E402
-from flabel.models import (  # noqa: E402
-    CorrelationResult,
-    Ja4Status,
-    NormalizedCapture,
-    SnapshotManifest,
-    SuricataRunInfo,
-    ToolFailure,
-    UnmatchedReason,
-    ZeekRunInfo,
-)
-
 TOOLCHAIN_MANIFEST = Path("/etc/flabel-toolchain.json")
 
 #: flabel's one timestamp format (spec §10), as a pattern rather than a `strftime` string:
@@ -341,6 +334,7 @@ def build_run_block(
     suricata: SuricataRunInfo | None = None,
     correlation: CorrelationResult | None = None,
     snapshot_resolved: bool | None = None,
+    unmatched_threshold: float = DEFAULT_THRESHOLD,
     tool_failures: Sequence[ToolFailure] = (),
     warnings: Sequence[str] = (),
     toolchain_path: Path = TOOLCHAIN_MANIFEST,
@@ -370,6 +364,14 @@ def build_run_block(
         "finished_at": finished_at,
         "duration_seconds": duration,
         "mode": MODE,
+        # The bar `counts.unmatched_ratio` was measured against, and the one input to a run that
+        # the run did not record (#68). It decides whether `labels.json` exists at all, so two
+        # documents reporting the same ratio were indistinguishable — one having passed a
+        # deliberately loosened gate, the other one that would never have been written at the
+        # default. Beside `mode` rather than in `counts` because it is an input, not a
+        # measurement; and never None, because argparse supplies the default, so a run always
+        # had a threshold even if it died before correlation.
+        "unmatched_threshold": unmatched_threshold,
         "tiers_attempted": list(TIERS_ATTEMPTED),
         "tiers_unavailable": list(TIERS_UNAVAILABLE),
         "input": _input_section(capture),

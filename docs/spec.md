@@ -985,6 +985,7 @@ or normalise**: the same capture labelled from two directories would otherwise d
   "flabel_version": str, "schema_version": "1.0",
   "started_at": str, "finished_at": str, "duration_seconds": float | None,
   "mode": "offline",                      # Phase 1 is always this
+  "unmatched_threshold": float,           # the gate this run was held to — see below
   "tiers_attempted": [2], "tiers_unavailable": [1],
   "input": {"path": str, "sha256": str, "format": "pcap|pcapng|pcap.gz|pcapng.gz",
             "bytes": int, "input_status": "complete|partial",
@@ -1070,6 +1071,14 @@ run where it matters most — the correlation gate firing — there is no `label
 and `counts.unmatched` gives only the scale of the loss: `no_flow_match` is a tuple-normalisation
 fault, `ambiguous_flow_match` is port reuse, and `unsupported_transport` is not a bug at all —
 they are different causes in different modules.
+
+**`unmatched_threshold` is the bar `unmatched_ratio` was measured against** (2026-08-15, issue #68). It decides *whether `labels.json` exists at all*: above it, `correlate()` raises and the run writes `run.json` with no labels. It is an operator-supplied input with a default of `0.01` (§12), and it was the one input to a run that the run did not record.
+
+Two `labels.json` files reporting `unmatched_ratio: 0.08` were indistinguishable, where one had passed a deliberately loosened gate and the other would never have been written at the default. The artifact could not be checked against the rule that produced it.
+
+It sits beside `mode` rather than inside `counts` because it is an **input**, not a measurement: everything in `counts` is a number read off the run, and a configuration knob among them invites a consumer to treat it as one. Every other input to a run is already recorded here — the snapshot id, the Suricata config sha256, the Zeek flags, the toolchain versions — and this was the gap, which also made Goal 2 unreproducible from the artifact alone. Phase 2 is expected to set its own, looser threshold (§9), at which point an unrecorded one stops being a detail.
+
+Never `null`: argparse supplies the default when the operator does not, so a run always had a threshold, even one that died before correlation. `null` would mean "not measured", and this is not measured — it is given.
 
 **`unmatched_ratio` is the number the gate acted on, and it is not `unmatched / detections`**
 (issue #84). Detections on a protocol Zeek cannot express are excluded from *both* sides of it:

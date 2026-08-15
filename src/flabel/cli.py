@@ -274,6 +274,11 @@ class _Progress:
     suricata: SuricataRunInfo | None = None
     correlation: CorrelationResult | None = None
     snapshot_resolved: bool | None = None
+    #: The gate this run is held to. On `_Progress` rather than passed to `_run_block` from
+    #: `args`, so that *every* path which writes a run block carries it — including the failure
+    #: paths, which write `run.json` and are exactly where "what bar was this measured against"
+    #: is hardest to answer afterwards. Set before anything can fail (#68).
+    unmatched_threshold: float = DEFAULT_THRESHOLD
     tool_failures: tuple[ToolFailure, ...] = ()
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
@@ -307,6 +312,7 @@ def _run_block(started_at: str, progress: _Progress) -> dict[str, Any]:
         suricata=progress.suricata,
         correlation=progress.correlation,
         snapshot_resolved=progress.snapshot_resolved,
+        unmatched_threshold=progress.unmatched_threshold,
         tool_failures=progress.tool_failures,
         warnings=progress.warnings,
     )
@@ -520,7 +526,7 @@ def _label(args: argparse.Namespace) -> int:
     """
     started = datetime.now(UTC)
     started_at = _stamp(started)
-    progress = _Progress()
+    progress = _Progress(unmatched_threshold=args.unmatched_threshold)
 
     # Before any directory exists: `SnapshotError` propagates to `main` (spec §12).
     snapshot_dir, manifest = load_snapshot(args.rules_dir, args.ruleset_snapshot)

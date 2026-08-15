@@ -16,6 +16,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, get_args
 
+#: Spec §9's default: past 1% of detections unplaceable, the labels no longer describe the
+#: capture well enough to be training data. Phase 2 configures its own, looser value rather
+#: than relaxing this one.
+#:
+#: Here rather than in `correlate.py`, where it reads most naturally, because `provenance.py`
+#: records it in the run block (#68) and `correlate` imports `provenance` — so the obvious home
+#: made it a cycle. `models.py` imports nothing from the package and is the base of the
+#: dependency graph, which is what makes it the place two modules can agree on a constant.
+#: `correlate` re-exports it, so nothing about how it is imported changes.
+DEFAULT_THRESHOLD = 0.01
+
 
 def _check(value: object, allowed: tuple[object, ...], field: str, owner: str) -> None:
     """Reject a value outside its `Literal`.

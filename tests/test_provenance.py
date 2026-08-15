@@ -1532,3 +1532,56 @@ def test_an_unclassified_snapshot_downgrades_rather_than_overclaiming(tmp_path):
     assert entry.label_basis == "indicator-reference", (
         "an unclassified snapshot must not be read as 'no rule is an indicator'"
     )
+
+
+# --- the gate the run was held to (#68) ---------------------------------------------------------
+
+
+def test_the_run_block_records_the_threshold_the_gate_used(tmp_path):
+    """It decides whether `labels.json` exists at all, and it was the one input never recorded.
+
+    Two documents reporting `unmatched_ratio: 0.08` were indistinguishable: one had passed a
+    deliberately loosened gate, the other would never have been written at the default. The
+    artifact could not be checked against the rule that produced it.
+    """
+    block = full_run(tmp_path, unmatched_threshold=0.25)
+
+    assert block["unmatched_threshold"] == 0.25
+
+
+def test_the_default_is_the_specs_and_not_a_second_copy_of_it(tmp_path):
+    """A hardcoded `0.01` here would be a second thing to keep in step with spec §12."""
+    from flabel.correlate import DEFAULT_THRESHOLD
+
+    assert full_run(tmp_path)["unmatched_threshold"] == DEFAULT_THRESHOLD
+
+
+def test_the_threshold_is_beside_mode_not_inside_counts(tmp_path):
+    """An input, not a measurement.
+
+    Everything in `counts` is a number read off the run. A configuration knob among them invites
+    a consumer to treat it as one — and a `counts` entry that is `0.25` on one run and `0.01` on
+    the next, for reasons nothing about the capture explains, is exactly the confusion this
+    field exists to remove.
+    """
+    block = full_run(tmp_path, unmatched_threshold=0.25)
+
+    assert "unmatched_threshold" in block
+    assert "unmatched_threshold" not in block["counts"]
+
+
+def test_a_run_that_died_before_correlation_still_records_its_threshold(tmp_path):
+    """Never `null`: argparse supplies the default, so a run always *had* a gate.
+
+    This is the path where the question is hardest to answer afterwards — `run.json` with no
+    labels beside it — so it is the path the field is most worth carrying. `null` would mean
+    "not measured", and this is not measured; it is given.
+    """
+    block = build_run_block(
+        started_at=STARTED,
+        finished_at=FINISHED,
+        unmatched_threshold=0.5,
+    )
+
+    assert block["counts"]["unmatched"] is None, "correlation must not have run, for this to test"
+    assert block["unmatched_threshold"] == 0.5
