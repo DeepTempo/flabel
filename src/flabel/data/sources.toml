@@ -66,8 +66,36 @@ url              = "https://rules.pawpatrules.fr/suricata/paw-patrules.tar.gz"
 licence          = "CC-BY-SA-4.0"
 source_class     = "signature"
 # Admitted wholesale with its false-positive risk accepted; the benign canary is its standing
-# review and runs on every build (docs/prd.md §6.3).
+# review (docs/prd.md §6.3 — the real one runs on a schedule, not on every build).
 admission_basis  = "wholesale"
+# UNIONED with [admission] below, never substituted for it: pawpatrules excludes
+# policy-violation AND misc-activity.
+#
+# Measured 2026-08-16, issue #113, on the first real internet-facing capture ever run through
+# flabel — 263,895 packets, 24 hours, one public IP, snapshot 40cac3960114e1b4. It produced 555
+# labels, and 587 of the 600 source entries came from just two rules:
+#
+#   sid 3300982  🐾 - ℹ Censys - Scanner         226 entries
+#   sid 3300984  🐾 - ℹ Palo Alto - Scanner      361 entries
+#
+# Both are `alert ip [<scanner CIDRs>] any -> any any`. A host with a public IP is surveyed
+# continuously by both; labelling that `verdict: malicious` teaches a model that internet-wide
+# survey traffic is an attack. Dropping the two sids takes the capture from 555 labels to 13.
+#
+# THE FEED ALREADY SAYS SO. pawpatrules marks severity in its `msg`: 9,284 rules `🚨`, 1 `👀`,
+# and 126 `ℹ` — and all 126 `ℹ` rules are exactly the misc-activity ones. They identify
+# software and scanners: VMware, Kaspersky, Zoom, Thunderbird, uBlock Origin, an Ingenico
+# payment terminal. None can honestly produce a malicious verdict; this is #34's third group.
+# Keyed on classtype rather than on the emoji because a msg-text convention is not an interface.
+#
+# WHY NOT GLOBAL: of the 274 misc-activity rules in that snapshot, 146 are in other feeds and
+# include 45 `ET PHISHING` and 18 `ET MALWARE` rules. Excluding it globally would drop real
+# detections, which is why the mechanism this uses had to become per-source.
+#
+# COST: 128 rules, 0.6% of pawpatrules and 0.15% of the 85,302-rule set. It does not disturb the
+# pinned corpus residue — the three sids in tests/fixtures/benign-corpus/tolerated.json are
+# trojan-activity, command-and-control and credential-theft.
+exclude_classtypes = ["misc-activity"]
 
 # --- ioc-dest: a rule matched a known-bad endpoint -> the flow is malicious ----------------
 

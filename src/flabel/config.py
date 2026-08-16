@@ -21,7 +21,7 @@ SOURCE_CLASSES = frozenset(get_args(SourceClass))
 ADMISSION_BASES = frozenset(get_args(AdmissionBasis))
 
 REQUIRED_FIELDS = ("name", "url", "licence", "source_class", "admission_basis")
-OPTIONAL_FIELDS = ("enabled",)
+OPTIONAL_FIELDS = ("enabled", "exclude_classtypes")
 
 #: Sources whose rules carry ET-style `metadata:` keys (`confidence`, `signature_severity`).
 #: `admission_basis = "metadata-filter"` is only meaningful for these — filtering on metadata
@@ -131,20 +131,74 @@ def load_admission_policy(path: Path | None = None) -> AdmissionPolicy:
             f"Known keys: {', '.join(ADMISSION_FIELDS)}."
         )
 
-    excluded = table.get("exclude_classtypes", [])
-    if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
-        raise ConfigError(f"{path}: `exclude_classtypes` must be a list of strings")
-    for item in excluded:
+    return AdmissionPolicy(
+        exclude_classtypes=_classtypes(table.get("exclude_classtypes", []), path, "[admission]")
+    )
+
+
+def _classtypes(value: Any, path: Path, where: str) -> frozenset[str]:
+    """Validate and casefold one `exclude_classtypes` list, wherever it was written.
+
+    Shared by `[admission]` and by each `[[source]]` (#113) rather than restated, because the
+    same four mistakes are available in both places and two copies would drift — the per-source
+    copy being the one nobody would think to update. `where` names the table, so a message about
+    a per-source list does not read as a message about the global one.
+    """
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"{path}: {where} `exclude_classtypes` must be a list of strings")
+    for item in value:
         if not item.strip():
-            raise ConfigError(f"{path}: `exclude_classtypes` contains an empty classtype")
+            raise ConfigError(f"{path}: {where} `exclude_classtypes` contains an empty classtype")
         if not CLASSTYPE_NAME.fullmatch(item):
             # A classtype that cannot appear in a rule would silently exclude nothing, which is
             # the same failure as a misspelled key: it reads as a policy that is in force.
             raise ConfigError(
-                f"{path}: {item!r} is not a valid classtype name. A classtype that no rule can "
-                f"declare would exclude nothing while appearing to be in force."
+                f"{path}: {where} {item!r} is not a valid classtype name. A classtype that no "
+                f"rule can declare would exclude nothing while appearing to be in force."
             )
-    return AdmissionPolicy(exclude_classtypes=frozenset(item.casefold() for item in excluded))
+    return frozenset(item.casefold() for item in value)
+
+
+def load_admission_policies(path: Path | None = None) -> dict[str, AdmissionPolicy]:
+    """Each source's *effective* admission policy, keyed by source name (#113).
+
+    A `[[source]]` may carry its own `exclude_classtypes`, and it is **unioned** with the global
+    `[admission]` list rather than replacing it: a feed can only ever be made more restricted.
+    Replace semantics would let a per-source list silently re-admit `policy-violation` for one
+    feed — issue #75 returning through the mechanism built to prevent it — and would mean reading
+    two places to know what a feed admits.
+
+    Why a per-source list exists at all, when `load_admission_policy` argues the policy is about
+    kinds of rule rather than feeds: because one feed's *taxonomy* differs. Measured 2026-08-16
+    on a real internet-facing capture (263,895 packets, 24h, one public IP), `pawpatrules`
+    contributed 599 of 600 source entries, and 587 of those came from two `misc-activity` rules
+    identifying the Censys and Palo Alto Expanse internet scanners. Excluding `misc-activity`
+    globally is not available: 146 of that snapshot's 274 misc-activity rules are in other feeds
+    and include 45 `ET PHISHING` and 18 `ET MALWARE` rules. So the exclusion has to be narrowed
+    to the feed whose taxonomy is the problem. That is a statement about pawpatrules, and it
+    belongs beside pawpatrules.
+
+    Read in one pass, so every source in a `rules update` is admitted under the same registry —
+    a second read could see a file edited mid-run and give two feeds different terms inside one
+    snapshot id.
+
+    Every enabled source has an entry, so a caller may index it without a fallback: `admit` is
+    called per source, and a missing key would be a `KeyError` after the network work and before
+    anything is written.
+    """
+    path = default_registry_path() if path is None else Path(path)
+    default = load_admission_policy(path)
+
+    policies: dict[str, AdmissionPolicy] = {}
+    for entry in _read_registry(path).get("source", []):
+        if not isinstance(entry, dict):
+            continue  # `enabled_sources` raises on this; here it is not ours to diagnose.
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        own = _classtypes(entry.get("exclude_classtypes", []), path, f"source {name!r}")
+        policies[name] = AdmissionPolicy(exclude_classtypes=default.exclude_classtypes | own)
+    return policies
 
 
 def _build_spec(entry: Any, path: Path) -> SourceSpec:

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from flabel.config import load_admission_policy
+from flabel.config import load_admission_policies, load_admission_policy
 from flabel.errors import ConfigError
 from flabel.models import AdmissionPolicy, SourceSpec
 from flabel.rules.admit import admit, classtype_of, is_address_indicator, rule_options
@@ -68,6 +68,41 @@ def registry_with(tmp_path: Path):
         return path
 
     return build
+
+
+def registry_without_pawpatrules_override() -> str:
+    """The shipped registry text with pawpatrules' own `exclude_classtypes` removed.
+
+    The sibling of `registry_without_admission`, and it exists for the same reason: the registry
+    ships one now (#113), TOML forbids declaring the same key twice, and a fixture that injects
+    its own has to take the shipped one out first. The assertion is deliberate — if that line
+    ever disappears from `sources.toml`, this fails rather than quietly reverting every test
+    below to exercising a registry with no per-source policy at all.
+    """
+    text = registry_without_admission()
+    shipped = '\nexclude_classtypes = ["misc-activity"]\n'
+    assert shipped in text, "pawpatrules no longer excludes misc-activity — see issue #113"
+    return text.replace(shipped, "\n", 1)
+
+
+def _registry_with_source_override(
+    tmp_path: Path, *, global_: list[str] | None, pawpatrules: list[str]
+) -> Path:
+    """The shipped registry with a per-source `exclude_classtypes` on `pawpatrules`.
+
+    Built on the real registry for the same reason `registry_with` is: the loader reads the same
+    file the sources come from, and a stub would not prove the two coexist.
+    """
+    text = registry_without_pawpatrules_override().replace(
+        '\nname             = "pawpatrules"\n',
+        f'\nname             = "pawpatrules"\nexclude_classtypes = {pawpatrules!r}\n',
+        1,
+    )
+    if global_ is not None:
+        text += f"\n[admission]\nexclude_classtypes = {global_!r}\n"
+    path = tmp_path / "sources.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 # --- reading a rule's classtype ----------------------------------------------------------------
@@ -592,3 +627,157 @@ def test_a_rule_that_inspects_payload_is_not_an_indicator_however_narrow_its_hea
     )
 
     assert not is_address_indicator(content_rule)
+
+
+# --- per-source exclusion, unioned with the global policy (#113) --------------------------------
+#
+# `load_admission_policy`'s docstring said a per-source override would be "a pure addition if a
+# feed ever needs one". One does. Measured 2026-08-16 against snapshot 40cac3960114e1b4 on a real
+# internet-facing capture — 263,895 packets, 24h, one public IP: 555 labels, of which 587 of the
+# 600 source entries came from two pawpatrules rules that identify the Censys and Palo Alto
+# Expanse internet scanners. Both are `classtype: misc-activity`, both are marked `ℹ` by the feed
+# author. Excluding misc-activity GLOBALLY is the wrong fix: 146 of the 274 misc-activity rules in
+# that snapshot are in other feeds and include 45 `ET PHISHING` and 18 `ET MALWARE` rules.
+#
+# UNION, NOT REPLACE (Craig, 2026-08-16). A per-source list can only ever make a feed *more*
+# restricted. Replace semantics would let a per-source list silently re-admit `policy-violation`
+# for one feed — issue #75 returning through the mechanism built to prevent it — and would mean
+# reading two places to know what a feed admits.
+
+
+def test_a_source_with_no_override_gets_the_global_policy(registry_with):
+    policies = load_admission_policies(
+        registry_with('\n[admission]\nexclude_classtypes = ["policy-violation"]\n')
+    )
+
+    assert policies["et/open"].exclude_classtypes == frozenset({"policy-violation"})
+
+
+def test_a_per_source_list_is_added_to_the_global_one_not_substituted_for_it(tmp_path):
+    """The whole of the union decision, and the reason for it.
+
+    Under replace semantics `pawpatrules` would silently start admitting `policy-violation`
+    again — #75 recurring through the mechanism built to prevent it — because the per-source
+    list says nothing about it.
+    """
+    path = _registry_with_source_override(
+        tmp_path, global_=["policy-violation"], pawpatrules=["misc-activity"]
+    )
+
+    policies = load_admission_policies(path)
+
+    assert policies["pawpatrules"].exclude_classtypes == frozenset(
+        {"policy-violation", "misc-activity"}
+    )
+    assert policies["et/open"].exclude_classtypes == frozenset({"policy-violation"})
+
+
+def test_a_source_cannot_use_its_override_to_re_admit_a_globally_excluded_classtype(tmp_path):
+    """Stated as its own test because it is the property, not a side effect of the last one.
+
+    A feed listing a *different* classtype must not weaken the global policy for itself. This is
+    what "fail-closed" means here, and it is the assertion that fails first if someone changes
+    the union to a replace.
+    """
+    path = _registry_with_source_override(
+        tmp_path, global_=["policy-violation"], pawpatrules=["misc-activity"]
+    )
+
+    assert load_admission_policies(path)["pawpatrules"].excludes("policy-violation")
+
+
+def test_an_override_repeating_the_global_value_changes_nothing(tmp_path):
+    """Idempotent, so a registry can restate a global exclusion locally without side effects."""
+    path = _registry_with_source_override(
+        tmp_path, global_=["policy-violation"], pawpatrules=["policy-violation"]
+    )
+
+    assert load_admission_policies(path)["pawpatrules"].exclude_classtypes == frozenset(
+        {"policy-violation"}
+    )
+
+
+def test_an_override_with_no_global_table_still_applies(tmp_path):
+    """The global table is optional; a per-source one must not depend on it existing."""
+    path = _registry_with_source_override(tmp_path, global_=None, pawpatrules=["misc-activity"])
+
+    assert load_admission_policies(path)["pawpatrules"].exclude_classtypes == frozenset(
+        {"misc-activity"}
+    )
+    assert load_admission_policies(path)["et/open"] == AdmissionPolicy()
+
+
+def test_every_enabled_source_has_an_entry(registry_with):
+    """`admit` is called per source, so a missing key would be a KeyError mid-fetch — after the
+    network work and before anything is written."""
+    from flabel.config import enabled_sources
+
+    path = registry_with('\n[admission]\nexclude_classtypes = ["policy-violation"]\n')
+    policies = load_admission_policies(path)
+
+    assert {spec.name for spec in enabled_sources(path)} <= set(policies)
+
+
+def test_a_per_source_override_is_casefolded_like_the_global_one(tmp_path):
+    """`config.CLASSTYPE_NAME` forbids uppercase, so this can only arrive via a future relaxation
+    — but the global list casefolds and two lists that fold differently would be a trap."""
+    path = _registry_with_source_override(tmp_path, global_=None, pawpatrules=["misc-activity"])
+
+    assert load_admission_policies(path)["pawpatrules"].excludes("MISC-ACTIVITY")
+
+
+@pytest.mark.parametrize(
+    "value, reason",
+    [
+        ('"misc-activity"', "string, not a list"),
+        ("[1]", "not strings"),
+        ('[""]', "empty classtype"),
+        ('["Misc Activity"]', "impossible name"),
+    ],
+    ids=["not-a-list", "not-strings", "empty", "impossible-name"],
+)
+def test_an_unusable_per_source_override_refuses_to_load(value, reason, tmp_path):
+    """The same validation as the global table, because the same mistakes are available.
+
+    Sharing the validator rather than restating it is the point: two copies would drift, and the
+    per-source one is the copy nobody would think to update.
+    """
+    path = tmp_path / "sources.toml"
+    text = registry_without_pawpatrules_override().replace(
+        '\nname             = "pawpatrules"\n',
+        f'\nname             = "pawpatrules"\nexclude_classtypes = {value}\n',
+        1,
+    )
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_admission_policies(path)
+
+
+def test_the_shipped_registry_excludes_misc_activity_for_pawpatrules_and_only_for_it():
+    """The shipped artifact, not the loader — the #75 lesson applied to this change (#113).
+
+    `[admission] exclude_classtypes` shipped in #78 with its loader, its counter and its tests,
+    and was inert for a day because `sources.toml` never received the table. A test of the
+    mechanism passed throughout. So this asserts the file.
+
+    `and only for it` is half the assertion: excluding misc-activity globally would drop the 45
+    `ET PHISHING` and 18 `ET MALWARE` rules that also carry it.
+    """
+    policies = load_admission_policies(REGISTRY)
+
+    assert policies["pawpatrules"].excludes("misc-activity"), (
+        "pawpatrules admits classtype:misc-activity again — that is issue #113, and it is "
+        "587 of 600 source entries on an internet-facing capture"
+    )
+    for name, policy in policies.items():
+        if name != "pawpatrules":
+            assert not policy.excludes("misc-activity"), (
+                f"{name} now excludes misc-activity too. 146 of the 274 misc-activity rules are "
+                f"outside pawpatrules and include 45 ET PHISHING and 18 ET MALWARE rules."
+            )
+
+
+def test_the_global_policy_is_unchanged_by_all_this():
+    """`load_admission_policy` keeps its old meaning and its old callers."""
+    assert load_admission_policy(REGISTRY).exclude_classtypes == frozenset({"policy-violation"})
