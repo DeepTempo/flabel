@@ -344,3 +344,83 @@ def test_a_short_name_is_left_alone():
     from triage import _fit
 
     assert _fit("small.pcap_2026Z") == "small.pcap_2026Z"
+
+
+# --- running from a capture directory, which is the normal case ---------------------------------
+
+
+def test_the_repo_is_found_from_the_script_not_the_cwd():
+    """The captures are outside the checkout by necessity, so that is where an operator stands.
+
+    The first version resolved nothing: `uv run flabel` with no `--project` exits 2 from another
+    directory, and spec §12's relative `--rules-dir` default would then have looked for the
+    snapshot store beside the captures. It failed loudly, which is the only reason this is a
+    footnote rather than an issue.
+    """
+    from triage import DEFAULT_RULES_DIR, REPO
+
+    assert (REPO / "pyproject.toml").is_file(), f"{REPO} is not the flabel checkout"
+    assert (REPO / "src" / "flabel").is_dir()
+    assert DEFAULT_RULES_DIR.is_absolute()
+    assert DEFAULT_RULES_DIR.is_relative_to(REPO), "the store must live in the checkout"
+
+
+def test_the_subprocess_is_pinned_to_the_checkout_and_an_absolute_rules_dir(monkeypatch, tmp_path):
+    """Both flags are load-bearing, so both are asserted on the argv rather than trusted."""
+    import triage
+
+    seen = {}
+
+    class Done:
+        returncode, stderr = 0, ""
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["cwd"] = kwargs.get("cwd")
+        return Done()
+
+    monkeypatch.setattr(triage.subprocess, "run", fake_run)
+    triage.label_one(tmp_path / "c.pcap", tmp_path / "out", tmp_path / "rules")
+
+    argv = seen["argv"]
+    assert "--project" in argv, "uv resolves the environment from the cwd without this"
+    assert argv[argv.index("--project") + 1] == str(triage.REPO)
+    assert "--rules-dir" in argv
+    assert Path(argv[argv.index("--rules-dir") + 1]).is_absolute()
+    assert seen["cwd"] == triage.REPO
+
+
+def test_an_absent_snapshot_store_refuses_rather_than_labelling_against_nothing(tmp_path, capsys):
+    """Twenty captures against a store that is not there is twenty runs of nothing.
+
+    Worse than a crash, because each run still produces a directory and the summary would report
+    a tidy zero for every capture — the shape this whole tool exists to refuse.
+    """
+    from triage import main
+
+    capture = tmp_path / "c.pcap"
+    capture.write_bytes(b"")
+
+    code = main(
+        [
+            "triage.py",
+            str(capture),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--rules-dir",
+            str(tmp_path / "absent"),
+        ]
+    )
+
+    assert code == 2
+    assert "no snapshot store" in capsys.readouterr().err
+
+
+def test_jobs_must_be_at_least_one(tmp_path):
+    """`--jobs 0` is a ThreadPoolExecutor ValueError deep in the run, after the argv was fine."""
+    from triage import main
+
+    capture = tmp_path / "c.pcap"
+    capture.write_bytes(b"")
+    with pytest.raises(SystemExit):
+        main(["triage.py", str(capture), "--output-dir", str(tmp_path / "o"), "--jobs", "0"])
