@@ -73,6 +73,15 @@ LabelBasis = Literal["direct", "indicator-reference"]
 #: destination-unreachable belongs to no exchange, and Suricata 8.0.6 emits that alert with no
 #: `direction` key at all. A sentinel rather than `None` (Craig, 2026-08-17), following
 #: `licence: "unstated"` — every `SourceEntry` field stays non-null except `classtype`.
+#:
+#: **The frame of reference is Suricata's flow, not Zeek's.** `to_server` means the matching
+#: packet travelled towards the endpoint *Suricata* treats as the responder. The `Label` beside
+#: it names a Zeek flow, and correlation matches a detection's tuple **in either direction**
+#: (spec §9) precisely because it does not require the two engines to agree on who initiated.
+#: They normally do; a midstream pickup, or a UDP flow one engine has expired and the other has
+#: not, are the cases where they need not. So this field is a faithful report of what the engine
+#: that raised the alert said, and not a derived statement about `Label.flow`'s orientation.
+#: Deriving one would be a different field and a different claim.
 Direction = Literal["to_server", "to_client", "unknown"]
 
 #: Container format of the capture as sniffed by magic bytes, never by file extension.
@@ -405,6 +414,14 @@ class Detection:
     #: says to parse this; spec §4's field list omitted somewhere to put it. It is what issue
     #: #10 (should untagged ET rules be admitted?) will be answered from.
     metadata: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # A `Detection` reaches `labels.json` directly, inside `unmatched_detections[]`, so the
+        # same argument that guards `SourceEntry` applies one model down: the `Literal` is a
+        # hint, and an unrecognised direction would serialise happily and mean nothing to a
+        # consumer written against spec §4's three values. `direction` is the only enumerated
+        # field here; the rest are the engine's raw report, checked where they are read.
+        _check(self.direction, get_args(Direction), "direction", "Detection")
 
 
 @dataclass(frozen=True)

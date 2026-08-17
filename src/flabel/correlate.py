@@ -455,9 +455,10 @@ def _source_order(entry: SourceEntry) -> tuple[int, str, int, int, str]:
 
     `direction` joined the key with the field itself (issue #115). Before it, one rule firing on
     both halves of a flow produced two *identical* entries and the tie could not be observed;
-    now they differ, and spec §10 records that eve.json's records arrive in a different order
-    between runs — so an unbroken tie would make `labels.json` differ across two runs over one
-    capture and fail Goal 2 for a reason having nothing to do with the pipeline.
+    now they differ, and eve.json's record order is not *guaranteed* stable between runs — spec
+    §10's measured instability is in `flow` records, not `alert` records, so this closes a latent
+    tie rather than an observed failure. An unbroken tie would make `labels.json` differ across
+    two runs over one capture and fail Goal 2 for a reason having nothing to do with the pipeline.
     """
     return (entry.tier, entry.source, entry.sid, entry.rev, entry.direction)
 

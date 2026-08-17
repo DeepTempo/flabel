@@ -255,6 +255,21 @@ Three properties of the fix, each a decision that could have gone the other way:
 | **Never null** | An alert Suricata cannot place on one side of a flow — an unsolicited ICMP destination-unreachable is the measured case on 8.0.6 — carries `"unknown"`, in the manner of `licence: "unstated"`. `classtype` stays the sole nullable field on a `SourceEntry`, which two tests assert against this section. |
 | **Read from the record, never derived** | `direction` is a top-level key of the eve record, beside `src_ip`, not a member of the `alert` object. Reading it from the wrong nesting level yields `"unknown"` on every alert and is indistinguishable from a tool that stopped reporting it, so the parse is asserted against a real run rather than a hand-written record. |
 
+**The frame of reference is Suricata's flow, not Zeek's.** `to_server` means the matching packet
+travelled towards the endpoint *Suricata* treats as the responder, and the `Label` it is published
+on names a **Zeek** flow. §9 matches a detection's tuple in either direction precisely because it
+does not require the two engines to agree on who initiated a connection; they normally do, and a
+midstream pickup or a UDP flow one engine has expired and the other has not are where they need
+not. The field is therefore a faithful report of what the engine that raised the alert said —
+**not** a derived claim about `Label.flow`'s orientation, which would be a different field.
+
+**`schema_version` stays `"1.0"`.** An additive Phase 1 field does not bump it, for the same reason
+Phase 2's tier-1 entries do not (§4): the version tracks what a consumer must understand to read
+the document, and a reader written against 1.0 reads a post-#115 file correctly and simply does not
+look at the new key. The cost is real and accepted: two files both stamped `"1.0"` can differ in
+whether `direction` is present, so a corpus spanning the change is told apart by the run block's
+`flabel_version`, not by the schema version.
+
 What this does **not** resolve is whether an inbound scan that our host refused belongs in
 malicious-flow ground truth at all. That is a product question about what the labels are training
 — "this host is being attacked" against "this host is compromised" — and no field settles it. The
@@ -920,7 +935,7 @@ writes one shape of `except` clause across the pipeline rather than one per stag
 Reproducibility depends entirely on this being exact.
 
 - `labels` sorted by `(flow.ts_first, flow.uid)`.
-- `sources` within a label sorted by `(tier, source, sid, rev, direction)`. `direction` joined the key with the field (issue #115): one rule matching both halves of a flow used to yield two identical entries, so the tie was unobservable, and eve.json's record order is not stable between runs (below).
+- `sources` within a label sorted by `(tier, source, sid, rev, direction)`. `direction` joined the key with the field (issue #115): one rule matching both halves of a flow used to yield two identical entries, so the tie was unobservable, and eve.json's record order is not *guaranteed* stable between runs — the instability measured below is in `flow` records rather than `alert` records, so this closes a latent tie rather than an observed failure.
 - `unmatched_detections` sorted by `(ts, source, sid)`.
 - `json.dump(..., sort_keys=True, indent=2, ensure_ascii=False)`, trailing newline.
 - Timestamps: ISO-8601 UTC with microsecond precision and a `Z` suffix. One format everywhere.

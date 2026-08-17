@@ -319,16 +319,6 @@ def test_the_direction_the_engine_reported_survives_onto_the_entry(direction):
     )
 
 
-def test_a_direction_outside_the_three_values_is_refused():
-    """`Literal` is a hint, not a check (see `models._check`).
-
-    An entry carrying `direction: "inbound"` would serialise happily and mean nothing to a
-    consumer written against spec §4's three values.
-    """
-    with pytest.raises(ValueError, match="direction"):
-        build_source_entry(make_detection(direction="inbound"), make_admission(), SNAPSHOT_ID)
-
-
 def test_classtype_none_is_preserved_rather_than_defaulted():
     """A missing classtype is ordinary and must survive as None.
 

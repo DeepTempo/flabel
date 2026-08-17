@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from flabel import correlate
 from flabel import labels as labels_module
 from flabel import notice as notice_module
 from flabel.labels import (
@@ -421,10 +422,10 @@ def test_two_entries_differing_only_in_direction_have_a_stable_order():
     One rule matching both halves of a flow — `alert ip any any -> any any` on a request and
     its response — used to produce two **identical** entries, so the order Suricata reported
     them in could not change the file. Carrying `direction` makes them different records, and
-    spec §10 records that eve.json's records arrive in a different order between runs. Without
-    `direction` in the sort key the tie would be broken by eve order, and two runs over one
-    capture would write `to_client` first sometimes — a Goal 2 failure blaming the pipeline for
-    an ordering nobody chose.
+    eve.json's record order is not guaranteed stable between runs. Without `direction` in the sort
+    key the tie would be broken by eve order, and two runs over one capture could write
+    `to_client` first sometimes — a Goal 2 failure blaming the pipeline for an ordering nobody
+    chose. Latent rather than observed: spec §10's measured instability is in `flow` records.
     """
     to_client = make_entry(direction="to_client")
     to_server = make_entry(direction="to_server")
@@ -435,6 +436,28 @@ def test_two_entries_differing_only_in_direction_have_a_stable_order():
     assert forwards == backwards
     ordered = [entry["direction"] for entry in json.loads(forwards)["labels"][0]["sources"]]
     assert ordered == ["to_client", "to_server"], "sorted, not merely stable"
+
+
+def test_the_two_sort_keys_are_the_same_key():
+    """`labels._entry_key` and `correlate._source_order` sort the same records, so they agree.
+
+    Two modules sort a label's `sources`: `correlate` so the returned tuple is already canonical,
+    and `labels` on the way out. Both docstrings claim the keys are identical and, until this
+    test, nothing checked it. The realistic drift — a field added to one and not the other — is
+    caught by the ordering tests either side of this one; what is not is a *reordering*
+    (`(tier, source, sid, direction, rev)` against `(tier, source, sid, rev, direction)`), which
+    is harmless only for as long as `labels.py` re-sorts everything anyway.
+    """
+    entries = [
+        make_entry(),
+        make_entry(direction="to_client"),
+        make_entry(direction="unknown", rev=6),
+        make_entry(tier=1, source="panw/ngfw", sid=99),
+    ]
+
+    assert [labels_module._entry_key(entry) for entry in entries] == [
+        correlate._source_order(entry) for entry in entries
+    ]
 
 
 def test_unmatched_detections_sort_by_ts_source_sid():

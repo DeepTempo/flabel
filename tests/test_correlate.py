@@ -197,8 +197,8 @@ def test_entries_differing_only_in_direction_come_out_in_one_order():
     `correlate` sorts a label's sources itself so the returned value is already canonical —
     `labels.py` sorting again is idempotent — which means the two sort keys have to agree.
     They did not have to before #115: entries from one rule firing both ways on a flow were
-    identical, so any order was the same bytes. Now they differ, and eve.json's record order
-    is not stable between runs (spec §10).
+    identical, so any order was the same bytes. Now they differ, and eve.json's record order is
+    not guaranteed stable between runs.
     """
     outbound = make_detection()
     inbound = make_detection(

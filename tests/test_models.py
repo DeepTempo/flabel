@@ -191,6 +191,9 @@ def test_best_tier_is_the_minimum_not_the_maximum():
         (SourceSpec, {"admission_basis": "vibes"}, "admission_basis"),
         (SourceEntry, {"label_basis": "hunch"}, "label_basis"),
         (SourceEntry, {"direction": "sideways"}, "direction"),
+        # `Detection` too, because it reaches `labels.json` directly inside
+        # `unmatched_detections[]` — the same publication path `SourceEntry` is guarded on.
+        (Detection, {"direction": "sideways"}, "direction"),
         (UnmatchedDetection, {"reason": "dunno"}, "reason"),
     ],
 )
@@ -199,6 +202,7 @@ def test_enum_fields_reject_undocumented_values(model, kwargs, bad_field):
     builders = {
         SourceSpec: make_spec,
         SourceEntry: make_entry,
+        Detection: make_detection,
         UnmatchedDetection: lambda **kw: UnmatchedDetection(
             detection=make_detection(), **{"reason": "no_flow_match", **kw}
         ),

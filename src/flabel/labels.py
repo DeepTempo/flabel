@@ -161,8 +161,9 @@ def _label_key(label: Label) -> tuple[float, str]:
 
 def _entry_key(entry: Any) -> tuple[int, str, int, int, str]:
     # `direction` is in the key because entries that differ only by it are now possible — one
-    # rule matching both halves of a flow (#115) — and eve.json's order is not stable between
-    # runs. Must stay identical to `correlate._source_order`, which sorts the same tuple first.
+    # rule matching both halves of a flow (#115) — and eve.json's record order is not guaranteed
+    # stable between runs. Must stay identical to `correlate._source_order`, which sorts the same
+    # tuple first; `test_the_two_sort_keys_are_the_same_key` asserts they have not drifted.
     return (entry.tier, entry.source, entry.sid, entry.rev, entry.direction)
 
 
