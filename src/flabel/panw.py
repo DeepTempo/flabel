@@ -360,6 +360,30 @@ def threat_id(entry: ET.Element) -> int | None:
     return int(tid) if tid.isdigit() else None
 
 
+def content_version(entry: ET.Element) -> str | None:
+    """The signature set that produced this detection, read off the entry itself.
+
+    `contentver` on a real response reads `AppThreat-9136-10199`. This is the tier-1 equivalent of
+    a ruleset snapshot id, and taking it per-entry rather than from `show system info` matters for
+    the same reason spec §9 insists the manifest handed to `correlate` is the one Suricata ran: a
+    content update landing mid-run would otherwise have every label cite the version installed at
+    the end, including the labels produced before it.
+    """
+    raw = _text(entry, "contentver")
+    return raw or None
+
+
+def session_id(entry: ET.Element) -> str | None:
+    """The firewall's session id for this detection.
+
+    Not published on a label — flabel's flow identity is Zeek's `uid` and a PAN-OS session id
+    means nothing to a consumer. Read because it is what distinguishes a signature firing on
+    several *separate* sessions that happen to share a 5-tuple from the same session logged
+    repeatedly, and those are different facts about a capture.
+    """
+    return _text(entry, "sessionid") or None
+
+
 def threat_name(entry: ET.Element) -> str:
     """The human-readable signature name, which becomes `SourceEntry.threat`.
 
@@ -385,6 +409,40 @@ def admits(entry: ET.Element) -> bool:
     if subtype and subtype not in LABELLING_SUBTYPES:
         return False
     return severity in ADMITTED_SEVERITIES
+
+
+def deduplicate(found: Sequence[Detection]) -> tuple[tuple[Detection, ...], int]:
+    """One detection per (signature, 5-tuple), and how many were collapsed.
+
+    **Measured 2026-08-17, and the numbers are the argument.** One replay produced 915 threat
+    entries covering 5 distinct signatures over 380 distinct (signature, 5-tuple) pairs. The worst
+    single pair appeared **143 times across just 2 firewall sessions** with `repeatcnt` of 1 on
+    every one — so PAN-OS was not aggregating, it was logging one signature firing repeatedly
+    inside a session.
+
+    Without this, `correlate` would attach all 143 to one flow — it keeps repeated assertions
+    deliberately (`test_a_rule_firing_twice_on_one_flow_keeps_both_assertions`) — and because
+    `SourceEntry` carries no timestamp, session or count field, those 143 rows would be
+    **byte-identical**. That is a 143x bloat of the labels a consumer reads, carrying no
+    information at all.
+
+    The count is not thrown away, because "this signature fired 798 times" is a real fact about a
+    capture and dropping it silently is the failure mode this project is built to avoid. It is
+    returned for the run block, where an input or a measurement belongs, rather than smuggled
+    onto a label that has nowhere to put it.
+
+    The earliest occurrence is the survivor. Its timestamp is the closest to the flow's own start,
+    which is what `Flow.ts_first` holds and what a mapped timestamp is compared against when a
+    5-tuple has to be told apart from another occurrence of itself.
+    """
+    best: dict[tuple[int, str, int, str, int, str], Detection] = {}
+    for d in found:
+        key = (d.sid, d.src_ip, d.src_port, d.dst_ip, d.dst_port, d.proto)
+        current = best.get(key)
+        if current is None or d.ts < current.ts:
+            best[key] = d
+    kept = tuple(sorted(best.values(), key=lambda d: (d.ts, d.sid, d.src_ip, d.src_port)))
+    return kept, len(found) - len(kept)
 
 
 def detections(entries: Sequence[ET.Element]) -> tuple[tuple[Detection, ...], tuple[str, ...]]:
@@ -426,10 +484,13 @@ def _detection(entry: ET.Element, sid: int, name: str) -> Detection:
         # matching the tool's own semantics rather than inventing a version. The signature set
         # *is* versioned, and that version is the content release recorded on the run.
         rev=0,
-        # PAN-OS `category` is the direct analogue of a Suricata classtype — `brute-force`,
-        # `code-execution`, `scan` — and is what a tier-1 admission policy would gate on if
-        # severity turns out to be too blunt.
-        classtype=_text(entry, "category") or None,
+        # `thr_category`, NOT `category`. Measured 2026-08-17 against a real response: PAN-OS
+        # uses `category` for the *URL* category, which reads `any` on every non-URL threat, and
+        # files the threat category under `thr_category` (`info-leak`, `brute-force`,
+        # `code-execution`). An earlier version of this module read `category` and published
+        # `classtype: "any"` on all 915 detections of a run — well-formed, uniform, and
+        # meaningless, in the field a tier-1 admission policy would gate on.
+        classtype=_text(entry, "thr_category") or None,
         app_proto=_text(entry, "app") or None,
         threat=name,
         # Replay wall-clock, deliberately. Reading it back as capture time needs
@@ -614,12 +675,15 @@ __all__ = [
     "ThreatQuery",
     "admits",
     "api_key",
+    "content_version",
     "counter_delta",
     "declined_note",
+    "deduplicate",
     "detections",
     "iter_entries",
     "loss",
     "parse_system_info",
+    "session_id",
     "threat_id",
     "threat_name",
     "verify_clock",

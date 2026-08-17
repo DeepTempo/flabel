@@ -1,22 +1,26 @@
 """Tier-1 label decisions, tested against recorded device responses.
 
-Never contacts a firewall (PRD §5: `[LAB]` criteria only). The XML below is the shape of what
-the real device returned on 2026-08-17 — the same 13 detections recorded in
-`docs/phase-2-reachability-spike.md` — so these tests assert against measured output rather than
-against a guess about what PAN-OS emits.
+Never contacts a firewall (PRD §5: `[LAB]` criteria only). Every field name and value below was
+read off a live response on 2026-08-17, so these tests assert against what PAN-OS actually emits
+rather than against a guess. That distinction has already earned itself once: an earlier fixture
+was modelled on the *CLI* output, where the threat category appears as `category` and the
+signature id is bundled into `threatid`. Over the XML API neither is true — `category` is the URL
+category and reads `any`, `thr_category` holds the threat category, and the id is in `tid` — and
+the fixture agreed with the bug it was supposed to catch.
 """
 
 from __future__ import annotations
 
+import time
 import xml.etree.ElementTree as ET
 
 import pytest
 
 from flabel import panw
 
-#: Six of the thirteen entries from the measured run: the corroborated Realtek detection, two
-#: brute-force entries in opposite directions, a scanner detection, and two of the
-#: `informational` protocol-conformance observations that must not become labels.
+#: Six entries in the exact shape the device returned on 2026-08-17 — field names verified against
+#: a live response, which is why `category` reads `any` and the threat category is `thr_category`.
+#: Includes an `informational` observation and a `url` subtype, neither of which may become a label.
 THREAT_XML = """<response status="success">
  <result>
   <job><status>FIN</status></job>
@@ -26,8 +30,11 @@ THREAT_XML = """<response status="success">
     <subtype>vulnerability</subtype>
     <src>45.90.163.37</src><dst>216.152.152.123</dst>
     <sport>56406</sport><dport>9034</dport><proto>udp</proto><app>unknown-udp</app>
-    <threatid>Realtek Jungle SDK Remote Code Execution Vulnerability(91535)</threatid>
-    <severity>critical</severity><category>code-execution</category>
+    <threatid>Realtek Jungle SDK Remote Code Execution Vulnerability</threatid>
+    <tid>91535</tid><sessionid>70001</sessionid><repeatcnt>1</repeatcnt>
+    <severity>critical</severity><category>any</category>
+    <thr_category>code-execution</thr_category>
+    <contentver>AppThreat-9136-10199</contentver>
     <direction>client-to-server</direction><action>drop</action>
    </entry>
    <entry logid="2">
@@ -35,8 +42,11 @@ THREAT_XML = """<response status="success">
     <subtype>vulnerability</subtype>
     <src>91.92.40.29</src><dst>216.152.152.123</dst>
     <sport>61968</sport><dport>22</dport><proto>tcp</proto><app>ssh</app>
-    <threatid>SSH User Authentication Brute Force Attempt(40015)</threatid>
-    <severity>high</severity><category>brute-force</category>
+    <threatid>SSH User Authentication Brute Force Attempt</threatid>
+    <tid>40015</tid><sessionid>70002</sessionid><repeatcnt>1</repeatcnt>
+    <severity>high</severity><category>any</category>
+    <thr_category>brute-force</thr_category>
+    <contentver>AppThreat-9136-10199</contentver>
     <direction>client-to-server</direction><action>reset-both</action>
    </entry>
    <entry logid="3">
@@ -44,8 +54,11 @@ THREAT_XML = """<response status="success">
     <subtype>vulnerability</subtype>
     <src>216.152.152.123</src><dst>91.92.40.29</dst>
     <sport>22</sport><dport>22598</dport><proto>tcp</proto><app>ssh</app>
-    <threatid>SSH User Authentication Brute Force Attempt(40015)</threatid>
-    <severity>high</severity><category>brute-force</category>
+    <threatid>SSH User Authentication Brute Force Attempt</threatid>
+    <tid>40015</tid><sessionid>70003</sessionid><repeatcnt>1</repeatcnt>
+    <severity>high</severity><category>any</category>
+    <thr_category>brute-force</thr_category>
+    <contentver>AppThreat-9136-10199</contentver>
     <direction>server-to-client</direction><action>reset-both</action>
    </entry>
    <entry logid="4">
@@ -53,8 +66,11 @@ THREAT_XML = """<response status="success">
     <subtype>vulnerability</subtype>
     <src>205.237.105.154</src><dst>216.152.152.123</dst>
     <sport>5123</sport><dport>5060</dport><proto>udp</proto><app>sip</app>
-    <threatid>SIPVicious Scanner Detection(54482)</threatid>
-    <severity>medium</severity><category>scan</category>
+    <threatid>SIPVicious Scanner Detection</threatid>
+    <tid>54482</tid><sessionid>70004</sessionid><repeatcnt>1</repeatcnt>
+    <severity>medium</severity><category>any</category>
+    <thr_category>info-leak</thr_category>
+    <contentver>AppThreat-9136-10199</contentver>
     <direction>client-to-server</direction><action>drop</action>
    </entry>
    <entry logid="5">
@@ -62,8 +78,11 @@ THREAT_XML = """<response status="success">
     <subtype>vulnerability</subtype>
     <src>115.231.78.11</src><dst>216.152.152.123</dst>
     <sport>61994</sport><dport>7</dport><proto>tcp</proto><app>echo</app>
-    <threatid>Non-RFC Compliant ECHO Traffic on Port 7(56796)</threatid>
-    <severity>informational</severity><category>protocol-anomaly</category>
+    <threatid>Non-RFC Compliant ECHO Traffic on Port 7</threatid>
+    <tid>56796</tid><sessionid>70005</sessionid><repeatcnt>1</repeatcnt>
+    <severity>informational</severity><category>any</category>
+    <thr_category>protocol-anomaly</thr_category>
+    <contentver>AppThreat-9136-10199</contentver>
     <direction>client-to-server</direction><action>alert</action>
    </entry>
    <entry logid="6">
@@ -71,8 +90,11 @@ THREAT_XML = """<response status="success">
     <subtype>url</subtype>
     <src>144.225.124.188</src><dst>216.152.152.123</dst>
     <sport>5353</sport><dport>1027</dport><proto>udp</proto><app>dns</app>
-    <threatid>some-url-category(9999)</threatid>
-    <severity>high</severity><category>unknown</category>
+    <threatid>some-url-category</threatid>
+    <tid>9999</tid><sessionid>70006</sessionid><repeatcnt>1</repeatcnt>
+    <severity>high</severity><category>search-engines</category>
+    <thr_category>unknown</thr_category>
+    <contentver>AppThreat-9136-10199</contentver>
     <direction>client-to-server</direction><action>alert</action>
    </entry>
   </logs></log>
@@ -273,3 +295,78 @@ def test_the_device_clock_is_parsed_from_show_clock_output():
 def test_an_unreadable_device_clock_is_an_error_rather_than_a_guess():
     with pytest.raises(Exception, match="clock could not be read"):
         panw._clock_epoch("not a time at all")
+
+
+def test_the_threat_category_comes_from_thr_category_not_from_category():
+    """Measured 2026-08-17: `category` is the URL category and reads `any` on every threat.
+
+    Reading it published `classtype: "any"` on all 915 detections of a run — uniform,
+    well-formed, and meaningless in the field a tier-1 admission policy would gate on.
+    """
+    entry = ET.fromstring(
+        "<entry><threatid>SIPVicious Scanner Detection</threatid><tid>54482</tid>"
+        "<severity>medium</severity><subtype>vulnerability</subtype>"
+        "<category>any</category><thr_category>info-leak</thr_category>"
+        "<src>1.2.3.4</src><dst>5.6.7.8</dst><sport>1</sport><dport>2</dport><proto>udp</proto>"
+        "<direction>client-to-server</direction></entry>"
+    )
+    found, _ = panw.detections([entry])
+    assert found[0].classtype == "info-leak"
+
+
+def test_the_numeric_id_is_taken_from_tid_when_the_xml_does_not_embed_it():
+    """The XML spells these differently from the CLI: `threatid` is the name, `tid` the number."""
+    entry = ET.fromstring("<entry><threatid>SIPVicious Scanner Detection</threatid>"
+                          "<tid>54482</tid></entry>")
+    assert panw.threat_id(entry) == 54482
+    assert panw.threat_name(entry) == "SIPVicious Scanner Detection"
+
+
+def test_the_content_version_is_read_from_the_entry_itself():
+    """Per-entry, so a content update mid-run cannot relabel earlier detections."""
+    entry = ET.fromstring("<entry><contentver>AppThreat-9136-10199</contentver></entry>")
+    assert panw.content_version(entry) == "AppThreat-9136-10199"
+
+
+def _det(sid: int, ts: float, sport: int = 5362) -> object:
+    entry = ET.fromstring(
+        f"<entry><threatid>x</threatid><tid>{sid}</tid><severity>high</severity>"
+        f"<subtype>vulnerability</subtype><thr_category>brute-force</thr_category>"
+        f"<src>51.178.198.251</src><dst>216.152.152.123</dst>"
+        f"<sport>{sport}</sport><dport>5060</dport><proto>udp</proto>"
+        f"<receive_time>{time.strftime('%Y/%m/%d %H:%M:%S', time.gmtime(ts))}</receive_time>"
+        f"<direction>client-to-server</direction></entry>"
+    )
+    found, _ = panw.detections([entry])
+    return found[0]
+
+
+def test_one_signature_firing_repeatedly_on_one_tuple_collapses_to_one_assertion():
+    """Measured: 143 entries on one (signature, tuple) across just 2 sessions, repeatcnt 1.
+
+    `SourceEntry` has no timestamp, session or count field, so keeping all 143 would put 143
+    byte-identical provenance rows on one label.
+    """
+    repeats = [_det(40023, 1787004700.0 + i) for i in range(143)]
+    kept, collapsed = panw.deduplicate(repeats)
+    assert len(kept) == 1
+    assert collapsed == 142
+
+
+def test_the_earliest_occurrence_is_the_one_kept():
+    """Its timestamp sits closest to the flow's own start, which is what `ts_first` holds."""
+    later = _det(40023, 1787004900.0)
+    earlier = _det(40023, 1787004700.0)
+    kept, _ = panw.deduplicate([later, earlier])
+    assert kept[0].ts == earlier.ts
+
+
+def test_the_same_signature_on_a_different_tuple_is_not_collapsed():
+    kept, collapsed = panw.deduplicate([_det(40023, 1787004700.0, sport=5362),
+                                        _det(40023, 1787004700.0, sport=4040)])
+    assert len(kept) == 2 and collapsed == 0
+
+
+def test_nothing_is_collapsed_when_nothing_repeats():
+    kept, collapsed = panw.deduplicate([_det(40023, 1787004700.0), _det(54482, 1787004701.0)])
+    assert len(kept) == 2 and collapsed == 0
