@@ -30,11 +30,19 @@ HTML block page is valid UTF-8 with no `alert` line in it.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Iterator
 
 from flabel import config
 from flabel.errors import ConfigError
-from flabel.models import AdmissionPolicy, SourceAdmission, SourceSpec
+from flabel.models import (
+    COMBINING_CATEGORIES,
+    EMOJI_JOINERS,
+    AdmissionPolicy,
+    SourceAdmission,
+    SourceSpec,
+    is_marker,
+)
 
 #: An enabled rule. Matched against the stripped line, so a feed that indents its rules — or
 #: ships CRLF — is read the same way Suricata reads it.
@@ -68,6 +76,11 @@ JA4_KEYWORD = "ja4.hash"
 #: `classification.config`, for the reason spec §8 gives: `alert.category` is a *description*
 #: looked up by name, so it varies by machine and is empty for any classtype the file omits.
 CLASSTYPE = re.compile(r"\bclasstype\s*:\s*([A-Za-z0-9._-]+)\s*;")
+
+#: A rule's `msg:` value. The marker a feed writes to classify its own rule lives at the front
+#: of it (`marker_of`), and #117 is what happens when nothing reads it.
+MSG = re.compile(r'\bmsg\s*:\s*"((?:[^"\\]|\\.)*)"')
+
 
 #: Rule options that carry **no detection logic**: bookkeeping, output, and flow/rate qualifiers.
 #: Everything else in Suricata's option vocabulary inspects something.
@@ -168,7 +181,7 @@ def admit(
     admitted: list[str] = []
     fetched = commented = 0
     no_confidence = low_confidence = low_severity = unloadable = 0
-    by_classtype = 0
+    by_classtype = by_marker = 0
     policy = AdmissionPolicy() if policy is None else policy
     ja3 = ja4 = 0
 
@@ -194,6 +207,11 @@ def admit(
         # reading as "would have been admitted, but its kind is not one we label from".
         if verdict is None and policy.excludes(classtype_of(rule)):
             verdict = "classtype"
+        # Last of the four, so a rule excluded by any earlier test keeps that test's bucket. A
+        # `misc-activity` scanner rule marked with an observational emoji is both, and counting
+        # it here would make "excluded by classtype" understate what #113's policy is doing.
+        if verdict is None and policy.excludes_marker(marker_of(rule, policy.msg_brand_marker)):
+            verdict = "marker"
 
         if verdict is None:
             admitted.append(rule)
@@ -213,6 +231,8 @@ def admit(
             unloadable += 1
         elif verdict == "classtype":
             by_classtype += 1
+        elif verdict == "marker":
+            by_marker += 1
         else:
             low_severity += 1
 
@@ -242,6 +262,7 @@ def admit(
         fetched_at=fetched_at,
         rules_excluded_unloadable=unloadable,
         rules_excluded_classtype=by_classtype,
+        rules_excluded_marker=by_marker,
     )
     _verify_identity(admission)
     return admitted, admission
@@ -318,6 +339,94 @@ def classtype_of(rule: str) -> str | None:
     """
     match = CLASSTYPE.search(rule)
     return match.group(1) if match else None
+
+
+def marker_of(rule: str, brand: str | None = None) -> str | None:
+    """The marker leading a rule's `msg:`, or `None` when it carries none (#117).
+
+    `pawpatrules` writes one emoji per rule to say what kind of rule it is, and it is the only
+    field that says so: measured on the 2026-08-12 mirror, 9,669 rules are marked as detections
+    and 571 carry one of the five observational markers. 126 of those are the info-marked rules
+    `exclude_classtypes` already removes, and **0 of the remaining 445 carry `misc-activity`** —
+    so #113's classtype policy cannot reach one of them. They declare `bad-unknown` and
+    `attempted-recon`, where real detections also live, which is why the classtype could not be
+    the discriminator.
+
+    **Positional, never a substring search, and that is a measurement rather than a preference.**
+    The same emoji appear *inside* rule text — "Google Chrome <globe> for Windows 7 unsupported
+    and vulnerable" is a detection carrying an observational marker mid-sentence. Matching
+    anywhere in the `msg:` hits **8,125** rules where this parse hits **571**; of the 7,554
+    difference, 3,997 are siren-marked detections and 3,315 are skull-marked ones. An unanchored
+    match would have cut a third of the feed's real signatures while reading, in a registry, as
+    a five-marker policy.
+
+    **The brand prefix is skipped.** All 21,467 rules begin with the feed's paw-print logo and
+    a ` - ` separator, so the first pictograph discriminates nothing. A leading run terminated by
+    that separator is treated as a brand prefix and stepped over. A feed writing its marker
+    first, with no prefix, still works — the partition finds nothing to skip.
+
+    **The first of several adjacent markers wins.** 34 rules are marked with fire-then-eye and
+    they are FireEye BEACON backdoor signatures — detections. Taking any marker in the run would
+    exclude all 34 under an eye policy; taking the first keeps them, and the corpus outcome is
+    identical either way (17 entries).
+    """
+    match = MSG.search(rule)
+    if match is None:
+        return None
+    first = _first_marker(match.group(1))
+    if first is None:
+        return None
+    marker, rest = first
+    if brand is None or marker != brand:
+        return marker
+    # The brand classifies nothing, so the rule's own marker is the next one. The dash the feed
+    # writes between them is optional and its spacing is not uniform — 21,455 rules write
+    # `<paw> - ` and 12 phishing rules write `<paw> -<marker>` with no space after the dash — so
+    # it is stepped over wherever it appears rather than matched as a fixed string.
+    after = rest.lstrip()
+    if after[:1] in _BRAND_DASHES:
+        after = after[1:]
+    second = _first_marker(after)
+    # `<paw> - APT.Backdoor.MSIL.SUNBURST` carries no marker of its own, and 33 rules are
+    # written that way: the answer is None, never the brand.
+    return second[0] if second is not None else None
+
+
+def _first_marker(text: str) -> tuple[str, str] | None:
+    """The first pictograph in `text`'s leading run, and what follows it.
+
+    `None` once the run reaches prose. Two conditions end it, and each exists for a measured
+    failure:
+
+    * **An ASCII character that is not spacing.** Past it the `msg:` is a sentence, and an emoji
+      found there belongs to the sentence — "Google Chrome <globe> for Windows 7 unsupported and
+      vulnerable" is a detection. This is what makes the parse positional rather than a substring
+      search, and it is worth 8,125 rules against 571.
+    * **A character that is not a pictograph.** The feed is French: `<paw> - Élévation de
+      privilèges` would otherwise report `É` as a marker, and a non-breaking space after the dash
+      would report `\xa0` — which is not merely noise, because a marker nobody recognises means
+      the rule is ADMITTED. See `models.is_marker`, and note the one letter-like exception it
+      names: the information-source marker is category `Ll`, not `So`.
+    """
+    for index, char in enumerate(text):
+        if char.isascii():
+            if char.isspace():
+                continue
+            return None
+        if unicodedata.category(char) in COMBINING_CATEGORIES or char in EMOJI_JOINERS:
+            # The pirate flag is one glyph and four codepoints (flag, ZWJ, skull, VS16) and 6,910
+            # rules lead with it. The marker is its first character, so joiners and variation
+            # selectors are stepped over rather than read as markers of their own.
+            continue
+        if not is_marker(char):
+            return None
+        return char, text[index + 1 :]
+    return None
+
+
+#: What separates a brand prefix from the rule's own marker. A list because the feed is not
+#: consistent about which dash or how much space surrounds it.
+_BRAND_DASHES = frozenset({"-", "\N{EN DASH}", "\N{EM DASH}"})
 
 
 def rule_options(rule: str) -> list[str]:
@@ -593,6 +702,7 @@ def _verify_identity(admission: SourceAdmission) -> None:
         + admission.rules_excluded_low_severity
         + admission.rules_excluded_unloadable
         + admission.rules_excluded_classtype
+        + admission.rules_excluded_marker
     )
     if accounted != admission.rules_fetched:
         raise ValueError(

@@ -25,7 +25,7 @@ import argparse
 import re
 from pathlib import Path
 
-from flabel.config import enabled_sources, load_admission_policy
+from flabel.config import enabled_sources, load_admission_policies
 from flabel.errors import FlabelError
 from flabel.models import SourceSpec
 from flabel.rules import utc_now
@@ -35,8 +35,8 @@ from flabel.rules.snapshot import load_sid_index, load_snapshot, write_snapshot
 
 COLUMNS = (
     f"{'source':26} {'basis':16} {'fetched':>8} {'admitted':>9} {'%':>6} {'no-conf':>8} "
-    f"{'low-conf':>9} {'low-sev':>8} {'unload':>7} {'#alert':>7} {'ja3':>4} {'ja4':>4} "
-    f"{'data':>5}"
+    f"{'low-conf':>9} {'low-sev':>8} {'unload':>7} {'classty':>8} {'marker':>7} "
+    f"{'#alert':>7} {'ja3':>4} {'ja4':>4} {'data':>5}"
 )
 
 
@@ -64,7 +64,12 @@ def main() -> int:
     specs = enabled_sources(args.sources)
     fetcher = transport(args, specs)
     fetched_at = utc_now()
-    policy = load_admission_policy(args.sources)
+    # The PER-SOURCE policies, not the global `[admission]` table. This read
+    # `load_admission_policy` until 2026-08-17, which meant the reproducer applied neither
+    # pawpatrules' `exclude_classtypes` (#113) nor its `exclude_msg_markers` (#117) — so the
+    # script this file's docstring and spec §6 both name as how the measurements are reproduced
+    # could not reproduce them, and `cli.py` had quietly diverged from it.
+    policies = load_admission_policies(args.sources)
 
     admitted: dict[str, list[str]] = {}
     admissions = []
@@ -82,7 +87,7 @@ def main() -> int:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(payload)
             text, files = extract_feed(payload, spec.url)
-            rules, counts = admit(spec, text.splitlines(), fetched_at, policy)
+            rules, counts = admit(spec, text.splitlines(), fetched_at, policies[spec.name])
         except FlabelError as exc:
             # Printed rather than raised: one dead feed should not hide the other eight from a
             # measurement run, even though a real `rules update` fails on it.
@@ -101,7 +106,8 @@ def main() -> int:
             f"{counts.name:26} {counts.admission_basis:16} {counts.rules_fetched:8} "
             f"{counts.rules_admitted:9} {share:5.1f}% {counts.rules_excluded_no_confidence:8} "
             f"{counts.rules_excluded_low_confidence:9} {counts.rules_excluded_low_severity:8} "
-            f"{counts.rules_excluded_unloadable:7} {counts.rules_excluded_commented:7} "
+            f"{counts.rules_excluded_unloadable:7} {counts.rules_excluded_classtype:8} "
+            f"{counts.rules_excluded_marker:7} {counts.rules_excluded_commented:7} "
             f"{counts.ja3_rules_admitted:4} {counts.ja4_rules_admitted:4} {len(files):5}"
         )
 
@@ -121,6 +127,7 @@ def main() -> int:
             + admission.rules_excluded_low_severity
             + admission.rules_excluded_unloadable
             + admission.rules_excluded_classtype
+            + admission.rules_excluded_marker
         )
         assert accounted == admission.rules_fetched, f"{admission.name} does not balance"
     print("spec §6 identity holds for every source: fetched == admitted + sum(excluded)")
@@ -178,6 +185,8 @@ def _totals(admissions: list) -> str:
         f"{sum(a.rules_excluded_low_confidence for a in admissions):9} "
         f"{sum(a.rules_excluded_low_severity for a in admissions):8} "
         f"{sum(a.rules_excluded_unloadable for a in admissions):7} "
+        f"{sum(a.rules_excluded_classtype for a in admissions):8} "
+        f"{sum(a.rules_excluded_marker for a in admissions):7} "
         f"{sum(a.rules_excluded_commented for a in admissions):7} "
         f"{sum(a.ja3_rules_admitted for a in admissions):4} "
         f"{sum(a.ja4_rules_admitted for a in admissions):4}"
