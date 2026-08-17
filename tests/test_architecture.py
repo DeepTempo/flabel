@@ -131,6 +131,9 @@ def test_pure_modules_are_all_accounted_for():
         # arithmetic — the part a wrong answer would put on a label — is pure and lives on
         # `ReplayWindow`, so `tests/test_replay.py` exercises it without a NIC or a firewall.
         "replay.py",
+        # Impure because it drives replay.py and panw.py in sequence. It makes no decision
+        # about what a label says — those live in panw.py, which is testable without a device.
+        "tier1.py",
         *NETWORK_MODULES,
     }
     classified = set(PURE_MODULES) | impure | {"__init__.py", "rules/__init__.py"}

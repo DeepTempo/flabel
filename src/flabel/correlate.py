@@ -47,7 +47,7 @@ from flabel.models import (
     UnmatchedDetection,
     UnmatchedReason,
 )
-from flabel.provenance import build_source_entry
+from flabel.provenance import build_device_source_entry, build_source_entry
 
 #: Re-exported so `from flabel.correlate import DEFAULT_THRESHOLD` keeps working — this is where
 #: readers look for it, next to the gate that applies it. It is *defined* in `models.py` because
@@ -120,6 +120,7 @@ def correlate(
     manifest: SnapshotManifest,
     threshold: float = DEFAULT_THRESHOLD,
     address_indicators: frozenset[int] | None = None,
+    device_rulesets: Mapping[tuple[int, str, int, str, int, str], str] | None = None,
 ) -> CorrelationResult:
     """Attach each detection to the one flow it fired on, and consolidate to one label per flow.
 
@@ -162,7 +163,8 @@ def correlate(
     # a tuple that matches, and a snapshot id no reader can resolve is broken whether or not
     # this particular capture produced a label from it.
     entries = [
-        (detection, _entry(detection, admissions, manifest.snapshot_id, address_indicators))
+        (detection, _entry(detection, admissions, manifest.snapshot_id, address_indicators,
+                           device_rulesets))
         for detection in detections
     ]
 
@@ -392,6 +394,7 @@ def _entry(
     admissions: Mapping[str, SourceAdmission],
     snapshot_id: str,
     address_indicators: frozenset[int] | None = None,
+    device_rulesets: Mapping[tuple[int, str, int, str, int, str], str] | None = None,
 ) -> SourceEntry:
     """This detection's provenance, built from the snapshot's record of its source.
 
@@ -405,6 +408,18 @@ def _entry(
     Everything past the lookup belongs to `build_source_entry`, which is where `label_basis`,
     `admission_basis` and `licence` are derived — once, for this step and step 8 both.
     """
+    # Tier 1 has no snapshot behind it. Its signature set is the vendor's and its admission
+    # decision is the operator's threat exceptions on the device, so both identifiers come from
+    # the device and `admissions` has nothing to say about it (Phase 2, #122). Routed on `tier`
+    # rather than on `source`, because the tier is the field a label already publishes to mean
+    # exactly this distinction — and a tier-1 detection reaching the snapshot lookup below would
+    # fail with "the snapshot does not describe it", which is true and useless.
+    if detection.tier == 1:
+        ruleset = (device_rulesets or {}).get(
+            (detection.sid, detection.src_ip, detection.src_port,
+             detection.dst_ip, detection.dst_port, detection.proto), "")
+        return build_device_source_entry(detection, ruleset)
+
     try:
         admission = admissions[detection.source]
     except KeyError:
