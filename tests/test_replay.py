@@ -9,8 +9,12 @@ assert the bug rather than the fix.
 
 from __future__ import annotations
 
+import struct
+
 import pytest
 
+from flabel import replay as replay_mod
+from flabel.errors import ToolError
 from flabel.replay import ReplayWindow
 
 #: The 2026-08-17 replay of lax/capture_2026-07-08_pub-216.152.152.123.pcap.
@@ -112,3 +116,64 @@ def test_a_replay_with_no_measurable_duration_falls_back_without_pretending_to_k
     replay = window(replay_end_wall=REPLAY_START)
     assert replay.effective_scale == replay.multiplier
     assert replay.uncertainty_seconds == pytest.approx(PCAP_SPAN)
+
+
+def _pcap(magic: bytes, endian: str, stamps: list[tuple[int, int]]) -> bytes:
+    """A minimal pcap holding `stamps`, one 4-byte packet each."""
+    out = magic + struct.pack(f"{endian}HHiIII", 2, 4, 0, 0, 65535, 1)
+    for seconds, fraction in stamps:
+        out += struct.pack(f"{endian}IIII", seconds, fraction, 4, 4) + b"\xde\xad\xbe\xef"
+    return out
+
+
+@pytest.mark.parametrize(
+    ("magic", "endian"),
+    [(replay_mod.MAGIC_MICRO_LE, "<"), (replay_mod.MAGIC_MICRO_BE, ">")],
+)
+def test_the_bounds_are_read_from_the_capture_in_either_byte_order(tmp_path, magic, endian):
+    path = tmp_path / "c.pcap"
+    path.write_bytes(_pcap(magic, endian, [(1000, 500000), (1005, 250000), (1009, 750000)]))
+    first, last = replay_mod.capture_bounds(path)
+    assert first == pytest.approx(1000.5)
+    assert last == pytest.approx(1009.75)
+
+
+@pytest.mark.parametrize(
+    ("magic", "endian"),
+    [(replay_mod.MAGIC_NANO_LE, "<"), (replay_mod.MAGIC_NANO_BE, ">")],
+)
+def test_a_nanosecond_capture_is_not_read_as_microseconds(tmp_path, magic, endian):
+    """The one scale error nothing downstream could catch.
+
+    A nanosecond fraction read as microseconds is out by a factor of 1000, and `ReplayWindow`
+    would invert the wrong number perfectly — every test of the arithmetic would still pass,
+    because the arithmetic would still be right.
+    """
+    path = tmp_path / "c.pcap"
+    path.write_bytes(_pcap(magic, endian, [(1000, 500_000_000), (1002, 250_000_000)]))
+    first, last = replay_mod.capture_bounds(path)
+    assert first == pytest.approx(1000.5)
+    assert last == pytest.approx(1002.25)
+
+
+def test_a_truncated_final_record_still_yields_the_bounds_of_what_was_readable(tmp_path):
+    """Truncated captures are ordinary input (spec §8), not a reason to refuse to replay."""
+    path = tmp_path / "c.pcap"
+    good = _pcap(replay_mod.MAGIC_MICRO_LE, "<", [(1000, 0), (1004, 0)])
+    path.write_bytes(good + b"\x01\x02\x03")
+    assert replay_mod.capture_bounds(path) == (pytest.approx(1000.0), pytest.approx(1004.0))
+
+
+def test_a_capture_with_no_packets_cannot_yield_a_replay_window(tmp_path):
+    path = tmp_path / "c.pcap"
+    path.write_bytes(_pcap(replay_mod.MAGIC_MICRO_LE, "<", []))
+    with pytest.raises(ToolError, match="no readable packet records"):
+        replay_mod.capture_bounds(path)
+
+
+def test_an_unrecognised_magic_is_reported_as_a_pipeline_error(tmp_path):
+    """ingest normalises to pcap first, so reaching here means the pipeline was mis-wired."""
+    path = tmp_path / "c.pcap"
+    path.write_bytes(b"\x00\x01\x02\x03" + b"\x00" * 40)
+    with pytest.raises(ToolError, match="pipeline error"):
+        replay_mod.capture_bounds(path)

@@ -41,7 +41,9 @@ Not pure: this module runs subprocesses. The timestamp arithmetic is pure and li
 from __future__ import annotations
 
 import shutil
+import struct
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -151,6 +153,109 @@ class ReplayWindow:
         replay, and spec §13 says report rather than guess.
         """
         return abs(first - second) > self.uncertainty_seconds
+
+
+#: pcap global-header magics. `ingest.py` has normalised to classic pcap by the time a replay
+#: happens (spec §8), so only these four matter: byte order either way, and the nanosecond
+#: variant, which differs *only* in how the fractional field is scaled. Getting that scale wrong
+#: would put every timestamp out by a factor of 1000 — a silent error `ReplayWindow` cannot
+#: detect and would faithfully invert.
+MAGIC_MICRO_BE = b"\xa1\xb2\xc3\xd4"
+MAGIC_MICRO_LE = b"\xd4\xc3\xb2\xa1"
+MAGIC_NANO_BE = b"\xa1\xb2\x3c\x4d"
+MAGIC_NANO_LE = b"\x4d\x3c\xb2\xa1"
+
+_RECORD_HEADER = 16
+_GLOBAL_HEADER = 24
+
+
+def capture_bounds(capture: Path) -> tuple[float, float]:
+    """The first and last packet timestamps, read from the capture's own record headers.
+
+    Read here rather than shelled out to `capinfos`, for the reason spec §8 has flabel walk pcap
+    headers itself: `capinfos` errors on a truncated capture instead of reporting how far it got,
+    and a truncated capture is ordinary input. It also adds no tool to the dependency set for the
+    sake of two numbers.
+
+    Both bounds come from the file, not from the replay, because they are what
+    `ReplayWindow` measures its scale *against*. There is no index in a pcap, so the last
+    timestamp is only knowable by walking every record header to the end.
+    """
+    try:
+        with capture.open("rb") as handle:
+            header = handle.read(_GLOBAL_HEADER)
+            if len(header) < _GLOBAL_HEADER:
+                raise ToolError(f"{capture} is too short to hold a pcap global header")
+            magic = header[:4]
+            if magic in (MAGIC_MICRO_LE, MAGIC_NANO_LE):
+                endian = "<"
+            elif magic in (MAGIC_MICRO_BE, MAGIC_NANO_BE):
+                endian = ">"
+            else:
+                raise ToolError(
+                    f"{capture} does not begin with a pcap magic this build recognises "
+                    f"({magic!r}). ingest normalises to pcap before a replay, so this is a "
+                    f"pipeline error rather than a bad capture."
+                )
+            divisor = 1_000_000_000.0 if magic in (MAGIC_NANO_LE, MAGIC_NANO_BE) else 1_000_000.0
+
+            first: float | None = None
+            last: float | None = None
+            while True:
+                record = handle.read(_RECORD_HEADER)
+                if len(record) < _RECORD_HEADER:
+                    # A short final header is a truncated capture, which ingest has already
+                    # classified and stamped `input_status: partial`. The bounds of what *is*
+                    # readable are still the right window to replay, so stop rather than fail.
+                    break
+                seconds, fraction, captured, _original = struct.unpack(f"{endian}IIII", record)
+                stamp = seconds + fraction / divisor
+                if first is None:
+                    first = stamp
+                last = stamp
+                handle.seek(captured, 1)
+    except OSError as exc:
+        raise ToolError(f"{capture} could not be read to find its time bounds: {exc}") from exc
+
+    if first is None or last is None:
+        raise ToolError(
+            f"{capture} holds no readable packet records, so a replay window cannot be measured"
+        )
+    return first, last
+
+
+def replay(
+    capture: Path,
+    cache: Path,
+    interfaces: tuple[str, str],
+    *,
+    multiplier: float = DEFAULT_MULTIPLIER,
+    topspeed: bool = False,
+) -> ReplayWindow:
+    """Put the capture on the wire, and return the window it occupied.
+
+    The wall clock is read either side of the invocation and nowhere else. That is what makes
+    `ReplayWindow.effective_scale` a measurement of *this* replay rather than a restatement of
+    the multiplier that was asked for — see the module header for why the difference matters.
+    """
+    first, last = capture_bounds(capture)
+
+    pacing = ["--topspeed"] if topspeed else [f"--multiplier={multiplier}"]
+    argv = [REPLAY, "-i", interfaces[0], "-I", interfaces[1], f"--cachefile={cache}",
+            *pacing, str(capture)]
+
+    started = time.time()
+    _run(argv, REPLAY_TIMEOUT_SECONDS, "replayed past the device")
+    ended = time.time()
+
+    return ReplayWindow(
+        pcap_first_ts=first,
+        pcap_last_ts=last,
+        replay_start_wall=started,
+        replay_end_wall=ended,
+        multiplier=multiplier,
+        topspeed=topspeed,
+    )
 
 
 def _run(argv: list[str], timeout: int, what: str) -> subprocess.CompletedProcess[bytes]:

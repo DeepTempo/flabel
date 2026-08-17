@@ -29,6 +29,7 @@ error than including a log that the tuple then declines to match.
 
 from __future__ import annotations
 
+import calendar
 import time
 import urllib.parse
 import urllib.request
@@ -125,13 +126,23 @@ class ThreatQuery:
     pad_seconds: int = WINDOW_PAD_SECONDS
 
     def _stamp(self, value: float) -> str:
-        """PAN-OS log-query time format, in the device's local time.
+        """PAN-OS log-query time format, in **UTC**.
 
-        `time.localtime` rather than UTC because `receive_time` is written in the device's local
-        zone and the query is compared against it as text. Both hosts are pointed at one NTP
-        source, which is what makes the two clocks comparable at all.
+        `receive_time` is written in the device's configured zone and this filter is compared
+        against it as *text*, so the two only agree if both sides use the same zone. UTC is that
+        zone, and `fl-ngfw` is configured to it (`set deviceconfig system timezone UTC`).
+
+        **Measured the hard way, 2026-08-17.** With `time.localtime` here, the replay host on UTC
+        and the device on PDT, this query returned **0 entries for a window in which the device
+        had written 13 threat logs** — the filter was seven hours off. NTP sync does not help:
+        it agrees the two clocks on the same *instant*, and says nothing about the zone each one
+        renders that instant in.
+
+        That failure is why `verify_clock` exists. Zero rows is indistinguishable from a capture
+        with nothing malicious in it, so a zone mismatch would quietly publish "nothing found"
+        for every run — the exact class of silent under-report spec §11 gives a named field.
         """
-        return time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(value))
+        return time.strftime("%Y/%m/%d %H:%M:%S", time.gmtime(value))
 
     def filter_expression(self) -> str:
         start = self._stamp(self.start_wall - self.pad_seconds)
@@ -259,6 +270,16 @@ class PanwDevice:
                     f"{JOB_TIMEOUT_SECONDS}s; the run cannot report which logs it did not read"
                 )
             time.sleep(JOB_POLL_SECONDS)
+
+    def clock(self) -> float:
+        """The device's own current time, as a POSIX timestamp.
+
+        Read so that `verify_clock` can compare it against the replaying host's, because the
+        query window is only meaningful if the two agree — see `ThreatQuery._stamp`.
+        """
+        root = self._request({"type": "op", "cmd": "<show><clock/></show>"},
+                             "reading the device clock")
+        return _clock_epoch("".join(root.itertext()).strip())
 
     def logs_written(self) -> Mapping[str, int]:
         """The device's own count of logs it has written, by type.
@@ -450,7 +471,7 @@ def _receive_epoch(entry: ET.Element) -> float:
     raw = _text(entry, "receive_time")
     for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M:%S %Z"):
         try:
-            return time.mktime(time.strptime(raw, fmt))
+            return calendar.timegm(time.strptime(raw, fmt))
         except (ValueError, OverflowError):
             continue
     return 0.0
@@ -495,6 +516,56 @@ def api_key(host: str, user: str, password: str, *, verify: bool = False) -> str
     return key.strip()
 
 
+#: How far the device's clock may sit from the replaying host's before the window is untrustworthy.
+#:
+#: Comfortably inside `WINDOW_PAD_SECONDS`, because the pad is what absorbs a small skew and this
+#: is the point at which the pad can no longer be relied on. Measured after pointing both hosts
+#: at `metadata.google.internal` and setting the device to UTC: 5 seconds apart. A timezone
+#: mismatch shows up here as thousands.
+MAX_CLOCK_SKEW_SECONDS = 30
+
+
+def _clock_epoch(text: str) -> float:
+    """PAN-OS `show clock` output as a POSIX timestamp.
+
+    Its format is `Mon Aug 17 22:11:59 UTC 2026`. Parsed as UTC because the device is configured
+    to UTC and `ThreatQuery` depends on that; a device in another zone yields a wrong instant
+    here, which is precisely what `verify_clock` is meant to catch rather than paper over.
+    """
+    for line in reversed(text.splitlines()):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        for fmt in ("%a %b %d %H:%M:%S %Z %Y", "%a %b %d %H:%M:%S %Y"):
+            try:
+                parsed = time.strptime(candidate, fmt)
+            except ValueError:
+                continue
+            return calendar.timegm(parsed)
+    raise ToolError(f"the device's clock could not be read from {text.strip()[:120]!r}")
+
+
+def verify_clock(device_ts: float, local_ts: float) -> tuple[bool, str | None]:
+    """Whether the device's clock is close enough for the query window to mean anything.
+
+    Returns a warning rather than raising, and the caller decides — but it must not be ignored.
+    A skew large enough to shift the window produces **zero rows**, which reads identically to a
+    capture containing nothing malicious. That is the one output this project must never produce
+    by accident (spec §13), so the condition is named and reported rather than inferred from an
+    empty result.
+    """
+    skew = abs(device_ts - local_ts)
+    if skew > MAX_CLOCK_SKEW_SECONDS:
+        return False, (
+            f"the firewall's clock is {skew:.0f}s from this host's, which is more than the "
+            f"{MAX_CLOCK_SKEW_SECONDS}s the padded query window can absorb. A window that misses "
+            f"the replay returns no threat logs, which is indistinguishable from a capture with "
+            f"nothing malicious in it. Check that both hosts use one NTP source and that the "
+            f"device's timezone is UTC."
+        )
+    return True, None
+
+
 def counter_delta(before: Mapping[str, int], after: Mapping[str, int]) -> int:
     """How many threat logs the device says it wrote across the replay.
 
@@ -536,6 +607,7 @@ def declined_note(declined: Sequence[str]) -> str | None:
 __all__ = [
     "ADMITTED_SEVERITIES",
     "LABELLING_SUBTYPES",
+    "MAX_CLOCK_SKEW_SECONDS",
     "TIER",
     "DeviceInfo",
     "PanwDevice",
@@ -550,4 +622,5 @@ __all__ = [
     "parse_system_info",
     "threat_id",
     "threat_name",
+    "verify_clock",
 ]

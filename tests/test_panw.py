@@ -231,3 +231,45 @@ def test_retrieving_more_than_was_written_is_not_a_loss():
     """The padded window can legitimately include a log from before the replay began."""
     lost, message = panw.loss(retrieved=14, written=13)
     assert not lost and message is None
+
+
+def test_the_query_window_is_written_in_utc():
+    """Measured 2026-08-17: this exact bug returned 0 rows for a window holding 13 logs.
+
+    `receive_time` is compared as text, so the filter and the device must render an instant in
+    the same zone. Formatting in the *replay host's* local zone silently shifted the window by
+    seven hours — the host was UTC, the device PDT — and produced an empty result that read as
+    "nothing malicious in this capture".
+    """
+    # 2026-08-17 22:11:59 UTC exactly.
+    query = panw.ThreatQuery(start_wall=1787004719.0, end_wall=1787004719.0, pad_seconds=0)
+    assert query.filter_expression() == (
+        "(receive_time geq '2026/08/17 22:11:59') and (receive_time leq '2026/08/17 22:11:59')"
+    )
+
+
+def test_a_receive_time_is_read_as_utc_not_as_local_time():
+    entry = ET.fromstring("<entry><receive_time>2026/08/17 22:11:59</receive_time></entry>")
+    found = panw._receive_epoch(entry)
+    assert found == pytest.approx(1787004719.0)
+
+
+def test_a_clock_within_the_pad_is_accepted():
+    ok, message = panw.verify_clock(device_ts=1787004719.0, local_ts=1787004724.0)
+    assert ok and message is None
+
+
+def test_a_timezone_sized_skew_is_refused_and_says_why():
+    """Seven hours is what a zone mismatch looks like, and it must not read as an empty capture."""
+    ok, message = panw.verify_clock(device_ts=1787004719.0, local_ts=1787004719.0 + 7 * 3600)
+    assert not ok
+    assert "timezone" in message and "nothing malicious" in message
+
+
+def test_the_device_clock_is_parsed_from_show_clock_output():
+    assert panw._clock_epoch("Mon Aug 17 22:11:59 UTC 2026") == pytest.approx(1787004719.0)
+
+
+def test_an_unreadable_device_clock_is_an_error_rather_than_a_guess():
+    with pytest.raises(Exception, match="clock could not be read"):
+        panw._clock_epoch("not a time at all")
