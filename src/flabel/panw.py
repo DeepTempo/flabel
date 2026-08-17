@@ -1,0 +1,553 @@
+"""The PANW NGFW as a Tier 1 detection source (Phase 2).
+
+Suricata reads a file; the firewall watches a wire and is then *asked* what it saw. So this
+module is a client, and it is the first thing in flabel that talks to a device.
+
+**This module breaks spec §2.2's "a labelling run performs no network I/O", deliberately and
+with Craig's agreement (2026-08-17).** The guarantee was written when every mode read files, and
+it now belongs to the mode that can keep it: `--offline` performs no network I/O, and the
+default path contacts the device. That is what `--offline` always meant, and the flag name
+predates this module by a phase. `tests/test_architecture.py` records the same decision, so
+`panw.py` is the second and last permitted network module, alongside `rules/fetch.py`.
+
+Tests never contact a device (PRD §5, `[LAB]` criteria only). Everything here that decides what
+a *label* says — the tuple spelling, the admission gate, the provenance mapping — is a pure
+function over parsed XML, so it is tested against recorded responses rather than a firewall.
+
+**Why the query is bounded by wall clock and the join is not.** A threat log carries the time
+the firewall saw the packet, which is replay time, not capture time. That timestamp is good for
+exactly one thing: selecting the logs belonging to this replay. It is *not* how a detection
+finds its flow — `correlate._place` matches the 5-tuple, and consults a clock only to separate a
+tuple that occurs more than once in one capture. Measured 2026-08-17 on a real capture: all 13
+tier-1 detections placed on tuple alone, 0 ambiguous, 0 unmatched. PRD §5 says the same thing
+from the other direction, which is why sub-second clock sync was never required.
+
+So the window is padded rather than tight. A tight window would drop a detection because a
+firewall's clock differs by a second, and losing a real label to a clock skew is a much worse
+error than including a log that the tuple then declines to match.
+"""
+
+from __future__ import annotations
+
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
+
+from flabel.errors import ToolError
+from flabel.models import Detection, Direction, ToolFailure
+
+#: The firewall is Tier 1 — a lower tier is a *higher*-trust observation, and `Label.best_tier`
+#: is the minimum across a flow's sources. `suricata.TIER` is 2 and says the same from its side.
+TIER = 1
+
+#: Seconds of slack added either side of the replay window when selecting logs. Generous on
+#: purpose: see the module header. Both hosts are NTP-synced to one source, so this is not
+#: covering for a broken clock — it is covering for the second-granularity of `receive_time`
+#: and for a session logged slightly after the packet that tripped it.
+WINDOW_PAD_SECONDS = 120
+
+#: PAN-OS returns logs a page at a time and caps a page at 5000 entries.
+PAGE_SIZE = 5000
+
+#: A log query is a job: submit, poll, retrieve. These bound the poll rather than the request.
+JOB_POLL_SECONDS = 2
+JOB_TIMEOUT_SECONDS = 600
+HTTP_TIMEOUT_SECONDS = 120
+
+#: Threat-log subtypes that assert a *threat*. PAN-OS files several other things in the threat
+#: log — `url`, `data`, `file`, `wildfire` — which are not signature matches on an attack and
+#: would each need their own provenance argument before they could label anything.
+LABELLING_SUBTYPES = frozenset({"vulnerability", "spyware", "virus", "wildfire-virus"})
+
+#: Severities admitted as `verdict: malicious` by default.
+#:
+#: **`informational` is excluded, and this is the tier-1 analogue of issue #75.** Measured
+#: 2026-08-17: of 13 detections on one real capture, 3 were `informational` — "Non-RFC Compliant
+#: DNS Traffic on Port 53/5353" (x2) and "Non-RFC Compliant ECHO Traffic on Port 7". Those are
+#: observations about protocol conformance, not attacks, and promoting one to `malicious` teaches
+#: a model that non-standard traffic is hostile. That is precisely the argument that excluded 436
+#: `policy-violation` rules from Tier 2, applied to the field PAN-OS gives us instead of a
+#: classtype.
+#:
+#: `low` is admitted pending Craig's decision, which is recorded as open on issue #122: the
+#: measured capture contained none, so excluding it would be a policy choice with no evidence
+#: behind it either way. The two `SIPVicious Scanner Detection` entries at `medium` are the live
+#: question — scanner identification is what #113 removed from Tier 2 — and they are admitted
+#: here only because inventing an exclusion this module cannot justify would be the same mistake
+#: in the other direction.
+ADMITTED_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
+
+#: PAN-OS protocol spellings that differ from Zeek's `conn.log`. Same job as
+#: `suricata.PROTO_ALIASES` and the same rule: Zeek's `transport_proto` has only tcp/udp/icmp/
+#: unknown_transport, so anything else must agree with Zeek or go unmatched. PAN-OS writes
+#: lowercase names already, so this table exists for the cases where it does not.
+PROTO_ALIASES = {"ipv6-icmp": "icmp", "icmpv6": "icmp"}
+
+
+@dataclass(frozen=True)
+class DeviceInfo:
+    """What the device is, for the run block's `tools` section.
+
+    `threat_version` is load-bearing, not decoration: it is the tier-1 equivalent of a ruleset
+    snapshot id, and a label that cannot name the signature set that produced it is exactly the
+    unattributable verdict this project refuses to ship. The base VM-Series image ships
+    Applications-only content, where this field reads `0` and *no* threat can ever fire — a run
+    against that device would look clean and be blind.
+    """
+
+    hostname: str
+    serial: str
+    sw_version: str
+    app_version: str
+    threat_version: str
+    model: str
+
+    @property
+    def has_threat_content(self) -> bool:
+        """Whether a threat signature set is installed at all."""
+        return bool(self.threat_version) and self.threat_version.strip() not in {"0", ""}
+
+
+@dataclass(frozen=True)
+class ThreatQuery:
+    """The window a tier-1 run asked the device for, recorded as an input to the run.
+
+    Recorded for the reason spec §10 records the unmatched threshold: it is a knob, and a
+    consumer cannot otherwise tell a run that asked for the right window from one that asked for
+    the wrong one and found nothing.
+    """
+
+    start_wall: float
+    end_wall: float
+    pad_seconds: int = WINDOW_PAD_SECONDS
+
+    def _stamp(self, value: float) -> str:
+        """PAN-OS log-query time format, in the device's local time.
+
+        `time.localtime` rather than UTC because `receive_time` is written in the device's local
+        zone and the query is compared against it as text. Both hosts are pointed at one NTP
+        source, which is what makes the two clocks comparable at all.
+        """
+        return time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(value))
+
+    def filter_expression(self) -> str:
+        start = self._stamp(self.start_wall - self.pad_seconds)
+        end = self._stamp(self.end_wall + self.pad_seconds)
+        return f"(receive_time geq '{start}') and (receive_time leq '{end}')"
+
+
+class PanwDevice:
+    """A firewall, reached over its XML API.
+
+    Holds an API key rather than a password. PAN-OS keys are long-lived, so a run needs no
+    password at all, and the credential that *can* be re-derived is the one that should not be
+    left on the replaying host.
+    """
+
+    def __init__(self, host: str, api_key: str, *, verify: bool = False) -> None:
+        self.host = host
+        self._key = api_key
+        # A lab firewall presents a self-signed certificate. Off by default and named in the
+        # signature so that turning it on is a one-word change rather than a rewrite — and so
+        # that this decision is visible in the run's own configuration rather than implied.
+        self.verify = verify
+
+    def _request(self, params: Mapping[str, str], what: str) -> ET.Element:
+        """One API call, returning the parsed `<response>` element.
+
+        Every failure — transport, HTTP, PAN-OS-level `status="error"`, unparseable body —
+        becomes a `ToolError` carrying a `ToolFailure`, because spec §11 says a run reports what
+        it lost and an operator reading `run.json` needs to know which call failed.
+        """
+        query = dict(params)
+        query["key"] = self._key
+        url = f"https://{self.host}/api/?{urllib.parse.urlencode(query)}"
+        # The key is stripped from anything that could be published. A ToolFailure lands in
+        # run.json, and a run artifact that carries a live firewall credential would be a
+        # far worse defect than the failure it was describing.
+        safe = url.replace(self._key, "<redacted>")
+
+        context = None
+        if not self.verify:
+            import ssl  # noqa: PLC0415 - local so the import is visible where it is justified
+
+            context = ssl._create_unverified_context()  # noqa: S323 - lab, self-signed
+
+        try:
+            with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS, context=context) as r:
+                body = r.read()
+        except Exception as exc:  # noqa: BLE001 - urllib raises a wide family; all are the same failure
+            raise ToolError(
+                f"the firewall at {self.host} could not be reached while {what}: {exc}",
+                failures=(ToolFailure(tool="panw-api", argv=(safe,), exit_code=None,
+                                      message=str(exc)),),
+            ) from exc
+
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise ToolError(
+                f"the firewall at {self.host} returned an unparseable response while {what}",
+                failures=(ToolFailure(tool="panw-api", argv=(safe,), exit_code=None,
+                                      message=str(exc)),),
+            ) from exc
+
+        if root.get("status") != "success":
+            message = "".join(root.itertext()).strip() or "no message"
+            raise ToolError(
+                f"the firewall at {self.host} refused the request while {what}: {message}",
+                failures=(ToolFailure(tool="panw-api", argv=(safe,), exit_code=None,
+                                      message=message),),
+            )
+        return root
+
+    def system_info(self) -> DeviceInfo:
+        root = self._request({"type": "op", "cmd": "<show><system><info/></system></show>"},
+                             "reading system info")
+        return parse_system_info(root)
+
+    def clear_sessions(self) -> None:
+        """Force every open session closed, which flushes its session-end traffic log.
+
+        today.md step 4, and it earns its place: a replayed capture frequently lacks clean
+        FIN/RST, so sessions would otherwise sit until PAN-OS's TCP timeout (3600 s by default)
+        and their logs would not exist when the query runs. This is also why session-*start*
+        logging is not needed — measured and decided 2026-08-17.
+        """
+        self._request({"type": "op", "cmd": "<clear><session><all/></session></clear>"},
+                      "clearing sessions")
+
+    def threat_entries(self, query: ThreatQuery) -> tuple[ET.Element, ...]:
+        """Every threat-log entry in the window, following PAN-OS's job-then-fetch protocol."""
+        entries: list[ET.Element] = []
+        skip = 0
+        while True:
+            page = self._threat_page(query, skip)
+            entries.extend(page)
+            if len(page) < PAGE_SIZE:
+                return tuple(entries)
+            skip += len(page)
+
+    def _threat_page(self, query: ThreatQuery, skip: int) -> list[ET.Element]:
+        submitted = self._request(
+            {"type": "log", "log-type": "threat", "query": query.filter_expression(),
+             "nlogs": str(PAGE_SIZE), "skip": str(skip), "dir": "forward"},
+            "submitting the threat-log query",
+        )
+        job = submitted.findtext(".//job")
+        if not job:
+            raise ToolError(
+                f"the firewall at {self.host} accepted the threat-log query without returning a "
+                f"job id, so its results cannot be collected"
+            )
+        return self._collect(job.strip())
+
+    def _collect(self, job: str) -> list[ET.Element]:
+        deadline = time.monotonic() + JOB_TIMEOUT_SECONDS
+        while True:
+            root = self._request({"type": "log", "action": "get", "job-id": job},
+                                 f"retrieving threat-log job {job}")
+            status = (root.findtext(".//job/status") or "").strip().upper()
+            if status == "FIN":
+                return list(root.findall(".//log/logs/entry"))
+            if time.monotonic() > deadline:
+                raise ToolError(
+                    f"threat-log job {job} on {self.host} was still {status or 'unknown'} after "
+                    f"{JOB_TIMEOUT_SECONDS}s; the run cannot report which logs it did not read"
+                )
+            time.sleep(JOB_POLL_SECONDS)
+
+    def logs_written(self) -> Mapping[str, int]:
+        """The device's own count of logs it has written, by type.
+
+        The integrity check for tier 1, and it exists because the one failure this pipeline
+        cannot otherwise see is a log the firewall wrote and we did not read. At `--multiplier
+        1000` the device generates logs at roughly a thousand times real-world rate, so
+        saturating its log path is a live possibility rather than a theoretical one. Comparing
+        this delta against the number of entries retrieved turns silent loss into a reported
+        loss condition.
+
+        Note the counters are cumulative since boot, so only a before/after difference means
+        anything. Measured 2026-08-17: `Vulnerability logs written` went 0 -> 13 across one
+        replay, matching the 13 entries the query returned.
+        """
+        root = self._request(
+            {"type": "op", "cmd": "<debug><log-receiver><statistics/></log-receiver></debug>"},
+            "reading log counters",
+        )
+        counters: dict[str, int] = {}
+        for line in "".join(root.itertext()).splitlines():
+            if "logs written" not in line.casefold():
+                continue
+            label, _, value = line.rpartition(":")
+            number = value.strip()
+            if number.isdigit():
+                counters[label.strip().casefold().replace(" logs written", "")] = int(number)
+        return counters
+
+
+def parse_system_info(root: ET.Element) -> DeviceInfo:
+    """`<show><system><info/></system></show>` as a `DeviceInfo`."""
+    def field(name: str) -> str:
+        return (root.findtext(f".//{name}") or "").strip()
+
+    return DeviceInfo(
+        hostname=field("hostname"),
+        serial=field("serial"),
+        sw_version=field("sw-version"),
+        app_version=field("app-version"),
+        threat_version=field("threat-version"),
+        model=field("model"),
+    )
+
+
+def _text(entry: ET.Element, name: str) -> str:
+    return (entry.findtext(name) or "").strip()
+
+
+def _port(entry: ET.Element, name: str) -> int:
+    """A port column, or 0 where the protocol has none.
+
+    0 rather than None because `Detection` types these as `int`, and because Zeek writes 0 in
+    both port columns for a protocol it cannot name — so 0 is the value that *matches* what
+    correlation will compare against, not a stand-in for missing.
+    """
+    raw = _text(entry, name)
+    return int(raw) if raw.isdigit() else 0
+
+
+def threat_id(entry: ET.Element) -> int | None:
+    """The numeric signature id, which becomes `Detection.sid`.
+
+    PAN-OS spells this two ways depending on version and field: a bare number in `<threatid>`,
+    or `Name(12345)` with the id in parentheses. Both are read, and a `threatid` that yields no
+    number returns None so the caller can report it rather than attribute the detection to
+    signature 0 — a label naming the wrong signature is worse than a detection reported as
+    unattributable.
+    """
+    raw = _text(entry, "threatid")
+    if raw.isdigit():
+        return int(raw)
+    if "(" in raw and raw.rstrip().endswith(")"):
+        inner = raw[raw.rfind("(") + 1 : -1].strip()
+        if inner.isdigit():
+            return int(inner)
+    tid = _text(entry, "tid")
+    return int(tid) if tid.isdigit() else None
+
+
+def threat_name(entry: ET.Element) -> str:
+    """The human-readable signature name, which becomes `SourceEntry.threat`.
+
+    Stripped of the trailing `(id)` when PAN-OS bundles both into one field, because the id is
+    published separately as `sid` and repeating it inside the name would make two fields that
+    can disagree.
+    """
+    raw = _text(entry, "threatid")
+    if raw.endswith(")") and "(" in raw:
+        return raw[: raw.rfind("(")].strip() or raw
+    return raw
+
+
+def admits(entry: ET.Element) -> bool:
+    """Whether this entry may assert `verdict: malicious`.
+
+    Two gates, both on fields PAN-OS gives us: the log subtype must be a signature match on a
+    threat, and the severity must be one this module admits. See `ADMITTED_SEVERITIES` for why
+    `informational` is excluded and why `medium` is not.
+    """
+    subtype = _text(entry, "subtype").casefold()
+    severity = _text(entry, "severity").casefold()
+    if subtype and subtype not in LABELLING_SUBTYPES:
+        return False
+    return severity in ADMITTED_SEVERITIES
+
+
+def detections(entries: Sequence[ET.Element]) -> tuple[tuple[Detection, ...], tuple[str, ...]]:
+    """Threat-log entries as tier-1 `Detection`s, plus a note for every entry declined.
+
+    Returns the declines rather than dropping them, for spec §2.8's reason: a suppressed
+    detection must be counted, never silent. The caller puts the count in the run block so a
+    consumer can see that the gate acted and by how much.
+    """
+    out: list[Detection] = []
+    declined: list[str] = []
+    for entry in entries:
+        name = threat_name(entry) or "unnamed"
+        if not admits(entry):
+            declined.append(
+                f"{name}: subtype={_text(entry, 'subtype') or 'none'} "
+                f"severity={_text(entry, 'severity') or 'none'}"
+            )
+            continue
+        sid = threat_id(entry)
+        if sid is None:
+            declined.append(f"{name}: no numeric threat id, so it cannot be attributed")
+            continue
+        out.append(_detection(entry, sid, name))
+    return tuple(out), tuple(declined)
+
+
+def _detection(entry: ET.Element, sid: int, name: str) -> Detection:
+    proto = _text(entry, "proto").casefold()
+    return Detection(
+        # A single logical source, not the device hostname: a label must stay meaningful when
+        # the same capture is replayed past a different firewall of the same kind. Which
+        # *device* produced it is recorded once in the run block, where it belongs.
+        source="panw/threat-prevention",
+        tier=TIER,
+        sid=sid,
+        # PAN-OS does not version signatures individually the way a Suricata rule carries
+        # `rev:`. 0 is the same convention `suricata.py` uses for a rule written without one —
+        # matching the tool's own semantics rather than inventing a version. The signature set
+        # *is* versioned, and that version is the content release recorded on the run.
+        rev=0,
+        # PAN-OS `category` is the direct analogue of a Suricata classtype — `brute-force`,
+        # `code-execution`, `scan` — and is what a tier-1 admission policy would gate on if
+        # severity turns out to be too blunt.
+        classtype=_text(entry, "category") or None,
+        app_proto=_text(entry, "app") or None,
+        threat=name,
+        # Replay wall-clock, deliberately. Reading it back as capture time needs
+        # `ReplayWindow`, which the caller holds; doing it here would bake a conversion into
+        # the record and lose the raw observation.
+        ts=_receive_epoch(entry),
+        src_ip=_text(entry, "src"),
+        src_port=_port(entry, "sport"),
+        dst_ip=_text(entry, "dst"),
+        dst_port=_port(entry, "dport"),
+        proto=PROTO_ALIASES.get(proto, proto),
+        direction=_direction(entry),
+    )
+
+
+def _direction(entry: ET.Element) -> Direction:
+    """Which way PAN-OS says the offending traffic was going (issue #115's field).
+
+    PAN-OS writes `client-to-server` / `server-to-client`; flabel's vocabulary is Suricata's
+    `to_server` / `to_client`. Anything unrecognised becomes `unknown`, which states that the
+    direction was not established rather than picking one — the defect #115 exists to prevent.
+    """
+    raw = _text(entry, "direction").casefold()
+    if raw in {"client-to-server", "c2s", "to_server"}:
+        return "to_server"
+    if raw in {"server-to-client", "s2c", "to_client"}:
+        return "to_client"
+    return "unknown"
+
+
+def _receive_epoch(entry: ET.Element) -> float:
+    """`receive_time` as a POSIX timestamp.
+
+    Parsed as device-local time, matching how the query filter is written. An unparseable
+    value yields 0.0 rather than raising: the timestamp scopes the query and separates repeated
+    tuples, so losing it costs a tie-break, while failing the run over it would throw away every
+    label in the capture.
+    """
+    raw = _text(entry, "receive_time")
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M:%S %Z"):
+        try:
+            return time.mktime(time.strptime(raw, fmt))
+        except (ValueError, OverflowError):
+            continue
+    return 0.0
+
+
+def iter_entries(xml_text: str) -> Iterator[ET.Element]:
+    """Threat-log entries out of a recorded API response, for tests and for offline replay.
+
+    The seam that keeps every labelling decision in this module testable without a firewall:
+    `tests/test_panw.py` feeds it responses captured from the real device.
+    """
+    root = ET.fromstring(xml_text)
+    yield from root.findall(".//log/logs/entry")
+
+
+def api_key(host: str, user: str, password: str, *, verify: bool = False) -> str:
+    """Exchange a password for a long-lived API key.
+
+    Separate from `PanwDevice` because it is the one call that needs a password, and the point
+    of the split is that a run never does. An operator does this once; the key is what the
+    pipeline is given.
+    """
+    url = f"https://{host}/api/?type=keygen"
+    data = urllib.parse.urlencode({"user": user, "password": password}).encode()
+    context = None
+    if not verify:
+        import ssl  # noqa: PLC0415
+
+        context = ssl._create_unverified_context()  # noqa: S323
+
+    try:
+        with urllib.request.urlopen(url, data=data, timeout=HTTP_TIMEOUT_SECONDS,
+                                    context=context) as r:
+            root = ET.fromstring(r.read())
+    except Exception as exc:  # noqa: BLE001
+        raise ToolError(f"could not obtain an API key from {host}: {exc}") from exc
+
+    key = root.findtext(".//key")
+    if root.get("status") != "success" or not key:
+        message = "".join(root.itertext()).strip() or "no message"
+        raise ToolError(f"{host} declined to issue an API key: {message}")
+    return key.strip()
+
+
+def counter_delta(before: Mapping[str, int], after: Mapping[str, int]) -> int:
+    """How many threat logs the device says it wrote across the replay.
+
+    Summed over the threat subtypes rather than read off one counter, because which counter
+    moves depends on which profile fired — measured 2026-08-17, when `Vulnerability logs
+    written` went to 13 while `Spyware`, `Attack` and `Anti-virus` all stayed at 0 and an
+    earlier version of this check read the wrong name and concluded nothing had been logged.
+    """
+    names = ("vulnerability", "spyware", "anti-virus", "wildfire anti-virus", "spyware-dns")
+    return sum(max(0, after.get(n, 0) - before.get(n, 0)) for n in names)
+
+
+def loss(retrieved: int, written: int) -> tuple[bool, str | None]:
+    """Whether the device wrote threat logs this run did not read.
+
+    The tier-1 loss condition. `written` greater than `retrieved` means labels are missing and
+    the output cannot claim to be complete; the reverse is not an error, because the padded
+    window can legitimately include a log from before the replay began.
+    """
+    if written > retrieved:
+        return True, (
+            f"the firewall wrote {written} threat log(s) but only {retrieved} were retrieved, so "
+            f"{written - retrieved} detection(s) are missing from this run"
+        )
+    return False, None
+
+
+def declined_note(declined: Sequence[str]) -> str | None:
+    """One run-block warning naming what the admission gate refused, or None if it refused none."""
+    if not declined:
+        return None
+    return (
+        f"{len(declined)} tier-1 detection(s) were not admitted as labels: "
+        + "; ".join(declined[:10])
+        + (" ..." if len(declined) > 10 else "")
+    )
+
+
+__all__ = [
+    "ADMITTED_SEVERITIES",
+    "LABELLING_SUBTYPES",
+    "TIER",
+    "DeviceInfo",
+    "PanwDevice",
+    "ThreatQuery",
+    "admits",
+    "api_key",
+    "counter_delta",
+    "declined_note",
+    "detections",
+    "iter_entries",
+    "loss",
+    "parse_system_info",
+    "threat_id",
+    "threat_name",
+]
