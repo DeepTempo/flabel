@@ -136,6 +136,7 @@ class SourceAdmission:
     rules_excluded_no_confidence: int
     rules_excluded_low_confidence: int
     rules_excluded_low_severity: int
+    rules_excluded_marker: int   # excluded by their `msg:` marker (#117)
     ja4_rules_admitted: int
     ja3_rules_admitted: int
     fetched_at: str              # ISO-8601 UTC
@@ -440,6 +441,7 @@ Pure. Given a source and its fetched rule text, return the admitted rules plus c
   Rules with no `confidence` key are excluded and counted separately from rules with `confidence Low`/`Medium` — the distinction feeds issue #10.
 - Commented-out rules (`#alert`) are never admitted.
 - **A rule whose `classtype:` the registry's `[admission]` table excludes is never admitted**, counted in `rules_excluded_classtype`.
+- **A rule whose leading `msg:` marker the registry excludes is never admitted** (issue #117), counted in `rules_excluded_marker`. Tested *after* the classtype, so a rule that is both keeps the earlier bucket and "excluded by classtype" does not understate what that policy removes.
 - Every exclusion increments exactly one counter; `fetched == admitted + sum(excluded)` is asserted.
 
 ### Per-rule admission — `[admission]` (issue #75)
@@ -528,6 +530,57 @@ does not exist upstream.
 **These counts describe one mirror, not a constant.** `abuse.ch/urlhaus` and two of `pawpatrules`'
 companion lists (`openphish`, `nrd_phishing_14day`) refresh upstream daily, which is why companion
 data is inside the `snapshot_id` hash (§7). A later fetch is a different measurement.
+
+### Per-rule admission by marker — `exclude_msg_markers` (issue #117)
+
+The sibling of `exclude_classtypes`, and it exists because the classtype could not reach the rules
+it needed to. `pawpatrules` writes an emoji at the front of every `msg:` saying what kind of rule it
+is — a siren for a detection, an eye or a lock or a globe for an observation — and it is the **only
+field that says so**. Measured on snapshot `267915ba4f708fc9`: **0 of the 605 observational rules
+carry `misc-activity`**. They declare `bad-unknown` and `attempted-recon`, which elsewhere in the
+ruleset carry genuine detections, so no classtype policy can separate them.
+
+What that cost, before this: 17 source entries across the 22-capture corpus labelling `go.dev` — the
+official Go website, on a Google-operated gTLD — as `verdict: malicious`, `label_basis: direct`. One
+of the four rules ends its own `msg:` with the word *"observed"*.
+
+```toml
+[[source]]
+name = "pawpatrules"
+exclude_msg_markers = ["ℹ", "👁", "🔒", "🌐", "🤨"]
+```
+
+**The marker is positional and is never a substring search.** The same emoji appear inside rule
+prose — *"Google Chrome 🌐 for Windows 7 unsupported and vulnerable"* is a detection. Matching
+anywhere in the `msg:` hits **8,125** rules where the anchored parse hits **605**, and of the 7,520
+difference 3,997 are siren-marked detections. An unanchored policy would have cut a third of the
+feed's real signatures while reading, in the registry, as a five-marker rule.
+
+`marker_of` therefore skips the feed's brand prefix — every rule begins with a paw print and a dash,
+so the first pictograph discriminates nothing — and returns the first marker after it. The first of
+several adjacent markers wins: 34 rules are marked fire-then-eye and are FireEye BEACON backdoor
+signatures, which taking any marker in the run would have excluded.
+
+**Cost, measured by running the shipped policy over the 21,467-rule feed:** `rules_excluded_marker`
+is **445**. The obvious number, 571, is the count of rules *carrying* one of the five markers — but
+126 of those are the `ℹ` rules `exclude_classtypes` already removes, and classtype is tested first.
+
+**A convention is not an interface, so it is watched rather than trusted.** The feed publishes no
+schema for these markers and could change them without notice; the failure that would follow is the
+quiet one, where the policy stays in the registry reading as if in force while excluding nothing —
+issue #75 returning through the mechanism built to prevent it. `tests/integration/marker_gate.py`
+runs in the scheduled feeds workflow and fails the build when the policy stops excluding anything,
+when it starts excluding an order of magnitude more, or when a marker nobody has classified appears
+on an admitted rule. It found a real parser defect on its first run against the live feed: twelve
+phishing rules write the brand prefix without a space after the dash, and the first version of the
+parse reported the paw print itself as their marker.
+
+**What this deliberately does not do.** It removes 17 of 338 corpus source entries. It does not
+touch the 207 entries from two siren-marked VxWorks scanning rules, or the 46 that #115's `direction`
+field now makes filterable — no marker policy reaches those, because the feed classifies them as
+detections and, as observations of inbound scanning, they are not wrong. Whether an inbound scan a
+host refused belongs in malicious-flow ground truth is a product question about what the labels
+train, and no admission policy settles it (§11's note on issue #118).
 
 ---
 

@@ -10,18 +10,26 @@ from __future__ import annotations
 
 import re
 import tomllib
+import unicodedata
 from importlib import resources
 from pathlib import Path
 from typing import Any, get_args
 
 from flabel.errors import ConfigError
-from flabel.models import AdmissionBasis, AdmissionPolicy, SourceClass, SourceSpec
+from flabel.models import (
+    COMBINING_CATEGORIES,
+    EMOJI_JOINERS,
+    AdmissionBasis,
+    AdmissionPolicy,
+    SourceClass,
+    SourceSpec,
+)
 
 SOURCE_CLASSES = frozenset(get_args(SourceClass))
 ADMISSION_BASES = frozenset(get_args(AdmissionBasis))
 
 REQUIRED_FIELDS = ("name", "url", "licence", "source_class", "admission_basis")
-OPTIONAL_FIELDS = ("enabled", "exclude_classtypes")
+OPTIONAL_FIELDS = ("enabled", "exclude_classtypes", "exclude_msg_markers")
 
 #: Sources whose rules carry ET-style `metadata:` keys (`confidence`, `signature_severity`).
 #: `admission_basis = "metadata-filter"` is only meaningful for these — filtering on metadata
@@ -96,7 +104,7 @@ def _read_registry(path: Path) -> dict[str, Any]:
 #: reason a misspelled `[[source]]` field is (spec §5): a registry that loads with a setting
 #: silently ignored is worse than one that refuses to load, because it reads as working — and
 #: here the ignored setting would be the one deciding which rules may assert a verdict.
-ADMISSION_FIELDS = ("exclude_classtypes",)
+ADMISSION_FIELDS = ("exclude_classtypes", "exclude_msg_markers")
 
 
 def load_admission_policy(path: Path | None = None) -> AdmissionPolicy:
@@ -132,7 +140,8 @@ def load_admission_policy(path: Path | None = None) -> AdmissionPolicy:
         )
 
     return AdmissionPolicy(
-        exclude_classtypes=_classtypes(table.get("exclude_classtypes", []), path, "[admission]")
+        exclude_classtypes=_classtypes(table.get("exclude_classtypes", []), path, "[admission]"),
+        exclude_msg_markers=_markers(table.get("exclude_msg_markers", []), path, "[admission]"),
     )
 
 
@@ -157,6 +166,52 @@ def _classtypes(value: Any, path: Path, where: str) -> frozenset[str]:
                 f"rule can declare would exclude nothing while appearing to be in force."
             )
     return frozenset(item.casefold() for item in value)
+
+
+def _markers(value: Any, path: Path, where: str) -> frozenset[str]:
+    """Validate one `exclude_msg_markers` list (#117).
+
+    Sibling of `_classtypes`, and separate rather than generalised because the four ways to get
+    it wrong are different ones. What both share is the failure they exist to prevent: a policy
+    that cannot match anything reads, in a registry, exactly like a policy that is in force —
+    which is issue #75 in the mechanism built to prevent issue #75.
+
+    The sharp case is an **ASCII** entry. `admit.marker_of` stops at the first ASCII character,
+    because past it the `msg:` is prose, so `exclude_msg_markers = ["OBS"]` could never match a
+    rule however many there were. Rejected at load rather than admitted as a no-op.
+
+    A **multi-character** entry is refused for the same reason one character further on: the
+    marker is a single pictograph, and a two-emoji entry describes a rule shape that exists
+    (34 rules are marked fire-then-eye) but that `marker_of` reports as its first character.
+    Accepting it would silently exclude nothing. Joiners and variation selectors are stripped
+    first, so a pirate flag written as its four-codepoint ZWJ sequence is accepted and stored
+    as the flag itself — which is what `marker_of` returns for those 6,910 rules.
+    """
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"{path}: {where} `exclude_msg_markers` must be a list of strings")
+    markers = set()
+    for item in value:
+        reduced = "".join(
+            c
+            for c in item
+            if c not in EMOJI_JOINERS and unicodedata.category(c) not in COMBINING_CATEGORIES
+        )
+        if not reduced:
+            raise ConfigError(f"{path}: {where} `exclude_msg_markers` contains an empty marker")
+        if reduced.isascii():
+            raise ConfigError(
+                f"{path}: {where} {item!r} is not a marker. A marker is the pictograph leading a "
+                f"rule's `msg:`, and the parse stops at the first ASCII character — so an ASCII "
+                f"entry would exclude nothing while appearing to be in force."
+            )
+        if len(reduced) > 1:
+            raise ConfigError(
+                f"{path}: {where} {item!r} is more than one marker. `marker_of` reports the "
+                f"first pictograph of a rule's marker run, so a multi-marker entry could never "
+                f"equal what it is compared against."
+            )
+        markers.add(reduced)
+    return frozenset(markers)
 
 
 def load_admission_policies(path: Path | None = None) -> dict[str, AdmissionPolicy]:
@@ -197,7 +252,11 @@ def load_admission_policies(path: Path | None = None) -> dict[str, AdmissionPoli
         if not isinstance(name, str):
             continue
         own = _classtypes(entry.get("exclude_classtypes", []), path, f"source {name!r}")
-        policies[name] = AdmissionPolicy(exclude_classtypes=default.exclude_classtypes | own)
+        markers = _markers(entry.get("exclude_msg_markers", []), path, f"source {name!r}")
+        policies[name] = AdmissionPolicy(
+            exclude_classtypes=default.exclude_classtypes | own,
+            exclude_msg_markers=default.exclude_msg_markers | markers,
+        )
     return policies
 
 

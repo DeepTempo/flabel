@@ -98,6 +98,16 @@ jobs:
       - name: Record what was admitted
         run: uv run flabel rules list --rules-dir .flabel/rules
 
+      # Issue #117 keys an admission policy on an emoji in third-party rule text, which is a
+      # convention and not an interface. This is the half that makes that defensible: it fails
+      # the build if the feed stops writing the convention (the policy would then sit in the
+      # registry excluding nothing, which is #75 all over again), if it starts excluding an
+      # order of magnitude more, or if a marker nobody has classified appears on an admitted
+      # rule. It runs here rather than in PR CI because only this workflow has the live feed.
+      - name: The pawpatrules marker convention has not moved (#117)
+        id: markers
+        run: uv run python tests/integration/marker_gate.py .flabel/rules
+
       - name: Label the benign canary
         run: |
           uv run flabel --offline tests/fixtures/benign.pcap \
@@ -226,6 +236,7 @@ jobs:
           FAILED_STEP: >-
             ${{ steps.corpus.outcome == 'failure' && 'corpus'
               || steps.canary.outcome == 'failure' && 'canary'
+              || steps.markers.outcome == 'failure' && 'markers'
               || 'pipeline' }}
         with:
           script: |
@@ -247,6 +258,14 @@ jobs:
                 "`tests/fixtures/benign-corpus/tolerated.json` does not account for. This is " +
                 "issue #75 recurring. The step log names the capture, source and sid. If the " +
                 "label is fair, add it to that file WITH A REASON — do not delete a capture.",
+              markers:
+                "The emoji convention `pawpatrules` marks its rules with — which " +
+                "`sources.toml` keys an admission policy on (#117) — has moved. The step log " +
+                "says which way. If it now excludes NOTHING, the observational rules are being " +
+                "admitted again and `go.dev` is a `verdict: malicious` label; if a new marker " +
+                "appeared, read a sample and decide whether it detects or observes before " +
+                "adding it to `KNOWN_ADMITTED_MARKERS` or to the registry. Do not silence this " +
+                "by widening the known set without reading the rules.",
               pipeline:
                 "The run did not complete, so neither review reached its verdict. This is a " +
                 "pipeline or ruleset failure rather than a false positive — read the failing " +

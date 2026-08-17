@@ -84,6 +84,16 @@ LabelBasis = Literal["direct", "indicator-reference"]
 #: Deriving one would be a different field and a different claim.
 Direction = Literal["to_server", "to_client", "unknown"]
 
+#: Codepoints that join or modify an emoji rather than being one of their own, and the Unicode
+#: categories of the same (#117). A ZWJ sequence like the pirate flag is four codepoints and one
+#: glyph, and 6,910 pawpatrules rules lead with it; a rule's marker is its first character.
+#:
+#: Here rather than in `rules/admit.py`, where the parse lives, because `config.py` validates the
+#: registry's marker list against the same definition and `admit` imports `config` — so the
+#: obvious home made it a cycle. Same move, and the same reason, as `DEFAULT_THRESHOLD`.
+EMOJI_JOINERS = frozenset({"\u200d", "️"})
+COMBINING_CATEGORIES = frozenset({"Mn", "Cf"})
+
 #: Container format of the capture as sniffed by magic bytes, never by file extension.
 CaptureFormat = Literal["pcap", "pcapng", "pcap.gz", "pcapng.gz"]
 
@@ -250,6 +260,27 @@ class AdmissionPolicy:
         """
         return classtype is not None and classtype.casefold() in self.exclude_classtypes
 
+    #: Leading `msg:` markers whose rules are never admitted (#117). `pawpatrules` writes one
+    #: emoji per rule — `\N{POLICE CARS REVOLVING LIGHT}` for a detection, `\N{EYE}` / `\N{LOCK}`
+    #: / `\N{GLOBE WITH MERIDIANS}` / `\N{FACE WITH RAISED EYEBROW}` for an observation — and it
+    #: is the ONLY field separating the two. Measured: 0 of the 605 observational rules carry
+    #: `misc-activity`, so #113's classtype policy cannot reach a single one of them, and they
+    #: span `bad-unknown` and `attempted-recon` where genuine detections also live.
+    #:
+    #: Not casefolded, unlike `exclude_classtypes`: these are pictographs, `str.casefold` does
+    #: nothing to them, and pretending otherwise would suggest a normalisation that is not
+    #: happening.
+    exclude_msg_markers: frozenset[str] = frozenset()
+
+    def excludes_marker(self, marker: str | None) -> bool:
+        """Whether a rule whose leading `msg:` marker is `marker` is excluded.
+
+        A rule with no marker is never excluded — 33 pawpatrules rules and eight entire feeds
+        carry none, so treating absence as a match would drop them all on a policy that never
+        named them. Same rule, and the same reason, as `excludes` for an absent `classtype:`.
+        """
+        return marker is not None and marker in self.exclude_msg_markers
+
 
 # --- ruleset snapshot ---------------------------------------------------------------------
 
@@ -301,6 +332,10 @@ class SourceAdmission:
     #: Its own counter, like every other exclusion, because §6's
     #: `fetched == admitted + sum(excluded)` identity has to keep describing the feed.
     rules_excluded_classtype: int = 0
+    #: Rules dropped because the marker leading their `msg:` is one the policy excludes (#117).
+    #: Its own counter for the same reason as every other exclusion: §6's
+    #: `fetched == admitted + sum(excluded)` identity has to keep describing the feed.
+    rules_excluded_marker: int = 0
 
     def __post_init__(self) -> None:
         _check(self.source_class, get_args(SourceClass), "source_class", "SourceAdmission")
