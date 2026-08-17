@@ -32,6 +32,7 @@ from flabel.labels import (
     serialise_bytes,
 )
 from flabel.models import (
+    DEVICE_LICENCE,
     Detection,
     Flow,
     Label,
@@ -913,3 +914,46 @@ def test_every_licence_in_the_shipped_registry_has_attribution_text():
         f"sources.toml ships licences with no ATTRIBUTION entry: {missing}. "
         f"Add the obligation text rather than letting NOTICE fall back to UNRECORDED."
     )
+
+
+def test_notice_lists_a_tier_1_source_with_its_absence_of_obligation():
+    """A device source has no snapshot entry and never will (Phase 2, #122).
+
+    `render_notice` cross-checks every source against the manifest and raises for one it cannot
+    attribute — which is right for a feed and wrong for a firewall, whose signatures were never
+    admitted from a snapshot. Measured: this is what stopped the first complete tier-1 run from
+    writing its labels, after the whole pipeline had already succeeded.
+
+    Listed rather than skipped, because a threat *name* is vendor text appearing verbatim in the
+    output and NOTICE records whose text is in there. What it records here is the absence of an
+    obligation, which is a statement rather than a gap.
+    """
+    entry = make_entry(
+        tier=1,
+        source="panw/threat-prevention",
+        sid=91535,
+        rev=0,
+        ruleset="AppThreat-9136-10199/config-2817",
+        admission_basis="device-policy",
+        licence=DEVICE_LICENCE,
+        classtype="code-execution",
+        threat="Realtek Jungle SDK Remote Code Execution Vulnerability",
+    )
+    label = make_label(None, entry)
+
+    text = notice_module.render_notice((label,), make_manifest())
+
+    assert "panw/threat-prevention" in text
+    assert "No attribution obligation" in text
+
+
+def test_notice_still_refuses_an_unattributable_tier_2_source():
+    """The tier-1 branch must not become a hole the snapshot check falls through.
+
+    A tier-2 source absent from the manifest is still a label built against a different
+    snapshot, and inventing its attribution remains forbidden.
+    """
+    label = make_label(None, make_entry(source="mystery/feed"))
+
+    with pytest.raises(ValueError, match="absent from snapshot"):
+        notice_module.render_notice((label,), make_manifest())

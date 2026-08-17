@@ -41,6 +41,7 @@ from flabel import __version__
 from flabel.labels import SCHEMA_VERSION
 from flabel.models import (
     DEFAULT_THRESHOLD,
+    DEVICE_LICENCE,
     SNAPSHOT_ID,
     CorrelationResult,
     Detection,
@@ -760,17 +761,7 @@ def _failure(failure: ToolFailure) -> dict[str, Any]:
     }
 
 
-#: What a tier-1 label's terms are, given that PANW signatures are not open-source rules.
-#:
-#: **Licence is deliberately not an open-source licence** (Craig, 2026-08-17). The tier-2 licence
-#: field exists to carry a redistribution obligation, because those rules are other people's text
-#: and shipping labels derived from them incurs duties that `NOTICE` spells out. A PANW signature
-#: is proprietary and this output is neither redistributed nor sold, so there is no obligation to
-#: record — and inventing an SPDX identifier for it would be worse than saying so plainly.
-#:
-#: The field is still populated rather than blanked, because a consumer reading `licence` across
-#: a mixed-tier label must be able to tell "no obligation, vendor signature" from "we forgot".
-DEVICE_LICENCE = "proprietary:vendor-signature (not redistributed)"
+# `DEVICE_LICENCE` is defined in models.py — see there for why it is not an SPDX id.
 
 
 def build_device_source_entry(detection: Detection, ruleset: str) -> SourceEntry:
