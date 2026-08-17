@@ -60,6 +60,17 @@ EntryKey = tuple[str, int, str, str]
 #: read as specific. Tuned for prompting a human, not for deciding anything.
 UBIQUITOUS = 2 / 3
 
+#: The flabel checkout this script lives in. Everything below is resolved against it rather than
+#: against the working directory, because the whole point of this tool is to be pointed at
+#: captures that live somewhere else. Run from a capture directory, the first version invoked
+#: `uv run flabel` with no project (exit 2, "No such file or directory") and would then have
+#: looked for the snapshot store under `./.flabel/rules` — i.e. beside the captures. It failed
+#: loudly, which is the only reason that is a footnote rather than an issue.
+REPO = Path(__file__).resolve().parents[1]
+
+#: Spec §12's default, made absolute against the checkout rather than the caller's cwd.
+DEFAULT_RULES_DIR = REPO / ".flabel/rules"
+
 
 @dataclass(frozen=True)
 class CaptureRun:
@@ -323,30 +334,38 @@ def _fit(name: str, width: int = 52) -> str:
 # --- driving the runs -----------------------------------------------------------------------
 
 
-def label_one(capture: Path, output_dir: Path, rules_dir: Path | None) -> tuple[Path, int, str]:
+def label_one(capture: Path, output_dir: Path, rules_dir: Path) -> tuple[Path, int, str]:
     """Run `flabel --offline` over one capture. Returns (capture, exit code, stderr tail).
 
     Invoked as a subprocess rather than by importing `cli.main`, deliberately: that is how an
     operator runs it, it isolates a crash to one capture, and it is what makes `--jobs` possible
     at all — the pipeline is not written to be re-entered in one process.
+
+    `--project` and an absolute `--rules-dir` are both required for this to work from anywhere,
+    and "anywhere" is the normal case: the captures are outside the repo by necessity, so that is
+    where an operator will be standing. Without `--project`, `uv` resolves the environment from
+    the cwd and exits 2; without an absolute rules dir, `flabel` resolves spec §12's relative
+    default against the cwd and looks for the snapshot store beside the captures.
     """
     argv = [
         "uv",
         "run",
+        "--project",
+        str(REPO),
         "flabel",
         "--offline",
         str(capture),
         "--output-dir",
         str(output_dir),
+        "--rules-dir",
+        str(rules_dir),
     ]
-    if rules_dir is not None:
-        argv += ["--rules-dir", str(rules_dir)]
-    done = subprocess.run(argv, capture_output=True, text=True)
+    done = subprocess.run(argv, capture_output=True, text=True, cwd=REPO)
     return capture, done.returncode, done.stderr.strip().splitlines()[-1] if done.stderr else ""
 
 
 def run_captures(
-    captures: list[Path], output_dir: Path, rules_dir: Path | None, jobs: int
+    captures: list[Path], output_dir: Path, rules_dir: Path, jobs: int
 ) -> list[tuple[Path, int, str]]:
     """Label every capture, up to `jobs` at once, reporting each as it finishes.
 
@@ -384,7 +403,13 @@ def main(argv: list[str]) -> int:
         help="skip running: summarise the run directories already under DIR",
     )
     parser.add_argument("--output-dir", type=Path, default=None, metavar="DIR")
-    parser.add_argument("--rules-dir", type=Path, default=None, metavar="DIR")
+    parser.add_argument(
+        "--rules-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=f"snapshot store (default: {DEFAULT_RULES_DIR}, inside the checkout)",
+    )
     parser.add_argument(
         "--jobs",
         type=int,
@@ -415,11 +440,27 @@ def main(argv: list[str]) -> int:
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
 
-    print(f"labelling {len(captures)} capture(s), {args.jobs} at a time…", file=sys.stderr)
-    results = run_captures(captures, args.output_dir, args.rules_dir, args.jobs)
+    rules_dir = (args.rules_dir or DEFAULT_RULES_DIR).resolve()
+    if not rules_dir.is_dir():
+        print(
+            f"no snapshot store at {rules_dir} — run `flabel rules update` first, or pass "
+            f"--rules-dir. Refusing rather than labelling {len(captures)} capture(s) against "
+            f"nothing.",
+            file=sys.stderr,
+        )
+        return 2
+
+    output_dir = args.output_dir.resolve()
+    print(
+        f"labelling {len(captures)} capture(s), {args.jobs} at a time\n"
+        f"  rules : {rules_dir}\n"
+        f"  output: {output_dir}",
+        file=sys.stderr,
+    )
+    results = run_captures(captures, output_dir, rules_dir, args.jobs)
     failed = [c for c, code, _ in results if code != 0]
 
-    rundirs = [p for p in args.output_dir.iterdir() if p.is_dir()]
+    rundirs = [p for p in output_dir.iterdir() if p.is_dir()]
     print()
     print(format_report(summarise(rundirs)))
     if failed:
