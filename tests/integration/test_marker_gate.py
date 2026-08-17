@@ -24,7 +24,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from marker_gate import KNOWN_ADMITTED_MARKERS, markers_of_admitted, verify  # noqa: E402
+from marker_gate import (  # noqa: E402
+    CEILING_SHARE,
+    EXPECTED_EXCLUDED,
+    FLOOR_FACTOR,
+    KNOWN_ADMITTED_MARKERS,
+    markers_of_admitted,
+    verify,
+)
 
 from flabel.models import AdmissionPolicy, SourceSpec  # noqa: E402
 from flabel.rules.admit import admit  # noqa: E402
@@ -43,7 +50,7 @@ SPEC = SourceSpec(
     admission_basis="wholesale",
 )
 FETCHED_AT = "2026-08-17T00:00:00.000000Z"
-POLICY = AdmissionPolicy(exclude_msg_markers=frozenset({EYE}))
+POLICY = AdmissionPolicy(exclude_msg_markers=frozenset({EYE}), msg_brand_marker=PAW)
 
 
 def paw_rule(sid: int, marker: str, text: str) -> str:
@@ -72,7 +79,7 @@ def healthy(tmp_path: Path) -> Path:
 
 
 def test_a_feed_still_writing_its_convention_passes(healthy: Path, capsys):
-    assert verify(healthy, expected_excluded=1) == 0
+    assert verify(healthy, expected_excluded=1, ceiling_share=1.0) == 0
     assert "excluded by marker" in capsys.readouterr().out
 
 
@@ -111,10 +118,47 @@ def test_a_marker_nobody_has_classified_fails(tmp_path: Path, capsys):
         ],
     )
 
-    assert verify(snapshot, expected_excluded=1) == 1
+    assert verify(snapshot, expected_excluded=1, ceiling_share=1.0) == 1
     out = capsys.readouterr().out
     assert "unreviewed marker" in out
     assert UNICORN in out
+
+
+def test_a_policy_that_still_bites_a_little_fails(tmp_path: Path, capsys):
+    """Non-zero is not the same as working, and the first draft only checked non-zero.
+
+    The realistic shape: upstream consolidates its observational markers under one this policy
+    does not name — the recon bell, say, which #118 argues should stay admitted. A handful of
+    stragglers keep the count off zero, the unreviewed-marker check finds nothing new because
+    the bell is a known marker, and the gate passes while #117 is substantially restored.
+    """
+    rules = [paw_rule(1, EYE, "the one straggler")]
+    rules += [paw_rule(sid, SIREN, f"detection {sid}") for sid in range(2, 40)]
+    snapshot = build(tmp_path / "rules", rules)
+
+    assert verify(snapshot, expected_excluded=100, ceiling_share=1.0) == 1
+    assert "under the floor" in capsys.readouterr().out
+
+
+def test_a_rule_that_dropped_the_brand_is_still_censused(tmp_path: Path, capsys):
+    """Why the census reads the sid index rather than looking for the feed's logo.
+
+    A feed that stops writing its brand is exactly the convention change this gate exists to
+    catch. Identifying its rules by that brand makes the check circular: the rules drop out of
+    their own census, so the marker nobody has classified is never reported, and they are
+    admitted meanwhile. Sabotaging `_rules_of_source` back to a substring test makes this pass.
+    """
+    unbranded = (
+        f'alert tcp any any -> any any (msg:"{UNICORN} A shape the feed has never used"; '
+        f'content:"GET"; classtype:bad-unknown; sid:42; rev:1;)'
+    )
+    snapshot = build(
+        tmp_path / "rules",
+        [paw_rule(1, EYE, "DNS request to .dev"), paw_rule(2, SIREN, "C2"), unbranded],
+    )
+
+    assert verify(snapshot, expected_excluded=1, ceiling_share=1.0) == 1
+    assert "unreviewed marker" in capsys.readouterr().out
 
 
 def test_a_convention_change_that_swallows_the_feed_fails(tmp_path: Path, capsys):
@@ -154,17 +198,40 @@ def test_a_snapshot_without_the_feed_fails_rather_than_passing_vacuously(tmp_pat
     assert "not in the snapshot" in capsys.readouterr().out
 
 
+def test_the_shipped_band_brackets_what_was_measured():
+    """The constants the workflow actually runs with, checked against the feed's real size.
+
+    Every other test here injects its bounds so a small fixture can reach both branches, which
+    leaves the SHIPPED numbers untested — the gap a reviewer found in the first draft. 21,467 is
+    the pawpatrules rule count on the 2026-08-12 mirror and 445 is what the shipped policy
+    excluded from it.
+    """
+    fetched, measured = 21467, EXPECTED_EXCLUDED
+
+    floor = EXPECTED_EXCLUDED // FLOOR_FACTOR
+    ceiling = int(fetched * CEILING_SHARE)
+
+    assert floor < measured < ceiling, (
+        f"the shipped band [{floor}, {ceiling}] does not bracket the {measured} rules the policy "
+        f"was measured to exclude — the gate would fail on a healthy feed"
+    )
+    assert ceiling < fetched * 0.1, (
+        f"a ceiling of {ceiling} tolerates deleting {ceiling / fetched:.0%} of the feed's rules; "
+        f"this policy is meant to cost about 2%"
+    )
+
+
 def test_the_reviewed_marker_set_is_not_empty():
     """Guards the guard: an empty set would make every marker unreviewed and the gate useless."""
     assert len(KNOWN_ADMITTED_MARKERS) >= 9
 
 
 def test_the_census_reads_the_marker_not_the_text():
-    """The 7,520-rule hazard, asserted where the gate would meet it.
+    """The 7,554-rule hazard, asserted where the gate would meet it.
 
     A rule whose *text* contains a marker must not be counted under it, or a feed writing
     "Chrome <globe> outdated" would look like it had grown a globe category.
     """
     rules = [paw_rule(1, SIREN, "Google Chrome \N{GLOBE WITH MERIDIANS} outdated")]
 
-    assert markers_of_admitted(rules) == {SIREN: 1}
+    assert markers_of_admitted(rules, PAW) == {SIREN: 1}

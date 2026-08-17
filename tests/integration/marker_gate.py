@@ -34,8 +34,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from flabel.config import load_admission_policies
 from flabel.rules.admit import marker_of
-from flabel.rules.snapshot import RULES_NAME, load_snapshot
+from flabel.rules.snapshot import RULES_NAME, load_sid_index, load_snapshot
+from flabel.suricata import SID
 
 SOURCE = "pawpatrules"
 
@@ -57,28 +59,61 @@ KNOWN_ADMITTED_MARKERS = frozenset(
         "\N{EYES}",  # 1 — HTTP direct to a public IP
     }
 )
+#: The brand is deliberately NOT in the set above. `marker_of` never returns it while the
+#: registry names it as `msg_brand_marker`, so seeing it means the feed changed the shape of its
+#: own prefix — which is exactly the event worth failing on.
 
 #: What was measured when the policy shipped. Not asserted exactly — upstream churns ~570 rules a
-#: day — but it is the anchor the ceiling below is a multiple of.
+#: day — but it is the anchor the band below is built from.
 EXPECTED_EXCLUDED = 445
-CEILING_FACTOR = 10
+
+#: The band the exclusion count must stay inside. A **floor** as well as a ceiling, which the
+#: first draft lacked: with only `excluded == 0` to catch a shrinking policy, upstream could
+#: re-mark 440 of the 445 rules under a marker this policy does not exclude and the gate would
+#: pass on 5 — "the policy still bites" asserted at one rule in 445. That is the floor-of-one
+#: weakness this repo has been burned by before.
+#:
+#: The ceiling is a share of the feed rather than a multiple of the anchor. `corpus_gate` uses a
+#: 10x multiple, but there it bounds a handful of tolerated false-positive entries; here it would
+#: bound the DELETION of detection rules, and 445 x 10 is 4,450 — 20.7% of a feed whose policy is
+#: sold as costing 2.1%.
+FLOOR_FACTOR = 10
+CEILING_SHARE = 0.05
 
 
-def markers_of_admitted(rules: list[str]) -> Counter[str]:
-    """Every marker appearing on an admitted rule, counted."""
-    return Counter(marker for rule in rules if (marker := marker_of(rule)) is not None)
+def markers_of_admitted(rules: list[str], brand: str | None) -> Counter[str]:
+    """Every marker appearing on an admitted rule, counted.
+
+    `brand` is the feed's own logo, which is on every rule and classifies nothing — passed in
+    from the shipped policy so the census reads a rule exactly the way `admit` did.
+    """
+    return Counter(marker for rule in rules if (marker := marker_of(rule, brand)) is not None)
 
 
-def verify(rules_dir: Path, expected_excluded: int = EXPECTED_EXCLUDED) -> int:
+def verify(
+    rules_dir: Path,
+    expected_excluded: int = EXPECTED_EXCLUDED,
+    ceiling_share: float = CEILING_SHARE,
+) -> int:
     """0 if the convention still holds, 1 with a diagnosis if it has moved.
 
     Takes the rules *root* and resolves the newest snapshot inside it, which is what
     `flabel rules update --rules-dir` writes and therefore what the scheduled workflow has.
+
+    `expected_excluded` and `ceiling_share` are arguments so both bounds are reachable from a
+    test against a small fixture — the same reason `corpus_gate.verify` takes its inputs rather
+    than reading them. The shipped values are asserted separately, against the real feed's size,
+    by `test_the_shipped_band_brackets_what_was_measured`.
     """
-    directory, manifest, _ = load_snapshot(rules_dir, None)
+    directory, manifest, warnings = load_snapshot(rules_dir, None)
+    for warning in warnings:
+        # Returned rather than printed by `load_snapshot` precisely so a caller has to unpack it
+        # to ignore it. Ignoring it here would be that argument made and then discarded.
+        print(f"note: {warning}")
     rules_text = (directory / RULES_NAME).read_text(encoding="utf-8")
     admissions = {admission.name: admission for admission in manifest.sources}
 
+    policy = load_admission_policies()[SOURCE]
     admission = admissions.get(SOURCE)
     if admission is None:
         print(f"FAIL: {SOURCE} is not in the snapshot at all, so its policy reviewed nothing")
@@ -96,19 +131,28 @@ def verify(rules_dir: Path, expected_excluded: int = EXPECTED_EXCLUDED) -> int:
         )
         return 1
 
-    ceiling = expected_excluded * CEILING_FACTOR
-    if excluded > ceiling:
+    floor = expected_excluded // FLOOR_FACTOR
+    if excluded < floor:
         print(
-            f"FAIL: {excluded} rules excluded by marker, over the ceiling of {ceiling} "
-            f"({expected_excluded} x {CEILING_FACTOR}). A convention change that made most of "
-            f"the feed look observational would gut it while every other gate stayed green."
+            f"FAIL: only {excluded} rules excluded by marker, under the floor of {floor} "
+            f"({expected_excluded} // {FLOOR_FACTOR}). Non-zero is not the same as working: "
+            f"upstream re-marking the observational rules under a marker this policy does not "
+            f"name would leave a handful excluded and #117 otherwise restored."
         )
         return 1
 
-    source_rules = [
-        rule for rule in rules_text.splitlines() if rule.startswith("alert") and _is_paw(rule)
-    ]
-    seen = markers_of_admitted(source_rules)
+    ceiling = int(admission.rules_fetched * ceiling_share)
+    if excluded > ceiling:
+        print(
+            f"FAIL: {excluded} rules excluded by marker, over the ceiling of {ceiling} "
+            f"({ceiling_share:.0%} of the {admission.rules_fetched} fetched). A convention "
+            f"change that made most of the feed look observational would delete real detection "
+            f"rules while every other gate stayed green."
+        )
+        return 1
+
+    source_rules = _rules_of_source(rules_text, load_sid_index(directory))
+    seen = markers_of_admitted(source_rules, policy.msg_brand_marker)
     unknown = sorted(set(seen) - KNOWN_ADMITTED_MARKERS)
     if unknown:
         for marker in unknown:
@@ -124,15 +168,24 @@ def verify(rules_dir: Path, expected_excluded: int = EXPECTED_EXCLUDED) -> int:
     return 0
 
 
-def _is_paw(rule: str) -> bool:
-    """Whether a rule is one of this feed's, by its brand prefix.
+def _rules_of_source(rules_text: str, index: dict[int, str]) -> list[str]:
+    """The admitted rules belonging to `SOURCE`, by the snapshot's own attribution.
 
-    The snapshot concatenates every source's rules into one file and the sid index is the
-    authority on origin — but a marker census only needs the rules carrying the convention, and
-    the brand prefix identifies those exactly. A rule from another feed that happened to start
-    with a paw print would be counted; none of the other eight uses emoji in `msg:` at all.
+    By `sid_index.json` rather than by looking for the feed's logo in the rule text. The first
+    draft did the latter, and it was circular: the census exists to detect the convention
+    CHANGING, so a feed that stopped writing its brand would drop out of its own census — the
+    rules would be admitted with an unrecognised marker and the check that should have caught it
+    would no longer be looking at them. The sid index is what spec §8 already calls the authority
+    on where a rule came from.
     """
-    return "\N{PAW PRINTS}" in rule
+    rules = []
+    for line in rules_text.splitlines():
+        if not line.startswith("alert"):
+            continue
+        match = SID.search(line)
+        if match and index.get(int(match.group(1))) == SOURCE:
+            rules.append(line)
+    return rules
 
 
 def main(argv: list[str]) -> int:

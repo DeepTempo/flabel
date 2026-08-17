@@ -98,16 +98,6 @@ jobs:
       - name: Record what was admitted
         run: uv run flabel rules list --rules-dir .flabel/rules
 
-      # Issue #117 keys an admission policy on an emoji in third-party rule text, which is a
-      # convention and not an interface. This is the half that makes that defensible: it fails
-      # the build if the feed stops writing the convention (the policy would then sit in the
-      # registry excluding nothing, which is #75 all over again), if it starts excluding an
-      # order of magnitude more, or if a marker nobody has classified appears on an admitted
-      # rule. It runs here rather than in PR CI because only this workflow has the live feed.
-      - name: The pawpatrules marker convention has not moved (#117)
-        id: markers
-        run: uv run python tests/integration/marker_gate.py .flabel/rules
-
       - name: Label the benign canary
         run: |
           uv run flabel --offline tests/fixtures/benign.pcap \
@@ -223,6 +213,21 @@ jobs:
       - name: Goal 5 broad — a new false positive on ordinary traffic fails the build
         id: corpus
         run: uv run python tests/integration/corpus_gate.py corpus-runs
+
+      # Issue #117 keys an admission policy on an emoji in third-party rule text, which is a
+      # convention and not an interface. This is the half that makes that defensible: it fails
+      # the build if the feed stops writing the convention (the policy would then sit in the
+      # registry excluding nothing, which is #75 all over again), if the count leaves its band
+      # in either direction, or if a marker nobody has classified appears on an admitted rule.
+      # It runs here rather than in PR CI because only this workflow has the live feed.
+      #
+      # AFTER the two false-positive reviews, deliberately. A failing step aborts the job, and
+      # this one's likeliest failure is "upstream added an emoji" — a read-a-sample-and-decide
+      # item. Running it first would take the benign canary and the corpus down with it, and
+      # those are the only false-positive review the 21,464 ungated pawpatrules rules get.
+      - name: The pawpatrules marker convention has not moved (#117)
+        id: markers
+        run: uv run python tests/integration/marker_gate.py .flabel/rules
 
       # A daily gate can be red for weeks with nothing but a badge to say so, and this one is
       # the only false-positive review the 21,464 ungated pawpatrules rules get. Failure files

@@ -536,9 +536,10 @@ data is inside the `snapshot_id` hash (§7). A later fetch is a different measur
 The sibling of `exclude_classtypes`, and it exists because the classtype could not reach the rules
 it needed to. `pawpatrules` writes an emoji at the front of every `msg:` saying what kind of rule it
 is — a siren for a detection, an eye or a lock or a globe for an observation — and it is the **only
-field that says so**. Measured on snapshot `267915ba4f708fc9`: **0 of the 605 observational rules
-carry `misc-activity`**. They declare `bad-unknown` and `attempted-recon`, which elsewhere in the
-ruleset carry genuine detections, so no classtype policy can separate them.
+field that says so**. Measured: 571 rules carry one of the five observational markers, 126 of them
+the info-marked rules `exclude_classtypes` already removes, and **0 of the remaining 445 carry
+`misc-activity`**. They declare `bad-unknown` and `attempted-recon`, which elsewhere in the ruleset
+carry genuine detections, so no classtype policy can separate them.
 
 What that cost, before this: 17 source entries across the 22-capture corpus labelling `go.dev` — the
 official Go website, on a Google-operated gTLD — as `verdict: malicious`, `label_basis: direct`. One
@@ -552,9 +553,10 @@ exclude_msg_markers = ["ℹ", "👁", "🔒", "🌐", "🤨"]
 
 **The marker is positional and is never a substring search.** The same emoji appear inside rule
 prose — *"Google Chrome 🌐 for Windows 7 unsupported and vulnerable"* is a detection. Matching
-anywhere in the `msg:` hits **8,125** rules where the anchored parse hits **605**, and of the 7,520
-difference 3,997 are siren-marked detections. An unanchored policy would have cut a third of the
-feed's real signatures while reading, in the registry, as a five-marker rule.
+anywhere in the `msg:` hits **8,125** rules where the anchored parse hits **571**, and of the 7,554
+difference 3,997 are siren-marked detections and 3,315 skull-marked ones. An unanchored policy would
+have cut a third of the feed's real signatures while reading, in the registry, as a five-marker
+rule.
 
 `marker_of` therefore skips the feed's brand prefix — every rule begins with a paw print and a dash,
 so the first pictograph discriminates nothing — and returns the first marker after it. The first of
@@ -562,8 +564,10 @@ several adjacent markers wins: 34 rules are marked fire-then-eye and are FireEye
 signatures, which taking any marker in the run would have excluded.
 
 **Cost, measured by running the shipped policy over the 21,467-rule feed:** `rules_excluded_marker`
-is **445**. The obvious number, 571, is the count of rules *carrying* one of the five markers — but
-126 of those are the `ℹ` rules `exclude_classtypes` already removes, and classtype is tested first.
+is **445** — 571 rules carry one of the five markers, and 126 of those are the `ℹ` rules
+`exclude_classtypes` already removes, classtype being tested first. Reproduce it offline with
+`uv run python tests/fixtures/rules/measure_feeds.py --mirror <mirror>`, whose table now carries a
+column for each of the two policies.
 
 **A convention is not an interface, so it is watched rather than trusted.** The feed publishes no
 schema for these markers and could change them without notice; the failure that would follow is the

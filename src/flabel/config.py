@@ -23,13 +23,14 @@ from flabel.models import (
     AdmissionPolicy,
     SourceClass,
     SourceSpec,
+    is_marker,
 )
 
 SOURCE_CLASSES = frozenset(get_args(SourceClass))
 ADMISSION_BASES = frozenset(get_args(AdmissionBasis))
 
 REQUIRED_FIELDS = ("name", "url", "licence", "source_class", "admission_basis")
-OPTIONAL_FIELDS = ("enabled", "exclude_classtypes", "exclude_msg_markers")
+OPTIONAL_FIELDS = ("enabled", "exclude_classtypes", "exclude_msg_markers", "msg_brand_marker")
 
 #: Sources whose rules carry ET-style `metadata:` keys (`confidence`, `signature_severity`).
 #: `admission_basis = "metadata-filter"` is only meaningful for these — filtering on metadata
@@ -104,7 +105,7 @@ def _read_registry(path: Path) -> dict[str, Any]:
 #: reason a misspelled `[[source]]` field is (spec §5): a registry that loads with a setting
 #: silently ignored is worse than one that refuses to load, because it reads as working — and
 #: here the ignored setting would be the one deciding which rules may assert a verdict.
-ADMISSION_FIELDS = ("exclude_classtypes", "exclude_msg_markers")
+ADMISSION_FIELDS = ("exclude_classtypes", "exclude_msg_markers", "msg_brand_marker")
 
 
 def load_admission_policy(path: Path | None = None) -> AdmissionPolicy:
@@ -142,6 +143,7 @@ def load_admission_policy(path: Path | None = None) -> AdmissionPolicy:
     return AdmissionPolicy(
         exclude_classtypes=_classtypes(table.get("exclude_classtypes", []), path, "[admission]"),
         exclude_msg_markers=_markers(table.get("exclude_msg_markers", []), path, "[admission]"),
+        msg_brand_marker=_brand(table.get("msg_brand_marker"), path, "[admission]"),
     )
 
 
@@ -198,20 +200,47 @@ def _markers(value: Any, path: Path, where: str) -> frozenset[str]:
         )
         if not reduced:
             raise ConfigError(f"{path}: {where} `exclude_msg_markers` contains an empty marker")
-        if reduced.isascii():
-            raise ConfigError(
-                f"{path}: {where} {item!r} is not a marker. A marker is the pictograph leading a "
-                f"rule's `msg:`, and the parse stops at the first ASCII character — so an ASCII "
-                f"entry would exclude nothing while appearing to be in force."
-            )
         if len(reduced) > 1:
             raise ConfigError(
                 f"{path}: {where} {item!r} is more than one marker. `marker_of` reports the "
                 f"first pictograph of a rule's marker run, so a multi-marker entry could never "
                 f"equal what it is compared against."
             )
+        if not is_marker(reduced):
+            raise ConfigError(
+                f"{path}: {where} {item!r} is not a marker. A marker is the symbol leading a "
+                f"rule's `msg:` (`models.is_marker`), and "
+                f"`marker_of` returns nothing else — so a letter, a quotation mark, an ASCII "
+                f"word or a non-breaking space would exclude nothing while sitting in the "
+                f"registry looking like a policy that is in force."
+            )
         markers.add(reduced)
     return frozenset(markers)
+
+
+def _brand(value: Any, path: Path, where: str) -> str | None:
+    """Validate a `msg_brand_marker` — the marker a feed puts on every rule (#117).
+
+    Same bar as `_markers`, one value instead of a list. Absent is the ordinary case: eight of
+    the nine feeds write no marker at all, and `marker_of` without a brand simply returns the
+    first pictograph it finds.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"{path}: {where} `msg_brand_marker` must be a string")
+    reduced = "".join(
+        c
+        for c in value
+        if c not in EMOJI_JOINERS and unicodedata.category(c) not in COMBINING_CATEGORIES
+    )
+    if len(reduced) != 1 or not is_marker(reduced):
+        raise ConfigError(
+            f"{path}: {where} `msg_brand_marker` {value!r} is not a single pictograph. A brand "
+            f"that matches nothing is worse than none: every rule then keeps its brand as its "
+            f"marker, and a policy naming a real marker excludes nothing."
+        )
+    return reduced
 
 
 def load_admission_policies(path: Path | None = None) -> dict[str, AdmissionPolicy]:
@@ -253,9 +282,13 @@ def load_admission_policies(path: Path | None = None) -> dict[str, AdmissionPoli
             continue
         own = _classtypes(entry.get("exclude_classtypes", []), path, f"source {name!r}")
         markers = _markers(entry.get("exclude_msg_markers", []), path, f"source {name!r}")
+        brand = _brand(entry.get("msg_brand_marker"), path, f"source {name!r}")
         policies[name] = AdmissionPolicy(
             exclude_classtypes=default.exclude_classtypes | own,
             exclude_msg_markers=default.exclude_msg_markers | markers,
+            # Per-source wins over the global one: a brand is one feed's, and unlike the two
+            # exclusion lists there is nothing to union — two brands is not a stricter policy.
+            msg_brand_marker=brand or default.msg_brand_marker,
         )
     return policies
 

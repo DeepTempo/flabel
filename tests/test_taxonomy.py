@@ -808,7 +808,7 @@ def test_the_global_policy_is_unchanged_by_all_this():
 # `pawpatrules` marks every rule with an emoji: `🚨` for a detection, `👁`/`🔒`/`🌐`/`🤨` for an
 # observation. It is the only field distinguishing the two, and #113's `exclude_classtypes` cannot
 # reach the observational ones — measured, they span `bad-unknown` and `attempted-recon`, and 0 of
-# the 605 carry `misc-activity`.
+# the 445 surviving the classtype filter carry `misc-activity`.
 #
 # Every number below was measured on 2026-08-17 against the 2026-08-12 feed mirror (21,467
 # pawpatrules rules) and the 22-capture corpus (338 source entries).
@@ -833,10 +833,64 @@ def paw_rule(sid: int, msg: str, *, classtype: str = "bad-unknown") -> str:
     )
 
 
+def test_a_marker_in_prose_after_the_brand_is_not_the_rules_marker():
+    """The prose stop, exercised directly — it had no test, and deleting it stayed green.
+
+    Every other parse test puts the marker in the LEADING position, so what protected them was
+    first-marker-wins, not this. The shape that needs the stop is ASCII prose after the brand
+    with an emoji later in the sentence, and no fixture had it. Found in review.
+
+    What it costs to lose: a detection rule reading `<paw> - Cobalt Strike <globe> beacon` would
+    report the globe and be EXCLUDED, and `rules_excluded_marker` would climb from 445 toward
+    8,125 — a silent loss of real signatures, which is the worst outcome this policy has.
+    """
+    assert marker_of(paw_rule(1, f"{PAW} - Cobalt Strike {GLOBE} beacon over HTTPS"), PAW) is None
+
+
+def test_a_marker_that_is_not_the_brand_is_never_treated_as_one():
+    """The re-admission path found in review, and the reason the brand is now named.
+
+    The first parser treated ANY leading marker followed by a dash as branding. So an
+    observational rule written `<eye> - DNS request to .dev` — no brand at all — reported no
+    marker and was ADMITTED: issue #117 reopening through a formatting change upstream could
+    make without notice, which is precisely the risk this whole design concedes is real.
+    """
+    assert marker_of(paw_rule(1, f"{EYE} - DNS request to .dev extension"), PAW) == EYE
+    assert marker_of(paw_rule(2, f"{SIREN} \N{EN DASH} Cobalt Strike"), PAW) == SIREN
+
+
+def test_a_letter_or_a_space_is_never_a_marker():
+    """The feed is French, and `\xa0` is a plausible typo. Both were returned as markers.
+
+    `É` produces a false gate alarm — noise, but it takes the benign canary and corpus down with
+    it. The non-breaking space is worse and silent: a rule reading `<paw> -\xa0<eye> DNS request`
+    reported `\xa0`, which no policy names, so the observational rule was ADMITTED.
+    """
+    assert marker_of(paw_rule(1, f"{PAW} - Élévation de privilèges"), PAW) is None
+    assert marker_of(paw_rule(2, f"{PAW} -\N{NO-BREAK SPACE}{EYE} DNS request"), PAW) is None
+
+
+def test_the_information_marker_is_a_letter_and_is_still_a_marker():
+    """`\N{INFORMATION SOURCE}` is Unicode category `Ll`, not `So` — it derives from italic *i*.
+
+    Measured after a review recommended a bare `So` test, which would have rejected the one
+    marker #113 and #117 both depend on. Widening to letters would have re-admitted `É`, so the
+    character is named explicitly in `models.LETTERLIKE_MARKERS` instead.
+    """
+    import unicodedata
+
+    assert unicodedata.category("ℹ") == "Ll", "the premise of the exception has changed"
+    assert marker_of(paw_rule(1, f"{PAW} - ℹ Censys - Scanner"), PAW) == "ℹ"
+
+
 def test_the_marker_is_the_one_after_the_feeds_brand_prefix():
-    """`🐾` is on all 21,467 rules, so the classifying marker is the next one."""
-    assert marker_of(paw_rule(1, f"{PAW} - {EYE} DNS request to .dev extension")) == EYE
-    assert marker_of(paw_rule(2, f"{PAW} - {SIREN} Connection to a C2")) == SIREN
+    """`🐾` is on all 21,467 rules, so the classifying marker is the next one.
+
+    Named in the registry as `msg_brand_marker` rather than inferred from shape — see
+    `test_a_marker_that_is_not_the_brand_is_never_treated_as_one` for what inferring it cost.
+    """
+    assert marker_of(paw_rule(1, f"{PAW} - {EYE} DNS request to .dev extension"), PAW) == EYE
+    assert marker_of(paw_rule(2, f"{PAW} - {SIREN} Connection to a C2"), PAW) == SIREN
 
 
 def test_a_marker_inside_the_text_is_not_the_rules_marker():
@@ -844,13 +898,13 @@ def test_a_marker_inside_the_text_is_not_the_rules_marker():
 
     `🌐` appears *inside* thousands of msgs — "Google Chrome 🌐 for Windows 7 unsupported and
     vulnerable". Measured on the mirror: a substring match for the five observational markers
-    hits **8,125** rules where the anchored parse hits **605**. The 7,520 difference is almost
+    hits **8,125** rules where the anchored parse hits **571**. The 7,554 difference is almost
     entirely detections — 3,997 `🚨` and 3,315 `☠` — so an unanchored match would have silently
     cut a third of the feed's real signatures while reading as a five-marker policy.
     """
     rule = paw_rule(3, f"{PAW} - {SIREN} Google Chrome {GLOBE} for Windows 7 vulnerable")
 
-    assert marker_of(rule) == SIREN, "the marker is positional, never a substring search"
+    assert marker_of(rule, PAW) == SIREN, "the marker is positional, never a substring search"
 
 
 def test_the_brand_prefix_is_found_however_the_feed_spaces_it():
@@ -868,8 +922,8 @@ def test_the_brand_prefix_is_found_however_the_feed_spaces_it():
     tight = paw_rule(1, f"{PAW} -{warning} DNS request to suspicious domain - Listed by OpenPhish")
     spaced = paw_rule(2, f"{PAW} - {warning} DNS request to suspicious domain")
 
-    assert marker_of(tight) == warning
-    assert marker_of(spaced) == warning
+    assert marker_of(tight, PAW) == warning
+    assert marker_of(spaced, PAW) == warning
 
 
 def test_the_first_of_two_adjacent_markers_wins():
@@ -880,12 +934,12 @@ def test_the_first_of_two_adjacent_markers_wins():
     """
     rule = paw_rule(4, f"{PAW} - {FIRE}{EYE} FireEye - Backdoor.HTTP.BEACON")
 
-    assert marker_of(rule) == FIRE
+    assert marker_of(rule, PAW) == FIRE
 
 
 def test_a_zwj_emoji_sequence_reduces_to_its_first_character():
     """`🏴‍☠️` is `🏴` + ZWJ + `☠` + VS16, and 6,910 rules lead with it."""
-    assert marker_of(paw_rule(5, f"{PAW} - \U0001f3f4‍☠️ Connection to Cobalt Strike")) == PIRATE
+    assert marker_of(paw_rule(5, f"{PAW} - \U0001f3f4‍☠️ Connection to Cobalt Strike"), PAW) == PIRATE
 
 
 @pytest.mark.parametrize(
@@ -903,11 +957,11 @@ def test_a_rule_with_no_marker_has_none(msg):
     `None` rather than `""`, so a policy naming a marker can never match a rule that has none —
     the same rule `AdmissionPolicy.excludes` follows for an absent `classtype:`.
     """
-    assert marker_of(paw_rule(6, msg)) is None
+    assert marker_of(paw_rule(6, msg), PAW) is None
 
 
 def test_a_rule_with_no_msg_at_all_has_no_marker():
-    assert marker_of("alert tcp any any -> any any (sid:7; rev:1;)") is None
+    assert marker_of("alert tcp any any -> any any (sid:7; rev:1;)", PAW) is None
 
 
 # --- excluding on the marker, at admission ------------------------------------------------------
@@ -915,7 +969,7 @@ def test_a_rule_with_no_msg_at_all_has_no_marker():
 
 def test_a_rule_whose_marker_is_excluded_is_never_admitted():
     """Issue #117: `🐾 - 👁 DNS request 🌐 to .dev extension` labelled `go.dev` twelve times."""
-    policy = AdmissionPolicy(exclude_msg_markers=frozenset({EYE}))
+    policy = AdmissionPolicy(exclude_msg_markers=frozenset({EYE}), msg_brand_marker=PAW)
     rules = [
         paw_rule(3301000, f"{PAW} - {EYE} DNS request {GLOBE} to .dev extension"),
         paw_rule(3300003, f"{PAW} - {SIREN} Connection to a C2"),
@@ -930,7 +984,7 @@ def test_a_rule_whose_marker_is_excluded_is_never_admitted():
 
 def test_the_marker_exclusion_balances_the_admission_identity():
     """Spec §6: `fetched == admitted + sum(excluded)`. A new counter or the identity breaks."""
-    policy = AdmissionPolicy(exclude_msg_markers=frozenset({EYE}))
+    policy = AdmissionPolicy(exclude_msg_markers=frozenset({EYE}), msg_brand_marker=PAW)
     rules = [
         paw_rule(1, f"{PAW} - {EYE} DNS request to .ru extension"),
         paw_rule(2, f"{PAW} - {EYE} DNS request to .biz extension"),
@@ -944,8 +998,8 @@ def test_the_marker_exclusion_balances_the_admission_identity():
 
 
 def test_a_rule_carrying_the_marker_only_in_its_text_is_still_admitted():
-    """The regression test for the 7,520 rules an unanchored match would have taken."""
-    policy = AdmissionPolicy(exclude_msg_markers=frozenset({GLOBE}))
+    """The regression test for the 7,554 rules an unanchored match would have taken."""
+    policy = AdmissionPolicy(exclude_msg_markers=frozenset({GLOBE}), msg_brand_marker=PAW)
     rules = [paw_rule(1, f"{PAW} - {SIREN} Microsoft Edge {GLOBE} outdated and vulnerable")]
 
     admitted, admission = admit(SPEC, rules, FETCHED_AT, policy)
@@ -961,7 +1015,9 @@ def test_a_rule_excluded_by_classtype_is_not_counted_twice():
     label from" — the same ordering argument `admit` already makes for the metadata buckets.
     """
     policy = AdmissionPolicy(
-        exclude_classtypes=frozenset({"misc-activity"}), exclude_msg_markers=frozenset({EYE})
+        exclude_classtypes=frozenset({"misc-activity"}),
+        exclude_msg_markers=frozenset({EYE}),
+        msg_brand_marker=PAW,
     )
     rules = [
         paw_rule(1, f"{PAW} - {EYE} Censys - Scanner", classtype="misc-activity"),
@@ -1060,3 +1116,20 @@ def test_an_unusable_marker_list_is_refused(registry_with, table, reason):
     """
     with pytest.raises(ConfigError):
         load_admission_policies(registry_with(table))
+
+
+def test_an_unusable_brand_is_refused(registry_with):
+    """A brand that matches nothing is worse than no brand at all.
+
+    `marker_of` only steps over the prefix when the first marker EQUALS the brand. So a brand
+    that no rule carries means every rule keeps its own brand as its marker — and a policy
+    naming a real marker then excludes nothing, silently, while sitting in the registry.
+    """
+    for value in ('"paw"', '"\U0001f43e\U0001f441"', "42"):
+        with pytest.raises(ConfigError, match="msg_brand_marker"):
+            load_admission_policies(registry_with(f"\n[admission]\nmsg_brand_marker = {value}\n"))
+
+
+def test_the_shipped_registry_names_the_brand(registry_with):
+    """The #113 lesson a third time: the mechanism is not the fix, the shipped artifact is."""
+    assert load_admission_policies(REGISTRY)["pawpatrules"].msg_brand_marker == PAW

@@ -103,8 +103,9 @@ exclude_classtypes = ["misc-activity"]
 # Issue #117, and it reverses this file's own reasoning above, so the reversal is argued rather
 # than quietly made.
 #
-# WHAT FORCED IT. The classtype filter cannot reach the feed's observational rules: measured on
-# snapshot 267915ba4f708fc9, **0 of the 605 carry misc-activity**. They declare `bad-unknown` and
+# WHAT FORCED IT. The classtype filter cannot reach the feed's observational rules. Measured:
+# 571 rules carry one of these five markers, 126 of them the ℹ rules exclude_classtypes already
+# removes, and **0 of the remaining 445 carry misc-activity**. They declare `bad-unknown` and
 # `attempted-recon`, which elsewhere in the ruleset carry genuine detections, so no classtype
 # policy can separate them. On the 22-capture corpus these produced 17 source entries labelling
 # `go.dev` — the official Go website, on a Google-operated gTLD — as `verdict: malicious`,
@@ -133,6 +134,12 @@ exclude_classtypes = ["misc-activity"]
 # be admitted, 2.1% of the feed. 17 of 338 source entries disappear. It does not touch the pinned
 # corpus residue, and it leaves the feed's 9,669 detection-marked rules exactly as they were.
 exclude_msg_markers = ["ℹ", "👁", "🔒", "🌐", "🤨"]
+# The marker the feed puts on EVERY rule, which therefore classifies nothing. Named rather than
+# inferred: the first version of the parser treated any leading marker followed by a dash as
+# branding, so a rule written `👁 - DNS request to .dev` — no brand — reported no marker at all
+# and was ADMITTED. That is #117 reopening through a formatting change upstream could make
+# without notice. Found in review, not by a test.
+msg_brand_marker = "🐾"
 
 # --- ioc-dest: a rule matched a known-bad endpoint -> the flow is malicious ----------------
 

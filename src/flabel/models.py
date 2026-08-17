@@ -11,6 +11,7 @@ and a claim that can be edited after the fact is not provenance.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,6 +94,34 @@ Direction = Literal["to_server", "to_client", "unknown"]
 #: obvious home made it a cycle. Same move, and the same reason, as `DEFAULT_THRESHOLD`.
 EMOJI_JOINERS = frozenset({"\u200d", "️"})
 COMBINING_CATEGORIES = frozenset({"Mn", "Cf"})
+
+#: What may be a rule's marker (#117). Category `So` — "Symbol, other" — is what fourteen of the
+#: feed's sixteen markers are, and what no letter, quotation mark or space is. Requiring it stops
+#: a French rule title reporting `É` as a marker, and a non-breaking space reporting `\xa0`; the
+#: second is not cosmetic, because a marker nobody recognises means the rule is ADMITTED.
+#:
+#: `\N{INFORMATION SOURCE}` is the exception and is named rather than accommodated by loosening
+#: the rule. **It is category `Ll`**, a lowercase letter, because it derives from an italic *i* —
+#: measured, after a review recommended a bare `So` test that would have rejected the one marker
+#: #113 and #117 both depend on. Widening the test to letters would have admitted `É` and `é`,
+#: which is the failure it exists to prevent, so the single character is listed instead.
+PICTOGRAPH_CATEGORIES = frozenset({"So"})
+LETTERLIKE_MARKERS = frozenset({"\N{INFORMATION SOURCE}"})
+
+
+def is_marker(char: str) -> bool:
+    """Whether `char` is a single character that may be a rule's `msg:` marker.
+
+    Total over any string, including `""` and multi-character input, because both callers reach
+    it with unvalidated text — `config._markers` with a registry entry and `admit._first_marker`
+    with feed text. `unicodedata.category` raises `TypeError` on anything but one character, and
+    a `TypeError` reaching an operator where a `ConfigError` was promised is the same defect this
+    repo already fixed in `build_source_entry`'s snapshot-id guard.
+    """
+    if len(char) != 1:
+        return False
+    return char in LETTERLIKE_MARKERS or unicodedata.category(char) in PICTOGRAPH_CATEGORIES
+
 
 #: Container format of the capture as sniffed by magic bytes, never by file extension.
 CaptureFormat = Literal["pcap", "pcapng", "pcap.gz", "pcapng.gz"]
@@ -263,14 +292,27 @@ class AdmissionPolicy:
     #: Leading `msg:` markers whose rules are never admitted (#117). `pawpatrules` writes one
     #: emoji per rule — `\N{POLICE CARS REVOLVING LIGHT}` for a detection, `\N{EYE}` / `\N{LOCK}`
     #: / `\N{GLOBE WITH MERIDIANS}` / `\N{FACE WITH RAISED EYEBROW}` for an observation — and it
-    #: is the ONLY field separating the two. Measured: 0 of the 605 observational rules carry
-    #: `misc-activity`, so #113's classtype policy cannot reach a single one of them, and they
-    #: span `bad-unknown` and `attempted-recon` where genuine detections also live.
+    #: is the ONLY field separating the two. Measured: 571 rules carry one of the five
+    #: observational markers, 126 of them the info-marked rules `exclude_classtypes` already
+    #: removes, and **0 of the remaining 445 carry `misc-activity`** — so #113's classtype policy
+    #: cannot reach one of them. They declare `bad-unknown` and `attempted-recon`, where genuine
+    #: detections also live.
     #:
     #: Not casefolded, unlike `exclude_classtypes`: these are pictographs, `str.casefold` does
     #: nothing to them, and pretending otherwise would suggest a normalisation that is not
     #: happening.
     exclude_msg_markers: frozenset[str] = frozenset()
+
+    #: The marker a feed puts on EVERY rule as its own branding, which therefore classifies
+    #: nothing (#117). `pawpatrules` writes a paw print on all 21,467 of its rules, so without
+    #: naming it the first pictograph would be the same on every one of them.
+    #:
+    #: Stated here rather than inferred from shape. The first cut treated *any* leading marker
+    #: followed by a dash as branding, which meant a rule written `<eye> - DNS request to .dev`
+    #: — no brand at all — reported no marker and was ADMITTED. That is #117 reopening through a
+    #: formatting change upstream could make without notice, which is exactly the risk this
+    #: policy already concedes is real.
+    msg_brand_marker: str | None = None
 
     def excludes_marker(self, marker: str | None) -> bool:
         """Whether a rule whose leading `msg:` marker is `marker` is excluded.
