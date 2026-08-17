@@ -101,6 +101,7 @@ def make_detection(**overrides) -> Detection:
         "dst_ip": SERVER,
         "dst_port": 80,
         "proto": "tcp",
+        "direction": "to_server",
     }
     return Detection(**{**fields, **overrides})
 
@@ -188,6 +189,27 @@ def test_a_rule_firing_twice_on_one_flow_keeps_both_assertions():
     result = correlate([make_detection(), make_detection()], by_uid(make_flow()), make_manifest())
 
     assert len(result.labels[0].sources) == 2
+
+
+def test_entries_differing_only_in_direction_come_out_in_one_order():
+    """The same guarantee `labels.py` makes, asserted where the tuple is first built.
+
+    `correlate` sorts a label's sources itself so the returned value is already canonical —
+    `labels.py` sorting again is idempotent — which means the two sort keys have to agree.
+    They did not have to before #115: entries from one rule firing both ways on a flow were
+    identical, so any order was the same bytes. Now they differ, and eve.json's record order
+    is not stable between runs (spec §10).
+    """
+    outbound = make_detection()
+    inbound = make_detection(
+        src_ip=SERVER, src_port=80, dst_ip=CLIENT, dst_port=51234, direction="to_client"
+    )
+
+    forwards = correlate([outbound, inbound], by_uid(make_flow()), make_manifest())
+    backwards = correlate([inbound, outbound], by_uid(make_flow()), make_manifest())
+
+    assert [entry.direction for entry in forwards.labels[0].sources] == ["to_client", "to_server"]
+    assert forwards.labels == backwards.labels
 
 
 def test_a_flow_with_no_detection_gets_no_label():

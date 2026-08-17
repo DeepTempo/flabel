@@ -54,6 +54,7 @@ DNS_SID = 9000006
 ICMP_SID = 9000007
 ICMP6_SID = 9000008
 HOME_NET_NEGATED_SID = 9000009
+ANY_IP_SID = 9000010
 
 #: A well-formed id that is not the hash of anything, for injecting an inconsistent snapshot.
 WRONG_SNAPSHOT_ID = "0123456789abcdef"
@@ -212,6 +213,7 @@ ICMP_SERVER = "10.0.0.203"
 ICMP6_CLIENT = "fd00::a1"
 ICMP6_SERVER = "fd00::a2"
 MIXED_BASE_TS = 1700000200.0
+ICMP_ERROR_BASE_TS = 1700000300.0
 
 
 def _udp(sport: int, dport: int, payload: bytes, src: str, dst: str) -> bytes:
@@ -271,6 +273,28 @@ def write_mixed_capture(path: Path) -> None:
     CANARY.write_pcap(
         str(path), [(MIXED_BASE_TS + index * 0.01, frame) for index, frame in enumerate(frames)]
     )
+
+
+def write_icmp_error_capture(path: Path) -> None:
+    """A single ICMPv4 destination-unreachable datagram, belonging to no exchange.
+
+    This is the fixture behind `Direction`'s third value. Suricata reports `direction` for a
+    packet it can place on one side of a flow; an unsolicited ICMP error is not such a packet,
+    and the alert record then carries **no `direction` key at all** — measured on 8.0.6, and
+    asserted against the raw eve.json in `test_an_alert_suricata_gave_no_direction_is_unknown`
+    rather than taken on trust.
+
+    One packet, not a pair, on purpose: the echo request/reply in `write_mixed_capture` is an
+    exchange Suricata *can* direct, so it would prove the opposite of what this fixture is for.
+    """
+    frame = CANARY.ethernet(
+        CANARY.ipv4(ICMP_ERROR_SERVER, ICMP_ERROR_CLIENT, _icmp4(3, 3), proto=1, ident=900)
+    )
+    CANARY.write_pcap(str(path), [(ICMP_ERROR_BASE_TS, frame)])
+
+
+ICMP_ERROR_CLIENT = "10.0.0.7"
+ICMP_ERROR_SERVER = "10.0.0.202"
 
 
 #: An Ethernet header with the IPv6 ethertype; `make_canary.ethernet` hardcodes IPv4's.
@@ -695,6 +719,114 @@ def test_icmp_detections_mirror_zeeks_port_columns(tmp_path):
     # the strings — so an unnormalised address makes every IPv6 detection unmatchable.
     assert (v6.src_ip, v6.dst_ip) == (ICMP6_CLIENT, ICMP6_SERVER)
     assert v6.src_port == 128
+
+
+# --- which way the matching packet was going (issue #115) -------------------------------------
+#
+# A destination-anchored IOC rule — `alert ip any any -> <flagged address> any`, 19.5% of the
+# real ruleset — fires on our RST *back* to an inbound scan from that address, and its `msg`
+# then says "Outgoing connection to ..." beside a flow that is inbound. Suricata already knows
+# which it was; these tests are the evidence that flabel now reads it rather than guessing.
+
+
+@pytest.mark.requires_tools
+def test_direction_is_read_from_the_alert_record(tmp_path):
+    """Both directions of one flow, from a real run: the field exists and it is parsed.
+
+    `alert ip any any -> any any` (sid 9000010) matches every packet of the canary's two HTTP
+    flows, so the same rule produces `to_server` alerts on the requests and `to_client` alerts
+    on the responses. That is the whole of #115 in miniature — one rule, one flow, opposite
+    directions — and it is why a label needs the field to be honest about what matched.
+
+    Measured on 8.0.6: `direction` is a **top-level** key of the eve record, beside `src_ip`,
+    not a member of the `alert` object where `signature_id` and `rev` live. Asserted against the
+    raw file below, because parsing the right value from the wrong nesting level is exactly the
+    mistake that would pass every other test in this module.
+    """
+    snapshot = make_snapshot(tmp_path, {"et/open": [ANY_IP_SID]})
+
+    detections, info = suricata.run_suricata(BENIGN, snapshot, tmp_path / "out")
+
+    assert info.tool_failures == ()
+    assert {detection.direction for detection in detections} == {"to_server", "to_client"}, (
+        "one rule matching both halves of a flow must not report one direction for both"
+    )
+
+    # The tuple and the direction have to agree, or the field is worse than absent: a consumer
+    # filtering on it would be filtering the wrong entries.
+    for detection in detections:
+        client_side = (detection.src_ip, detection.src_port) in {
+            ("10.0.0.5", 49152),
+            ("10.0.0.6", 49153),
+        }
+        expected = "to_server" if client_side else "to_client"
+        assert detection.direction == expected, (
+            f"{detection.src_ip}:{detection.src_port} -> {detection.dst_ip}:{detection.dst_port} "
+            f"reported {detection.direction}"
+        )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "eve.json").read_text().splitlines()
+        if line.strip()
+    ]
+    alerts = [record for record in records if record["event_type"] == "alert"]
+    assert alerts, "no alert records, so the assertions above proved nothing"
+    assert all("direction" in record for record in alerts), (
+        "Suricata stopped reporting `direction` at the top level of the alert record"
+    )
+    assert not any("direction" in record["alert"] for record in alerts), (
+        "`direction` moved into the `alert` object; the parser reads the top level"
+    )
+
+
+@pytest.mark.requires_tools
+def test_an_alert_suricata_gave_no_direction_is_unknown(tmp_path):
+    """The third value is a measurement, not a defensive default.
+
+    An unsolicited ICMP destination-unreachable belongs to no exchange Suricata can place a
+    packet within, and it emits the alert with **no `direction` key at all** — so the absent
+    case is reachable from ordinary traffic, not a hypothetical about malformed input.
+
+    `"unknown"` rather than `null` (Craig, 2026-08-17), following `licence: "unstated"` in
+    spec §4: the field stays mandatory and non-null, and `classtype` remains the sole nullable
+    field on a `SourceEntry`. What it must never do is pick one of the two real directions,
+    which would be flabel inventing the answer that #115 exists because guessing gets wrong.
+    """
+    capture = tmp_path / "icmp-error.pcap"
+    write_icmp_error_capture(capture)
+    snapshot = make_snapshot(tmp_path, {"et/open": [ANY_IP_SID]})
+
+    detections, info = suricata.run_suricata(capture, snapshot, tmp_path / "out")
+
+    assert info.tool_failures == ()
+    assert len(detections) == 1
+    assert detections[0].direction == "unknown"
+
+    alerts = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "eve.json").read_text().splitlines()
+        if line.strip() and json.loads(line)["event_type"] == "alert"
+    ]
+    assert len(alerts) == 1
+    assert "direction" not in alerts[0], (
+        "Suricata now reports a direction for this packet, so the fixture no longer evidences "
+        "the absent case — find one that does rather than deleting the test"
+    )
+
+
+def test_a_direction_this_build_does_not_recognise_is_unknown():
+    """A value we cannot interpret is reported as uninterpreted, never as a guess.
+
+    Suricata could add a value in a later release. Mapping it to `unknown` keeps every label
+    well-formed and says plainly that the direction was not established; mapping it to one of
+    the two real values would put a claim in the output that nothing measured.
+    """
+    assert suricata._direction("to_server") == "to_server"
+    assert suricata._direction("to_client") == "to_client"
+    assert suricata._direction(None) == "unknown"
+    assert suricata._direction("sideways") == "unknown"
+    assert suricata._direction(7) == "unknown"
 
 
 @pytest.mark.requires_tools

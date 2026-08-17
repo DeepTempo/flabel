@@ -450,9 +450,16 @@ def _labels(
     return tuple(sorted(labels, key=lambda label: (label.flow.ts_first, label.flow.uid)))
 
 
-def _source_order(entry: SourceEntry) -> tuple[int, str, int, int]:
-    """Spec §10: `sources` sorted by `(tier, source, sid, rev)`, numerically for the numbers."""
-    return (entry.tier, entry.source, entry.sid, entry.rev)
+def _source_order(entry: SourceEntry) -> tuple[int, str, int, int, str]:
+    """Spec §10: `sources` sorted by `(tier, source, sid, rev, direction)`, numbers numerically.
+
+    `direction` joined the key with the field itself (issue #115). Before it, one rule firing on
+    both halves of a flow produced two *identical* entries and the tie could not be observed;
+    now they differ, and spec §10 records that eve.json's records arrive in a different order
+    between runs — so an unbroken tie would make `labels.json` differ across two runs over one
+    capture and fail Goal 2 for a reason having nothing to do with the pipeline.
+    """
+    return (entry.tier, entry.source, entry.sid, entry.rev, entry.direction)
 
 
 def _unmatched_order(item: UnmatchedDetection) -> tuple[float, str, int]:

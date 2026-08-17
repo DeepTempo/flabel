@@ -57,11 +57,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from flabel.errors import SnapshotError, ToolError
 from flabel.models import (
     Detection,
+    Direction,
     SnapshotManifest,
     SourceAdmission,
     SuricataRunInfo,
@@ -733,8 +734,29 @@ def _detection(
         dst_ip=_address(record.get("dest_ip")),
         dst_port=dst_port,
         proto=_proto(record.get("proto")),
+        # Top level of the eve record, beside `src_ip` — **not** inside the `alert` object with
+        # `signature_id` and `rev`. Measured on 8.0.6, and asserted against a real run, because
+        # reading the right key at the wrong nesting level yields `unknown` on every alert and
+        # looks exactly like a tool that stopped reporting it.
+        direction=_direction(record.get("direction")),
         metadata=_metadata(alert.get("metadata")),
     )
+
+
+def _direction(raw: Any) -> Direction:
+    """Which side of the flow the matching packet was on (issue #115).
+
+    Anything this build does not recognise — an absent key, a value a later Suricata adds —
+    becomes `unknown`, which says the direction was not established. The alternative would be
+    to pick one of the two real values, and inventing a direction is the defect #115 exists
+    to report: a rule whose `msg` says "Outgoing connection" fired on an inbound flow, and a
+    guess would make the label agree with itself while still being wrong.
+
+    Not an error, because an alert Suricata cannot direct is ordinary traffic — an unsolicited
+    ICMP destination-unreachable is the measured case — and failing the run over it would lose
+    every label in the capture for a field no verdict depends on.
+    """
+    return raw if raw in get_args(Direction) else "unknown"
 
 
 def _proto(raw: Any) -> str:

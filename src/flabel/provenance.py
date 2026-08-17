@@ -198,6 +198,12 @@ def build_source_entry(
         rev=detection.rev,
         classtype=detection.classtype,
         threat=detection.threat,
+        # Published, never consulted (issue #115). `threat` is the rule's verbatim `msg`, so a
+        # destination-anchored IOC rule that matched our reply to an inbound packet puts
+        # "Outgoing connection to ..." next to an inbound flow. Both are true reports of what
+        # the rule and the capture said; carrying the direction is what lets a consumer see the
+        # contradiction and filter, instead of flabel resolving it by inference.
+        direction=detection.direction,
         # From the snapshot's admission record: the terms this source was admitted on, frozen
         # with the rules that fired. Never from the live registry — see the module docstring.
         admission_basis=admission.admission_basis,

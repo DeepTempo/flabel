@@ -245,10 +245,12 @@ my-capture_2026-08-11T213045Z/
 
 | Source class | Required fields | Nullable |
 | :-- | :-- | :-- |
-| Suricata (signature or IOC) | `tier`, `source`, `sid`, `rev`, `ruleset` (snapshot id), `admission_basis`, `licence`, `label_basis`, `threat` | `classtype` |
+| Suricata (signature or IOC) | `tier`, `source`, `sid`, `rev`, `ruleset` (snapshot id), `admission_basis`, `licence`, `label_basis`, `threat`, `direction` | `classtype` |
 | PANW (Phase 2) | `tier`, `source`, `threat_id`, `threat`, `content_version`, `panos_version`, `device_observed_at`, `label_basis` | — |
 
 **Amendment, 2026-08-15 (#89): `classtype` is nullable, not required.** It was listed as required above through PRD v0.4, and the code and `docs/spec.md` §4 have always made it `str | None` — so read literally, Goal 1 was not met. The divergence is resolved in favour of the code. **10,949 of the 84,995 admitted rules declare no `classtype:` at all**, so requiring it would mean either refusing to label on 12.9% of the ruleset or inventing a value, and an invented classtype is exactly the untraceable provenance Goal 1 exists to prevent. Spec §4's `classtype: str | None` is the single declaration both the field list and its nullability are now read from at test time; a `""` is still a defect, because §4 provides no empty-string convention the way it provides `"unstated"` for an unknown licence.
+
+**Amendment, 2026-08-17 (#115): `direction` is required, and never null.** Added after twenty-two real internet-facing captures showed the field a label needs to be honest about itself. 19.5% of the ruleset is destination-anchored with an unconstrained source (`alert ip any any -> <flagged address> any`), so a rule written for outbound traffic to a known-bad address fires on *our RST back* to that address's inbound scan — and the label then reads `threat: "Outgoing connection to ..."` beside an inbound flow. Suricata reports which side of the flow the matching packet was on; flabel now publishes it. **No verdict depends on it**: suppressing the label instead was rejected because a rule that legitimately matches a C2 response would be silently dropped, which is the failure §2.5 forbids. The value is `to_server`, `to_client`, or `unknown` — the last for an alert Suricata could not place on either side, measured on an unsolicited ICMP destination-unreachable. `unknown` is a sentinel in the manner of `licence: "unstated"`, so `classtype` remains the sole nullable field.
 
 **`label_basis`** distinguishes `direct` (this flow is the malicious activity) from `indicator-reference` (this flow merely referenced a malicious indicator). An IOC rule matching a DNS query labels the flow **to your resolver**; an HTTP-URL rule behind a proxy labels the flow **to the proxy**. Both are correct rule matches on benign infrastructure flows, and a model trained on them learns that its own resolver is malicious. The distinction must be machine-visible so a consumer can exclude them.
 
@@ -285,7 +287,7 @@ my-capture_2026-08-11T213045Z/
     { "tier": 2, "source": "suricata", "sid": 2028831, "rev": 1,
       "ruleset": "snap-9f2c1a…", "admission_basis": "metadata-filter",
       "licence": "MIT", "classtype": "command-and-control",
-      "label_basis": "direct", "threat": "..." }
+      "label_basis": "direct", "threat": "...", "direction": "to_server" }
   ]
 }
 ```

@@ -91,6 +91,7 @@ def make_detection(**overrides) -> Detection:
         "dst_ip": "198.51.100.7",
         "dst_port": 443,
         "proto": "tcp",
+        "direction": "to_server",
         "metadata": ("confidence High", "signature_severity Major"),
     }
     return Detection(**{**fields, **overrides})
@@ -107,6 +108,7 @@ def make_entry(**overrides) -> SourceEntry:
         "licence": "MIT",
         "classtype": "trojan-activity",
         "label_basis": "direct",
+        "direction": "to_server",
         "threat": "ET MALWARE Example C2 Checkin",
     }
     return SourceEntry(**{**fields, **overrides})
@@ -411,6 +413,28 @@ def test_sources_within_a_label_sort_by_tier_source_sid_rev():
     ]
     assert ordered == sorted(ordered)
     assert ordered[0] == (1, "panw/ngfw", 99, 1)
+
+
+def test_two_entries_differing_only_in_direction_have_a_stable_order():
+    """The reproducibility hazard `direction` introduced, and why it is in the sort key.
+
+    One rule matching both halves of a flow — `alert ip any any -> any any` on a request and
+    its response — used to produce two **identical** entries, so the order Suricata reported
+    them in could not change the file. Carrying `direction` makes them different records, and
+    spec §10 records that eve.json's records arrive in a different order between runs. Without
+    `direction` in the sort key the tie would be broken by eve order, and two runs over one
+    capture would write `to_client` first sometimes — a Goal 2 failure blaming the pipeline for
+    an ordering nobody chose.
+    """
+    to_client = make_entry(direction="to_client")
+    to_server = make_entry(direction="to_server")
+
+    forwards = serialise(document(labels=(make_label(None, to_server, to_client),)))
+    backwards = serialise(document(labels=(make_label(None, to_client, to_server),)))
+
+    assert forwards == backwards
+    ordered = [entry["direction"] for entry in json.loads(forwards)["labels"][0]["sources"]]
+    assert ordered == ["to_client", "to_server"], "sorted, not merely stable"
 
 
 def test_unmatched_detections_sort_by_ts_source_sid():

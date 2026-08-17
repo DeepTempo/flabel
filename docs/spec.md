@@ -108,6 +108,7 @@ All are frozen dataclasses in `models.py`.
 SourceClass = Literal["signature", "ioc-dest", "ioc-name", "identify"]
 AdmissionBasis = Literal["metadata-filter", "wholesale"]
 LabelBasis = Literal["direct", "indicator-reference"]
+Direction = Literal["to_server", "to_client", "unknown"]
 
 @dataclass(frozen=True)
 class SourceSpec:
@@ -173,6 +174,7 @@ class Detection:
     src_ip: str; src_port: int
     dst_ip: str; dst_port: int
     proto: str
+    direction: Direction         # which side of the flow the matching packet was on
 
 @dataclass(frozen=True)
 class SourceEntry:               # one asserting detection on a label
@@ -186,6 +188,7 @@ class SourceEntry:               # one asserting detection on a label
     classtype: str | None
     label_basis: LabelBasis
     threat: str
+    direction: Direction
 
 @dataclass(frozen=True)
 class Label:
@@ -229,6 +232,36 @@ corrections, not design changes: nothing here alters what a label means.
 | `rules_failed`, `rules_skipped` on `SuricataRunInfo` | step 6 | Suricata reports `N loaded, M failed, K skipped` and exits 0 either way. Without the last two, a snapshot of 85,545 rules loading as 85,519 is a run that looks complete and silently never examined the capture with 26 rules. `failed` and `skipped` are separate because they are different faults: `failed` is a rule this build cannot parse, `skipped` is a rule dropped for duplicating another's SID. |
 | `ja4_status: Literal["present", "not-installed", "probe-failed"] \| None` on `ZeekRunInfo` | step 5 | A null `ja4` on a flow has two causes — no TLS in the capture, or no fingerprinting package installed — and they are not the same fact. Step 5 initially overloaded `ja4_package_version` with status strings; that field is now reserved for an actual version (§8 says where it comes from), and the status has its own field. `probe-failed` is separate from `not-installed` because an absent package is the ordinary laptop case and a broken `ZEEKPATH` is a defect. |
 | `rules_excluded_unloadable` on `SourceAdmission` | step 6 | Three pawpatrules rules cannot compile under this configuration (§8). They have to be excluded at admission, and §6's `fetched == admitted + sum(excluded)` identity means every exclusion needs its own counter, or the rules go missing unaccounted for. |
+
+**`direction` is published on every `SourceEntry`, and no verdict depends on it** (issue #115,
+Craig, 2026-08-17). It is the one field here added because of what real captures did rather than
+what a tool measurement demanded, so the reasoning is recorded in full.
+
+Measured on twenty-two internet-facing captures: **16,576 rules — 19.5% of the 84,977-rule
+snapshot** — are `alert <proto> any any -> <literal address> any`, destination-anchored with an
+unconstrained source, concentrated in the highest-signal families in the ruleset (Cobalt Strike,
+Conti, Emotet, Log4Shell, Trickbot, Dridex, Ryuk). Every one of them fires on *our RST back* to an
+unsolicited inbound packet from a flagged address. The resulting label carried `threat: "Outgoing
+connection to an IP seen in Conti Ransomware Leak"` beside a Zeek flow with `conn_state: REJ`,
+`history: Sr`, zero bytes each way — one SYN in, one RST out. Forty-six of the corpus's
+fifty-four questionable source entries were this, and Suricata had reported `direction:
+to_client` on every one of them.
+
+Three properties of the fix, each a decision that could have gone the other way:
+
+| | |
+| :-- | :-- |
+| **Additive** | No label is dropped, no `label_basis` changes, no gate consults it. The rejected alternative was suppressing a `to_client` match on a destination-anchored rule, which is an inference: a rule that legitimately matches a C2 *response* would be silently lost, and §2.5 says absence is never a signal. Publishing lets a consumer filter on evidence flabel measured rather than on a guess flabel made. |
+| **Never null** | An alert Suricata cannot place on one side of a flow — an unsolicited ICMP destination-unreachable is the measured case on 8.0.6 — carries `"unknown"`, in the manner of `licence: "unstated"`. `classtype` stays the sole nullable field on a `SourceEntry`, which two tests assert against this section. |
+| **Read from the record, never derived** | `direction` is a top-level key of the eve record, beside `src_ip`, not a member of the `alert` object. Reading it from the wrong nesting level yields `"unknown"` on every alert and is indistinguishable from a tool that stopped reporting it, so the parse is asserted against a real run rather than a hand-written record. |
+
+What this does **not** resolve is whether an inbound scan that our host refused belongs in
+malicious-flow ground truth at all. That is a product question about what the labels are training
+— "this host is being attacked" against "this host is compromised" — and no field settles it. The
+same corpus answered a neighbouring one by measurement (issue #118): a flow that never established
+*should* still be able to carry `verdict: malicious`, because every real exploit attempt in the
+corpus was a single fire-and-forget UDP packet with `conn_state: S0`, and excluding on
+establishment would have deleted the twenty most valuable labels while keeping the noise.
 
 **`ToolError` carries the evidence, not just a message.** Recorded in step 5 and relied on by
 step 6: the exception exposes `failures` (the `ToolFailure` records it was raised over) and
@@ -679,7 +712,7 @@ suricata -r <normalized.pcap> -c <package-data>/suricata.yaml \
 
 - `-S` loads **only** the snapshot rules, replacing any system ruleset — no ambient state.
 - `--runmode single` for determinism of the alert set.
-- Parsed from `eve.json`: records with `event_type == "alert"` → `Detection`, taking `alert.signature_id`, `alert.rev`, `alert.signature`, `alert.metadata`, `app_proto`, `timestamp`, and the 5-tuple.
+- Parsed from `eve.json`: records with `event_type == "alert"` → `Detection`, taking `alert.signature_id`, `alert.rev`, `alert.signature`, `alert.metadata`, `app_proto`, `timestamp`, `direction`, and the 5-tuple.
 - The originating source for each SID is resolved from the snapshot's `sid_index.json` (§7), since `eve.json` does not carry it.
 - Detections whose source has `may_label == False` are **dropped before correlation** and counted in `identify_alerts_suppressed`.
 - Every path handed to the tool is absolute. Measured on 8.0.6: a relative `-S` resolves against the process's working directory, and §12's default `--rules-dir` is relative — so the ordinary case would otherwise depend on where flabel was launched from.
@@ -887,7 +920,7 @@ writes one shape of `except` clause across the pipeline rather than one per stag
 Reproducibility depends entirely on this being exact.
 
 - `labels` sorted by `(flow.ts_first, flow.uid)`.
-- `sources` within a label sorted by `(tier, source, sid, rev)`.
+- `sources` within a label sorted by `(tier, source, sid, rev, direction)`. `direction` joined the key with the field (issue #115): one rule matching both halves of a flow used to yield two identical entries, so the tie was unobservable, and eve.json's record order is not stable between runs (below).
 - `unmatched_detections` sorted by `(ts, source, sid)`.
 - `json.dump(..., sort_keys=True, indent=2, ensure_ascii=False)`, trailing newline.
 - Timestamps: ISO-8601 UTC with microsecond precision and a `Z` suffix. One format everywhere.
