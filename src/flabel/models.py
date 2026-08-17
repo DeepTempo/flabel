@@ -59,6 +59,31 @@ AdmissionBasis = Literal["metadata-filter", "wholesale"]
 #: consumer can tell a content match from an indirect reference without reading rule text.
 LabelBasis = Literal["direct", "indicator-reference"]
 
+#: Which way the packet that matched was going, as Suricata reported it (issue #115).
+#:
+#: Carried onto every `SourceEntry` and never consulted for a verdict. A destination-anchored
+#: IOC rule — `alert ip any any -> <flagged address> any`, 19.5% of the measured 84,977-rule
+#: snapshot — fires on our RST *back* to an unsolicited inbound packet, and its `msg` then reads
+#: "Outgoing connection to ..." beside a flow that is inbound. Both halves of that label are
+#: what the rule and the capture actually said; publishing which direction matched is what lets
+#: a consumer tell them apart, and it is cheaper and safer than flabel inferring an answer
+#: (spec §2.5, and the option rejected on #115).
+#:
+#: `unknown` is a **measured** third value, not a defensive default: an unsolicited ICMP
+#: destination-unreachable belongs to no exchange, and Suricata 8.0.6 emits that alert with no
+#: `direction` key at all. A sentinel rather than `None` (Craig, 2026-08-17), following
+#: `licence: "unstated"` — every `SourceEntry` field stays non-null except `classtype`.
+#:
+#: **The frame of reference is Suricata's flow, not Zeek's.** `to_server` means the matching
+#: packet travelled towards the endpoint *Suricata* treats as the responder. The `Label` beside
+#: it names a Zeek flow, and correlation matches a detection's tuple **in either direction**
+#: (spec §9) precisely because it does not require the two engines to agree on who initiated.
+#: They normally do; a midstream pickup, or a UDP flow one engine has expired and the other has
+#: not, are the cases where they need not. So this field is a faithful report of what the engine
+#: that raised the alert said, and not a derived statement about `Label.flow`'s orientation.
+#: Deriving one would be a different field and a different claim.
+Direction = Literal["to_server", "to_client", "unknown"]
+
 #: Container format of the capture as sniffed by magic bytes, never by file extension.
 CaptureFormat = Literal["pcap", "pcapng", "pcap.gz", "pcapng.gz"]
 
@@ -382,10 +407,21 @@ class Detection:
     dst_ip: str
     dst_port: int
     proto: str
+    #: Which side of the flow the matching packet was on (issue #115). No default: the value
+    #: comes from the engine, and a default is how it would silently stop doing so.
+    direction: Direction
     #: The rule's `metadata:` values, as Suricata reports them in `alert.metadata`. Spec §8
     #: says to parse this; spec §4's field list omitted somewhere to put it. It is what issue
     #: #10 (should untagged ET rules be admitted?) will be answered from.
     metadata: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # A `Detection` reaches `labels.json` directly, inside `unmatched_detections[]`, so the
+        # same argument that guards `SourceEntry` applies one model down: the `Literal` is a
+        # hint, and an unrecognised direction would serialise happily and mean nothing to a
+        # consumer written against spec §4's three values. `direction` is the only enumerated
+        # field here; the rest are the engine's raw report, checked where they are read.
+        _check(self.direction, get_args(Direction), "direction", "Detection")
 
 
 @dataclass(frozen=True)
@@ -406,10 +442,12 @@ class SourceEntry:
     classtype: str | None
     label_basis: LabelBasis
     threat: str
+    direction: Direction
 
     def __post_init__(self) -> None:
         _check(self.admission_basis, get_args(AdmissionBasis), "admission_basis", "SourceEntry")
         _check(self.label_basis, get_args(LabelBasis), "label_basis", "SourceEntry")
+        _check(self.direction, get_args(Direction), "direction", "SourceEntry")
 
 
 @dataclass(frozen=True)

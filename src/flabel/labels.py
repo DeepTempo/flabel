@@ -10,7 +10,7 @@ and the one place determinism can be lost is a serialiser that lets input order,
 order, host timezone or locale through into the output. So each rule below is a contract:
 
 * every array is explicitly ordered — `labels` by `(ts_first, uid)`, a label's `sources` by
-  `(tier, source, sid, rev)`, `unmatched_detections` by `(ts, source, sid)`;
+  `(tier, source, sid, rev, direction)`, `unmatched_detections` by `(ts, source, sid)`;
 * object keys are sorted by the encoder rather than by construction order;
 * every moment in time is one format — ISO-8601 UTC, microsecond precision, `Z` suffix — so an
   epoch float never reaches a slot a reader will parse as a string;
@@ -159,8 +159,12 @@ def _label_key(label: Label) -> tuple[float, str]:
     return (label.flow.ts_first, label.flow.uid)
 
 
-def _entry_key(entry: Any) -> tuple[int, str, int, int]:
-    return (entry.tier, entry.source, entry.sid, entry.rev)
+def _entry_key(entry: Any) -> tuple[int, str, int, int, str]:
+    # `direction` is in the key because entries that differ only by it are now possible — one
+    # rule matching both halves of a flow (#115) — and eve.json's record order is not guaranteed
+    # stable between runs. Must stay identical to `correlate._source_order`, which sorts the same
+    # tuple first; `test_the_two_sort_keys_are_the_same_key` asserts they have not drifted.
+    return (entry.tier, entry.source, entry.sid, entry.rev, entry.direction)
 
 
 def _unmatched_key(entry: UnmatchedDetection) -> tuple[float, str, int]:

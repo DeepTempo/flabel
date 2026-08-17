@@ -434,6 +434,7 @@ def gate_failure() -> CorrelationError:
         dst_ip="10.0.0.200",
         dst_port=80,
         proto="tcp",
+        direction="to_server",
     )
     result = CorrelationResult(
         labels=(),
@@ -870,6 +871,47 @@ def test_the_end_to_end_run_labels_the_flow_the_rule_matched(
     # Spec §10: sorted by (ts_first, uid), so two runs cannot order them differently.
     keys = [(label["flow"]["ts_first"], label["flow"]["uid"]) for label in document["labels"]]
     assert keys == sorted(keys)
+
+
+@pytest.mark.requires_tools
+def test_the_direction_reaches_labels_json_from_the_engine(
+    tmp_path: Path, no_network: None
+) -> None:
+    """Issue #115 end to end: eve.json says which way, and `labels.json` says the same.
+
+    `alert ip any any -> any any` matches every packet of the canary's two HTTP flows, so each
+    flow is labelled with **both** a `to_server` entry (the request) and a `to_client` one (the
+    response) — from one rule, on one flow. Nothing else in the suite asserts both values
+    survive the whole pipeline, and the pipeline is where the value can be lost: a
+    `build_source_entry` that stopped reading `detection.direction`, or a `suricata.py` that
+    stopped parsing it, leaves every unit test in `test_provenance.py` green.
+
+    Asserted against eve.json rather than against a literal, so the test cannot drift into
+    agreeing with a hardcoded default.
+    """
+    output = tmp_path / "out"
+    rules = tmp_path / "rules"
+    make_snapshot(rules, {"et/open": [ANY_IP_PROTOCOL]})
+
+    assert cli.main(offline(BENIGN, rules, output)) == EXIT_SUCCESS
+
+    rundir = only_run_dir(output)
+    document = json.loads((rundir / "labels.json").read_text(encoding="utf-8"))
+    entries = [entry for label in document["labels"] for entry in label["sources"]]
+    assert entries, "no source entries, so this asserts nothing"
+
+    reported = [
+        json.loads(line)["direction"]
+        for line in (rundir / "suricata" / "eve.json").read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line)["event_type"] == "alert"
+    ]
+    assert sorted(entry["direction"] for entry in entries) == sorted(reported), (
+        "labels.json does not carry the directions the engine reported"
+    )
+    assert {"to_server", "to_client"} <= set(reported), (
+        "the fixture stopped producing both directions, so the assertion above is weaker than "
+        "it reads — a rule matching only requests would pass it"
+    )
 
 
 @pytest.mark.requires_tools

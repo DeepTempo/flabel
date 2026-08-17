@@ -120,6 +120,7 @@ def make_detection(**overrides) -> Detection:
         "dst_ip": "198.51.100.7",
         "dst_port": 80,
         "proto": "tcp",
+        "direction": "to_server",
     }
     return Detection(**{**fields, **overrides})
 
@@ -291,10 +292,31 @@ def test_fields_come_from_the_detection_and_the_admission_not_from_each_other():
     assert entry.rev == detection.rev
     assert entry.classtype == detection.classtype
     assert entry.threat == detection.threat
+    assert entry.direction == detection.direction
 
     assert entry.admission_basis == admission.admission_basis
     assert entry.licence == admission.licence
     assert entry.ruleset == SNAPSHOT_ID
+
+
+@pytest.mark.parametrize("direction", ["to_server", "to_client", "unknown"])
+def test_the_direction_the_engine_reported_survives_onto_the_entry(direction):
+    """Issue #115: the field is published unchanged, and no verdict depends on it.
+
+    A destination-anchored IOC rule matching `to_client` is our reply to an inbound packet,
+    and its `msg` says "Outgoing connection". flabel's answer is to carry the contradiction
+    into the label rather than resolve it: the entry still asserts what the rule asserted, and
+    a consumer can now see which way the matching packet was going and filter accordingly.
+
+    Parametrized over all three values because `unknown` is the one a defaulting bug would
+    produce silently — see `test_suricata.py` for the ICMP error that really does yield it.
+    """
+    entry = build_source_entry(make_detection(direction=direction), make_admission(), SNAPSHOT_ID)
+
+    assert entry.direction == direction
+    assert entry.label_basis in {"direct", "indicator-reference"}, (
+        "publishing the direction must not change what the label claims"
+    )
 
 
 def test_classtype_none_is_preserved_rather_than_defaulted():
