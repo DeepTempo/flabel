@@ -114,6 +114,10 @@ def test_pure_modules_are_all_accounted_for():
         "suricata.py",
         "cli.py",
         "rules/snapshot.py",
+        # Impure because it drives tcpprep/tcprewrite/tcpreplay as subprocesses. The timestamp
+        # arithmetic — the part a wrong answer would put on a label — is pure and lives on
+        # `ReplayWindow`, so `tests/test_replay.py` exercises it without a NIC or a firewall.
+        "replay.py",
         NETWORK_MODULE,
     }
     classified = set(PURE_MODULES) | impure | {"__init__.py", "rules/__init__.py"}
