@@ -53,7 +53,17 @@ def _check(value: object, allowed: tuple[object, ...], field: str, owner: str) -
 SourceClass = Literal["signature", "ioc-dest", "ioc-name", "identify"]
 
 #: How rules from a source were selected. `metadata-filter` requires ET-style metadata.
-AdmissionBasis = Literal["metadata-filter", "wholesale"]
+#:
+#: `device-policy` is Phase 2's (Craig, 2026-08-17) and makes a different kind of statement from
+#: the other two. Those describe a decision flabel made when admitting rules into a snapshot;
+#: `device-policy` says the decision was made **on the firewall**, by its threat exceptions, and
+#: that flabel admitted what the device reported without second-guessing it.
+#:
+#: Saying so explicitly is the point. A consumer weighting labels by trust has to know that the
+#: gate for these entries lives in a configuration flabel does not contain — which is why a
+#: tier-1 entry's `ruleset` carries the device's content version *and* its config version, so the
+#: policy that admitted a detection is as identifiable as the signature that produced it.
+AdmissionBasis = Literal["metadata-filter", "wholesale", "device-policy"]
 
 #: How directly a label follows from its rule match. Carried on every SourceEntry so a
 #: consumer can tell a content match from an indirect reference without reading rule text.

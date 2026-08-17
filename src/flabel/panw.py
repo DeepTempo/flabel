@@ -58,28 +58,32 @@ JOB_POLL_SECONDS = 2
 JOB_TIMEOUT_SECONDS = 600
 HTTP_TIMEOUT_SECONDS = 120
 
-#: Threat-log subtypes that assert a *threat*. PAN-OS files several other things in the threat
-#: log — `url`, `data`, `file`, `wildfire` — which are not signature matches on an attack and
-#: would each need their own provenance argument before they could label anything.
-LABELLING_SUBTYPES = frozenset({"vulnerability", "spyware", "virus", "wildfire-virus"})
+#: **flabel applies no severity gate to tier 1** (Craig, 2026-08-17).
+#:
+#: The admission decision for tier 1 lives on the firewall, in its threat exceptions, and is
+#: curated there before a run happens. An earlier version of this module excluded
+#: `informational` on the tier-2 argument from issue #75 — that a protocol-conformance
+#: observation is not an attack. That reasoning is still right *about Suricata*, where flabel
+#: owns the ruleset; it is wrong here, where it would silently overrule an exception the operator
+#: deliberately configured, and drop a detection they had already decided to keep.
+#:
+#: What replaces it is not "trust us" but a recorded basis: every tier-1 entry carries
+#: `admission_basis: "device-policy"` and a `ruleset` naming both the content version and the
+#: device's config version. A consumer can therefore see that the gate lived on the device, and
+#: identify exactly which policy revision it was.
+#:
+#: The subtype gate below stays, because it is structural rather than a quality judgment.
+SEVERITY_GATE = None
 
-#: Severities admitted as `verdict: malicious` by default.
+#: Threat-log subtypes that assert a *threat*, and the only ones that may become labels.
 #:
-#: **`informational` is excluded, and this is the tier-1 analogue of issue #75.** Measured
-#: 2026-08-17: of 13 detections on one real capture, 3 were `informational` — "Non-RFC Compliant
-#: DNS Traffic on Port 53/5353" (x2) and "Non-RFC Compliant ECHO Traffic on Port 7". Those are
-#: observations about protocol conformance, not attacks, and promoting one to `malicious` teaches
-#: a model that non-standard traffic is hostile. That is precisely the argument that excluded 436
-#: `policy-violation` rules from Tier 2, applied to the field PAN-OS gives us instead of a
-#: classtype.
-#:
-#: `low` is admitted pending Craig's decision, which is recorded as open on issue #122: the
-#: measured capture contained none, so excluding it would be a policy choice with no evidence
-#: behind it either way. The two `SIPVicious Scanner Detection` entries at `medium` are the live
-#: question — scanner identification is what #113 removed from Tier 2 — and they are admitted
-#: here only because inventing an exclusion this module cannot justify would be the same mistake
-#: in the other direction.
-ADMITTED_SEVERITIES = frozenset({"critical", "high", "medium", "low"})
+#: Structural, not a judgment about quality: PAN-OS files `url`, `data` and `file` events in the
+#: threat log too, and those carry a category name where a signature name belongs. Admitting one
+#: would publish a label whose `threat` reads "search-engines" and whose `sid` identifies a URL
+#: category — a well-formed label about nothing. This is not the operator's exceptions being
+#: second-guessed; it is the difference between a signature match and a different kind of record
+#: that happens to share a log.
+LABELLING_SUBTYPES = frozenset({"vulnerability", "spyware", "virus", "wildfire-virus"})
 
 #: PAN-OS protocol spellings that differ from Zeek's `conn.log`. Same job as
 #: `suricata.PROTO_ALIASES` and the same rule: Zeek's `transport_proto` has only tcp/udp/icmp/
@@ -400,15 +404,29 @@ def threat_name(entry: ET.Element) -> str:
 def admits(entry: ET.Element) -> bool:
     """Whether this entry may assert `verdict: malicious`.
 
-    Two gates, both on fields PAN-OS gives us: the log subtype must be a signature match on a
-    threat, and the severity must be one this module admits. See `ADMITTED_SEVERITIES` for why
-    `informational` is excluded and why `medium` is not.
+    One gate, and it is structural: the record must be a signature match on a threat. Severity is
+    deliberately not consulted — see `SEVERITY_GATE` — because the quality decision for tier 1 is
+    made on the device and re-making it here would discard detections the operator's threat
+    exceptions had already admitted.
     """
     subtype = _text(entry, "subtype").casefold()
-    severity = _text(entry, "severity").casefold()
-    if subtype and subtype not in LABELLING_SUBTYPES:
-        return False
-    return severity in ADMITTED_SEVERITIES
+    return not (subtype and subtype not in LABELLING_SUBTYPES)
+
+
+def ruleset_id(entry: ET.Element) -> str:
+    """What produced this detection *and* what allowed it through, as one identifier.
+
+    The tier-1 counterpart of a snapshot id, and it needs both halves. The content version names
+    the signature set; the config version names the firewall configuration — including the threat
+    exceptions that constitute tier 1's admission policy. With only the first, two labels from
+    the same signatures under materially different exception sets would be indistinguishable, and
+    the basis on which a detection was admitted would not be recoverable from the artifact.
+
+    Measured shape: `AppThreat-9136-10199/config-2817`.
+    """
+    content = _text(entry, "contentver") or "unknown-content"
+    config = _text(entry, "config_ver")
+    return f"{content}/config-{config}" if config else content
 
 
 def deduplicate(found: Sequence[Detection]) -> tuple[tuple[Detection, ...], int]:
@@ -435,9 +453,9 @@ def deduplicate(found: Sequence[Detection]) -> tuple[tuple[Detection, ...], int]
     which is what `Flow.ts_first` holds and what a mapped timestamp is compared against when a
     5-tuple has to be told apart from another occurrence of itself.
     """
-    best: dict[tuple[int, str, int, str, int, str], Detection] = {}
+    best: dict[DetectionKey, Detection] = {}
     for d in found:
-        key = (d.sid, d.src_ip, d.src_port, d.dst_ip, d.dst_port, d.proto)
+        key = detection_key(d)
         current = best.get(key)
         if current is None or d.ts < current.ts:
             best[key] = d
@@ -445,29 +463,48 @@ def deduplicate(found: Sequence[Detection]) -> tuple[tuple[Detection, ...], int]
     return kept, len(found) - len(kept)
 
 
-def detections(entries: Sequence[ET.Element]) -> tuple[tuple[Detection, ...], tuple[str, ...]]:
-    """Threat-log entries as tier-1 `Detection`s, plus a note for every entry declined.
+#: How a detection is identified for dedup and for looking its ruleset back up.
+DetectionKey = tuple[int, str, int, str, int, str]
 
-    Returns the declines rather than dropping them, for spec §2.8's reason: a suppressed
-    detection must be counted, never silent. The caller puts the count in the run block so a
-    consumer can see that the gate acted and by how much.
+
+def detection_key(detection: Detection) -> DetectionKey:
+    return (detection.sid, detection.src_ip, detection.src_port,
+            detection.dst_ip, detection.dst_port, detection.proto)
+
+
+def detections(
+    entries: Sequence[ET.Element],
+) -> tuple[tuple[Detection, ...], tuple[str, ...], dict[DetectionKey, str]]:
+    """Threat-log entries as tier-1 `Detection`s, the declines, and each one's ruleset id.
+
+    Declines are returned rather than dropped, for spec §2.8's reason: a suppressed detection is
+    counted, never silent. The caller puts the count in the run block so a consumer can see the
+    gate acted and by how much.
+
+    The ruleset mapping exists because `Detection` has no field for it — it describes what the
+    *engine observed*, while the ruleset belongs to provenance — and tier 1 reads that identifier
+    off each entry rather than once per run (`ruleset_id`). Keyed rather than positional so
+    `deduplicate` can reorder and drop entries without the two lists silently drifting apart.
     """
     out: list[Detection] = []
     declined: list[str] = []
+    rulesets: dict[DetectionKey, str] = {}
     for entry in entries:
         name = threat_name(entry) or "unnamed"
         if not admits(entry):
             declined.append(
-                f"{name}: subtype={_text(entry, 'subtype') or 'none'} "
-                f"severity={_text(entry, 'severity') or 'none'}"
+                f"{name}: subtype={_text(entry, 'subtype') or 'none'} is not a signature match "
+                f"on a threat"
             )
             continue
         sid = threat_id(entry)
         if sid is None:
             declined.append(f"{name}: no numeric threat id, so it cannot be attributed")
             continue
-        out.append(_detection(entry, sid, name))
-    return tuple(out), tuple(declined)
+        detection = _detection(entry, sid, name)
+        out.append(detection)
+        rulesets.setdefault(detection_key(detection), ruleset_id(entry))
+    return tuple(out), tuple(declined), rulesets
 
 
 def _detection(entry: ET.Element, sid: int, name: str) -> Detection:
@@ -666,8 +703,8 @@ def declined_note(declined: Sequence[str]) -> str | None:
 
 
 __all__ = [
-    "ADMITTED_SEVERITIES",
-    "LABELLING_SUBTYPES",
+        "LABELLING_SUBTYPES",
+    "SEVERITY_GATE",
     "MAX_CLOCK_SKEW_SECONDS",
     "TIER",
     "DeviceInfo",
@@ -679,10 +716,12 @@ __all__ = [
     "counter_delta",
     "declined_note",
     "deduplicate",
+    "detection_key",
     "detections",
     "iter_entries",
     "loss",
     "parse_system_info",
+    "ruleset_id",
     "session_id",
     "threat_id",
     "threat_name",

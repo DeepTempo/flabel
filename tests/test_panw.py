@@ -162,14 +162,17 @@ def test_the_threat_name_does_not_repeat_the_id_it_is_published_beside():
     assert panw.threat_name(entry) == "SIPVicious Scanner Detection"
 
 
-def test_informational_severity_is_not_admitted_as_malicious():
-    """The tier-1 analogue of #75.
+def test_severity_is_not_a_gate_because_the_device_owns_that_decision():
+    """Decided 2026-08-17: tier-1 admission lives in the firewall's threat exceptions.
 
-    "Non-RFC Compliant ECHO Traffic on Port 7" is an observation about protocol conformance. A
-    model trained on it as `malicious` learns that non-standard traffic is hostile.
+    An earlier version excluded `informational` on issue #75's argument. That reasoning holds for
+    Suricata, where flabel owns the ruleset; here it would overrule an exception the operator
+    configured deliberately and drop a detection they had already chosen to keep. What replaces
+    the gate is a recorded basis, not silent trust — see `test_a_tier_1_entry_records_the_policy
+    _that_admitted_it`.
     """
     informational = [e for e in entries() if panw.threat_id(e) == 56796]
-    assert informational and not panw.admits(informational[0])
+    assert informational and panw.admits(informational[0])
 
 
 def test_a_url_subtype_is_not_admitted_even_at_high_severity():
@@ -185,7 +188,7 @@ def test_the_corroborated_detection_survives_the_gate_with_its_tuple_intact():
     (CVE-2021-35394); the firewall flagged the same 5-tuple as signature 91535. The tuple must
     survive this module unchanged or `correlate._place` cannot join them.
     """
-    found, _ = panw.detections(entries())
+    found, _, _rs = panw.detections(entries())
     realtek = [d for d in found if d.sid == 91535]
     assert len(realtek) == 1
     d = realtek[0]
@@ -199,10 +202,11 @@ def test_the_corroborated_detection_survives_the_gate_with_its_tuple_intact():
 
 def test_declined_entries_are_reported_rather_than_dropped():
     """Spec §2.8: a suppressed detection is counted, never silent."""
-    found, declined = panw.detections(entries())
-    assert len(found) == 4
-    assert len(declined) == 2
-    assert any("56796" in d or "Non-RFC" in d for d in declined)
+    found, declined, _rs = panw.detections(entries())
+    # Five of six admitted: only the `url` subtype is refused, and it is refused structurally.
+    assert len(found) == 5
+    assert len(declined) == 1
+    assert "not a signature match" in declined[0]
 
 
 def test_both_directions_of_one_signature_are_kept_as_separate_detections():
@@ -211,7 +215,7 @@ def test_both_directions_of_one_signature_are_kept_as_separate_detections():
     correlate() consolidates by flow; discarding one here would decide that for it, and the
     server-side entry is a different connection rather than a duplicate.
     """
-    found, _ = panw.detections(entries())
+    found, _, _rs = panw.detections(entries())
     ssh = [d for d in found if d.sid == 40015]
     assert len(ssh) == 2
     assert {d.direction for d in ssh} == {"to_server", "to_client"}
@@ -310,7 +314,7 @@ def test_the_threat_category_comes_from_thr_category_not_from_category():
         "<src>1.2.3.4</src><dst>5.6.7.8</dst><sport>1</sport><dport>2</dport><proto>udp</proto>"
         "<direction>client-to-server</direction></entry>"
     )
-    found, _ = panw.detections([entry])
+    found, _, _rs = panw.detections([entry])
     assert found[0].classtype == "info-leak"
 
 
@@ -337,7 +341,7 @@ def _det(sid: int, ts: float, sport: int = 5362) -> object:
         f"<receive_time>{time.strftime('%Y/%m/%d %H:%M:%S', time.gmtime(ts))}</receive_time>"
         f"<direction>client-to-server</direction></entry>"
     )
-    found, _ = panw.detections([entry])
+    found, _, _rs = panw.detections([entry])
     return found[0]
 
 

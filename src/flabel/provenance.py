@@ -758,3 +758,62 @@ def _failure(failure: ToolFailure) -> dict[str, Any]:
         "exit_code": failure.exit_code,
         "message": failure.message,
     }
+
+
+#: What a tier-1 label's terms are, given that PANW signatures are not open-source rules.
+#:
+#: **Licence is deliberately not an open-source licence** (Craig, 2026-08-17). The tier-2 licence
+#: field exists to carry a redistribution obligation, because those rules are other people's text
+#: and shipping labels derived from them incurs duties that `NOTICE` spells out. A PANW signature
+#: is proprietary and this output is neither redistributed nor sold, so there is no obligation to
+#: record — and inventing an SPDX identifier for it would be worse than saying so plainly.
+#:
+#: The field is still populated rather than blanked, because a consumer reading `licence` across
+#: a mixed-tier label must be able to tell "no obligation, vendor signature" from "we forgot".
+DEVICE_LICENCE = "proprietary:vendor-signature (not redistributed)"
+
+
+def build_device_source_entry(detection: Detection, ruleset: str) -> SourceEntry:
+    """A tier-1 detection's provenance, taken from the device rather than from a snapshot.
+
+    The tier-2 path derives a label's terms from the snapshot manifest, which is what makes an
+    open-source rule's licence and admission basis frozen alongside the rules that fired. Tier 1
+    has no manifest: the signature set is the vendor's, and the admission decision is the
+    operator's threat exceptions on the device. So the same fields are populated from the two
+    identifiers the device does give us, and `build_source_entry`'s guards do not apply because
+    there is no `SourceAdmission` to disagree with.
+
+    `ruleset` is `panw.ruleset_id(entry)` — content version *and* config version together. Both
+    halves are needed: the first says which signatures existed, the second which exceptions were
+    in force, and for tier 1 the second **is** the admission policy. A label naming only the
+    signature set could not be traced back to the decision that admitted it.
+
+    `label_basis` is `direct` without exception. The tier-2 distinction exists because some feeds
+    label by referencing an indicator — an address or domain seen in a list — rather than by
+    matching content. A PANW threat signature matches on the traffic itself, so the indirect case
+    this field was invented to expose does not arise here.
+    """
+    if detection.tier != 1:
+        raise ValueError(
+            f"build_device_source_entry is the tier-1 path but was given a tier "
+            f"{detection.tier} detection from {detection.source!r}; a label would claim its "
+            f"verdict came from a device that never saw it"
+        )
+    if not ruleset:
+        raise ValueError(
+            f"a tier-1 entry for sid {detection.sid} has no ruleset identifier, so the label "
+            f"could not name the signature set or the policy that produced it"
+        )
+    return SourceEntry(
+        tier=detection.tier,
+        source=detection.source,
+        sid=detection.sid,
+        rev=detection.rev,
+        classtype=detection.classtype,
+        threat=detection.threat,
+        direction=detection.direction,
+        ruleset=ruleset,
+        admission_basis="device-policy",
+        licence=DEVICE_LICENCE,
+        label_basis="direct",
+    )
