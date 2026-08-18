@@ -182,11 +182,48 @@ def test_a_missing_capture_fails_before_anything_is_run(lab):
     assert not Path(lab["_recorded"]).exists()
 
 
-def test_no_argument_prints_usage_and_exits_two(lab):
+def test_no_argument_prints_usage_to_stderr_and_exits_two(lab):
     result = invoke(lab)
 
     assert result.returncode == 2
-    assert "usage: flabel-run" in result.stderr
+    assert "usage:" in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("flag", ["-h", "--help", "help"])
+def test_help_goes_to_stdout_and_succeeds(lab, flag):
+    """Asking is not the same event as being told.
+
+    `--help` on stderr with a failing status cannot be piped into a pager, which is the one
+    thing an operator does with it.
+    """
+    result = invoke(lab, flag)
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert "usage:" in result.stdout
+
+
+def test_help_documents_the_knobs_that_change_what_a_label_means(lab):
+    """--topspeed and the settle are not cosmetic, so help has to say what they cost."""
+    text = invoke(lab, "--help").stdout
+    for knob in (
+        "FLABEL_REPLAY_MULTIPLIER",
+        "FLABEL_REPLAY_TOPSPEED",
+        "FLABEL_SETTLE_SECONDS",
+        "FLABEL_PLAIN_PROGRESS",
+        "--offline",
+    ):
+        assert knob in text, f"help does not mention {knob}"
+    assert "unmatched rather than" in text, "help must say what --topspeed costs"
+
+
+def test_help_works_without_a_config_file(lab, tmp_path):
+    """An operator whose config is missing still needs to be able to read the help."""
+    result = invoke(lab, "--help", extra={"FLABEL_RUN_CONF": str(tmp_path / "absent.env")})
+
+    assert result.returncode == 0
+    assert "usage:" in result.stdout
 
 
 def test_a_missing_config_file_says_where_it_should_be(lab, tmp_path):

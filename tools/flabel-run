@@ -20,21 +20,66 @@ REPO="${FLABEL_RUN_REPO:-/opt/flabel/repo}"
 # and a test must be able to observe the command WITHOUT running it as root or at all.
 SUDO="${FLABEL_RUN_SUDO:-sudo}"
 
+#: Written to stdout and exit 0 for an explicit --help, to stderr and exit 2 for a usage error.
+#: Those are different events: one is the operator asking, the other is the operator being told,
+#: and a script that answers --help on stderr with a failing status cannot be piped into a pager.
 usage() {
-  cat >&2 <<'EOF'
-usage: flabel-run <capture.pcap | gs://bucket/object.pcap> [extra flabel args]
+  cat <<'EOF'
+flabel-run — label a packet capture on the replay box.
 
-  flabel-run /var/lib/flabel/captures/lax.pcap
+usage:
+  flabel-run <capture.pcap | gs://bucket/object.pcap> [flabel args...]
+  flabel-run --help
+
+arguments:
+  <capture>        A local path, absolute or relative, or a gs:// object. A gs:// object is
+                   staged into /var/lib/flabel/captures first and reused if already there.
+  [flabel args]    Anything after the capture is passed straight to flabel. Most useful:
+                     --offline                  tier 2 only: no replay, no device, no network
+                     --unmatched-threshold N    fail the run above this share unplaced (0.01)
+                     --ruleset-snapshot ID      label against a specific snapshot
+                     --output-dir DIR           override /var/lib/flabel/runs
+
+environment (anything you set here WINS over /var/lib/flabel/flabel.env):
+  FLABEL_REPLAY_MULTIPLIER   time compression for the replay (default 1000). A 4h capture
+                             replays in ~15s at 1000; lower it to replay closer to real time.
+  FLABEL_REPLAY_TOPSPEED     1 to replay as fast as possible. Abandons relative packet
+                             timing, so a 5-tuple occurring twice in one capture can no
+                             longer be told apart and is reported unmatched rather than
+                             guessed. Off by default for that reason.
+  FLABEL_SETTLE_SECONDS      wait after the replay before clearing sessions (default 60).
+                             Content-ID finishes a session after its last packet, so a
+                             threat on the tail of a flow is logged after the replay returns.
+  FLABEL_INLINE_HOST         firewall management address
+  FLABEL_INLINE_API_KEY_FILE file holding the XML API key
+  FLABEL_REPLAY_IF1/IF2      replay interfaces (default ens5, ens6)
+  FLABEL_PLAIN_PROGRESS      1 to force one-line-per-step output instead of the live display
+  NO_COLOR                   same effect, by convention
+
+output:
+  One directory per run under /var/lib/flabel/runs/{capture}_{timestamp}/ holding
+  labels.json, run.json, NOTICE, zeek/ and suricata/. A run never modifies a previous
+  one. A run that fails writes run.json and NO labels.json — the absence is the signal.
+
+examples:
+  flabel-run ./capture.pcap
   flabel-run gs://pm-proto-496816-flabel-pcaps/attackcollect/capture_2026-07-07.pcap
-  flabel-run mycapture.pcap --offline        # tier 2 only, no device, no replay
-
-Output: one run directory per run under /var/lib/flabel/runs/, holding labels.json,
-run.json, NOTICE, zeek/ and suricata/. A run never modifies a previous one.
+  flabel-run ./capture.pcap --offline
+  FLABEL_REPLAY_MULTIPLIER=200 FLABEL_SETTLE_SECONDS=30 flabel-run ./capture.pcap
 EOF
-  exit 2
 }
 
-[ $# -ge 1 ] || usage
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  "")
+    usage >&2
+    exit 2
+    ;;
+esac
+
 TARGET="$1"; shift
 
 [ -f "$CONF" ] || { echo "flabel-run: $CONF is missing; the device settings live there" >&2; exit 1; }
