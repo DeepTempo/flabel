@@ -197,8 +197,9 @@ class PanwDevice:
         except Exception as exc:  # noqa: BLE001 - urllib raises a wide family; all are the same failure
             raise ToolError(
                 f"the firewall at {self.host} could not be reached while {what}: {exc}",
-                failures=(ToolFailure(tool="panw-api", argv=(safe,), exit_code=None,
-                                      message=str(exc)),),
+                failures=(
+                    ToolFailure(tool="panw-api", argv=(safe,), exit_code=None, message=str(exc)),
+                ),
             ) from exc
 
         try:
@@ -206,22 +207,25 @@ class PanwDevice:
         except ET.ParseError as exc:
             raise ToolError(
                 f"the firewall at {self.host} returned an unparseable response while {what}",
-                failures=(ToolFailure(tool="panw-api", argv=(safe,), exit_code=None,
-                                      message=str(exc)),),
+                failures=(
+                    ToolFailure(tool="panw-api", argv=(safe,), exit_code=None, message=str(exc)),
+                ),
             ) from exc
 
         if root.get("status") != "success":
             message = "".join(root.itertext()).strip() or "no message"
             raise ToolError(
                 f"the firewall at {self.host} refused the request while {what}: {message}",
-                failures=(ToolFailure(tool="panw-api", argv=(safe,), exit_code=None,
-                                      message=message),),
+                failures=(
+                    ToolFailure(tool="panw-api", argv=(safe,), exit_code=None, message=message),
+                ),
             )
         return root
 
     def system_info(self) -> DeviceInfo:
-        root = self._request({"type": "op", "cmd": "<show><system><info/></system></show>"},
-                             "reading system info")
+        root = self._request(
+            {"type": "op", "cmd": "<show><system><info/></system></show>"}, "reading system info"
+        )
         return parse_system_info(root)
 
     def clear_sessions(self) -> None:
@@ -232,8 +236,9 @@ class PanwDevice:
         and their logs would not exist when the query runs. This is also why session-*start*
         logging is not needed — measured and decided 2026-08-17.
         """
-        self._request({"type": "op", "cmd": "<clear><session><all/></session></clear>"},
-                      "clearing sessions")
+        self._request(
+            {"type": "op", "cmd": "<clear><session><all/></session></clear>"}, "clearing sessions"
+        )
 
     def threat_entries(self, query: ThreatQuery) -> tuple[ET.Element, ...]:
         """Every threat-log entry in the window, following PAN-OS's job-then-fetch protocol."""
@@ -248,8 +253,14 @@ class PanwDevice:
 
     def _threat_page(self, query: ThreatQuery, skip: int) -> list[ET.Element]:
         submitted = self._request(
-            {"type": "log", "log-type": "threat", "query": query.filter_expression(),
-             "nlogs": str(PAGE_SIZE), "skip": str(skip), "dir": "forward"},
+            {
+                "type": "log",
+                "log-type": "threat",
+                "query": query.filter_expression(),
+                "nlogs": str(PAGE_SIZE),
+                "skip": str(skip),
+                "dir": "forward",
+            },
             "submitting the threat-log query",
         )
         job = submitted.findtext(".//job")
@@ -263,8 +274,9 @@ class PanwDevice:
     def _collect(self, job: str) -> list[ET.Element]:
         deadline = time.monotonic() + JOB_TIMEOUT_SECONDS
         while True:
-            root = self._request({"type": "log", "action": "get", "job-id": job},
-                                 f"retrieving threat-log job {job}")
+            root = self._request(
+                {"type": "log", "action": "get", "job-id": job}, f"retrieving threat-log job {job}"
+            )
             status = (root.findtext(".//job/status") or "").strip().upper()
             if status == "FIN":
                 return list(root.findall(".//log/logs/entry"))
@@ -281,8 +293,9 @@ class PanwDevice:
         Read so that `verify_clock` can compare it against the replaying host's, because the
         query window is only meaningful if the two agree — see `ThreatQuery._stamp`.
         """
-        root = self._request({"type": "op", "cmd": "<show><clock/></show>"},
-                             "reading the device clock")
+        root = self._request(
+            {"type": "op", "cmd": "<show><clock/></show>"}, "reading the device clock"
+        )
         return _clock_epoch("".join(root.itertext()).strip())
 
     def logs_written(self) -> Mapping[str, int]:
@@ -316,6 +329,7 @@ class PanwDevice:
 
 def parse_system_info(root: ET.Element) -> DeviceInfo:
     """`<show><system><info/></system></show>` as a `DeviceInfo`."""
+
     def field(name: str) -> str:
         return (root.findtext(f".//{name}") or "").strip()
 
@@ -468,8 +482,14 @@ DetectionKey = tuple[int, str, int, str, int, str]
 
 
 def detection_key(detection: Detection) -> DetectionKey:
-    return (detection.sid, detection.src_ip, detection.src_port,
-            detection.dst_ip, detection.dst_port, detection.proto)
+    return (
+        detection.sid,
+        detection.src_ip,
+        detection.src_port,
+        detection.dst_ip,
+        detection.dst_port,
+        detection.proto,
+    )
 
 
 def detections(
@@ -601,8 +621,9 @@ def api_key(host: str, user: str, password: str, *, verify: bool = False) -> str
         context = ssl._create_unverified_context()  # noqa: S323
 
     try:
-        with urllib.request.urlopen(url, data=data, timeout=HTTP_TIMEOUT_SECONDS,
-                                    context=context) as r:
+        with urllib.request.urlopen(
+            url, data=data, timeout=HTTP_TIMEOUT_SECONDS, context=context
+        ) as r:
             root = ET.fromstring(r.read())
     except Exception as exc:  # noqa: BLE001
         raise ToolError(f"could not obtain an API key from {host}: {exc}") from exc
@@ -703,7 +724,7 @@ def declined_note(declined: Sequence[str]) -> str | None:
 
 
 __all__ = [
-        "LABELLING_SUBTYPES",
+    "LABELLING_SUBTYPES",
     "SEVERITY_GATE",
     "MAX_CLOCK_SKEW_SECONDS",
     "TIER",

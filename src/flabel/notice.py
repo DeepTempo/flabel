@@ -165,14 +165,16 @@ def render_notice(
             # than skipped, because a threat *name* is vendor text that appears verbatim in the
             # output, and NOTICE is the record of whose text is in there — but what it records
             # is the absence of an obligation, which is a statement, not a gap.
-            lines.extend([
-                name,
-                f"    {DEVICE_LICENCE}",
-                "    No attribution obligation: these are proprietary device signatures, and",
-                "    this output is not redistributed. The signature set and the device policy",
-                "    that admitted each detection are named per-label in sources[].ruleset.",
-                "",
-            ])
+            lines.extend(
+                [
+                    name,
+                    f"    {DEVICE_LICENCE}",
+                    "    No attribution obligation: these are proprietary device signatures, and",
+                    "    this output is not redistributed. The signature set and the device policy",
+                    "    that admitted each detection are named per-label in sources[].ruleset.",
+                    "",
+                ]
+            )
             continue
         if admission is None:
             # An attribution flabel cannot substantiate must not be invented. Correlation

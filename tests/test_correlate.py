@@ -136,7 +136,6 @@ def many_detections(count: int, unmatched: int) -> list[Detection]:
 # --- the ordinary cases --------------------------------------------------------------------
 
 
-
 def device_rulesets(*detections):
     """Stand-in device provenance for tier-1 detections in these tests.
 
@@ -804,8 +803,12 @@ def test_best_tier_is_the_minimum_not_the_maximum():
     """
     detections = [make_detection(tier=2, sid=2011465), make_detection(tier=1, sid=900001)]
 
-    result = correlate(detections, by_uid(make_flow()), make_manifest(),
-                       device_rulesets=device_rulesets(*detections))
+    result = correlate(
+        detections,
+        by_uid(make_flow()),
+        make_manifest(),
+        device_rulesets=device_rulesets(*detections),
+    )
 
     assert result.labels[0].best_tier == 1
 
@@ -825,8 +828,9 @@ def test_sources_are_sorted_by_tier_then_source_then_sid_then_rev():
         make_detection(source="z/last", tier=1, sid=10, rev=1),
     ]
 
-    result = correlate(detections, by_uid(make_flow()), manifest,
-                       device_rulesets=device_rulesets(*detections))
+    result = correlate(
+        detections, by_uid(make_flow()), manifest, device_rulesets=device_rulesets(*detections)
+    )
 
     assert [
         (entry.tier, entry.source, entry.sid, entry.rev) for entry in result.labels[0].sources
@@ -898,8 +902,9 @@ def test_the_result_does_not_depend_on_the_order_the_detections_arrive_in():
 
     rulesets = device_rulesets(*detections)
     forwards = correlate(detections, flows, make_manifest(), device_rulesets=rulesets)
-    backwards = correlate(list(reversed(detections)), flows, make_manifest(),
-                          device_rulesets=rulesets)
+    backwards = correlate(
+        list(reversed(detections)), flows, make_manifest(), device_rulesets=rulesets
+    )
 
     assert forwards == backwards
 

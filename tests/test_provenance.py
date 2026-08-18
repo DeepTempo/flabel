@@ -1660,11 +1660,19 @@ def test_a_run_that_died_before_correlation_still_records_its_threshold(tmp_path
 
 def _tier1_detection(**overrides):
     fields = {
-        "source": "panw/threat-prevention", "tier": 1, "sid": 91535, "rev": 0,
-        "classtype": "code-execution", "app_proto": "unknown-udp",
+        "source": "panw/threat-prevention",
+        "tier": 1,
+        "sid": 91535,
+        "rev": 0,
+        "classtype": "code-execution",
+        "app_proto": "unknown-udp",
         "threat": "Realtek Jungle SDK Remote Code Execution Vulnerability",
-        "ts": 1787004719.0, "src_ip": "45.90.163.37", "src_port": 56406,
-        "dst_ip": "216.152.152.123", "dst_port": 9034, "proto": "udp",
+        "ts": 1787004719.0,
+        "src_ip": "45.90.163.37",
+        "src_port": 56406,
+        "dst_ip": "216.152.152.123",
+        "dst_port": 9034,
+        "proto": "udp",
         "direction": "to_server",
     }
     fields.update(overrides)

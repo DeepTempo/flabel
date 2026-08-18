@@ -532,7 +532,6 @@ def _confirm_shortfall(info: SuricataRunInfo, manifest: SnapshotManifest) -> boo
 # --- the labelling run ------------------------------------------------------------------------
 
 
-
 #: Where the tier-1 stage gets the device from. **Environment, not flags** — spec §12 fixes the
 #: CLI contract and says Phase 2 adds none, so a lab endpoint cannot become an argument. The two
 #: `FLABEL_INLINE_*` names are the ones `.env.example` already shipped, and are reused rather
@@ -562,8 +561,10 @@ def _device_settings() -> dict[str, object]:
     return {
         "host": host,
         "api_key": key,
-        "interfaces": (os.environ.get("FLABEL_REPLAY_IF1", "ens5"),
-                       os.environ.get("FLABEL_REPLAY_IF2", "ens6")),
+        "interfaces": (
+            os.environ.get("FLABEL_REPLAY_IF1", "ens5"),
+            os.environ.get("FLABEL_REPLAY_IF2", "ens6"),
+        ),
         "multiplier": float(os.environ.get("FLABEL_REPLAY_MULTIPLIER", "1000")),
         "topspeed": os.environ.get("FLABEL_REPLAY_TOPSPEED", "").lower() in {"1", "true", "yes"},
         "settle_seconds": int(os.environ.get("FLABEL_SETTLE_SECONDS", "60")),
@@ -627,7 +628,9 @@ def _label(args: argparse.Namespace) -> int:
             tier1_result = None
             if device_settings is not None:
                 tier1_result = tier1.run(
-                    progress.capture.path, Path(workdir), **device_settings  # type: ignore[arg-type]
+                    progress.capture.path,
+                    Path(workdir),
+                    **device_settings,  # type: ignore[arg-type]
                 )
                 for warning in tier1_result.warnings:
                     print(f"flabel: warning: {warning}", file=sys.stderr)
