@@ -53,7 +53,16 @@ for i in ens5 ens6; do
 done
 sysctl -w net.ipv4.ip_forward=1
 
-install -d -m 0755 /opt/flabel /var/lib/flabel/captures
+install -d -m 0755 /opt/flabel /var/lib/flabel/captures /var/lib/flabel/runs
+
+# The wrapper is installed FROM THE CHECKOUT, not written here. It used to live only on the box,
+# which put it outside every gate the Python has — and all three bugs that reached "it is
+# running" on 2026-08-17 were in it: Zeek invisible under sudo, a relative capture path resolved
+# against the repo, and the config file overwriting the caller's environment. It now has tests
+# (tests/test_flabel_run.py), so what matters is that the box runs the tested copy.
+if [ -x /opt/flabel/repo/tools/flabel-run ]; then
+  install -m 0755 /opt/flabel/repo/tools/flabel-run /usr/local/bin/flabel-run
+fi
 echo "=== versions ==="
 tcpreplay --version 2>&1 | head -1
 /opt/zeek/bin/zeek --version 2>&1 | head -1
