@@ -34,9 +34,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from flabel import panw, replay
+from flabel import panw, progress, replay
 from flabel.errors import ToolError
 from flabel.models import Detection
+from flabel.progress import Reporter
 
 #: Seconds between the end of the replay and the first session clear (today.md step 3).
 DEFAULT_SETTLE_SECONDS = 60
@@ -72,8 +73,16 @@ def run(
     multiplier: float = replay.DEFAULT_MULTIPLIER,
     topspeed: bool = False,
     settle_seconds: int = DEFAULT_SETTLE_SECONDS,
+    report: Reporter | None = None,
 ) -> Tier1Result:
-    """Replay `capture` past the device at `host` and return its verdicts."""
+    """Replay `capture` past the device at `host` and return its verdicts.
+
+    `report` is optional and every call to it is guarded, so the pipeline runs identically
+    without one. Progress is a view of the work, never a participant in it.
+    """
+    say = report if report is not None else _Silent()
+
+    say.start("device")
     device = panw.PanwDevice(host, api_key)
     info = device.system_info()
     if not info.has_threat_content:
@@ -82,32 +91,87 @@ def run(
             f"threat signatures installed and no tier-1 label could ever be produced. Install "
             f"Applications-and-Threats content before labelling."
         )
+    say.finish("device", f"{info.hostname} {info.sw_version} │ threat {info.threat_version}")
 
-    agreed, complaint = panw.verify_clock(device.clock(), time.time())
+    say.start("clock")
+    device_clock = device.clock()
+    agreed, complaint = panw.verify_clock(device_clock, time.time())
     if not agreed:
+        say.fail("clock", complaint or "clocks disagree")
         raise ToolError(complaint or "the firewall's clock disagrees with this host's")
+    say.finish("clock", f"device {device_clock - time.time():+.0f}s │ within window")
 
     before = device.logs_written()
     device.clear_sessions()
 
+    say.start("prep", "splitting by direction")
     cache = workdir / "replay.cache"
     staged = workdir / "replay-ready.pcap"
     replay.prepare_cache(capture, cache)
     macs = _interface_macs(interfaces)
     replay.rewrite_source_macs(capture, cache, staged, macs)
-    window = replay.replay(staged, cache, interfaces, multiplier=multiplier, topspeed=topspeed)
+    stats = replay.capture_stats(staged)
+    say.finish("prep", f"{progress.count(stats.packets)} pkts │ {progress.span(stats.span)} span")
 
-    time.sleep(settle_seconds)
+    say.start("replay", f"0/{progress.count(stats.packets)}")
+
+    def on_packet(sent: int, pps: float) -> None:
+        fraction = min(1.0, sent / stats.packets) if stats.packets else None
+        say.update(
+            "replay",
+            detail=f"{progress.count(sent)}/{progress.count(stats.packets)}",
+            fraction=fraction,
+            sample=pps,
+        )
+
+    window = replay.replay(
+        staged,
+        cache,
+        interfaces,
+        multiplier=multiplier,
+        topspeed=topspeed,
+        on_progress=on_packet,
+    )
+    say.finish(
+        "replay",
+        f"{progress.count(stats.packets)} pkts in {progress.duration(window.wall_span)} "
+        f"│ x{window.effective_scale:.0f}",
+    )
+
+    # Counted down rather than slept through. It is the longest stretch of a run in which
+    # nothing visibly happens, and an operator watching a still screen for a minute has no way
+    # to tell a settle from a hang.
+    say.start("settle", "")
+    settle_end = time.monotonic() + settle_seconds
+    while True:
+        left = settle_end - time.monotonic()
+        if left <= 0:
+            break
+        say.update(
+            "settle",
+            detail=f"{progress.duration(left)} left │ letting Content-ID finish",
+            fraction=1.0 - (left / settle_seconds) if settle_seconds else None,
+        )
+        time.sleep(min(0.25, left))
+    say.finish("settle", f"{settle_seconds}s elapsed")
+
+    say.start("flush", "clearing sessions to force session-end logs")
     device.clear_sessions()
     time.sleep(FLUSH_SECONDS)
+    say.finish("flush")
 
     after = device.logs_written()
     written = panw.counter_delta(before, after)
 
+    say.start("query", "threat logs for the replay window")
     query = panw.ThreatQuery(start_wall=window.replay_start_wall, end_wall=window.replay_end_wall)
     entries = device.threat_entries(query)
     found, declined, rulesets = panw.detections(entries)
     kept, collapsed = panw.deduplicate(found)
+    say.finish(
+        "query",
+        f"{len(entries)} entries │ {len(kept)} detections │ {written} written",
+    )
 
     warnings: list[str] = []
     lost, complaint = panw.loss(retrieved=len(entries), written=written)
@@ -128,6 +192,11 @@ def run(
             "unmatched rather than guessed"
         )
 
+    # After every warning is collected, not as each is appended: a note printed mid-collection
+    # would have missed the topspeed one, which is the warning most worth seeing.
+    for warning in warnings:
+        say.note(warning)
+
     return Tier1Result(
         detections=kept,
         rulesets=rulesets,
@@ -139,6 +208,25 @@ def run(
         collapsed=collapsed,
         warnings=tuple(warnings),
     )
+
+
+class _Silent:
+    """A reporter that says nothing, so `run()` needs no `if report is not None` at each call.
+
+    Cheaper than threading an Optional through eleven call sites, and it keeps the reporting
+    calls readable as a description of the sequence.
+    """
+
+    def header(self, text: str) -> None: ...
+    def start(self, key: str, detail: str = "") -> None: ...
+    def update(
+        self, key: str, detail: str = "", fraction: float | None = None, sample: float | None = None
+    ) -> None: ...
+    def finish(self, key: str, detail: str = "") -> None: ...
+    def skip(self, key: str, detail: str = "") -> None: ...
+    def fail(self, key: str, detail: str = "") -> None: ...
+    def note(self, text: str) -> None: ...
+    def close(self) -> None: ...
 
 
 def _interface_macs(interfaces: tuple[str, str]) -> tuple[str, str]:
