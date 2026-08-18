@@ -241,8 +241,16 @@ def replay(
     first, last = capture_bounds(capture)
 
     pacing = ["--topspeed"] if topspeed else [f"--multiplier={multiplier}"]
-    argv = [REPLAY, "-i", interfaces[0], "-I", interfaces[1], f"--cachefile={cache}",
-            *pacing, str(capture)]
+    argv = [
+        REPLAY,
+        "-i",
+        interfaces[0],
+        "-I",
+        interfaces[1],
+        f"--cachefile={cache}",
+        *pacing,
+        str(capture),
+    ]
 
     started = time.time()
     _run(argv, REPLAY_TIMEOUT_SECONDS, "replayed past the device")
@@ -268,23 +276,41 @@ def _run(argv: list[str], timeout: int, what: str) -> subprocess.CompletedProces
     if shutil.which(binary) is None:
         raise ToolError(
             f"{binary} is not on PATH, so the capture cannot be {what}",
-            failures=(ToolFailure(tool=binary, argv=tuple(argv), exit_code=None,
-                                  message=f"{binary} not found on PATH"),),
+            failures=(
+                ToolFailure(
+                    tool=binary,
+                    argv=tuple(argv),
+                    exit_code=None,
+                    message=f"{binary} not found on PATH",
+                ),
+            ),
         )
     try:
         return subprocess.run(argv, capture_output=True, timeout=timeout, check=True)
     except subprocess.TimeoutExpired as exc:
         raise ToolError(
             f"{binary} did not finish within {timeout}s while {what}",
-            failures=(ToolFailure(tool=binary, argv=tuple(argv), exit_code=None,
-                                  message=f"timed out after {timeout}s"),),
+            failures=(
+                ToolFailure(
+                    tool=binary,
+                    argv=tuple(argv),
+                    exit_code=None,
+                    message=f"timed out after {timeout}s",
+                ),
+            ),
         ) from exc
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"").decode("utf-8", "replace").strip()
         raise ToolError(
             f"{binary} failed while {what}: {stderr or 'no stderr'}",
-            failures=(ToolFailure(tool=binary, argv=tuple(argv), exit_code=exc.returncode,
-                                  message=stderr or "no stderr"),),
+            failures=(
+                ToolFailure(
+                    tool=binary,
+                    argv=tuple(argv),
+                    exit_code=exc.returncode,
+                    message=stderr or "no stderr",
+                ),
+            ),
         ) from exc
 
 
@@ -304,8 +330,11 @@ def prepare_cache(capture: Path, cache: Path) -> None:
     (`..._pub-216.152.152.123.pcap`), but it makes flow direction depend on a filename
     convention, and a mislabelled file would silently invert every zone in the output.
     """
-    _run([PREP, "--auto=client", f"--pcap={capture}", f"--cachefile={cache}"],
-         PREP_TIMEOUT_SECONDS, "split by direction")
+    _run(
+        [PREP, "--auto=client", f"--pcap={capture}", f"--cachefile={cache}"],
+        PREP_TIMEOUT_SECONDS,
+        "split by direction",
+    )
 
 
 def rewrite_source_macs(capture: Path, cache: Path, out: Path, macs: tuple[str, str]) -> None:
@@ -323,6 +352,14 @@ def rewrite_source_macs(capture: Path, cache: Path, out: Path, macs: tuple[str, 
     unnecessary rewrite step is the kind of thing that survives for years on the strength of one
     successful run.
     """
-    _run([REWRITE, f"--enet-smac={macs[0]},{macs[1]}", f"--cachefile={cache}",
-          f"--infile={capture}", f"--outfile={out}"],
-         PREP_TIMEOUT_SECONDS, "re-addressed for replay")
+    _run(
+        [
+            REWRITE,
+            f"--enet-smac={macs[0]},{macs[1]}",
+            f"--cachefile={cache}",
+            f"--infile={capture}",
+            f"--outfile={out}",
+        ],
+        PREP_TIMEOUT_SECONDS,
+        "re-addressed for replay",
+    )

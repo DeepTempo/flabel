@@ -193,7 +193,11 @@ def test_the_corroborated_detection_survives_the_gate_with_its_tuple_intact():
     assert len(realtek) == 1
     d = realtek[0]
     assert (d.src_ip, d.src_port, d.dst_ip, d.dst_port, d.proto) == (
-        "45.90.163.37", 56406, "216.152.152.123", 9034, "udp",
+        "45.90.163.37",
+        56406,
+        "216.152.152.123",
+        9034,
+        "udp",
     )
     assert d.tier == 1
     assert d.classtype == "code-execution"
@@ -320,8 +324,9 @@ def test_the_threat_category_comes_from_thr_category_not_from_category():
 
 def test_the_numeric_id_is_taken_from_tid_when_the_xml_does_not_embed_it():
     """The XML spells these differently from the CLI: `threatid` is the name, `tid` the number."""
-    entry = ET.fromstring("<entry><threatid>SIPVicious Scanner Detection</threatid>"
-                          "<tid>54482</tid></entry>")
+    entry = ET.fromstring(
+        "<entry><threatid>SIPVicious Scanner Detection</threatid><tid>54482</tid></entry>"
+    )
     assert panw.threat_id(entry) == 54482
     assert panw.threat_name(entry) == "SIPVicious Scanner Detection"
 
@@ -366,8 +371,9 @@ def test_the_earliest_occurrence_is_the_one_kept():
 
 
 def test_the_same_signature_on_a_different_tuple_is_not_collapsed():
-    kept, collapsed = panw.deduplicate([_det(40023, 1787004700.0, sport=5362),
-                                        _det(40023, 1787004700.0, sport=4040)])
+    kept, collapsed = panw.deduplicate(
+        [_det(40023, 1787004700.0, sport=5362), _det(40023, 1787004700.0, sport=4040)]
+    )
     assert len(kept) == 2 and collapsed == 0
 
 

@@ -163,8 +163,12 @@ def correlate(
     # a tuple that matches, and a snapshot id no reader can resolve is broken whether or not
     # this particular capture produced a label from it.
     entries = [
-        (detection, _entry(detection, admissions, manifest.snapshot_id, address_indicators,
-                           device_rulesets))
+        (
+            detection,
+            _entry(
+                detection, admissions, manifest.snapshot_id, address_indicators, device_rulesets
+            ),
+        )
         for detection in detections
     ]
 
@@ -416,8 +420,16 @@ def _entry(
     # fail with "the snapshot does not describe it", which is true and useless.
     if detection.tier == 1:
         ruleset = (device_rulesets or {}).get(
-            (detection.sid, detection.src_ip, detection.src_port,
-             detection.dst_ip, detection.dst_port, detection.proto), "")
+            (
+                detection.sid,
+                detection.src_ip,
+                detection.src_port,
+                detection.dst_ip,
+                detection.dst_port,
+                detection.proto,
+            ),
+            "",
+        )
         return build_device_source_entry(detection, ruleset)
 
     try:
