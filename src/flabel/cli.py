@@ -172,7 +172,20 @@ def build_parser() -> argparse.ArgumentParser:
     """The labelling parser: the three modes of spec §12, one flag each (#132)."""
     parser = argparse.ArgumentParser(
         prog="flabel",
-        description="Label malicious flows in a packet capture.",
+        # The default mode is stated here because argparse cannot state it anywhere else: a
+        # mode selected by the ABSENCE of a flag has no option entry to carry a help string, so
+        # without this the one behaviour most operators get is the one `--help` does not
+        # mention. Both other modes are described against their flag, below.
+        # Hard-wrapped, because `RawDescriptionHelpFormatter` (set below, so the epilog's
+        # command list keeps its shape) does not wrap the description either.
+        description=(
+            "Label malicious flows in a packet capture.\n"
+            "\n"
+            "With no mode flag, the capture is replayed past the inline device and labelled\n"
+            "from its threat logs — tier 1 only. The device comes from FLABEL_INLINE_*; see\n"
+            ".env.example. Zeek runs in every mode: it is what flows are read from, not a\n"
+            "tier that can be switched off.\n"
+        ),
         epilog=(
             f"ruleset snapshots:\n"
             f"  flabel {RULES_COMMAND} update [--sources FILE] [--rules-dir DIR]\n"

@@ -2204,3 +2204,21 @@ def test_a_both_run_that_loses_the_device_says_which_half_it_lost(
     assert run["mode"] == "both"
     assert run["tiers_attempted"] == [1, 2]
     assert run["tiers_unavailable"] == [1, 2], "the device was lost, and Suricata never reached"
+
+
+def test_help_states_what_the_bare_command_does() -> None:
+    """The default mode is selected by the ABSENCE of a flag, so nothing else can describe it.
+
+    argparse gives every option a help string and gives the default mode none, which left the
+    one behaviour most operators get as the only one `--help` did not mention. Asserted on the
+    rendered text rather than on the description constant, because the wrapping is manual —
+    `RawDescriptionHelpFormatter` does not wrap — and a long line silently overflowing the
+    terminal is the failure this is most likely to acquire.
+    """
+    rendered = cli.build_parser().format_help()
+
+    assert "With no mode flag" in rendered
+    assert "tier 1 only" in rendered
+    assert "Zeek runs in every mode" in rendered
+    overlong = [line for line in rendered.splitlines() if len(line) > 80]
+    assert not overlong, f"--help has lines wider than 80 columns: {overlong}"
