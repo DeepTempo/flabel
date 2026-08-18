@@ -273,6 +273,27 @@ look at the new key. The cost is real and accepted: two files both stamped `"1.0
 whether `direction` is present, so a corpus spanning the change is told apart by the run block's
 `flabel_version`, not by the schema version.
 
+**#132 is the first change that is not additive, and it still does not bump it** (Craig,
+2026-08-18, after review). Two things moved: `run.mode` gained the values `replay` and `both`, and
+`run.ruleset`'s four fields became nullable. Read literally that breaks a 1.0 consumer —
+`run["ruleset"]["snapshot_id"][:8]` raises where a string was guaranteed. The reason it is not a
+version bump is that **no document a consumer could already have changes shape**:
+
+* The null `ruleset` block occurs only in `replay` mode, which produced no output before this
+  change. There is no historical file to re-read and no consumer that can have been reading one.
+* `--offline` output is byte-identical but for `tiers_unavailable`, which narrows from `[1]` to
+  `[]` — a field whose old value was a Phase 1 constant that had been wrong since tier 1 shipped.
+* `--both` output stamps `mode: "both"` where the same pipeline previously stamped `"offline"`.
+  A consumer branching on that string does change behaviour — and it was being misinformed
+  before, because Phase 2 stamped `"offline"` on every run that replayed past a firewall.
+
+So the consumer this would protect is one relying on a value the document should never have
+published. Bumping to signal that costs every consumer of unchanged `--offline` output a rejected
+version string, to warn about a field that was previously lying to them. The version tracks what a
+reader must understand; a reader must understand `mode` before branching on it, which was true at
+1.0 as well. The cost is accepted and recorded here rather than left implicit: `flabel_version` in
+the run block is what tells a corpus spanning 2026-08-18 apart.
+
 What this does **not** resolve is whether an inbound scan that our host refused belongs in
 malicious-flow ground truth at all. That is a product question about what the labels are training
 — "this host is being attacked" against "this host is compromised" — and no field settles it. The
@@ -1092,9 +1113,16 @@ all three from the invocation is what makes that class of staleness unreachable.
 
 `tiers_unavailable` is therefore empty on every successful run, in all three modes, and that is not
 a dead field: the path that populates it is the failure path. A `--both` run whose device raised
-mid-replay writes `run.json` with `[1]`; one that died in Zeek before Suricata writes `[2]`. Those
-are exactly the runs whose reader needs to know which half they got, and a field that said `[1]`
-regardless could not tell them.
+mid-replay writes `[1, 2]` — tier 1 is where it died, and tier 2 was never reached, because the
+device stage runs first. One that got past the device and then lost Zeek or Suricata writes `[2]`,
+as does an `--offline` run whose Suricata failed. Those are exactly the runs whose reader needs to
+know which half they got, and a field that said `[1]` regardless could not tell them.
+
+**A tier counts as delivered only when its stage returned**, never because its record exists in the
+block. `run_suricata` reports a tool failure by *returning* a populated `SuricataRunInfo` and
+letting the caller raise, so `tools.suricata` is filled in on precisely the runs where tier 2 was
+lost. Both completions are therefore told to the run block by the orchestrator rather than inferred
+from what is present in it.
 
 **A `replay` run has no `ruleset` block to fill**, and every field in it is `null` rather than
 absent or zero. Tier 1 loads no Suricata rules, so there is no snapshot: `null` is §2.5's "not
@@ -1343,7 +1371,8 @@ flabel --both <capture>               Tier 1 and Tier 2, labelling from both.
     --ruleset-snapshot <id>           default: newest available. REFUSED on a replay-only
                                       run — exit 2. See below.
     --output-dir <dir>                default: cwd
-    --rules-dir <dir>                 default: ./.flabel/rules
+    --rules-dir <dir>                 default: ./.flabel/rules. Tier 2 only — REFUSED on a
+                                      replay-only run, with --ruleset-snapshot.
     --sources <file>                  REFUSED here — exit 2. See below.
     --unmatched-threshold <float>     default: 0.01
 flabel rules update [--sources <f>] [--rules-dir <d>]
@@ -1365,12 +1394,17 @@ is recorded here rather than deleted: the contract was closed on the belief that
 needed to *build* the default path, and that held right up until the built default turned out to be
 the wrong default. `--offline` is unchanged, and remains permanent.
 
-**`--ruleset-snapshot` is refused on a replay-only run**, on `--sources`' reasoning (§5, issue #71)
-one mode along: that pipeline loads no Suricata rules, so the flag cannot change a single label,
-and an operator who passed one believes they have pinned what this run labelled against. Accepting
-and ignoring it would put that belief into `run.ruleset`. `--offline --both` is refused by
-argparse's own mutually-exclusive group, because the two requests cannot both be honoured and
-picking a winner would make the losing flag silently ineffective.
+**`--ruleset-snapshot` and `--rules-dir` are refused on a replay-only run**, on `--sources`'
+reasoning (§5, issue #71) one mode along: that pipeline loads no Suricata rules, so neither flag
+can change a single label, and an operator who passed one believes they have pinned what this run
+labelled against. Accepting and ignoring it would put that belief into `run.ruleset`, which is
+all-null on such a run. Both are refused rather than only the snapshot id, because they express the
+same intent at two levels of precision — refusing one and ignoring the other would teach that the
+distinction is meaningful when it is not. Only an *explicitly passed* `--rules-dir` is refused; its
+default is resolved at use, so a bare replay-only run is unaffected.
+
+`--offline --both` is refused by argparse's own mutually-exclusive group, because the two requests
+cannot both be honoured and picking a winner would make the losing flag silently ineffective.
 
 **`--sources` is refused on the labelling path, not ignored** (2026-08-15, issue #71). It is still *declared* there, so the refusal can explain itself rather than argparse saying `unrecognized arguments`. Passing it exits 2 before any tool runs and before a run directory exists.
 

@@ -338,7 +338,7 @@ def read_toolchain(path: Path = TOOLCHAIN_MANIFEST) -> tuple[dict[str, str], tup
 
 
 def _tiers(
-    mode: RunMode, *, tier1_ran: bool, suricata: SuricataRunInfo | None
+    mode: RunMode, *, tier1_ran: bool, tier2_ran: bool
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """What this run set out to do, and which of it did not happen.
 
@@ -355,12 +355,22 @@ def _tiers(
 
     So on a successful run this is empty, in all three modes, and that is not a dead field: the
     path that populates it is the failure path. A `--both` run whose device raised mid-replay
-    writes `run.json` with `[1]`, and one that died in Zeek before Suricata writes `[2]`. Those
-    are the runs where "which half of this did I actually get" is the question, and until #132
-    the block could not answer it.
+    writes `[1, 2]` — tier 1 is where it died and tier 2 was never reached — while one that got
+    past the device and then lost Suricata writes `[2]`, as does an `--offline` run whose
+    Suricata failed. Those are the runs where "which half of this did I actually get" is the
+    question, and until #132 the block could not answer it.
+
+    **Both completions are told, neither inferred**, and the first version of this got that wrong
+    in a way its own tests missed (review of #132). Tier 2's completion was read off
+    `suricata is not None` — but `progress.suricata` is assigned from `run_suricata`'s return
+    *before* the `ToolError` for a recorded tool failure is raised, and `_absorb` re-attaches it
+    on the way out precisely so the failure can be reported. The object being present is evidence
+    the stage RAN, never that it SUCCEEDED, and reading it as the latter made every Suricata
+    failure report "I asked for tier 2 and lost nothing" — on exactly the runs this field exists
+    to describe.
     """
     attempted = TIERS_BY_MODE[mode]
-    completed = {1: tier1_ran, 2: suricata is not None}
+    completed = {1: tier1_ran, 2: tier2_ran}
     return attempted, tuple(tier for tier in attempted if not completed[tier])
 
 
@@ -375,6 +385,7 @@ def build_run_block(
     correlation: CorrelationResult | None = None,
     mode: RunMode,
     tier1_ran: bool = False,
+    tier2_ran: bool = False,
     snapshot_resolved: bool | None = None,
     unmatched_threshold: float = DEFAULT_THRESHOLD,
     tool_failures: Sequence[ToolFailure] = (),
@@ -398,7 +409,7 @@ def build_run_block(
     versions, toolchain_warnings = read_toolchain(toolchain_path)
     ja4_version, ja4_warnings = _ja4_package_version(zeek, versions)
     failures = _collect_failures(zeek, suricata, tool_failures)
-    attempted, unavailable = _tiers(mode, tier1_ran=tier1_ran, suricata=suricata)
+    attempted, unavailable = _tiers(mode, tier1_ran=tier1_ran, tier2_ran=tier2_ran)
 
     return {
         "flabel_version": flabel_version,

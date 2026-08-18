@@ -2006,17 +2006,22 @@ def test_a_replay_only_run_needs_no_ruleset_snapshot_on_disk(
 ) -> None:
     """A fresh checkout can run the default without `flabel rules update` first (#132).
 
-    `--rules-dir` points at an empty directory, which `--offline` would fail on with
-    `SnapshotError` before creating a run directory. Tier 1 reads no Suricata rules, so failing
-    a run over 85,000 rules it was never going to open would be a precondition invented by the
-    orchestration rather than required by the pipeline.
+    The run happens from an empty working directory, so the *default* `./.flabel/rules` resolves
+    somewhere with no snapshot in it — which is what a fresh checkout looks like, and what
+    `--offline` fails on with `SnapshotError` before a run directory exists. Tier 1 reads no
+    Suricata rules, so failing over 85,000 it was never going to open would be a precondition
+    invented by the orchestration rather than required by the pipeline.
+
+    `--rules-dir` is deliberately *not* passed: it is refused on this mode (see below), and
+    reaching the default is the whole point — a test that named a rules directory would prove
+    the flag works rather than that the mode needs no rules.
     """
-    empty = tmp_path / "no-rules"
-    empty.mkdir()
+    monkeypatch.chdir(tmp_path)
     output = tmp_path / "out"
     stub_device(monkeypatch, detections=[device_detection()])
+    assert not (tmp_path / ".flabel" / "rules").exists(), "the default store must be absent here"
 
-    code = cli.main([str(BENIGN), "--rules-dir", str(empty), "--output-dir", str(output)])
+    code = cli.main([str(BENIGN), "--output-dir", str(output)])
 
     assert code == EXIT_SUCCESS
     assert read_run(output)["run"]["mode"] == "replay"
@@ -2101,6 +2106,41 @@ def test_offline_and_both_together_are_refused(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as excinfo:
         cli.build_parser().parse_args(["--offline", "--both", str(BENIGN)])
     assert excinfo.value.code == EXIT_USAGE
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--ruleset-snapshot", "0123456789abcdef"],
+        ["--rules-dir", "some/snapshots"],
+        ["--ruleset-snapshot", "0123456789abcdef", "--rules-dir", "some/snapshots"],
+    ],
+    ids=["snapshot-id", "rules-dir", "both-flags"],
+)
+def test_the_tier_2_rule_flags_are_refused_on_a_replay_only_run(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    flag: list[str],
+) -> None:
+    """Both express the same intent at different precision, so refusing one and ignoring the
+    other would teach that the distinction means something (review of #132).
+
+    `--rules-dir` was the one left ignored: it loaded nothing, exited 0, and produced an
+    all-null `ruleset` block beside a tier-1 result — the operator's belief that they had
+    pinned the rules going unanswered, which is exactly what #71 refused `--sources` for.
+    """
+    output = tmp_path / "out"
+    stub_device(monkeypatch)
+
+    code = cli.main([str(BENIGN), *flag, "--output-dir", str(output)])
+
+    assert code == EXIT_USAGE
+    assert not output.exists(), "a refused invocation must not leave a run directory"
+    error = capsys.readouterr().err
+    assert "--both" in error, "the refusal must name the mode that accepts it"
+    for name in flag[::2]:
+        assert name in error, f"the refusal must name {name}, which the operator typed"
 
 
 def test_a_ruleset_snapshot_is_refused_on_a_replay_only_run(
@@ -2222,3 +2262,52 @@ def test_help_states_what_the_bare_command_does() -> None:
     assert "Zeek runs in every mode" in rendered
     overlong = [line for line in rendered.splitlines() if len(line) > 80]
     assert not overlong, f"--help has lines wider than 80 columns: {overlong}"
+
+
+@pytest.mark.requires_tools
+def test_an_offline_run_whose_suricata_failed_reports_the_tier_as_lost(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """End to end, on the real failure path — the defect review caught in the first #132 (#132).
+
+    `run_suricata` records rather than raises, so `progress.suricata` is populated and then
+    `_tier2` raises on the recorded failure. The first version read tier 2's completion off that
+    attribute and published `tiers_unavailable: []` here: "I asked for tier 2 and lost nothing",
+    about a run whose only tier died and which wrote no labels.
+
+    Driven through `cli.main` rather than `build_run_block` because the defect was in the
+    wiring, not the helper — the helper did exactly what it was told. Testing the helper is what
+    let this through the first time.
+    """
+    from flabel.models import SuricataRunInfo
+
+    failure = ToolFailure(
+        tool="suricata",
+        argv=("suricata", "-r", "capture.pcap"),
+        exit_code=1,
+        message="suricata died loading the snapshot",
+    )
+
+    def failed(capture: Path, snapshot: Path, outdir: Path):
+        outdir.mkdir(parents=True, exist_ok=True)
+        return [], SuricataRunInfo(
+            version="8.0.6",
+            snapshot_id=snapshot_id_of(rules_dir),
+            rules_loaded=0,
+            alerts_total=0,
+            tool_failures=(failure,),
+        )
+
+    monkeypatch.setattr(cli, "run_suricata", failed)
+    output = tmp_path / "out"
+
+    assert cli.main(offline(BENIGN, rules_dir, output)) == EXIT_FAILURE
+
+    run = read_run(output)["run"]
+    assert run["tiers_attempted"] == [2]
+    assert run["tiers_unavailable"] == [2], (
+        "the one tier this run asked for died, and the block must say so"
+    )
+    assert run["tools"]["suricata"] == "8.0.6", (
+        "the stage's record is still published — its presence is what must not be read as success"
+    )

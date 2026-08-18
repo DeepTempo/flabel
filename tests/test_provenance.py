@@ -636,6 +636,9 @@ def full_run(tmp_path: Path, **overrides) -> dict:
         # without saying which pipelines it reports on. Tests about a different mode override
         # it, and `test_every_mode_publishes_the_tiers_it_attempted` covers all three.
         "mode": "offline",
+        # ...and it finished, which is what these fixtures describe. Told rather than inferred
+        # from `suricata` being set — see the test directly below on why that inference was wrong.
+        "tier2_ran": True,
         "toolchain_path": tmp_path / "absent-toolchain.json",
     }
     return build_run_block(**{**arguments, **overrides})
@@ -1283,7 +1286,7 @@ def test_a_mode_is_required_and_is_not_defaulted(tmp_path):
 )
 def test_every_mode_publishes_the_tiers_it_attempted(tmp_path, mode, attempted):
     """`tiers_attempted` is the mode's definition, so the two can never drift (#132)."""
-    block = full_run(tmp_path, mode=mode, tier1_ran=1 in attempted)
+    block = full_run(tmp_path, mode=mode, tier1_ran=1 in attempted, tier2_ran=2 in attempted)
     assert block["mode"] == mode
     assert block["tiers_attempted"] == attempted
     assert block["schema_version"] == SCHEMA_VERSION
@@ -1298,8 +1301,25 @@ def test_a_completed_run_reports_nothing_unavailable_in_any_mode(tmp_path, mode)
     filtering this field for degraded runs. The not-asked-for fact is already carried twice, by
     `mode` and by the absence from `tiers_attempted`.
     """
-    block = full_run(tmp_path, mode=mode, tier1_ran=True)
+    block = full_run(tmp_path, mode=mode, tier1_ran=True, tier2_ran=True)
     assert block["tiers_unavailable"] == []
+
+
+def test_a_populated_suricata_record_is_not_evidence_the_tier_succeeded(tmp_path):
+    """The defect the first version of #132 shipped, caught in review.
+
+    `progress.suricata` is assigned from `run_suricata`'s return before `_tier2` raises on a
+    recorded tool failure, and `_absorb` re-attaches it on the way out so the failure can be
+    reported at all. Reading tier 2's completion off `suricata is not None` therefore said "I
+    asked for tier 2 and lost nothing" about a run whose only tier died — the precise case the
+    field was added for.
+
+    The run info is present here, exactly as it is on that path, and the tier is still lost.
+    """
+    block = full_run(tmp_path, mode="offline", tier2_ran=False)
+
+    assert block["tools"]["suricata"], "the stage ran: its version was recorded"
+    assert block["tiers_unavailable"] == [2], "...and it still did not deliver"
 
 
 def test_a_tier_that_was_attempted_and_lost_is_the_one_thing_unavailable_reports(tmp_path):
@@ -1309,14 +1329,15 @@ def test_a_tier_that_was_attempted_and_lost_is_the_one_thing_unavailable_reports
     question its reader has is *which half did I get*. Before #132 the block could not answer:
     it said `[1]` whatever happened.
     """
-    lost_device = full_run(tmp_path, mode="both", tier1_ran=False)
-    assert lost_device["tiers_unavailable"] == [1]
-
-    lost_suricata = full_run(tmp_path, mode="both", tier1_ran=True, suricata=None)
+    lost_suricata = full_run(tmp_path, mode="both", tier1_ran=True, tier2_ran=False)
     assert lost_suricata["tiers_unavailable"] == [2]
 
-    lost_both = full_run(tmp_path, mode="both", tier1_ran=False, suricata=None)
-    assert lost_both["tiers_unavailable"] == [1, 2]
+    # The device is the first stage, so losing it loses Suricata too — the run never got there.
+    lost_device = full_run(tmp_path, mode="both", tier1_ran=False, tier2_ran=False)
+    assert lost_device["tiers_unavailable"] == [1, 2]
+
+    offline_lost_suricata = full_run(tmp_path, mode="offline", tier2_ran=False)
+    assert offline_lost_suricata["tiers_unavailable"] == [2]
 
 
 def test_the_duration_is_derived_from_the_two_timestamps(tmp_path):

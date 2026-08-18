@@ -232,9 +232,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rules-dir",
         type=Path,
-        default=DEFAULT_RULES_DIR,
+        # `None` rather than `DEFAULT_RULES_DIR`, resolved at use below. The default itself is
+        # unchanged; what this buys is telling "the operator asked for this store" apart from
+        # "nobody said", which is the difference between a flag to refuse and a flag nobody
+        # passed. Only the labelling parser does this — `flabel rules` genuinely needs the value.
+        default=None,
         metavar="DIR",
-        help=f"ruleset snapshot store (default: {DEFAULT_RULES_DIR})",
+        help=(
+            f"ruleset snapshot store (default: {DEFAULT_RULES_DIR}). Tier 2 only — REFUSED on "
+            f"a replay-only run, which loads no rules"
+        ),
     )
     parser.add_argument(
         "--sources",
@@ -377,6 +384,10 @@ class _Progress:
     #: between the two is exactly `tiers_unavailable`, which is the field that tells a reader a
     #: `--both` run lost its device half rather than never having had one.
     tier1_ran: bool = False
+    #: The same fact for tier 2, and it has to be a fact rather than `suricata is not None`:
+    #: `_tier2` populates that attribute before raising, so it survives the very failure
+    #: `tiers_unavailable` exists to report.
+    tier2_ran: bool = False
     capture: NormalizedCapture | None = None
     manifest: SnapshotManifest | None = None
     zeek: ZeekRunInfo | None = None
@@ -422,6 +433,7 @@ def _run_block(started_at: str, progress: _Progress) -> dict[str, Any]:
         correlation=progress.correlation,
         mode=progress.mode,
         tier1_ran=progress.tier1_ran,
+        tier2_ran=progress.tier2_ran,
         snapshot_resolved=progress.snapshot_resolved,
         unmatched_threshold=progress.unmatched_threshold,
         tool_failures=progress.tool_failures,
@@ -779,7 +791,12 @@ def _label(args: argparse.Namespace) -> int:
                 assert snapshot_dir is not None and manifest is not None, (
                     "tier 2 is wanted, so the snapshot loaded above must exist"
                 )
-                detections, indicators = _tier2(progress, say, snapshot_dir, manifest, rundir, args)
+                detections, indicators = _tier2(progress, say, snapshot_dir, manifest, rundir)
+                # **After** `_tier2` returns, mirroring `tier1_ran`. Deliberately not inferred
+                # from `progress.suricata` being set: that is assigned inside `_tier2` before it
+                # raises on a recorded tool failure, so its presence means the stage ran, not
+                # that it delivered (review of #132).
+                progress.tier2_ran = True
 
             # Tier 1 and tier 2 are correlated together, not separately: a flow both tiers
             # flagged must come out as ONE label carrying both assertions, which is what
@@ -828,7 +845,6 @@ def _tier2(
     snapshot_dir: Path,
     manifest: SnapshotManifest,
     rundir: Path,
-    args: argparse.Namespace,
 ) -> tuple[tuple[Detection, ...], frozenset[int] | None]:
     """Run Suricata and return its detections with the snapshot's indicator classification.
 
@@ -1060,7 +1076,15 @@ def main(argv: list[str] | None = None) -> int:
                 "\n"
                 "then label against the snapshot it produced, with --ruleset-snapshot <id>."
             )
-        if args.ruleset_snapshot is not None and _mode(args) == "replay":
+        rules_flags = [
+            name
+            for name, value in (
+                ("--ruleset-snapshot", args.ruleset_snapshot),
+                ("--rules-dir", args.rules_dir),
+            )
+            if value is not None
+        ]
+        if rules_flags and _mode(args) == "replay":
             # Same reasoning as `--sources`, one mode along (#132). A replay-only run loads no
             # Suricata rules, so naming a snapshot cannot change a single label — and an operator
             # who passed one believes they have pinned the rules this run labelled against.
@@ -1069,11 +1093,16 @@ def main(argv: list[str] | None = None) -> int:
             # typed. Refusing costs them one retry; ignoring costs them the reading of the
             # artifact.
             raise UsageError(
-                "--ruleset-snapshot has no effect on a replay-only run and is refused rather "
-                "than ignored: the default pipeline labels from the inline device and loads no "
-                "Suricata rules, so there is no ruleset for a snapshot id to select. Add "
-                "--both to run Suricata alongside the device, or --offline to run it alone."
+                f"{' and '.join(rules_flags)} has no effect on a replay-only run and is refused "
+                f"rather than ignored: the default pipeline labels from the inline device and "
+                f"loads no Suricata rules, so there is no ruleset to select or to select from. "
+                f"Add --both to run Suricata alongside the device, or --offline to run it alone."
             )
+        # Resolved here rather than in `add_argument`, now that `None` carries the meaning
+        # "unspecified". Spec §12's default is unchanged; `_label` and everything below it still
+        # receive a `Path` and never see the distinction.
+        if args.rules_dir is None:
+            args.rules_dir = DEFAULT_RULES_DIR
         return _label(args)
     except FlabelError as exc:
         # Every deliberate failure inherits from `FlabelError`, so this one clause covers them
