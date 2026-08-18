@@ -239,28 +239,55 @@ def test_the_threshold_default_is_the_specs(tmp_path: Path) -> None:
     assert args.unmatched_threshold == DEFAULT_THRESHOLD == 0.01
 
 
-# --- the Phase 1 default path is a stub (US-22) ----------------------------------------------
+# --- the default path is tier 1 (Phase 2, #122) ----------------------------------------------
 
 
-def test_the_default_path_prints_coming_soon_names_offline_and_exits_3(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_the_default_path_is_no_longer_a_stub(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Spec §12: exit 3 is "not implemented", which is not the same as failure.
+    """`flabel <capture>` runs tier 1 now (Craig, 2026-08-17). Phase 2 added no flags.
 
-    A caller scripting against flabel has to tell "the Tier 1 feature is not built" from "the
-    run failed", and the message has to name the flag that does work or the operator is left
-    guessing at a capability that exists.
+    With no device configured it fails for the reason it actually has — missing configuration —
+    rather than announcing an unbuilt feature. Exit 3 was "not implemented"; there is nothing
+    unimplemented left to report.
     """
+    monkeypatch.delenv("FLABEL_INLINE_HOST", raising=False)
+    monkeypatch.delenv("FLABEL_INLINE_API_KEY", raising=False)
+    monkeypatch.delenv("FLABEL_INLINE_API_KEY_FILE", raising=False)
+
     code = cli.main([str(BENIGN), "--output-dir", str(tmp_path)])
 
-    assert code == EXIT_NOT_IMPLEMENTED
+    assert code != EXIT_NOT_IMPLEMENTED
     captured = capsys.readouterr()
-    assert cli.STUB_MESSAGE in captured.err
-    assert "--offline" in captured.err
+    assert cli.STUB_MESSAGE not in captured.err
+    assert "FLABEL_INLINE_HOST" in captured.err
 
 
-def test_the_stub_writes_nothing_at_all(tmp_path: Path) -> None:
-    """Spec §13: a run directory is complete or absent, and the stub performs no run."""
+def test_an_unconfigured_tier_1_run_names_the_offline_alternative(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator must not be left guessing at a capability that does work without a device."""
+    monkeypatch.delenv("FLABEL_INLINE_HOST", raising=False)
+    monkeypatch.delenv("FLABEL_INLINE_API_KEY", raising=False)
+    monkeypatch.delenv("FLABEL_INLINE_API_KEY_FILE", raising=False)
+
+    cli.main([str(BENIGN), "--output-dir", str(tmp_path)])
+
+    assert "--offline" in capsys.readouterr().err
+
+
+def test_a_tier_1_run_that_cannot_reach_a_device_writes_no_run_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §13: a run directory is complete or absent.
+
+    Configuration is resolved before any stage runs, so an unconfigured tier-1 invocation leaves
+    nothing behind — the same contract the stub had, for a different reason.
+    """
+    monkeypatch.delenv("FLABEL_INLINE_HOST", raising=False)
+    monkeypatch.delenv("FLABEL_INLINE_API_KEY", raising=False)
+    monkeypatch.delenv("FLABEL_INLINE_API_KEY_FILE", raising=False)
+
     cli.main([str(BENIGN), "--output-dir", str(tmp_path)])
 
     assert list(tmp_path.iterdir()) == []

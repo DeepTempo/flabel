@@ -106,7 +106,9 @@ Findings that shaped the design:
 
 **Environment.** Phase 1 requires no lab: it runs on one machine against local files.
 
-Phase 2 requires **two hosts** — a PANW VM-Series in virtual-wire configuration, and a host that runs flabel and the replay. Suricata does not need a host of its own because it reads the capture file; the original three-host design was reduced accordingly. Clock sync is **NTP to sub-second accuracy with a padded query window**, not millisecond: correlation is tuple-driven and time only scopes the log query, so the design deliberately does not depend on tight clock accuracy — a millisecond gate could fail for a reason that does not affect a single label. Whether virtual-wire replay is achievable in GCP at all is unresolved (§13 Q16).
+Phase 2 requires **two hosts** — a PANW VM-Series in a **two-zone Layer 3** configuration, and a host that runs flabel and the replay.
+
+**Amended 2026-08-17: this said virtual-wire, and virtual wire is not achievable in GCP.** A vwire interface carries no IP address, and GCP's virtual switch forwards by destination IP rather than by L2 adjacency, so there is no route target to deliver replayed frames to. The L3 substitution gives each replay leg an IP that a VPC custom route can target. That answers §13 Q16, and the measurement is in `docs/phase-2-reachability-spike.md`: the device received the replayed traffic **with the original 5-tuple intact**, which is what lets correlation match on the tuple with no address map. Suricata does not need a host of its own because it reads the capture file; the original three-host design was reduced accordingly. Clock sync is **NTP to sub-second accuracy with a padded query window**, not millisecond: correlation is tuple-driven and time only scopes the log query, so the design deliberately does not depend on tight clock accuracy — a millisecond gate could fail for a reason that does not affect a single label. Q16 is **answered**: see above and `docs/phase-2-reachability-spike.md`.
 
 ## 6. Feature Description
 
@@ -183,7 +185,7 @@ Phase 2 requires **two hosts** — a PANW VM-Series in virtual-wire configuratio
 
 ### 6.4 Tier 1 Detection — PANW VM-Series — *Phase 2*
 
-**Description:** Replays the normalized capture past a PANW VM-Series in virtual-wire configuration, then retrieves the resulting threat detections. **Not in Phase 1.** Specified here so that Phase 1 preserves the interfaces it needs.
+**Description:** Replays the normalized capture past a PANW VM-Series in a two-zone Layer 3 configuration, then retrieves the resulting threat detections. **Built 2026-08-17** (`replay.py`, `panw.py`, `tier1.py`).
 
 **Key Business Rules / Logic:**
 
@@ -452,7 +454,7 @@ Each criterion is marked **[CI]** (testable in continuous integration) or **[LAB
 **Architecture / System Design Notes:**
 
 - **Phase 1 is file-only.** Zeek and Suricata read the normalized capture directly. One machine, no lab, no clocks, no network I/O during a run. Fully deterministic given a fixed Zeek seed, a pinned snapshot, and pinned tool versions.
-- **Phase 2 adds replay** past a PANW VM-Series in virtual-wire configuration. Confining replay to the one component that needs it is what makes this a configuration boundary rather than a rewrite.
+- **Phase 2 adds replay** past a PANW VM-Series in a two-zone Layer 3 configuration. Confining replay to the one component that needs it is what makes this a configuration boundary rather than a rewrite.
 - **Phase 2 must be additive** (Goal 6): new `sources[]` entries, no schema version change, no consumer change.
 - Correlation is tuple-plus-time driven; replay-time stamps are never emitted as capture-timeline values.
 - Fingerprint matching uses Suricata's native `ja3.hash` / `ja4.hash` keywords, inheriting Tier 2's filtering and provenance.
@@ -542,7 +544,7 @@ Each criterion is marked **[CI]** (testable in continuous integration) or **[LAB
 | 13 | Can `zeek/foxio/ja4` emit plain JA4 only, if the JA4+ contingency is invoked? | TBD | Phase 1 spec | Open |
 | 14 | What is the Phase 2 replay rate ("controlled rate")? | TBD | Phase 2 spike | Open |
 | 15 | Where do JA4 rules come from — wait for ET, evaluate a feed, or self-derive? | Craig | Post-Phase 1 | Open — issue #13 |
-| 16 | **Is virtual-wire replay achievable for a VM-Series in GCP at all?** Public-cloud VM-Series interfaces may be Layer 3 only, and a VPC drops arbitrary Ethernet frames and spoofed source IPs — which is what replaying an original capture sends. Unverified; recorded as an assumption, not a fact | Craig | Before Phase 2 planning | Open — **blocks all of Phase 2.** Reachability spike runs after Phase 1 by decision, so this sits on the Phase 2 critical path |
+| 16 | **Is virtual-wire replay achievable for a VM-Series in GCP at all?** Public-cloud VM-Series interfaces may be Layer 3 only, and a VPC drops arbitrary Ethernet frames and spoofed source IPs — which is what replaying an original capture sends. Unverified; recorded as an assumption, not a fact | Craig | Before Phase 2 planning | **ANSWERED 2026-08-17** — `docs/phase-2-reachability-spike.md`. Virtual wire: **no**, and for the reason half-guessed here — a vwire interface has no IP, and GCP forwards by destination IP, so there is nothing to route to. Two-zone **Layer 3**: **yes**. The other half of the assumption was **wrong in our favour**: with `--can-ip-forward` and a VPC custom route, GCP delivered the replayed traffic carrying the capture's original spoofed source addresses, and the 5-tuple arrived intact — so correlation needs no address map and the `tcprewrite --pnat` fallback was never required |
 
 ## 14. Basic Test Cases
 

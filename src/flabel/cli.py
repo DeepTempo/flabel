@@ -31,14 +31,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from flabel import __version__
+from flabel import __version__, tier1
 from flabel.config import enabled_sources, load_admission_policies
 from flabel.correlate import DEFAULT_THRESHOLD, _check_threshold, correlate
 from flabel.errors import (
     EXIT_SUCCESS,
+    ConfigError,
     CorrelationError,
     FlabelError,
-    NotImplementedInPhase1,
     SnapshotError,
     ToolError,
     UsageError,
@@ -69,8 +69,10 @@ from flabel.rules.snapshot import (
 from flabel.suricata import run_suricata
 from flabel.zeek import run_zeek
 
-#: What the Phase 1 default path prints (US-22). Exact text, because it is the string an
-#: operator will search for and the one the test asserts.
+#: What the Phase 1 default path used to print (US-22). The stub is gone — `flabel <capture>` runs
+#: tier 1 — and this is kept only so a test can assert the string never appears again. Retired
+#: rather than deleted because "the default path announces an unbuilt feature" is a regression
+#: worth naming, and a test asserting the absence of an anonymous string reads like a typo.
 STUB_MESSAGE = "Coming Soon (TM)"
 
 #: Spec §12's defaults. Relative, and resolved at use rather than at import: `Path.cwd()` in a
@@ -530,6 +532,44 @@ def _confirm_shortfall(info: SuricataRunInfo, manifest: SnapshotManifest) -> boo
 # --- the labelling run ------------------------------------------------------------------------
 
 
+
+#: Where the tier-1 stage gets the device from. **Environment, not flags** — spec §12 fixes the
+#: CLI contract and says Phase 2 adds none, so a lab endpoint cannot become an argument. The two
+#: `FLABEL_INLINE_*` names are the ones `.env.example` already shipped, and are reused rather
+#: than replaced.
+#:
+#: The key is read from a file when `FLABEL_INLINE_API_KEY_FILE` is set, which is how the replay
+#: host holds it: a credential in a 0600 file is not in the process environment of everything the
+#: run spawns, and does not reach a crash dump or a `ps` listing.
+def _device_settings() -> dict[str, object]:
+    """The tier-1 stage's configuration, or a `ConfigError` naming what is missing."""
+    host = os.environ.get("FLABEL_INLINE_HOST", "").strip()
+    key_file = os.environ.get("FLABEL_INLINE_API_KEY_FILE", "").strip()
+    key = os.environ.get("FLABEL_INLINE_API_KEY", "").strip()
+    if key_file:
+        try:
+            key = Path(key_file).read_text().strip()
+        except OSError as exc:
+            raise ConfigError(
+                f"FLABEL_INLINE_API_KEY_FILE {key_file} could not be read: {exc}"
+            ) from exc
+    if not host or not key:
+        raise ConfigError(
+            "a tier-1 run needs the inline device's address and an API key. Set "
+            "FLABEL_INLINE_HOST and either FLABEL_INLINE_API_KEY_FILE or FLABEL_INLINE_API_KEY "
+            "(see .env.example), or run the Tier 2 pipeline with --offline."
+        )
+    return {
+        "host": host,
+        "api_key": key,
+        "interfaces": (os.environ.get("FLABEL_REPLAY_IF1", "ens5"),
+                       os.environ.get("FLABEL_REPLAY_IF2", "ens6")),
+        "multiplier": float(os.environ.get("FLABEL_REPLAY_MULTIPLIER", "1000")),
+        "topspeed": os.environ.get("FLABEL_REPLAY_TOPSPEED", "").lower() in {"1", "true", "yes"},
+        "settle_seconds": int(os.environ.get("FLABEL_SETTLE_SECONDS", "60")),
+    }
+
+
 def _label(args: argparse.Namespace) -> int:
     """Wire ingest -> zeek -> suricata -> correlate -> labels into one run directory.
 
@@ -541,6 +581,12 @@ def _label(args: argparse.Namespace) -> int:
     started = datetime.now(UTC)
     started_at = _stamp(started)
     progress = _Progress(unmatched_threshold=args.unmatched_threshold)
+
+    # Resolved first, before the snapshot, because it is free and it is the precondition
+    # specific to the mode the operator actually invoked. A tier-1 run with no device configured
+    # should say so, rather than first complaining about a ruleset it would also have needed.
+    # Neither failure creates a run directory, so spec §13 is unaffected either way.
+    device_settings = None if args.offline else _device_settings()
 
     # Before any directory exists: `SnapshotError` propagates to `main` (spec §12).
     snapshot_dir, manifest, snapshot_warnings = load_snapshot(args.rules_dir, args.ruleset_snapshot)
@@ -575,6 +621,18 @@ def _label(args: argparse.Namespace) -> int:
         rundir = _make_run_directory(args.output_dir, args.capture, started)
 
         try:
+            # Tier 1 first: it is the only stage with a deadline. The device's threat logs are
+            # selected by a wall-clock window, so the longer the gap between the replay and the
+            # query the more unrelated traffic the padded window can sweep in.
+            tier1_result = None
+            if device_settings is not None:
+                tier1_result = tier1.run(
+                    progress.capture.path, Path(workdir), **device_settings  # type: ignore[arg-type]
+                )
+                for warning in tier1_result.warnings:
+                    print(f"flabel: warning: {warning}", file=sys.stderr)
+                progress.warnings = (*progress.warnings, *tier1_result.warnings)
+
             flows, progress.zeek = run_zeek(progress.capture.path, rundir / ZEEK_DIR)
 
             detections, progress.suricata = run_suricata(
@@ -628,8 +686,21 @@ def _label(args: argparse.Namespace) -> int:
             # no rule is an indicator" are different facts about the ruleset.
             indicators = load_address_indicators(snapshot_dir)
 
+            # Tier 1 and tier 2 are correlated together, not separately: a flow both tiers
+            # flagged must come out as ONE label carrying both assertions, which is what
+            # `best_tier` and the multi-entry `sources[]` exist for. Measured 2026-08-17 —
+            # Suricata's single label on a 19,890-flow capture named the same 5-tuple the
+            # firewall did.
+            if tier1_result is not None:
+                detections = (*detections, *tier1_result.detections)
+
             progress.correlation = correlate(
-                detections, flows, manifest, args.unmatched_threshold, indicators
+                detections,
+                flows,
+                manifest,
+                args.unmatched_threshold,
+                indicators,
+                device_rulesets=tier1_result.rulesets if tier1_result else None,
             )
 
             # Inside the `try`, so a failure while rendering NOTICE or serialising is reported
@@ -804,13 +875,6 @@ def main(argv: list[str] | None = None) -> int:
                 "    flabel rules update --sources <file>\n"
                 "\n"
                 "then label against the snapshot it produced, with --ruleset-snapshot <id>."
-            )
-        if not args.offline:
-            raise NotImplementedInPhase1(
-                f"{STUB_MESSAGE}\n"
-                f"Tier 1 (PANW NGFW) labelling is Phase 2 and is not built yet. "
-                f"For the Tier 2 pipeline — Suricata and Zeek reading the capture file — "
-                f"run: flabel --offline {args.capture}"
             )
         return _label(args)
     except FlabelError as exc:
