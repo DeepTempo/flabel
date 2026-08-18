@@ -273,6 +273,27 @@ look at the new key. The cost is real and accepted: two files both stamped `"1.0
 whether `direction` is present, so a corpus spanning the change is told apart by the run block's
 `flabel_version`, not by the schema version.
 
+**#132 is the first change that is not additive, and it still does not bump it** (Craig,
+2026-08-18, after review). Two things moved: `run.mode` gained the values `replay` and `both`, and
+`run.ruleset`'s four fields became nullable. Read literally that breaks a 1.0 consumer —
+`run["ruleset"]["snapshot_id"][:8]` raises where a string was guaranteed. The reason it is not a
+version bump is that **no document a consumer could already have changes shape**:
+
+* The null `ruleset` block occurs only in `replay` mode, which produced no output before this
+  change. There is no historical file to re-read and no consumer that can have been reading one.
+* `--offline` output is byte-identical but for `tiers_unavailable`, which narrows from `[1]` to
+  `[]` — a field whose old value was a Phase 1 constant that had been wrong since tier 1 shipped.
+* `--both` output stamps `mode: "both"` where the same pipeline previously stamped `"offline"`.
+  A consumer branching on that string does change behaviour — and it was being misinformed
+  before, because Phase 2 stamped `"offline"` on every run that replayed past a firewall.
+
+So the consumer this would protect is one relying on a value the document should never have
+published. Bumping to signal that costs every consumer of unchanged `--offline` output a rejected
+version string, to warn about a field that was previously lying to them. The version tracks what a
+reader must understand; a reader must understand `mode` before branching on it, which was true at
+1.0 as well. The cost is accepted and recorded here rather than left implicit: `flabel_version` in
+the run block is what tells a corpus spanning 2026-08-18 apart.
+
 What this does **not** resolve is whether an inbound scan that our host refused belongs in
 malicious-flow ground truth at all. That is a product question about what the labels are training
 — "this host is being attacked" against "this host is compromised" — and no field settles it. The
@@ -1079,6 +1100,36 @@ a consumer reads the numbers the way they are meant.
   compressed. They identify the operator's artifact, which is what provenance needs; the normalized
   capture is derived and reproducible from it.
 
+**`mode`, `tiers_attempted` and `tiers_unavailable` are three different questions** (2026-08-18,
+issue #132). `mode` is what the operator asked for and is named after the flag they typed;
+`tiers_attempted` is what that mode means, from one table in `models.TIERS_BY_MODE`; and
+`tiers_unavailable` is **attempted-and-lost, never not-asked-for**.
+
+That last distinction is the correction. Phase 1 hardcoded all three — `"offline"`, `[2]`, `[1]` —
+on the reasoning that tier 1 was unbuilt, and Phase 2 built tier 1 without coming back, so for
+four days every run that replayed past the firewall published a run block calling itself offline
+with tier 1 unavailable, contradicted in the same document by a `sources[].tier` of `1`. Deriving
+all three from the invocation is what makes that class of staleness unreachable.
+
+`tiers_unavailable` is therefore empty on every successful run, in all three modes, and that is not
+a dead field: the path that populates it is the failure path. A `--both` run whose device raised
+mid-replay writes `[1, 2]` — tier 1 is where it died, and tier 2 was never reached, because the
+device stage runs first. One that got past the device and then lost Zeek or Suricata writes `[2]`,
+as does an `--offline` run whose Suricata failed. Those are exactly the runs whose reader needs to
+know which half they got, and a field that said `[1]` regardless could not tell them.
+
+**A tier counts as delivered only when its stage returned**, never because its record exists in the
+block. `run_suricata` reports a tool failure by *returning* a populated `SuricataRunInfo` and
+letting the caller raise, so `tools.suricata` is filled in on precisely the runs where tier 2 was
+lost. Both completions are therefore told to the run block by the orchestrator rather than inferred
+from what is present in it.
+
+**A `replay` run has no `ruleset` block to fill**, and every field in it is `null` rather than
+absent or zero. Tier 1 loads no Suricata rules, so there is no snapshot: `null` is §2.5's "not
+measured", where `0` would claim the run loaded a ruleset and found it empty. `NOTICE` is still
+written — the run's output carries vendor threat names, and the artifact's subject is whose text is
+in there — but it names no snapshot and records the absence of an attribution obligation.
+
 **`run.input.path` is the operator's original path** (`NormalizedCapture.original_path`), never the
 normalized copy, because the normalized copy lives in a per-run temporary directory that means
 nothing to a reader. That makes it **the one input field a reproducibility comparison must exclude
@@ -1091,9 +1142,9 @@ or normalise**: the same capture labelled from two directories would otherwise d
 {
   "flabel_version": str, "schema_version": "1.0",
   "started_at": str, "finished_at": str, "duration_seconds": float | None,
-  "mode": "offline",                      # Phase 1 is always this
+  "mode": "replay|offline|both",          # the invocation, one value per flag (§12)
   "unmatched_threshold": float,           # the gate this run was held to — see below
-  "tiers_attempted": [2], "tiers_unavailable": [1],
+  "tiers_attempted": [1|2], "tiers_unavailable": [1|2],
   "input": {"path": str, "sha256": str, "format": "pcap|pcapng|pcap.gz|pcapng.gz",
             "bytes": int, "input_status": "complete|partial",
             "packets_read": int,
@@ -1101,7 +1152,7 @@ or normalise**: the same capture labelled from two directories would otherwise d
             "discarded_link_types": [str], "discarded_packets": int,
             "normalization": [str]},
   "ruleset": {"snapshot_id": str, "sources": [...SourceAdmission...],
-              "total_admitted": int, "total_ja4_admitted": int},
+              "total_admitted": int, "total_ja4_admitted": int},   # every field null on `replay`
   "tools": {"zeek": str, "zeek_flags": ["-C", "-D"], "suricata": str,
             "editcap": str | None, "ja4_zeek_package": str | None,
             "ja4_status": "present|not-installed|probe-failed" | None,
@@ -1312,18 +1363,48 @@ consumer training on the output would read a missing package as an observation.
 ## 12. CLI contract — `cli.py`
 
 ```
-flabel <capture>                      Runs Tier 1 + Tier 2: replays the capture past the
-                                      device, then labels from both. Adds no flags — the
-                                      device comes from FLABEL_INLINE_* (see .env.example).
-flabel --offline <capture>            Runs the Tier 2 pipeline.
-    --ruleset-snapshot <id>           default: newest available
+flabel <capture>                      Tier 1 only: replays the capture past the device and
+                                      labels from its threat logs. The device comes from
+                                      FLABEL_INLINE_* (see .env.example).
+flabel --offline <capture>            Tier 2 only: Suricata + Zeek read the capture file.
+flabel --both <capture>               Tier 1 and Tier 2, labelling from both.
+    --ruleset-snapshot <id>           default: newest available. REFUSED on a replay-only
+                                      run — exit 2. See below.
     --output-dir <dir>                default: cwd
-    --rules-dir <dir>                 default: ./.flabel/rules
+    --rules-dir <dir>                 default: ./.flabel/rules. Tier 2 only — REFUSED on a
+                                      replay-only run, with --ruleset-snapshot.
     --sources <file>                  REFUSED here — exit 2. See below.
     --unmatched-threshold <float>     default: 0.01
 flabel rules update [--sources <f>] [--rules-dir <d>]
 flabel rules list  [--rules-dir <d>]
 ```
+
+**Zeek runs in all three modes and is not a tier.** It is the flow substrate every label's `flow`
+block is built from: a replay-only run still needs `conn.log` to attach a threat log to a flow and
+to publish a `uid`. A mode switches off a *detector*, never the thing detections are attached to.
+
+**The bare command was Tier 1 + Tier 2 until 2026-08-18** (Craig, issue #132), and `--both` is that
+behaviour renamed rather than removed. Three pipelines existed and only two could be asked for, so
+evaluating the device alone meant paying a full 85,000-rule Suricata load on every replay and
+reading an output that mixed the tier under test with the open-source baseline. Naming all three is
+what lets a run be about one tier deliberately.
+
+**This supersedes "Phase 2 adds no flags"** (PRD v0.4, 2026-08-11), which was true when written and
+is recorded here rather than deleted: the contract was closed on the belief that Phase 2 only
+needed to *build* the default path, and that held right up until the built default turned out to be
+the wrong default. `--offline` is unchanged, and remains permanent.
+
+**`--ruleset-snapshot` and `--rules-dir` are refused on a replay-only run**, on `--sources`'
+reasoning (§5, issue #71) one mode along: that pipeline loads no Suricata rules, so neither flag
+can change a single label, and an operator who passed one believes they have pinned what this run
+labelled against. Accepting and ignoring it would put that belief into `run.ruleset`, which is
+all-null on such a run. Both are refused rather than only the snapshot id, because they express the
+same intent at two levels of precision — refusing one and ignoring the other would teach that the
+distinction is meaningful when it is not. Only an *explicitly passed* `--rules-dir` is refused; its
+default is resolved at use, so a bare replay-only run is unaffected.
+
+`--offline --both` is refused by argparse's own mutually-exclusive group, because the two requests
+cannot both be honoured and picking a winner would make the losing flag silently ineffective.
 
 **`--sources` is refused on the labelling path, not ignored** (2026-08-15, issue #71). It is still *declared* there, so the refusal can explain itself rather than argparse saying `unrecognized arguments`. Passing it exits 2 before any tool runs and before a run directory exists.
 
@@ -1331,7 +1412,7 @@ The reason is §4's, and the behaviour it protects does not change: a label's te
 
 What changed is that the flag used to be parsed and discarded. `flabel --offline capture.pcap --sources my-registry.toml` looked like it had changed which sources may label; it had not, and nothing said so. That is §5's own rule — *a registry that loads with a setting silently ignored is worse than one that refuses to load* — applied to the CLI instead of the TOML. Choosing a registry happens at `flabel rules update --sources <file>`, and the resulting snapshot is then named with `--ruleset-snapshot <id>`.
 
-The refusal also applies to the Phase 1 stub path, which exits 2 rather than 3: the invocation is wrong either way, and Phase 2 adds no flags, so this stays true when the default path is built.
+The refusal applies on every labelling invocation, in all three modes: the invocation is wrong either way, and it exits 2 rather than 3. It predates the stub path being built and is unaffected by #132 adding `--both` — what a snapshot's terms are does not depend on which tiers ran.
 
 **Exit codes**
 

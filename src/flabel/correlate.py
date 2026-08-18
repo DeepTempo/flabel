@@ -117,7 +117,7 @@ ICMPV6_COUNTERPART = {
 def correlate(
     detections: Sequence[Detection],
     flows: Mapping[str, Flow],
-    manifest: SnapshotManifest,
+    manifest: SnapshotManifest | None,
     threshold: float = DEFAULT_THRESHOLD,
     address_indicators: frozenset[int] | None = None,
     device_rulesets: Mapping[tuple[int, str, int, str, int, str], str] | None = None,
@@ -127,6 +127,13 @@ def correlate(
     `manifest` is the snapshot Suricata actually ran — spec §12's orchestration asserts that
     its `snapshot_id` equals `SuricataRunInfo.snapshot_id`, because a `rules update` landing
     between the two loads would otherwise have every label cite a ruleset whose rules never ran.
+
+    **`None` is a replay-only run** (#132): tier 1 loads no Suricata rules, so there is no
+    snapshot to cite and demanding one would fail a run over rules it was never going to read.
+    Nothing tier 1 emits needs it — a tier-1 entry's `ruleset` is the device's content version,
+    threaded through `device_rulesets`, and `_entry` routes on `detection.tier` before it ever
+    reaches the snapshot lookup. A tier-2 detection arriving with no manifest is therefore a
+    mis-wired pipeline rather than a data condition, and raises rather than degrading.
 
     `address_indicators` is the snapshot's per-rule classification — the sids whose rules fire
     on the header tuple alone (issue #75), from `rules.snapshot.load_address_indicators`. **`None`
@@ -145,12 +152,12 @@ def correlate(
     # comprehension that indexes it is the same one `suricata.py` needs; two copies would carry
     # two copies of the duplicate-name hazard `SnapshotManifest.__post_init__` now rejects.
     # Read once into a local, because the property rebuilds the mapping on every access.
-    admissions = manifest.sources_by_name
+    admissions = manifest.sources_by_name if manifest is not None else {}
 
     # Reported once for the run, not once per label (issue #75, PLAN 11c). Spec §2.5: the
     # downgrade is a decision taken in the absence of a fact, so the absence has to be stated.
     unclassified: tuple[str, ...] = ()
-    if address_indicators is None and detections:
+    if manifest is not None and address_indicators is None and detections:
         unclassified = (
             f"snapshot {manifest.snapshot_id} recorded no per-rule indicator classification, so "
             f"every label_basis in this run is indicator-reference rather than direct. Rebuild "
@@ -166,7 +173,11 @@ def correlate(
         (
             detection,
             _entry(
-                detection, admissions, manifest.snapshot_id, address_indicators, device_rulesets
+                detection,
+                admissions,
+                manifest.snapshot_id if manifest is not None else None,
+                address_indicators,
+                device_rulesets,
             ),
         )
         for detection in detections
@@ -396,7 +407,7 @@ def _counterparts(address: str) -> Mapping[int, int]:
 def _entry(
     detection: Detection,
     admissions: Mapping[str, SourceAdmission],
-    snapshot_id: str,
+    snapshot_id: str | None,
     address_indicators: frozenset[int] | None = None,
     device_rulesets: Mapping[tuple[int, str, int, str, int, str], str] | None = None,
 ) -> SourceEntry:
@@ -431,6 +442,18 @@ def _entry(
             "",
         )
         return build_device_source_entry(detection, ruleset)
+
+    # Past the tier-1 return, so a `None` snapshot here means a tier-2 detection on a run that
+    # loaded no rules. That is not a capture flabel can describe — it is `correlate` being handed
+    # alerts from an engine the mode says never ran — so it fails with the wiring named rather
+    # than building a label whose `ruleset` is the string "None" (spec §4's own guard, one layer
+    # up from where it would otherwise catch this).
+    if snapshot_id is None:
+        raise SnapshotError(
+            f"detection sid {detection.sid} is tier {detection.tier}, but this run loaded no "
+            f"ruleset snapshot: a replay-only run has no tier-2 rules, so this detection came "
+            f"from a stage the run's mode says did not happen"
+        )
 
     try:
         admission = admissions[detection.source]
