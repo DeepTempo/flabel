@@ -39,6 +39,11 @@ PURE_MODULES = (
     "notice.py",
     "canonical.py",
     "rules/admit.py",
+    # Pure despite drawing on a terminal. It writes to a stream the CALLER supplies — the default
+    # is only resolved in `reporter()` — so tests drive it with a StringIO, and it imports nothing
+    # this guard forbids. Classified here rather than as impure so those imports stay checked: a
+    # progress display that grew a subprocess call would be a genuine surprise.
+    "progress.py",
 )
 
 #: Spec §2.2: only `flabel rules update` touches the network, and only through this module.

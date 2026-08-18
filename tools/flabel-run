@@ -1,0 +1,88 @@
+#!/bin/bash
+# flabel-run — label a capture on the replay box.
+#
+#   flabel-run <capture.pcap | gs://bucket/path.pcap> [extra flabel args]
+#
+# Exists because a tier-1 run needs three things the bare command does not carry: root (tcpreplay
+# opens raw sockets), /usr/local/bin on PATH under sudo (where zeek is symlinked), and the device
+# settings from /var/lib/flabel/flabel.env. Getting any of them wrong fails late — after a replay
+# and a 60s settle have already been spent — so they are set in one place instead of remembered.
+set -euo pipefail
+
+# Overridable so the tests can drive this without /opt or /var, and so a second lab does not
+# need a forked copy. Defaults are what the provisioning script lays down.
+CONF="${FLABEL_RUN_CONF:-/var/lib/flabel/flabel.env}"
+CAPTURES="${FLABEL_RUN_CAPTURES:-/var/lib/flabel/captures}"
+RUNS="${FLABEL_RUN_RUNS:-/var/lib/flabel/runs}"
+REPO="${FLABEL_RUN_REPO:-/opt/flabel/repo}"
+
+# The privilege wrapper, overridable for the same reason: a replay needs root for raw sockets,
+# and a test must be able to observe the command WITHOUT running it as root or at all.
+SUDO="${FLABEL_RUN_SUDO:-sudo}"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: flabel-run <capture.pcap | gs://bucket/object.pcap> [extra flabel args]
+
+  flabel-run /var/lib/flabel/captures/lax.pcap
+  flabel-run gs://pm-proto-496816-flabel-pcaps/attackcollect/capture_2026-07-07.pcap
+  flabel-run mycapture.pcap --offline        # tier 2 only, no device, no replay
+
+Output: one run directory per run under /var/lib/flabel/runs/, holding labels.json,
+run.json, NOTICE, zeek/ and suricata/. A run never modifies a previous one.
+EOF
+  exit 2
+}
+
+[ $# -ge 1 ] || usage
+TARGET="$1"; shift
+
+[ -f "$CONF" ] || { echo "flabel-run: $CONF is missing; the device settings live there" >&2; exit 1; }
+
+# The config file supplies DEFAULTS; anything already in the environment wins.
+#
+# `set -a; . "$CONF"` was the obvious way to do this and it is backwards: sourcing overwrites,
+# so `FLABEL_SETTLE_SECONDS=15 flabel-run x.pcap` still settled for the file's 60 and gave no
+# hint it had ignored you. Saving and restoring is uglier than sourcing and is the behaviour a
+# caller expects from an environment variable.
+_saved_env="$(export -p | grep -E '^(export |declare -x )FLABEL_' || true)"
+# shellcheck disable=SC1090
+set -a; . "$CONF"; set +a
+eval "$_saved_env"
+
+# A gs:// argument is staged locally first. flabel reads a file, and pulling it here keeps the
+# fetch out of the timed part of the run — a slow download inside the replay window would widen
+# the gap between the replay and the log query for no reason.
+if [[ "$TARGET" == gs://* ]]; then
+  mkdir -p "$CAPTURES"
+  LOCAL="$CAPTURES/$(basename "$TARGET")"
+  if [ -f "$LOCAL" ]; then
+    echo "flabel-run: already staged at $LOCAL"
+  else
+    echo "flabel-run: fetching $TARGET"
+    gcloud storage cp "$TARGET" "$LOCAL"
+  fi
+  TARGET="$LOCAL"
+fi
+
+[ -f "$TARGET" ] || { echo "flabel-run: no such capture: $TARGET" >&2; exit 1; }
+
+# Resolved to an absolute path BEFORE the cd below, which is the whole reason this line exists.
+# The check above runs in the caller's directory; the command runs in $REPO. Without this,
+# `flabel-run ./some.pcap` passes the check and then fails inside the repo — or, far worse,
+# silently labels a different file that happens to share the name there.
+TARGET="$(readlink -f -- "$TARGET")"
+
+mkdir -p "$RUNS"
+
+cd "$REPO"
+exec $SUDO -E env \
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  FLABEL_INLINE_HOST="${FLABEL_INLINE_HOST:-}" \
+  FLABEL_INLINE_API_KEY_FILE="${FLABEL_INLINE_API_KEY_FILE:-}" \
+  FLABEL_REPLAY_IF1="${FLABEL_REPLAY_IF1:-ens5}" \
+  FLABEL_REPLAY_IF2="${FLABEL_REPLAY_IF2:-ens6}" \
+  FLABEL_REPLAY_MULTIPLIER="${FLABEL_REPLAY_MULTIPLIER:-1000}" \
+  FLABEL_REPLAY_TOPSPEED="${FLABEL_REPLAY_TOPSPEED:-}" \
+  FLABEL_SETTLE_SECONDS="${FLABEL_SETTLE_SECONDS:-60}" \
+  uv run flabel "$TARGET" --output-dir "$RUNS" "$@"

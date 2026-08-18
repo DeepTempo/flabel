@@ -31,7 +31,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
+# Imported under a distinct name: `progress` is already the local _Progress instance
+# threaded through _label, and shadowing it would be a very quiet bug.
 from flabel import __version__, tier1
+from flabel import progress as progress_mod
 from flabel.config import enabled_sources, load_admission_policies
 from flabel.correlate import DEFAULT_THRESHOLD, _check_threshold, correlate
 from flabel.errors import (
@@ -94,6 +97,30 @@ RUN_DIR_TIMESTAMP = "%Y%m%dT%H%M%S.%fZ"
 #: Stripped from a capture's name when naming its run directory, longest chain first, so
 #: `capture.pcapng.gz` yields `capture` rather than `capture.pcapng`.
 CAPTURE_SUFFIXES = (".gz", ".pcapng", ".pcap")
+
+#: The run's stages, in the order they happen, as (key, label). The display draws every one of
+#: them from the start — including the ones still to come — because a list that grows as it goes
+#: tells the operator nothing about how much is left.
+#:
+#: Tier-2-only runs skip the four device stages rather than omitting them, so `--offline` and a
+#: full run are visibly the same pipeline with a piece switched off.
+STEPS: tuple[tuple[str, str], ...] = (
+    ("ingest", "ingest"),
+    ("device", "device"),
+    ("clock", "clock"),
+    ("prep", "prep"),
+    ("replay", "replay"),
+    ("settle", "settle"),
+    ("flush", "flush"),
+    ("query", "query"),
+    ("zeek", "zeek"),
+    ("suricata", "suricata"),
+    ("correlate", "correlate"),
+    ("write", "write"),
+)
+
+#: Device stages, skipped as a group on `--offline`.
+DEVICE_STEPS = ("device", "clock", "prep", "replay", "settle", "flush", "query")
 
 LABELS_NAME = "labels.json"
 RUN_NAME = "run.json"
@@ -599,14 +626,29 @@ def _label(args: argparse.Namespace) -> int:
         print(f"flabel: warning: {warning}", file=sys.stderr)
     progress.warnings = (*progress.warnings, *snapshot_warnings)
 
+    say = progress_mod.reporter(list(STEPS))
+    if args.offline:
+        for key in DEVICE_STEPS:
+            say.skip(key, "offline")
+
     with TemporaryDirectory(prefix=TEMP_PREFIX) as workdir:
         # The normalized capture lives here and nowhere else (spec §10). Not in the run
         # directory: it is derived, it would double the output's size, and spec §13 forbids
         # copying capture data outside the run directory — which includes not adding a second
         # copy of the operator's packets to an artifact they will ship somewhere.
         try:
+            say.start("ingest")
             progress.capture = normalize(args.capture, Path(workdir))
+            say.header(
+                f"{args.capture.name} │ {progress_mod.count(progress.capture.packets_read)} packets"
+            )
+            say.finish(
+                "ingest",
+                f"{progress.capture.input_status} │ "
+                f"{progress_mod.count(progress.capture.packets_read)} pkts",
+            )
         except ToolError as exc:
+            say.fail("ingest", str(exc)[:60])
             # `editcap` failed. Unlike `CaptureError`, the operator's file was readable, so
             # there is a run worth reporting — and the `ToolFailure` records are the only
             # description of what went wrong. Create the directory *now* rather than earlier,
@@ -630,16 +672,26 @@ def _label(args: argparse.Namespace) -> int:
                 tier1_result = tier1.run(
                     progress.capture.path,
                     Path(workdir),
+                    report=say,
                     **device_settings,  # type: ignore[arg-type]
                 )
                 for warning in tier1_result.warnings:
                     print(f"flabel: warning: {warning}", file=sys.stderr)
                 progress.warnings = (*progress.warnings, *tier1_result.warnings)
 
+            say.start("zeek", "reading the capture")
             flows, progress.zeek = run_zeek(progress.capture.path, rundir / ZEEK_DIR)
+            say.finish("zeek", f"{len(flows):,} flows")
+
+            say.start("suricata", "loading rules")
 
             detections, progress.suricata = run_suricata(
                 progress.capture.path, snapshot_dir, rundir / SURICATA_DIR
+            )
+            say.finish(
+                "suricata",
+                f"{progress.suricata.rules_loaded or 0:,} rules │ "
+                f"{progress.suricata.alerts_total or 0} alerts",
             )
             if progress.suricata.tool_failures:
                 # `run_suricata` records rather than raises, so the one convention the rest of
@@ -697,6 +749,7 @@ def _label(args: argparse.Namespace) -> int:
             if tier1_result is not None:
                 detections = (*detections, *tier1_result.detections)
 
+            say.start("correlate", f"{len(detections)} detections")
             progress.correlation = correlate(
                 detections,
                 flows,
@@ -710,7 +763,17 @@ def _label(args: argparse.Namespace) -> int:
             # like any other. Outside it, such a failure escaped past the handler and left the
             # `run.json` written moments earlier standing as a record of a successful run —
             # complete, plausible, and describing a run that did not finish.
-            return _write_output(rundir, started_at, progress, manifest)
+            say.finish(
+                "correlate",
+                f"{len(progress.correlation.labels)} labels │ "
+                f"{len(progress.correlation.unmatched)} unmatched",
+            )
+
+            say.start("write", rundir.name)
+            code = _write_output(rundir, started_at, progress, manifest)
+            say.finish("write", rundir.name)
+            say.close()
+            return code
         except FlabelError as exc:
             _absorb(progress, exc)
             return _fail(rundir, started_at, progress, exc)

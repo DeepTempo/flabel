@@ -40,10 +40,12 @@ Not pure: this module runs subprocesses. The timestamp arithmetic is pure and li
 
 from __future__ import annotations
 
+import re
 import shutil
 import struct
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,6 +172,30 @@ _GLOBAL_HEADER = 24
 
 
 def capture_bounds(capture: Path) -> tuple[float, float]:
+    """The first and last packet timestamps. Thin wrapper over `capture_stats`."""
+    stats = capture_stats(capture)
+    return stats.first_ts, stats.last_ts
+
+
+@dataclass(frozen=True)
+class CaptureStats:
+    """What one walk of the record headers can tell us.
+
+    The packet count rides along because the walk already visits every header to find the
+    last timestamp — so the denominator a progress bar needs is free, and reading it any
+    other way would mean a second pass over the file or a second tool.
+    """
+
+    first_ts: float
+    last_ts: float
+    packets: int
+
+    @property
+    def span(self) -> float:
+        return self.last_ts - self.first_ts
+
+
+def capture_stats(capture: Path) -> CaptureStats:
     """The first and last packet timestamps, read from the capture's own record headers.
 
     Read here rather than shelled out to `capinfos`, for the reason spec §8 has flabel walk pcap
@@ -201,6 +227,7 @@ def capture_bounds(capture: Path) -> tuple[float, float]:
 
             first: float | None = None
             last: float | None = None
+            packets = 0
             while True:
                 record = handle.read(_RECORD_HEADER)
                 if len(record) < _RECORD_HEADER:
@@ -213,6 +240,7 @@ def capture_bounds(capture: Path) -> tuple[float, float]:
                 if first is None:
                     first = stamp
                 last = stamp
+                packets += 1
                 handle.seek(captured, 1)
     except OSError as exc:
         raise ToolError(f"{capture} could not be read to find its time bounds: {exc}") from exc
@@ -221,7 +249,23 @@ def capture_bounds(capture: Path) -> tuple[float, float]:
         raise ToolError(
             f"{capture} holds no readable packet records, so a replay window cannot be measured"
         )
-    return first, last
+    return CaptureStats(first_ts=first, last_ts=last, packets=packets)
+
+
+#: tcpreplay's periodic stats, measured against 4.4.4:
+#:
+#:     Actual: 728 packets (49441 bytes) sent in 1.00 seconds
+#:     Rated: 49246.7 Bps, 0.393 Mbps, 725.14 pps
+#:
+#: Two lines per interval, and the pair is what a live counter needs: the first carries progress,
+#: the second carries throughput. Parsed rather than inferred from elapsed time because tcpreplay
+#: knows what it actually sent and we would only be guessing.
+SENT = re.compile(r"Actual:\s+(\d+)\s+packets\s+\((\d+)\s+bytes\)")
+RATED = re.compile(r"Rated:.*?([\d.]+)\s+pps")
+
+#: How often tcpreplay reports. One second is the finest it offers and is well under the time a
+#: person notices a stalled display.
+STATS_INTERVAL = 1
 
 
 def replay(
@@ -231,6 +275,7 @@ def replay(
     *,
     multiplier: float = DEFAULT_MULTIPLIER,
     topspeed: bool = False,
+    on_progress: Callable[[int, float], None] | None = None,
 ) -> ReplayWindow:
     """Put the capture on the wire, and return the window it occupied.
 
@@ -363,3 +408,81 @@ def rewrite_source_macs(capture: Path, cache: Path, out: Path, macs: tuple[str, 
         PREP_TIMEOUT_SECONDS,
         "re-addressed for replay",
     )
+
+
+def _run_streaming(
+    argv: list[str],
+    timeout: int,
+    what: str,
+    on_progress: Callable[[int, float], None] | None,
+) -> None:
+    """Run tcpreplay and report its stats as they arrive.
+
+    Separate from `_run` because the two want opposite things from a pipe. `_run` uses
+    `capture_output`, which returns everything at once — correct for a tool whose output only
+    matters if it fails, and useless for one we want to watch. This reads line by line instead.
+
+    **The pipe is drained unconditionally, even with no callback.** A child writing to a pipe
+    nobody reads blocks once the buffer fills, and a replay that deadlocks at 64KB of stats
+    output would look exactly like a firewall that stopped responding. Draining is not optional
+    just because nobody is watching.
+
+    Output is kept for the failure message, but only the tail: tcpreplay can emit thousands of
+    stats lines and a `ToolFailure` carrying all of them helps nobody.
+    """
+    binary = argv[0]
+    if shutil.which(binary) is None:
+        raise ToolError(
+            f"{binary} is not on PATH, so the capture cannot be {what}",
+            failures=(
+                ToolFailure(
+                    tool=binary,
+                    argv=tuple(argv),
+                    exit_code=None,
+                    message=f"{binary} not found on PATH",
+                ),
+            ),
+        )
+
+    tail: list[str] = []
+    sent = 0
+    deadline = time.monotonic() + timeout
+    process = subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            tail.append(line.rstrip())
+            del tail[:-40]
+            match = SENT.search(line)
+            if match:
+                sent = int(match.group(1))
+                continue
+            rated = RATED.search(line)
+            if rated and on_progress is not None:
+                on_progress(sent, float(rated.group(1)))
+            if time.monotonic() > deadline:
+                process.kill()
+                raise ToolError(
+                    f"{binary} did not finish within {timeout}s while {what}",
+                    failures=(
+                        ToolFailure(
+                            tool=binary,
+                            argv=tuple(argv),
+                            exit_code=None,
+                            message=f"timed out after {timeout}s",
+                        ),
+                    ),
+                )
+        code = process.wait(timeout=60)
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+    if code != 0:
+        message = "\n".join(tail[-10:]) or "no output"
+        raise ToolError(
+            f"{binary} failed while {what}: {message}",
+            failures=(ToolFailure(tool=binary, argv=tuple(argv), exit_code=code, message=message),),
+        )

@@ -177,3 +177,41 @@ def test_an_unrecognised_magic_is_reported_as_a_pipeline_error(tmp_path):
     path.write_bytes(b"\x00\x01\x02\x03" + b"\x00" * 40)
     with pytest.raises(ToolError, match="pipeline error"):
         replay_mod.capture_bounds(path)
+
+
+def test_the_capture_walk_also_yields_the_packet_count(tmp_path):
+    """The denominator a progress bar needs, for free.
+
+    The header walk already visits every record to find the last timestamp, so counting costs
+    nothing — where asking capinfos would mean a second pass and a second tool.
+    """
+    path = tmp_path / "c.pcap"
+    path.write_bytes(_pcap(replay_mod.MAGIC_MICRO_LE, "<", [(1000, 0), (1004, 0), (1009, 0)]))
+    stats = replay_mod.capture_stats(path)
+    assert stats.packets == 3
+    assert stats.span == pytest.approx(9.0)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("Actual: 728 packets (49441 bytes) sent in 1.00 seconds", 728),
+        ("Actual: 52599 packets (5019715 bytes) sent in 14.86 seconds", 52599),
+    ],
+)
+def test_the_sent_count_is_read_from_tcpreplays_own_report(line, expected):
+    """Parsed rather than inferred from elapsed time: tcpreplay knows, we would be guessing."""
+    assert int(replay_mod.SENT.search(line).group(1)) == expected
+
+
+def test_the_rate_is_read_from_the_pps_field_not_the_bandwidth_fields():
+    """The line carries Bps, Mbps and pps; only the last is packets."""
+    line = "Rated: 49246.7 Bps, 0.393 Mbps, 725.14 pps"
+    assert float(replay_mod.RATED.search(line).group(1)) == pytest.approx(725.14)
+
+
+def test_a_stats_line_tcpreplay_did_not_emit_does_not_match():
+    """The warning spam --no-flow-stats suppresses must never be read as progress."""
+    noise = "Warning in flows.c:flow_decode() line 198: Unable to process unsupported DLT type"
+    assert replay_mod.SENT.search(noise) is None
+    assert replay_mod.RATED.search(noise) is None
