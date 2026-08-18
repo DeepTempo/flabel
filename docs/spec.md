@@ -34,7 +34,9 @@ Terms are used exactly as defined here, in code and in output.
 These hold everywhere. A violation is a bug, not a trade-off.
 
 1. **Zero runtime dependencies.** Standard library only. `tomllib` (3.11+) for config; `argparse` for the CLI. Dev dependencies (pytest, ruff) are unrestricted.
-2. **Only `flabel rules update` performs network I/O.** A labelling run that attempts a network connection is a defect. This is what makes Goal 2 achievable.
+2. **`--offline` performs no network I/O, and `flabel rules update` is the only other network path.** A `--offline` labelling run that attempts a network connection is a defect. This is what makes Goal 2 achievable *for that mode*.
+
+   **Amended 2026-08-17 (Craig), when Phase 2 landed.** This clause was written when every mode read files. Tier 1 cannot honour it — the firewall has to be asked what it saw — so the guarantee moved to the mode that can keep it rather than being quietly weakened for all of them. The default path contacts the device through `panw.py`, which is the second and last permitted network module; `tests/test_architecture.py` enforces the closed list. Reproducibility is correspondingly narrower and says so: an `--offline` run is reproducible from its snapshot, while a tier-1 run depends on a device whose content and configuration versions it therefore records on every label.
 3. **Zeek is always invoked with `-D`.** Verified: without it, `uid` differs on every run and reproducibility is impossible.
 4. **All consumers read the same normalized capture.** They cannot disagree about input.
 5. **Absence is never a signal.** Every enumerated loss condition is reported in the run block. Silence means nothing happened, never "something happened and we didn't say."
@@ -1310,8 +1312,9 @@ consumer training on the output would read a missing package as an observation.
 ## 12. CLI contract — `cli.py`
 
 ```
-flabel <capture>                      Phase 1: stub. Prints "Coming Soon (TM)",
-                                      names --offline, writes nothing, exit 3.
+flabel <capture>                      Runs Tier 1 + Tier 2: replays the capture past the
+                                      device, then labels from both. Adds no flags — the
+                                      device comes from FLABEL_INLINE_* (see .env.example).
 flabel --offline <capture>            Runs the Tier 2 pipeline.
     --ruleset-snapshot <id>           default: newest available
     --output-dir <dir>                default: cwd
@@ -1339,7 +1342,7 @@ The refusal also applies to the Phase 1 stub path, which exits 2 rather than 3: 
 **A rejected capture leaves no run directory, and that is deliberate** (Craig, 2026-08-14). Issue #23 argued that a script must not have to parse a log to learn that the artifact beside it is not a result — but that argument is about a run which *started* and then died, where `run.json` records what was lost. A capture flabel cannot read never starts a run: §8 step 4 has made an unreadable header a `CaptureError` with no output since step 3, and step 9's zero-packet case is the same category, not a new one. The exit code and the stderr message are the contract every `CaptureError` has. A batch caller distinguishes "this capture was rejected" from "flabel died mid-run" by whether a run directory exists at all, which is the same signal §13 already relies on.
 | 1 | Failure. **No `labels.json`** — but the run directory exists and holds `run.json` with `tool_failures[]` (§10), unless the failure occurred before a run directory could be created (a missing snapshot, an unreadable capture). |
 | 2 | Usage error (argparse). |
-| 3 | Not implemented — the Phase 1 default path only. |
+| 3 | Not implemented. **Unused since Phase 2** — the default path is built, so nothing remains to report. Retained rather than renumbered: a caller scripting against the old contract must not have exit 3 silently start meaning something else. |
 
 Partial input is deliberately **not** a distinct code: truncated captures are common, and a non-zero exit would make every ordinary `set -e` script treat a successful run as a failure.
 
@@ -1355,7 +1358,7 @@ flabel **must never**:
 - emit a label from a fingerprint value alone, without a rule match;
 - emit a label attributable to an `identify`-class source;
 - assign a detection to a flow by guess when the match is ambiguous;
-- perform network I/O outside `flabel rules update`;
+- perform network I/O on an `--offline` run, or outside `flabel rules update` and `panw.py`;
 - invoke Zeek without `-D`;
 - overwrite or modify a previous run directory;
 - write a partial `labels.json` on a hard failure — either a complete run directory exists or none does;
