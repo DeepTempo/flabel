@@ -215,3 +215,68 @@ def test_a_stats_line_tcpreplay_did_not_emit_does_not_match():
     noise = "Warning in flows.c:flow_decode() line 198: Unable to process unsupported DLT type"
     assert replay_mod.SENT.search(noise) is None
     assert replay_mod.RATED.search(noise) is None
+
+
+def _fake_tcpreplay(tmp_path, flush: bool, intervals: int = 5):
+    """A stand-in that emits tcpreplay's stats format, with buffering under our control.
+
+    Two variants, because they distinguish the two possible causes of a counter that sits at
+    zero: `flush=True` is a well-behaved line-buffered child, and if progress still does not
+    arrive the fault is in our reader. `flush=False` is a block-buffered child, which is what a
+    C program writing to a pipe does by default.
+    """
+    script = tmp_path / "fake-tcpreplay"
+    body = "\n".join(
+        [
+            "import sys, time",
+            "if '--version' in sys.argv:",
+            "    print('fake tcpreplay 0.0'); raise SystemExit(0)",
+            f"for i in range(1, {intervals} + 1):",
+            "    sent = i * 1000",
+            "    line = f'Actual: {sent} packets ({sent * 60} bytes) sent in {i}.00 seconds'",
+            "    sys.stdout.write(line + chr(10))",
+            "    sys.stdout.write(f'Rated: 60000.0 Bps, 0.48 Mbps, {900 + i}.00 pps\\n')",
+            "    sys.stdout.flush()" if flush else "    pass",
+            "    time.sleep(0.05)",
+        ]
+    )
+    script.write_text(f"#!/usr/bin/env python3\n{body}\n")
+    script.chmod(0o755)
+    return script
+
+
+def test_progress_arrives_while_the_replay_is_still_running(tmp_path, monkeypatch):
+    """The reader must report each interval as it lands, not all of them at the end.
+
+    A counter that sits at 0/total until the replay finishes is the symptom this guards. With a
+    line-buffered child, every interval has to reach the callback — and the *order* proves they
+    were not delivered in one burst after exit.
+    """
+    fake = _fake_tcpreplay(tmp_path, flush=True, intervals=5)
+    monkeypatch.setattr(replay_mod, "REPLAY", str(fake))
+    capture = tmp_path / "c.pcap"
+    capture.write_bytes(_pcap(replay_mod.MAGIC_MICRO_LE, "<", [(1000, 0), (1005, 0)]))
+
+    seen: list[tuple[int, float]] = []
+    replay_mod.replay(
+        capture, tmp_path / "cache", ("lo", "lo"), on_progress=lambda s, r: seen.append((s, r))
+    )
+
+    assert [s for s, _ in seen] == [1000, 2000, 3000, 4000, 5000]
+    assert [r for _, r in seen] == [901.0, 902.0, 903.0, 904.0, 905.0]
+
+
+def test_the_pipe_is_drained_even_with_no_callback(tmp_path, monkeypatch):
+    """A child writing to a pipe nobody reads blocks once the buffer fills.
+
+    A replay deadlocked on its own stats output would look exactly like a firewall that stopped
+    answering, so draining is not optional just because nobody is watching.
+    """
+    fake = _fake_tcpreplay(tmp_path, flush=True, intervals=400)
+    monkeypatch.setattr(replay_mod, "REPLAY", str(fake))
+    capture = tmp_path / "c.pcap"
+    capture.write_bytes(_pcap(replay_mod.MAGIC_MICRO_LE, "<", [(1000, 0), (1005, 0)]))
+
+    window = replay_mod.replay(capture, tmp_path / "cache", ("lo", "lo"), on_progress=None)
+
+    assert window.wall_span >= 0

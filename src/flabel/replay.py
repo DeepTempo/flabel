@@ -293,12 +293,20 @@ def replay(
         "-I",
         interfaces[1],
         f"--cachefile={cache}",
+        # Reported every second so a caller can show a live count. Without this tcpreplay says
+        # nothing until it exits, and a progress bar sits at 0/total for the whole replay —
+        # which is precisely the bug this argument was added to fix, and which shipped once
+        # because a patch to add it silently failed to apply.
+        f"--stats={STATS_INTERVAL}",
+        # Suppresses tcpreplay's flow tracker, which cannot decode this DLT and emits one
+        # "unsupported DLT type" warning per flow — noise that drowns the stats being parsed.
+        "--no-flow-stats",
         *pacing,
         str(capture),
     ]
 
     started = time.time()
-    _run(argv, REPLAY_TIMEOUT_SECONDS, "replayed past the device")
+    _run_streaming(argv, REPLAY_TIMEOUT_SECONDS, "replayed past the device", on_progress)
     ended = time.time()
 
     return ReplayWindow(
