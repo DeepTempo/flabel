@@ -54,7 +54,30 @@ def _check(value: object, allowed: tuple[object, ...], field: str, owner: str) -
 SourceClass = Literal["signature", "ioc-dest", "ioc-name", "identify"]
 
 #: How rules from a source were selected. `metadata-filter` requires ET-style metadata.
-AdmissionBasis = Literal["metadata-filter", "wholesale"]
+#:
+#: `device-policy` is Phase 2's (Craig, 2026-08-17) and makes a different kind of statement from
+#: the other two. Those describe a decision flabel made when admitting rules into a snapshot;
+#: `device-policy` says the decision was made **on the firewall**, by its threat exceptions, and
+#: that flabel admitted what the device reported without second-guessing it.
+#:
+#: Saying so explicitly is the point. A consumer weighting labels by trust has to know that the
+#: gate for these entries lives in a configuration flabel does not contain — which is why a
+#: tier-1 entry's `ruleset` carries the device's content version *and* its config version, so the
+#: policy that admitted a detection is as identifiable as the signature that produced it.
+AdmissionBasis = Literal["metadata-filter", "wholesale", "device-policy"]
+
+#: What a tier-1 label's terms are, given that PANW signatures are not open-source rules.
+#:
+#: **Deliberately not an SPDX identifier** (Craig, 2026-08-17). The licence field exists to carry
+#: a redistribution obligation, because tier-2 rules are other people's text and shipping labels
+#: derived from them incurs duties `NOTICE` spells out. A device signature is proprietary and this
+#: output is neither redistributed nor sold, so there is no obligation to record.
+#:
+#: Populated rather than blanked, because a consumer reading `licence` across a mixed-tier label
+#: must be able to tell "no obligation, vendor signature" from "we forgot". `notice.py` matches on
+#: this exact value to render the non-obligation, which is why it lives here rather than in either
+#: of the two modules that need it.
+DEVICE_LICENCE = "proprietary:vendor-signature (not redistributed)"
 
 #: How directly a label follows from its rule match. Carried on every SourceEntry so a
 #: consumer can tell a content match from an indirect reference without reading rule text.

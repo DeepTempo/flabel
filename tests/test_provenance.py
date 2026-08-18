@@ -528,6 +528,7 @@ from flabel.models import (  # noqa: E402
 )
 from flabel.provenance import (  # noqa: E402
     TOOLCHAIN_MANIFEST,
+    build_device_source_entry,
     build_run_block,
     read_toolchain,
 )
@@ -1652,3 +1653,57 @@ def test_a_run_that_died_before_correlation_still_records_its_threshold(tmp_path
 
     assert block["counts"]["unmatched"] is None, "correlation must not have run, for this to test"
     assert block["unmatched_threshold"] == 0.5
+
+
+# --- Tier 1: provenance taken from the device rather than a snapshot (Phase 2, #122) ----------
+
+
+def _tier1_detection(**overrides):
+    fields = {
+        "source": "panw/threat-prevention", "tier": 1, "sid": 91535, "rev": 0,
+        "classtype": "code-execution", "app_proto": "unknown-udp",
+        "threat": "Realtek Jungle SDK Remote Code Execution Vulnerability",
+        "ts": 1787004719.0, "src_ip": "45.90.163.37", "src_port": 56406,
+        "dst_ip": "216.152.152.123", "dst_port": 9034, "proto": "udp",
+        "direction": "to_server",
+    }
+    fields.update(overrides)
+    return Detection(**fields)
+
+
+def test_a_tier_1_entry_records_the_policy_that_admitted_it():
+    """Tier 1's admission gate lives in the device's threat exceptions (Craig, 2026-08-17).
+
+    So the entry has to say two things a tier-2 entry does not: that the decision was made on the
+    device, and *which* configuration made it. Without the config version a label could name the
+    signatures that existed but not the exceptions in force, and for tier 1 those exceptions are
+    the admission policy.
+    """
+    entry = build_device_source_entry(_tier1_detection(), "AppThreat-9136-10199/config-2817")
+    assert entry.admission_basis == "device-policy"
+    assert entry.ruleset == "AppThreat-9136-10199/config-2817"
+    assert entry.tier == 1
+    assert entry.label_basis == "direct"
+
+
+def test_a_tier_1_licence_states_no_obligation_rather_than_inventing_one():
+    """PANW signatures are proprietary and this output is not redistributed (Craig, 2026-08-17).
+
+    Populated rather than blanked so a consumer reading a mixed-tier label can tell "no
+    obligation, vendor signature" from "we forgot to record it".
+    """
+    entry = build_device_source_entry(_tier1_detection(), "AppThreat-9136-10199/config-2817")
+    assert "proprietary" in entry.licence
+    assert entry.licence != ""
+
+
+def test_the_tier_1_path_refuses_a_tier_2_detection():
+    """Routing a Suricata detection here would claim a device produced a verdict it never saw."""
+    with pytest.raises(ValueError, match="tier-1 path"):
+        build_device_source_entry(_tier1_detection(tier=2), "AppThreat-9136-10199/config-2817")
+
+
+def test_a_tier_1_entry_without_a_ruleset_is_refused():
+    """An unattributable verdict is the worst thing this project can ship."""
+    with pytest.raises(ValueError, match="no ruleset identifier"):
+        build_device_source_entry(_tier1_detection(), "")

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from flabel.models import Label, SnapshotManifest, UnmatchedDetection
+from flabel.models import DEVICE_LICENCE, Label, SnapshotManifest, UnmatchedDetection
 
 #: What each licence actually asks of someone redistributing labels derived from its rules.
 #: Keyed by the SPDX id the registry records (spec §5). Deliberately a statement of the
@@ -159,6 +159,21 @@ def render_notice(
     # run directory is compared for Goal 2 like any other artifact.
     for name in sorted(licences):
         admission = admissions.get(name)
+        if admission is None and licences[name] == DEVICE_LICENCE:
+            # A tier-1 source has no snapshot entry and never will: its signatures are the
+            # vendor's, not a feed flabel admitted (Phase 2, #122). It is still listed rather
+            # than skipped, because a threat *name* is vendor text that appears verbatim in the
+            # output, and NOTICE is the record of whose text is in there — but what it records
+            # is the absence of an obligation, which is a statement, not a gap.
+            lines.extend([
+                name,
+                f"    {DEVICE_LICENCE}",
+                "    No attribution obligation: these are proprietary device signatures, and",
+                "    this output is not redistributed. The signature set and the device policy",
+                "    that admitted each detection are named per-label in sources[].ruleset.",
+                "",
+            ])
+            continue
         if admission is None:
             # An attribution flabel cannot substantiate must not be invented. Correlation
             # already refuses a detection whose source is absent from the manifest, so

@@ -80,10 +80,16 @@ flabel rules update                    # fetch the nine sources, write a ruleset
 flabel --offline capture.pcap          # label it
 ```
 
-**Phase 1 is open-source screening only** (Suricata and Zeek reading the capture file). A second
-tier — a PANW next-generation firewall seeing the traffic via replay — is designed but deferred
-to Phase 2, behind a feasibility question that has not been answered. The CLI contract is already
-final: `--offline` is permanent and Phase 2 adds no flags.
+**Two tiers.** `--offline` is open-source screening only — Suricata and Zeek reading the capture
+file, and no network I/O of any kind. The default path adds **Tier 1**: the capture is replayed
+past a PANW next-generation firewall and its threat verdicts are labelled alongside Suricata's. A
+flow both tiers flag becomes one label carrying both assertions, with `best_tier: 1`.
+
+Tier 1 needs a lab — a replay host with two interfaces into a VM-Series in a two-zone Layer 3
+configuration. `docs/phase-2-reachability-spike.md` records the measurement that showed this
+works in a cloud VPC at all, and `docs/phase-2-replay-box-provision.sh` builds the replay host.
+The device is configured through `FLABEL_INLINE_*` (see `.env.example`) rather than through
+flags: `--offline` is permanent and Phase 2 added none.
 
 Progress is tracked in [`docs/status.yaml`](docs/status.yaml). The specification is
 [`docs/spec.md`](docs/spec.md); the build plan is [`PLAN.md`](PLAN.md); the original design brief
