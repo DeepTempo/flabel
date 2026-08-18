@@ -631,6 +631,11 @@ def full_run(tmp_path: Path, **overrides) -> dict:
         # A completed run resolved its snapshot. Stated rather than inferred from `manifest`
         # being present, for the same reason the run block itself does not infer it.
         "snapshot_resolved": True,
+        # The mode these fixtures describe: a manifest, a Suricata run and no device. Stated
+        # here because `build_run_block` requires it (#132) — a run block cannot be built
+        # without saying which pipelines it reports on. Tests about a different mode override
+        # it, and `test_every_mode_publishes_the_tiers_it_attempted` covers all three.
+        "mode": "offline",
         "toolchain_path": tmp_path / "absent-toolchain.json",
     }
     return build_run_block(**{**arguments, **overrides})
@@ -654,6 +659,7 @@ def test_a_run_block_is_assemblable_with_no_stage_having_completed(tmp_path):
     block = build_run_block(
         started_at=STARTED,
         finished_at=FINISHED,
+        mode="offline",
         tool_failures=(ToolFailure(tool="zeek", argv=("zeek",), exit_code=127, message="no"),),
         toolchain_path=tmp_path / "absent.json",
     )
@@ -669,7 +675,10 @@ def test_the_key_set_is_the_same_whether_the_run_succeeded_or_died(tmp_path):
     """
     complete = full_run(tmp_path)
     empty = build_run_block(
-        started_at=STARTED, finished_at=FINISHED, toolchain_path=tmp_path / "absent.json"
+        started_at=STARTED,
+        finished_at=FINISHED,
+        mode="offline",
+        toolchain_path=tmp_path / "absent.json",
     )
 
     def shape(node):
@@ -688,7 +697,10 @@ def test_a_fact_that_was_never_established_is_null_not_zero(tmp_path):
     read as "nothing was lost".
     """
     block = build_run_block(
-        started_at=STARTED, finished_at=FINISHED, toolchain_path=tmp_path / "absent.json"
+        started_at=STARTED,
+        finished_at=FINISHED,
+        mode="offline",
+        toolchain_path=tmp_path / "absent.json",
     )
     for section in ("input", "ruleset", "tools", "counts"):
         assert set(block[section]), f"{section} lost its keys"
@@ -1215,6 +1227,7 @@ def test_a_crash_before_the_snapshot_loads_does_not_claim_the_ruleset_was_missin
     crashed = build_run_block(
         started_at=STARTED,
         finished_at=FINISHED,
+        mode="offline",
         capture=make_capture(tmp_path),
         tool_failures=(ToolFailure(tool="zeek", argv=("zeek",), exit_code=-9, message="killed"),),
         toolchain_path=tmp_path / "absent-toolchain.json",
@@ -1230,7 +1243,10 @@ def test_an_unknown_loss_condition_is_null_rather_than_false(tmp_path):
     False here would assert the run checked and found nothing wrong, which it did not.
     """
     summary = build_run_block(
-        started_at=STARTED, finished_at=FINISHED, toolchain_path=tmp_path / "absent.json"
+        started_at=STARTED,
+        finished_at=FINISHED,
+        mode="offline",
+        toolchain_path=tmp_path / "absent.json",
     )["loss_conditions"]
     assert summary["ja4_unavailable"] is None
     assert summary["identify_alert_suppressed"] is None
@@ -1241,12 +1257,66 @@ def test_an_unknown_loss_condition_is_null_rather_than_false(tmp_path):
 # --- the rest of the run block ------------------------------------------------------------------
 
 
-def test_the_run_block_carries_the_phase_1_constants(tmp_path):
-    block = full_run(tmp_path)
-    assert block["mode"] == "offline"
-    assert block["tiers_attempted"] == [2]
-    assert block["tiers_unavailable"] == [1]
+def test_a_mode_is_required_and_is_not_defaulted(tmp_path):
+    """The Phase 1 constants were wrong for four days because nothing forced a caller to say.
+
+    `MODE = "offline"` was hardcoded on the reasoning that tier 1 was unbuilt. Phase 2 built it
+    and did not come back; every run that replayed past the firewall published `mode: "offline"`
+    with `tiers_unavailable: [1]`, contradicted in the same document by a `sources[].tier` of 1.
+
+    A default here — any default — restores that failure exactly: the caller that forgets gets a
+    plausible answer instead of an error. So the parameter is keyword-only and mandatory, and
+    this test is what stops someone re-adding the convenience.
+    """
+    arguments = {
+        "started_at": STARTED,
+        "finished_at": FINISHED,
+        "toolchain_path": tmp_path / "absent-toolchain.json",
+    }
+    with pytest.raises(TypeError, match="mode"):
+        build_run_block(**arguments)
+
+
+@pytest.mark.parametrize(
+    ("mode", "attempted"),
+    [("replay", [1]), ("offline", [2]), ("both", [1, 2])],
+)
+def test_every_mode_publishes_the_tiers_it_attempted(tmp_path, mode, attempted):
+    """`tiers_attempted` is the mode's definition, so the two can never drift (#132)."""
+    block = full_run(tmp_path, mode=mode, tier1_ran=1 in attempted)
+    assert block["mode"] == mode
+    assert block["tiers_attempted"] == attempted
     assert block["schema_version"] == SCHEMA_VERSION
+
+
+@pytest.mark.parametrize("mode", ["replay", "offline", "both"])
+def test_a_completed_run_reports_nothing_unavailable_in_any_mode(tmp_path, mode):
+    """A deliberate single-tier run is not a degraded run (Craig, 2026-08-18, #132).
+
+    Phase 1 published `tiers_unavailable: [1]` on every `--offline` run, which made "I did not
+    ask for the device" indistinguishable from "I asked and did not get it" to a consumer
+    filtering this field for degraded runs. The not-asked-for fact is already carried twice, by
+    `mode` and by the absence from `tiers_attempted`.
+    """
+    block = full_run(tmp_path, mode=mode, tier1_ran=True)
+    assert block["tiers_unavailable"] == []
+
+
+def test_a_tier_that_was_attempted_and_lost_is_the_one_thing_unavailable_reports(tmp_path):
+    """The failure path is what populates the field, and it is why the field still exists.
+
+    A `--both` run whose device raised mid-replay writes `run.json` and no `labels.json`; the
+    question its reader has is *which half did I get*. Before #132 the block could not answer:
+    it said `[1]` whatever happened.
+    """
+    lost_device = full_run(tmp_path, mode="both", tier1_ran=False)
+    assert lost_device["tiers_unavailable"] == [1]
+
+    lost_suricata = full_run(tmp_path, mode="both", tier1_ran=True, suricata=None)
+    assert lost_suricata["tiers_unavailable"] == [2]
+
+    lost_both = full_run(tmp_path, mode="both", tier1_ran=False, suricata=None)
+    assert lost_both["tiers_unavailable"] == [1, 2]
 
 
 def test_the_duration_is_derived_from_the_two_timestamps(tmp_path):
@@ -1648,6 +1718,7 @@ def test_a_run_that_died_before_correlation_still_records_its_threshold(tmp_path
     block = build_run_block(
         started_at=STARTED,
         finished_at=FINISHED,
+        mode="offline",
         unmatched_threshold=0.5,
     )
 

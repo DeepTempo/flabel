@@ -79,6 +79,25 @@ AdmissionBasis = Literal["metadata-filter", "wholesale", "device-policy"]
 #: of the two modules that need it.
 DEVICE_LICENCE = "proprietary:vendor-signature (not redistributed)"
 
+#: Which pipelines the operator asked for, named after the flag that selects each (#132,
+#: Craig 2026-08-18). Phase 1 recorded a single hardcoded `"offline"` because there was only one
+#: pipeline; a run block that still said so while tier 1 replayed past a firewall would be a
+#: provenance field describing a run that did not happen.
+#:
+#: Named for the invocation rather than for the tiers, so `mode` answers "what was asked for" and
+#: `tiers_attempted` answers "what that meant" — two facts that a single field conflated for as
+#: long as one implied the other.
+RunMode = Literal["replay", "offline", "both"]
+
+#: Which tiers each mode attempts. The one place the mapping is stated: `cli` gates its stages on
+#: it and `provenance` publishes it, and two copies would let the artifact claim a tier the
+#: pipeline never ran.
+TIERS_BY_MODE: dict[RunMode, tuple[int, ...]] = {
+    "replay": (1,),
+    "offline": (2,),
+    "both": (1, 2),
+}
+
 #: How directly a label follows from its rule match. Carried on every SourceEntry so a
 #: consumer can tell a content match from an indirect reference without reading rule text.
 LabelBasis = Literal["direct", "indicator-reference"]

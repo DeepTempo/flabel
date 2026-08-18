@@ -66,8 +66,9 @@ worst thing this project can ship.
 
 ## Status
 
-**Build stage, 9 of 10 steps complete.** `flabel --offline <capture>` runs the whole Tier 2
-pipeline and writes a run directory. What is still missing is the CI gates that would let you
+**Build stage, 9 of 10 steps complete.** Both tiers run: `flabel <capture>` replays past the
+device, `flabel --offline <capture>` runs the whole Tier 2 pipeline, and `--both` runs the two
+together. Each writes a run directory. What is still missing is the CI gates that would let you
 trust it unattended: the canary and reproducibility checks of step 10.
 
 | | |
@@ -77,19 +78,29 @@ trust it unattended: the canary and reproducibility checks of step 10.
 
 ```
 flabel rules update                    # fetch the nine sources, write a ruleset snapshot
-flabel --offline capture.pcap          # label it
+flabel --offline capture.pcap          # label it with Suricata + Zeek
 ```
 
-**Two tiers.** `--offline` is open-source screening only — Suricata and Zeek reading the capture
-file, and no network I/O of any kind. The default path adds **Tier 1**: the capture is replayed
-past a PANW next-generation firewall and its threat verdicts are labelled alongside Suricata's. A
-flow both tiers flag becomes one label carrying both assertions, with `best_tier: 1`.
+**Two tiers, three modes** — one flag each, and the flag you leave off matters:
+
+| Invocation | Tier 1 (device) | Tier 2 (Suricata) |
+| :-- | :-: | :-: |
+| `flabel capture.pcap` | ✅ | — |
+| `flabel --offline capture.pcap` | — | ✅ |
+| `flabel --both capture.pcap` | ✅ | ✅ |
+
+**Tier 2** is open-source screening: Suricata and Zeek reading the capture file, with no network
+I/O of any kind. **Tier 1** replays the capture past a PANW next-generation firewall and labels
+from its threat logs. Under `--both`, a flow both tiers flag becomes one label carrying both
+assertions, with `best_tier: 1`.
+
+Zeek runs in all three modes. It is what flows are read from — every label's `flow` block and
+`uid` come from `conn.log` — so it is the substrate, not a tier you can switch off.
 
 Tier 1 needs a lab — a replay host with two interfaces into a VM-Series in a two-zone Layer 3
 configuration. `docs/phase-2-reachability-spike.md` records the measurement that showed this
 works in a cloud VPC at all, and `docs/phase-2-replay-box-provision.sh` builds the replay host.
-The device is configured through `FLABEL_INLINE_*` (see `.env.example`) rather than through
-flags: `--offline` is permanent and Phase 2 added none.
+The device is configured through `FLABEL_INLINE_*` (see `.env.example`) rather than through flags.
 
 Progress is tracked in [`docs/status.yaml`](docs/status.yaml). The specification is
 [`docs/spec.md`](docs/spec.md); the build plan is [`PLAN.md`](PLAN.md); the original design brief

@@ -111,10 +111,12 @@ ADMISSION_FIELDS = ("exclude_classtypes", "exclude_msg_markers", "msg_brand_mark
 def load_admission_policy(path: Path | None = None) -> AdmissionPolicy:
     """Read the `[admission]` table from the registry, or return the permissive default (#75).
 
-    **In the registry rather than on the CLI**, because spec §12's contract is closed —
-    `--offline` is permanent and Phase 2 adds no flags — and `--sources` already exists as the
-    override. It also puts the policy inside admission, so it is inside `snapshot_id`: the rules
-    a label cites are exactly the rules the policy admitted, and the two cannot drift apart.
+    **In the registry rather than on the CLI**, and the reason outlived its original premise.
+    This said "spec §12's contract is closed — Phase 2 adds no flags"; #132 reopened it for
+    `--both`, so that half no longer argues anything. What does, and always did the real work: the
+    policy belongs inside admission, therefore inside `snapshot_id`, so the rules a label cites are
+    exactly the rules the policy admitted and the two cannot drift apart. A CLI flag would sit
+    outside the snapshot and break that. `--sources` already exists as the override.
 
     **In one table rather than per source**, because the policy is about kinds of rule, not about
     feeds. `pawpatrules` is one source containing both direct detections and policy observations

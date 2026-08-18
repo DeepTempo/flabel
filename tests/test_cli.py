@@ -245,11 +245,16 @@ def test_the_threshold_default_is_the_specs(tmp_path: Path) -> None:
 def test_the_default_path_is_no_longer_a_stub(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`flabel <capture>` runs tier 1 now (Craig, 2026-08-17). Phase 2 added no flags.
+    """`flabel <capture>` runs tier 1 (Craig, 2026-08-17), and still does after #132.
 
     With no device configured it fails for the reason it actually has — missing configuration —
     rather than announcing an unbuilt feature. Exit 3 was "not implemented"; there is nothing
     unimplemented left to report.
+
+    #132 narrowed the default from tier 1 + tier 2 to tier 1 alone, which leaves this test's
+    subject untouched: both defaults need the device, so both fail here for the same reason. The
+    tests that can tell the two defaults apart are in "the three modes" below, and they had to be
+    written — this one passes under either.
     """
     monkeypatch.delenv("FLABEL_INLINE_HOST", raising=False)
     monkeypatch.delenv("FLABEL_INLINE_API_KEY", raising=False)
@@ -1753,7 +1758,8 @@ def test_the_stub_path_refuses_it_too(tmp_path: Path) -> None:
 
     The usage error wins over "not implemented" because the invocation is wrong either way, and
     telling someone their flag was ignored is more use than telling them to come back in Phase 2.
-    Phase 2 adds no flags (spec §12), so this stays true when the default path is built.
+    It held when the default path was built, and holds again now the default has changed (#132):
+    what a snapshot's terms are does not depend on which tiers a mode runs.
     """
     assert cli.main([str(BENIGN), "--sources", str(tmp_path / "m.toml")]) == EXIT_USAGE
 
@@ -1831,3 +1837,370 @@ def test_a_dead_run_records_the_threshold_in_run_json(
     run = json.loads((rundir / "run.json").read_text(encoding="utf-8"))["run"]
     assert run["counts"]["unmatched"] is None
     assert run["unmatched_threshold"] == 0.4
+
+
+# --- the three modes (#132) -----------------------------------------------------------------
+#
+# The device is stubbed at `tier1.run` and nowhere deeper. That boundary is the project's
+# standing line — "tools real, network stubbed", and the PANW device is never contacted — so
+# stubbing here replaces exactly the network and leaves the whole of `_label`'s orchestration
+# real: the mode derivation, the stage gating, correlation, and every artifact written.
+#
+# The stub returns a genuine `Tier1Result`, not a namespace with three attributes. A stub shaped
+# to what the caller happens to read today keeps passing when the caller starts reading a fourth
+# field; a real dataclass fails to construct the moment the record changes.
+
+#: The canary's HTTP flow, which `MATCHES_CANARY` also fires on — so a tier-1 detection built on
+#: it correlates to the same flow a tier-2 one does, and `--both` can be shown consolidating two
+#: assertions onto one label rather than emitting two labels.
+CANARY_FLOW = ("10.0.0.5", 49152, "10.0.0.200", 80, "tcp")
+
+#: A plausible PANW content/config pair. Non-empty because `build_device_source_entry` refuses an
+#: empty ruleset: a tier-1 label that cannot name the signature set behind it is the
+#: unattributable verdict spec §13 forbids.
+DEVICE_RULESET = "AppThreat-9136-10199/config-2817"
+
+
+def device_detection(sid: int = 30001, threat: str = "Realtek SDK RCE") -> Detection:
+    """One tier-1 detection on the canary's HTTP flow."""
+    src_ip, src_port, dst_ip, dst_port, proto = CANARY_FLOW
+    return Detection(
+        source="panw",
+        tier=1,
+        sid=sid,
+        rev=1,
+        classtype="attempted-admin",
+        app_proto="web-browsing",
+        threat=threat,
+        ts=0.0,
+        src_ip=src_ip,
+        src_port=src_port,
+        dst_ip=dst_ip,
+        dst_port=dst_port,
+        proto=proto,
+        direction="to_server",
+    )
+
+
+def stub_device(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    detections: Sequence[Detection] = (),
+    warnings: Sequence[str] = (),
+) -> dict[str, int]:
+    """Replace the tier-1 stage with one that reports `detections`, and count its calls.
+
+    The returned dict is what lets a test assert a stage did **not** run. Asserting only on the
+    output cannot tell "the device was skipped" from "the device ran and found nothing", and
+    those are the two readings this whole change turns on.
+    """
+    from flabel import replay as replay_mod
+    from flabel import tier1 as tier1_mod
+    from flabel.panw import DeviceInfo
+
+    calls = {"count": 0}
+
+    def fake_run(capture, workdir, *, report, **settings):
+        calls["count"] += 1
+        for key in cli.DEVICE_STEPS:
+            report.skip(key, "stubbed")
+        return tier1_mod.Tier1Result(
+            detections=tuple(detections),
+            rulesets={
+                (
+                    detection.sid,
+                    detection.src_ip,
+                    detection.src_port,
+                    detection.dst_ip,
+                    detection.dst_port,
+                    detection.proto,
+                ): DEVICE_RULESET
+                for detection in detections
+            },
+            window=replay_mod.ReplayWindow(
+                pcap_first_ts=0.0,
+                pcap_last_ts=1.0,
+                replay_start_wall=1000.0,
+                replay_end_wall=1001.0,
+                multiplier=1.0,
+            ),
+            device=DeviceInfo(
+                hostname="fw-test",
+                serial="000000000000",
+                sw_version="11.1.4",
+                app_version="9136-10199",
+                threat_version="9136-10199",
+                model="PA-VM",
+            ),
+            entries_retrieved=len(detections),
+            logs_written=len(detections),
+            declined=(),
+            collapsed=0,
+            warnings=tuple(warnings),
+        )
+
+    monkeypatch.setattr(cli.tier1, "run", fake_run)
+    monkeypatch.setenv("FLABEL_INLINE_HOST", "192.0.2.1")
+    monkeypatch.setenv("FLABEL_INLINE_API_KEY", "not-a-real-key")
+    monkeypatch.delenv("FLABEL_INLINE_API_KEY_FILE", raising=False)
+    return calls
+
+
+def read_run(output_dir: Path) -> dict:
+    return json.loads((only_run_dir(output_dir) / "run.json").read_text(encoding="utf-8"))
+
+
+def read_labels(output_dir: Path) -> dict:
+    return json.loads((only_run_dir(output_dir) / "labels.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.requires_tools
+def test_the_default_run_is_replay_only_and_does_not_run_suricata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """`flabel <capture>` is tier 1 alone as of 2026-08-18 (Craig, #132).
+
+    Asserted by what is **absent**: no `suricata/` directory, null rule counts, and a null
+    `ruleset` block. A test that only checked the label would pass with Suricata still running,
+    which is the defect class `docs/status.yaml` records three times in one day.
+    """
+    output = tmp_path / "out"
+    calls = stub_device(monkeypatch, detections=[device_detection()])
+
+    assert cli.main([str(BENIGN), "--output-dir", str(output)]) == EXIT_SUCCESS
+
+    rundir = only_run_dir(output)
+    assert calls["count"] == 1, "the device stage must have run"
+    assert not (rundir / "suricata").exists(), "a replay-only run must not run Suricata"
+    assert (rundir / "zeek").is_dir(), "Zeek is the flow substrate in every mode, not a tier"
+
+    run = read_run(output)["run"]
+    assert run["mode"] == "replay"
+    assert run["tiers_attempted"] == [1]
+    assert run["tiers_unavailable"] == []
+    assert run["counts"]["rules_loaded"] is None, "null means not measured; 0 would be a claim"
+    assert run["ruleset"]["snapshot_id"] is None
+
+
+@pytest.mark.requires_tools
+def test_a_replay_only_run_labels_from_the_device_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """The positive half: the mode still produces a traceable verdict."""
+    output = tmp_path / "out"
+    stub_device(monkeypatch, detections=[device_detection()])
+
+    cli.main([str(BENIGN), "--output-dir", str(output)])
+
+    labels = read_labels(output)["labels"]
+    assert len(labels) == 1, f"expected one tier-1 label, got {labels}"
+    (entry,) = labels[0]["sources"]
+    assert entry["tier"] == 1
+    assert entry["ruleset"] == DEVICE_RULESET, "a tier-1 label names the device's content version"
+    assert labels[0]["best_tier"] == 1
+
+
+@pytest.mark.requires_tools
+def test_a_replay_only_run_needs_no_ruleset_snapshot_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """A fresh checkout can run the default without `flabel rules update` first (#132).
+
+    `--rules-dir` points at an empty directory, which `--offline` would fail on with
+    `SnapshotError` before creating a run directory. Tier 1 reads no Suricata rules, so failing
+    a run over 85,000 rules it was never going to open would be a precondition invented by the
+    orchestration rather than required by the pipeline.
+    """
+    empty = tmp_path / "no-rules"
+    empty.mkdir()
+    output = tmp_path / "out"
+    stub_device(monkeypatch, detections=[device_detection()])
+
+    code = cli.main([str(BENIGN), "--rules-dir", str(empty), "--output-dir", str(output)])
+
+    assert code == EXIT_SUCCESS
+    assert read_run(output)["run"]["mode"] == "replay"
+
+
+@pytest.mark.requires_tools
+def test_both_runs_the_device_and_suricata_and_consolidates_onto_one_label(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """`--both` is what the bare command used to do, and it must still do all of it.
+
+    Both tiers fire on the canary's *first* HTTP flow, so the run is also the check that
+    consolidation survived the refactor: that flow must come out as ONE label carrying two
+    source entries with `best_tier` the stronger of them, not as two labels.
+
+    The canary has a second HTTP flow that only the tier-2 rule matches, and it is left in
+    rather than engineered away — it is the control. A consolidation bug that merged everything
+    onto one label would satisfy "the shared flow has two entries" and be caught only by the
+    flow that must stay separate.
+    """
+    output = tmp_path / "out"
+    calls = stub_device(monkeypatch, detections=[device_detection()])
+
+    code = cli.main(
+        [
+            "--both",
+            str(BENIGN),
+            "--rules-dir",
+            str(rules_dir),
+            "--output-dir",
+            str(output),
+        ]
+    )
+
+    assert code == EXIT_SUCCESS
+    assert calls["count"] == 1
+    rundir = only_run_dir(output)
+    assert (rundir / "suricata").is_dir(), "--both must run Suricata"
+
+    run = read_run(output)["run"]
+    assert run["mode"] == "both"
+    assert run["tiers_attempted"] == [1, 2]
+    assert run["counts"]["rules_loaded"], "--both loads the ruleset"
+    assert run["ruleset"]["snapshot_id"] == snapshot_id_of(rules_dir)
+
+    labels = read_labels(output)["labels"]
+    by_flow = {(label["flow"]["src_ip"], label["flow"]["src_port"]): label for label in labels}
+    assert len(by_flow) == len(labels) == 2, f"one label per flow, got {labels}"
+
+    shared = by_flow[(CANARY_FLOW[0], CANARY_FLOW[1])]
+    assert sorted(entry["tier"] for entry in shared["sources"]) == [1, 2], (
+        "the flow both tiers flagged must be one label carrying both assertions"
+    )
+    assert shared["best_tier"] == 1
+
+    (tier2_only,) = [label for label in labels if label is not shared]
+    assert [entry["tier"] for entry in tier2_only["sources"]] == [2]
+    assert tier2_only["best_tier"] == 2
+
+
+@pytest.mark.requires_tools
+def test_offline_still_never_touches_the_device(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """`--offline` is unchanged, and the stub's call count is what proves it."""
+    output = tmp_path / "out"
+    calls = stub_device(monkeypatch, detections=[device_detection()])
+
+    assert cli.main(offline(BENIGN, rules_dir, output)) == EXIT_SUCCESS
+
+    assert calls["count"] == 0, "--offline must not invoke the tier-1 stage"
+    run = read_run(output)["run"]
+    assert run["mode"] == "offline"
+    assert run["tiers_attempted"] == [2]
+    assert all(
+        entry["tier"] == 2 for label in read_labels(output)["labels"] for entry in label["sources"]
+    )
+
+
+def test_offline_and_both_together_are_refused(tmp_path: Path) -> None:
+    """Two irreconcilable requests. Picking a winner would silently ignore the loser."""
+    with pytest.raises(SystemExit) as excinfo:
+        cli.build_parser().parse_args(["--offline", "--both", str(BENIGN)])
+    assert excinfo.value.code == EXIT_USAGE
+
+
+def test_a_ruleset_snapshot_is_refused_on_a_replay_only_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same reasoning as `--sources` (#71): ignoring a flag is worse than refusing it.
+
+    The refusal must also happen *before* a run directory exists, which is the contract every
+    usage error in spec §12 has.
+    """
+    output = tmp_path / "out"
+    stub_device(monkeypatch)
+
+    code = cli.main(
+        [str(BENIGN), "--ruleset-snapshot", "0123456789abcdef", "--output-dir", str(output)]
+    )
+
+    assert code == EXIT_USAGE
+    assert not output.exists(), "a refused invocation must not leave a run directory"
+    assert "--both" in capsys.readouterr().err, "the refusal must name the mode that accepts it"
+
+
+@pytest.mark.requires_tools
+def test_a_ruleset_snapshot_is_still_accepted_by_the_modes_that_load_rules(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """The complement of the refusal above, so it cannot be over-applied."""
+    stub_device(monkeypatch, detections=[device_detection()])
+    snapshot = snapshot_id_of(rules_dir)
+
+    offline_out = tmp_path / "offline-out"
+    assert (
+        cli.main(offline(BENIGN, rules_dir, offline_out, "--ruleset-snapshot", snapshot))
+        != EXIT_USAGE
+    )
+
+    both_out = tmp_path / "both-out"
+    assert (
+        cli.main(
+            [
+                "--both",
+                str(BENIGN),
+                "--rules-dir",
+                str(rules_dir),
+                "--output-dir",
+                str(both_out),
+                "--ruleset-snapshot",
+                snapshot,
+            ]
+        )
+        != EXIT_USAGE
+    )
+
+
+@pytest.mark.requires_tools
+def test_a_replay_only_notice_records_that_no_rule_source_is_behind_the_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """NOTICE is written in every mode: its absence must not be something to interpret.
+
+    What it says changes. A replay-only run cites no snapshot, and the one entry it carries
+    records the *absence* of an obligation for the vendor's threat names — which spec §4 calls a
+    statement rather than a gap.
+    """
+    output = tmp_path / "out"
+    stub_device(monkeypatch, detections=[device_detection()])
+
+    cli.main([str(BENIGN), "--output-dir", str(output)])
+
+    notice = (only_run_dir(output) / "NOTICE").read_text(encoding="utf-8")
+    assert "Ruleset snapshot: none" in notice
+    assert "proprietary:vendor-signature" in notice
+
+
+@pytest.mark.requires_tools
+def test_a_both_run_that_loses_the_device_says_which_half_it_lost(
+    tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch, no_network: None
+) -> None:
+    """`tiers_unavailable` earns its place on the failure path, not the success path (#132).
+
+    Phase 1 published `[1]` on every run whatever happened, so the field could not answer the
+    one question its reader has: of the two tiers I asked for, which did I get?
+    """
+    output = tmp_path / "out"
+
+    def explode(capture, workdir, *, report, **settings):
+        raise ToolError("the device stopped answering mid-replay")
+
+    monkeypatch.setattr(cli.tier1, "run", explode)
+    monkeypatch.setenv("FLABEL_INLINE_HOST", "192.0.2.1")
+    monkeypatch.setenv("FLABEL_INLINE_API_KEY", "not-a-real-key")
+
+    code = cli.main(
+        ["--both", str(BENIGN), "--rules-dir", str(rules_dir), "--output-dir", str(output)]
+    )
+
+    assert code == EXIT_FAILURE
+    rundir = only_run_dir(output)
+    assert not (rundir / "labels.json").exists(), "a failed run claims no verdicts (issue #23)"
+    run = read_run(output)["run"]
+    assert run["mode"] == "both"
+    assert run["tiers_attempted"] == [1, 2]
+    assert run["tiers_unavailable"] == [1, 2], "the device was lost, and Suricata never reached"

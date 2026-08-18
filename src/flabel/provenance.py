@@ -43,11 +43,13 @@ from flabel.models import (
     DEFAULT_THRESHOLD,
     DEVICE_LICENCE,
     SNAPSHOT_ID,
+    TIERS_BY_MODE,
     CorrelationResult,
     Detection,
     Ja4Status,
     LabelBasis,
     NormalizedCapture,
+    RunMode,
     SnapshotManifest,
     SourceAdmission,
     SourceEntry,
@@ -249,12 +251,16 @@ TOOLCHAIN_MANIFEST = Path("/etc/flabel-toolchain.json")
 #: rather than producing it. `labels.iso_from_epoch` is what writes it.
 ISO_8601_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
 
-#: Phase 1 constants (spec §10). Tier 1 is the PANW NGFW path, which Phase 1 does not attempt;
-#: saying so explicitly is the difference between "no tier-1 verdicts" and "tier 1 found
-#: nothing", which is spec §2.5 applied to a whole tier.
-MODE = "offline"
-TIERS_ATTEMPTED = (2,)
-TIERS_UNAVAILABLE = (1,)
+#: Retired 2026-08-18 (#132), and kept as a comment rather than deleted because the constants it
+#: replaced were WRONG for four days. Phase 1 hardcoded `MODE = "offline"`, `TIERS_ATTEMPTED =
+#: (2,)` and `TIERS_UNAVAILABLE = (1,)` on the reasoning that tier 1 was unbuilt; Phase 2 built it
+#: and did not come back here, so every run that replayed past the firewall and produced tier-1
+#: labels published a run block calling itself offline with tier 1 unavailable — contradicted, in
+#: the same document, by `labels[].sources[].tier == 1`.
+#:
+#: The lesson is the one `docs/status.yaml` keeps recording: a constant justified by a phase
+#: outlives the phase. Mode and tiers are now derived from the invocation, which cannot go stale
+#: because there is nothing left to forget to update.
 
 #: Keys read out of `/etc/flabel-toolchain.json`, and where each lands in `tools`. `zeek` and
 #: `suricata` are deliberately absent: those come from the binaries that actually ran, which is
@@ -331,6 +337,33 @@ def read_toolchain(path: Path = TOOLCHAIN_MANIFEST) -> tuple[dict[str, str], tup
     return values, tuple(warnings)
 
 
+def _tiers(
+    mode: RunMode, *, tier1_ran: bool, suricata: SuricataRunInfo | None
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """What this run set out to do, and which of it did not happen.
+
+    `tiers_attempted` is the mode's own definition (`models.TIERS_BY_MODE`) — what the operator
+    asked for, which is knowable before anything runs and stays true on a run that died in
+    ingest.
+
+    **`tiers_unavailable` means attempted-and-lost, never not-asked-for** (Craig, 2026-08-18,
+    #132). A `--offline` run is not a run missing tier 1; it is a run that wanted tier 2, and
+    publishing `[1]` there — which Phase 1 did — makes every deliberate single-tier run
+    indistinguishable from a degraded one to a consumer filtering on this field. The
+    not-asked-for fact is already carried, twice: by `mode` and by the absence from
+    `tiers_attempted`.
+
+    So on a successful run this is empty, in all three modes, and that is not a dead field: the
+    path that populates it is the failure path. A `--both` run whose device raised mid-replay
+    writes `run.json` with `[1]`, and one that died in Zeek before Suricata writes `[2]`. Those
+    are the runs where "which half of this did I actually get" is the question, and until #132
+    the block could not answer it.
+    """
+    attempted = TIERS_BY_MODE[mode]
+    completed = {1: tier1_ran, 2: suricata is not None}
+    return attempted, tuple(tier for tier in attempted if not completed[tier])
+
+
 def build_run_block(
     *,
     started_at: str,
@@ -340,6 +373,8 @@ def build_run_block(
     zeek: ZeekRunInfo | None = None,
     suricata: SuricataRunInfo | None = None,
     correlation: CorrelationResult | None = None,
+    mode: RunMode,
+    tier1_ran: bool = False,
     snapshot_resolved: bool | None = None,
     unmatched_threshold: float = DEFAULT_THRESHOLD,
     tool_failures: Sequence[ToolFailure] = (),
@@ -363,6 +398,7 @@ def build_run_block(
     versions, toolchain_warnings = read_toolchain(toolchain_path)
     ja4_version, ja4_warnings = _ja4_package_version(zeek, versions)
     failures = _collect_failures(zeek, suricata, tool_failures)
+    attempted, unavailable = _tiers(mode, tier1_ran=tier1_ran, suricata=suricata)
 
     return {
         "flabel_version": flabel_version,
@@ -370,7 +406,7 @@ def build_run_block(
         "started_at": started_at,
         "finished_at": finished_at,
         "duration_seconds": duration,
-        "mode": MODE,
+        "mode": mode,
         # The bar `counts.unmatched_ratio` was measured against, and the one input to a run that
         # the run did not record (#68). It decides whether `labels.json` exists at all, so two
         # documents reporting the same ratio were indistinguishable — one having passed a
@@ -379,8 +415,8 @@ def build_run_block(
         # measurement; and never None, because argparse supplies the default, so a run always
         # had a threshold even if it died before correlation.
         "unmatched_threshold": unmatched_threshold,
-        "tiers_attempted": list(TIERS_ATTEMPTED),
-        "tiers_unavailable": list(TIERS_UNAVAILABLE),
+        "tiers_attempted": list(attempted),
+        "tiers_unavailable": list(unavailable),
         "input": _input_section(capture),
         "ruleset": _ruleset_section(manifest),
         "tools": _tools_section(zeek, suricata, versions, ja4_version),

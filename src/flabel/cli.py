@@ -50,8 +50,11 @@ from flabel.errors import (
 from flabel.ingest import normalize
 from flabel.labels import build_document, serialise_bytes
 from flabel.models import (
+    TIERS_BY_MODE,
     CorrelationResult,
+    Detection,
     NormalizedCapture,
+    RunMode,
     SnapshotManifest,
     SuricataRunInfo,
     ToolFailure,
@@ -119,8 +122,13 @@ STEPS: tuple[tuple[str, str], ...] = (
     ("write", "write"),
 )
 
-#: Device stages, skipped as a group on `--offline`.
+#: Device stages, skipped as a group when the mode does not include tier 1.
 DEVICE_STEPS = ("device", "clock", "prep", "replay", "settle", "flush", "query")
+
+#: The tier-2 stage, skipped when the mode does not include it. A one-element tuple rather than a
+#: bare string so the two skip groups read the same way at the call site — and so a second tier-2
+#: stage can be added without the reader having to notice which of the two conventions applies.
+SURICATA_STEPS = ("suricata",)
 
 LABELS_NAME = "labels.json"
 RUN_NAME = "run.json"
@@ -161,7 +169,7 @@ def unmatched_threshold(value: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The labelling parser: `flabel <capture>` and `flabel --offline <capture>` (spec §12)."""
+    """The labelling parser: the three modes of spec §12, one flag each (#132)."""
     parser = argparse.ArgumentParser(
         prog="flabel",
         description="Label malicious flows in a packet capture.",
@@ -173,16 +181,33 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("capture", type=Path, help="the pcap/pcapng capture to label")
-    parser.add_argument(
+    # Mutually exclusive, and argparse's own group rather than a hand-rolled check, so
+    # `--offline --both` exits 2 with a message naming both flags before any tool runs. The two
+    # requests are not reconcilable — one says "do not touch the device", the other "use it" —
+    # and picking a winner would make the losing flag silently ineffective, which is the failure
+    # `--sources` was refused for (spec §5, §12).
+    tiers = parser.add_mutually_exclusive_group()
+    tiers.add_argument(
         "--offline",
         action="store_true",
-        help="run the Tier 2 (Suricata + Zeek) pipeline. Permanent — Phase 2 adds no flags.",
+        help="tier 2 only: Suricata + Zeek read the capture. No device, no replay, no network.",
+    )
+    tiers.add_argument(
+        "--both",
+        action="store_true",
+        help=(
+            "tier 1 and tier 2: replay past the device AND run Suricata, labelling from both. "
+            "This was the default until 2026-08-18 (#132)."
+        ),
     )
     parser.add_argument(
         "--ruleset-snapshot",
         default=None,
         metavar="ID",
-        help="ruleset snapshot to label against (default: newest available)",
+        help=(
+            "ruleset snapshot to label against (default: newest available). Tier 2 only — "
+            "REFUSED on a replay-only run, which loads no rules"
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -238,6 +263,24 @@ def build_rules_parser() -> argparse.ArgumentParser:
     listing = actions.add_parser("list", help="list the snapshots on disk")
     listing.add_argument("--rules-dir", type=Path, default=DEFAULT_RULES_DIR, metavar="DIR")
     return parser
+
+
+def _mode(args: argparse.Namespace) -> RunMode:
+    """Which pipelines this invocation asked for (spec §12, #132).
+
+    The bare command is **replay-only** as of 2026-08-18. It used to mean tier 1 + tier 2, and
+    the change is deliberate: the two tiers answer different questions, and pairing them on every
+    run made every replay pay a full Suricata rule load and every output mix the tier under
+    evaluation with the open-source baseline. `--both` is that old default, now named.
+
+    Derived in one place and passed down, rather than each stage re-reading `args.offline`. The
+    gating question is asked five times in `_label` — snapshot, device settings, skip lists,
+    correlation, NOTICE — and five independent readings of two booleans is five chances for one
+    of them to disagree about what the operator asked for.
+    """
+    if args.offline:
+        return "offline"
+    return "both" if args.both else "replay"
 
 
 # --- run directory ------------------------------------------------------------------------
@@ -311,6 +354,16 @@ class _Progress:
     `null` mean "not measured" — distinct from zero, which is a claim about the capture.
     """
 
+    #: What the operator asked for (#132). On `_Progress` for the same reason
+    #: `unmatched_threshold` is: *every* path that writes a run block needs it, including the
+    #: failure paths, and a `run.json` that cannot say which pipelines were meant to run cannot
+    #: be read as evidence of what was lost. Not defaulted — a run always has a mode, and a
+    #: default here would let a caller publish someone else's.
+    mode: RunMode
+    #: Whether the tier-1 stage returned. Distinct from `mode` including tier 1: the difference
+    #: between the two is exactly `tiers_unavailable`, which is the field that tells a reader a
+    #: `--both` run lost its device half rather than never having had one.
+    tier1_ran: bool = False
     capture: NormalizedCapture | None = None
     manifest: SnapshotManifest | None = None
     zeek: ZeekRunInfo | None = None
@@ -354,6 +407,8 @@ def _run_block(started_at: str, progress: _Progress) -> dict[str, Any]:
         zeek=progress.zeek,
         suricata=progress.suricata,
         correlation=progress.correlation,
+        mode=progress.mode,
+        tier1_ran=progress.tier1_ran,
         snapshot_resolved=progress.snapshot_resolved,
         unmatched_threshold=progress.unmatched_threshold,
         tool_failures=progress.tool_failures,
@@ -608,28 +663,49 @@ def _label(args: argparse.Namespace) -> int:
     """
     started = datetime.now(UTC)
     started_at = _stamp(started)
-    progress = _Progress(unmatched_threshold=args.unmatched_threshold)
+    mode = _mode(args)
+    tier1_wanted = 1 in TIERS_BY_MODE[mode]
+    tier2_wanted = 2 in TIERS_BY_MODE[mode]
+    progress = _Progress(unmatched_threshold=args.unmatched_threshold, mode=mode)
 
     # Resolved first, before the snapshot, because it is free and it is the precondition
     # specific to the mode the operator actually invoked. A tier-1 run with no device configured
     # should say so, rather than first complaining about a ruleset it would also have needed.
     # Neither failure creates a run directory, so spec §13 is unaffected either way.
-    device_settings = None if args.offline else _device_settings()
+    device_settings = _device_settings() if tier1_wanted else None
 
     # Before any directory exists: `SnapshotError` propagates to `main` (spec §12).
-    snapshot_dir, manifest, snapshot_warnings = load_snapshot(args.rules_dir, args.ruleset_snapshot)
-    progress.manifest = manifest
-    progress.snapshot_resolved = True
-    # Both readers, because they are different people (#91): stderr for the operator watching
-    # the run (spec §12), `run.warnings[]` for whoever reads the artifact later (spec §10).
-    for warning in snapshot_warnings:
-        print(f"flabel: warning: {warning}", file=sys.stderr)
-    progress.warnings = (*progress.warnings, *snapshot_warnings)
+    #
+    # **Not loaded at all on a replay-only run** (#132). Tier 1 reads no Suricata rules, so
+    # requiring a snapshot would fail the new default on a fresh checkout — over 85,000 rules the
+    # run was never going to open — and would then publish a `ruleset` block naming a snapshot
+    # that did not participate in a single label. `_ruleset_section` already renders `None` as
+    # all-null, which is spec §2.5's distinction between "not measured" and zero, applied to a
+    # whole block.
+    snapshot_dir: Path | None = None
+    manifest: SnapshotManifest | None = None
+    if tier2_wanted:
+        snapshot_dir, manifest, snapshot_warnings = load_snapshot(
+            args.rules_dir, args.ruleset_snapshot
+        )
+        progress.manifest = manifest
+        progress.snapshot_resolved = True
+        # Both readers, because they are different people (#91): stderr for the operator watching
+        # the run (spec §12), `run.warnings[]` for whoever reads the artifact later (spec §10).
+        for warning in snapshot_warnings:
+            print(f"flabel: warning: {warning}", file=sys.stderr)
+        progress.warnings = (*progress.warnings, *snapshot_warnings)
 
     say = progress_mod.reporter(list(STEPS))
-    if args.offline:
+    # Skipped, never omitted: all three modes draw the same twelve stages so the display shows one
+    # pipeline with pieces switched off rather than three different-looking pipelines. The reason
+    # string is the flag the operator typed, so the line answers "why" without them re-deriving it.
+    if not tier1_wanted:
         for key in DEVICE_STEPS:
             say.skip(key, "offline")
+    if not tier2_wanted:
+        for key in SURICATA_STEPS:
+            say.skip(key, "replay-only")
 
     with TemporaryDirectory(prefix=TEMP_PREFIX) as workdir:
         # The normalized capture lives here and nowhere else (spec §10). Not in the run
@@ -675,6 +751,7 @@ def _label(args: argparse.Namespace) -> int:
                     report=say,
                     **device_settings,  # type: ignore[arg-type]
                 )
+                progress.tier1_ran = True
                 for warning in tier1_result.warnings:
                     print(f"flabel: warning: {warning}", file=sys.stderr)
                 progress.warnings = (*progress.warnings, *tier1_result.warnings)
@@ -683,63 +760,13 @@ def _label(args: argparse.Namespace) -> int:
             flows, progress.zeek = run_zeek(progress.capture.path, rundir / ZEEK_DIR)
             say.finish("zeek", f"{len(flows):,} flows")
 
-            say.start("suricata", "loading rules")
-
-            detections, progress.suricata = run_suricata(
-                progress.capture.path, snapshot_dir, rundir / SURICATA_DIR
-            )
-            say.finish(
-                "suricata",
-                f"{progress.suricata.rules_loaded or 0:,} rules │ "
-                f"{progress.suricata.alerts_total or 0} alerts",
-            )
-            if progress.suricata.tool_failures:
-                # `run_suricata` records rather than raises, so the one convention the rest of
-                # the pipeline uses is restored here and the failure takes the same path as
-                # every other (spec §4).
-                raise ToolError(
-                    progress.suricata.tool_failures[0].message,
-                    failures=progress.suricata.tool_failures,
-                    run_info=progress.suricata,
+            detections: tuple[Detection, ...] = ()
+            indicators: frozenset[int] | None = None
+            if tier2_wanted:
+                assert snapshot_dir is not None and manifest is not None, (
+                    "tier 2 is wanted, so the snapshot loaded above must exist"
                 )
-
-            # The manifest handed to `correlate` must be the one Suricata ran (spec §9).
-            # `run_suricata` loads a manifest and returns only the id, so this is the second
-            # load — and with `--ruleset-snapshot` defaulting to "newest available", a
-            # `rules update` landing between the two resolves a *different* snapshot. Every
-            # label would then cite a ruleset whose rules never ran: well-formed, and wrong in
-            # the field that makes a label reproducible.
-            if manifest.snapshot_id != progress.suricata.snapshot_id:
-                raise SnapshotError(
-                    f"the snapshot Suricata ran ({progress.suricata.snapshot_id}) is not the "
-                    f"one loaded for correlation ({manifest.snapshot_id}); a `rules update` "
-                    f"landed mid-run, and every label would cite rules that never ran"
-                )
-
-            # **After** the assertion above, not before it. `_shortfall` compares the engine's
-            # loaded count against *this* manifest's `total_admitted`, so if the two snapshots
-            # ever disagree the percentage put to the operator is computed from mismatched
-            # inputs — and declining would report "the ruleset was incomplete" in place of the
-            # real diagnosis. Order the cheap certainty first.
-            if _shortfall(progress.suricata, manifest) and not _confirm_shortfall(
-                progress.suricata, manifest
-            ):
-                # `FlabelError` itself, not `UsageError`: declining is a deliberate stop, and
-                # spec §12 reserves exit 2 for an invocation argparse could not express. The
-                # operator invoked flabel correctly and then judged the ruleset too incomplete
-                # to label against, which is exit 1 — a run that wrote no labels.
-                raise FlabelError(
-                    "stopped at the operator's request: the ruleset was incomplete, so no "
-                    "labels were written"
-                )
-
-            # Read from the snapshot that Suricata actually ran, after the id assertion above
-            # (issue #75, PLAN 11c). `None` means this snapshot recorded no per-rule
-            # classification — schema 1, or the schema 2 the definition in #79 corrected — and
-            # `correlate` then downgrades every basis and says so once in `run.warnings[]`.
-            # Deliberately not defaulted to an empty set: "recorded nothing" and "recorded that
-            # no rule is an indicator" are different facts about the ruleset.
-            indicators = load_address_indicators(snapshot_dir)
+                detections, indicators = _tier2(progress, say, snapshot_dir, manifest, rundir, args)
 
             # Tier 1 and tier 2 are correlated together, not separately: a flow both tiers
             # flagged must come out as ONE label carrying both assertions, which is what
@@ -782,8 +809,86 @@ def _label(args: argparse.Namespace) -> int:
             return _fail(rundir, started_at, progress, _unexpected(exc))
 
 
+def _tier2(
+    progress: _Progress,
+    say: progress_mod.Reporter,
+    snapshot_dir: Path,
+    manifest: SnapshotManifest,
+    rundir: Path,
+    args: argparse.Namespace,
+) -> tuple[tuple[Detection, ...], frozenset[int] | None]:
+    """Run Suricata and return its detections with the snapshot's indicator classification.
+
+    Extracted when the stage became conditional (#132). It was inline while every run did it;
+    a mode that skips it needs the whole block — the run, the two guards on the snapshot, and
+    the operator prompt — to move together, because each of them is meaningless without the
+    others and leaving any behind would run a check against a stage that did not happen.
+    """
+    say.start("suricata", "loading rules")
+
+    detections, progress.suricata = run_suricata(
+        progress.capture.path,  # type: ignore[union-attr]
+        snapshot_dir,
+        rundir / SURICATA_DIR,
+    )
+    say.finish(
+        "suricata",
+        f"{progress.suricata.rules_loaded or 0:,} rules │ "
+        f"{progress.suricata.alerts_total or 0} alerts",
+    )
+    if progress.suricata.tool_failures:
+        # `run_suricata` records rather than raises, so the one convention the rest of
+        # the pipeline uses is restored here and the failure takes the same path as
+        # every other (spec §4).
+        raise ToolError(
+            progress.suricata.tool_failures[0].message,
+            failures=progress.suricata.tool_failures,
+            run_info=progress.suricata,
+        )
+
+    # The manifest handed to `correlate` must be the one Suricata ran (spec §9).
+    # `run_suricata` loads a manifest and returns only the id, so this is the second
+    # load — and with `--ruleset-snapshot` defaulting to "newest available", a
+    # `rules update` landing between the two resolves a *different* snapshot. Every
+    # label would then cite a ruleset whose rules never ran: well-formed, and wrong in
+    # the field that makes a label reproducible.
+    if manifest.snapshot_id != progress.suricata.snapshot_id:
+        raise SnapshotError(
+            f"the snapshot Suricata ran ({progress.suricata.snapshot_id}) is not the "
+            f"one loaded for correlation ({manifest.snapshot_id}); a `rules update` "
+            f"landed mid-run, and every label would cite rules that never ran"
+        )
+
+    # **After** the assertion above, not before it. `_shortfall` compares the engine's
+    # loaded count against *this* manifest's `total_admitted`, so if the two snapshots
+    # ever disagree the percentage put to the operator is computed from mismatched
+    # inputs — and declining would report "the ruleset was incomplete" in place of the
+    # real diagnosis. Order the cheap certainty first.
+    if _shortfall(progress.suricata, manifest) and not _confirm_shortfall(
+        progress.suricata, manifest
+    ):
+        # `FlabelError` itself, not `UsageError`: declining is a deliberate stop, and
+        # spec §12 reserves exit 2 for an invocation argparse could not express. The
+        # operator invoked flabel correctly and then judged the ruleset too incomplete
+        # to label against, which is exit 1 — a run that wrote no labels.
+        raise FlabelError(
+            "stopped at the operator's request: the ruleset was incomplete, so no "
+            "labels were written"
+        )
+
+    # Read from the snapshot that Suricata actually ran, after the id assertion above
+    # (issue #75, PLAN 11c). `None` means this snapshot recorded no per-rule
+    # classification — schema 1, or the schema 2 the definition in #79 corrected — and
+    # `correlate` then downgrades every basis and says so once in `run.warnings[]`.
+    # Deliberately not defaulted to an empty set: "recorded nothing" and "recorded that
+    # no rule is an indicator" are different facts about the ruleset.
+    indicators = load_address_indicators(snapshot_dir)
+
+    return detections, indicators
+
+
 def _write_output(
-    rundir: Path, started_at: str, progress: _Progress, manifest: SnapshotManifest
+    rundir: Path, started_at: str, progress: _Progress, manifest: SnapshotManifest | None
 ) -> int:
     """Write the three artifacts of a successful run.
 
@@ -941,6 +1046,20 @@ def main(argv: list[str] | None = None) -> int:
                 "    flabel rules update --sources <file>\n"
                 "\n"
                 "then label against the snapshot it produced, with --ruleset-snapshot <id>."
+            )
+        if args.ruleset_snapshot is not None and _mode(args) == "replay":
+            # Same reasoning as `--sources`, one mode along (#132). A replay-only run loads no
+            # Suricata rules, so naming a snapshot cannot change a single label — and an operator
+            # who passed one believes they have pinned the rules this run labelled against.
+            # Accepting and ignoring it would put that belief in writing, because `run.ruleset`
+            # would then either name a snapshot that did not run or contradict the flag they
+            # typed. Refusing costs them one retry; ignoring costs them the reading of the
+            # artifact.
+            raise UsageError(
+                "--ruleset-snapshot has no effect on a replay-only run and is refused rather "
+                "than ignored: the default pipeline labels from the inline device and loads no "
+                "Suricata rules, so there is no ruleset for a snapshot id to select. Add "
+                "--both to run Suricata alongside the device, or --offline to run it alone."
             )
         return _label(args)
     except FlabelError as exc:

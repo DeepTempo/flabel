@@ -11,14 +11,14 @@ The original design brief is `docs/prep-n-research.md`. It marks open questions 
 - Install: `uv sync`  · also needs Zeek, Suricata, Wireshark (`brew install zeek suricata wireshark`)
 - Test:    `uv run pytest -q`   (tests invoke Zeek/Suricata for real — see Conventions)
 - Lint:    `uv run ruff check . && uv run ruff format .`
-- Run:     `uv run flabel --offline <pcap>`   (bare `flabel <pcap>` is a Phase 2 stub)
+- Run:     `uv run flabel --offline <pcap>`   (bare `flabel <pcap>` replays past the device)
 
 ## Delivery phases
-- **Phase 1 (current): Tier 2 only** — Suricata + Zeek reading the capture file. No lab.
-- **Phase 2: Tier 1** — PANW NGFW via capture replay. Blocked on an unverified feasibility
-  question (can a cloud VM-Series see replayed traffic at all?) — PRD §13 Q16. Plan Phase 2
-  only after that reachability spike.
-- The CLI contract is already final: `--offline` is permanent, Phase 2 adds no flags.
+- **Phase 1 (done): Tier 2** — Suricata + Zeek reading the capture file. Signed off 2026-08-14.
+- **Phase 2 (done): Tier 1** — PANW NGFW via capture replay, merged 2026-08-18 (#122, #128).
+- Three modes, one flag each (spec §12, #132): bare `flabel <capture>` is **tier 1 only**,
+  `--offline` is tier 2 only and permanent, `--both` runs both. Zeek runs in all three — it is
+  the flow substrate, not a tier.
 
 ## Architecture
 Entry point `src/flabel/cli.py` (argparse, zero runtime deps). One module per pipeline stage:

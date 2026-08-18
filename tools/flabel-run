@@ -35,10 +35,19 @@ arguments:
   <capture>        A local path, absolute or relative, or a gs:// object. A gs:// object is
                    staged into /var/lib/flabel/captures first and reused if already there.
   [flabel args]    Anything after the capture is passed straight to flabel. Most useful:
+                     (no flag)                  tier 1 only: replay past the firewall and label
+                                                from its threat logs. This is the default.
+                     --both                     tier 1 AND tier 2 — replay past the firewall and
+                                                run Suricata, labelling from both. Slower: it
+                                                loads ~85,000 rules on top of the replay.
                      --offline                  tier 2 only: no replay, no device, no network
                      --unmatched-threshold N    fail the run above this share unplaced (0.01)
-                     --ruleset-snapshot ID      label against a specific snapshot
+                     --ruleset-snapshot ID      label against a specific snapshot. Tier 2 only,
+                                                so it is refused without --both or --offline.
                      --output-dir DIR           override /var/lib/flabel/runs
+
+                   Zeek runs whichever mode you pick — it is what flows are read from, not a
+                   tier that can be switched off.
 
 environment (anything you set here WINS over /var/lib/flabel/flabel.env):
   FLABEL_REPLAY_MULTIPLIER   time compression for the replay (default 1000). A 4h capture
@@ -64,6 +73,7 @@ output:
 examples:
   flabel-run ./capture.pcap
   flabel-run gs://pm-proto-496816-flabel-pcaps/attackcollect/capture_2026-07-07.pcap
+  flabel-run ./capture.pcap --both
   flabel-run ./capture.pcap --offline
   FLABEL_REPLAY_MULTIPLIER=200 FLABEL_SETTLE_SECONDS=30 flabel-run ./capture.pcap
 EOF

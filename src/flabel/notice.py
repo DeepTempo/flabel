@@ -126,7 +126,7 @@ def labelling_sources(
 
 def render_notice(
     labels: Sequence[Label],
-    manifest: SnapshotManifest,
+    manifest: SnapshotManifest | None,
     unmatched: Sequence[UnmatchedDetection] = (),
 ) -> str:
     """The `NOTICE` text for this run.
@@ -134,17 +134,28 @@ def render_notice(
     `manifest` supplies each source's URL and is the authority the labels are checked against.
     `labels` and `unmatched` together decide who is listed — every source whose text reached the
     output, not only those that reached a verdict.
+
+    **`None` is a replay-only run** (#132), which loaded no rule feeds and so has no snapshot to
+    name. NOTICE is still written rather than skipped: its subject is whose text is in the
+    output, and a tier-1 run's output carries vendor threat names — the one entry below that
+    records an absence of obligation rather than an obligation. A run directory that sometimes
+    omits the legal artifact would make its absence something a reader has to interpret.
     """
     # The manifest's own index, not a fourth copy of the same comprehension (#49): uniqueness
     # is guaranteed on the type, so this cannot silently drop an entry the way a local
     # dict-comprehension over a tuple with a repeated name would.
-    admissions = manifest.sources_by_name
+    admissions = manifest.sources_by_name if manifest is not None else {}
     licences = labelling_sources(labels, unmatched, manifest)
 
     lines = [
         HEADER,
         "",
-        f"Ruleset snapshot: {manifest.snapshot_id}",
+        (
+            f"Ruleset snapshot: {manifest.snapshot_id}"
+            if manifest is not None
+            else "Ruleset snapshot: none — this run labelled from the inline device only, and "
+            "loaded no rule feeds."
+        ),
         "",
     ]
 
@@ -152,6 +163,9 @@ def render_notice(
         lines.append(
             "This run asserted no labels, so no rule source requires attribution here. The "
             "snapshot's full source list is in labels.json under run.ruleset.sources."
+            if manifest is not None
+            else "This run asserted no labels, and loaded no rule sources that could require "
+            "attribution."
         )
         return "\n".join(lines) + "\n"
 
@@ -182,14 +196,16 @@ def render_notice(
             # reaching here means a label was built against a different snapshot.
             raise ValueError(
                 f"{name} appears in this run's output but is absent from snapshot "
-                f"{manifest.snapshot_id}: its attribution cannot be established"
+                f"{manifest.snapshot_id if manifest else 'none (replay-only run)'}: its "
+                f"attribution cannot be established"
             )
         licence = licences[name]
         if admission.licence != licence:
             raise ValueError(
                 f"{name} labels cite licence {licence!r} but snapshot "
-                f"{manifest.snapshot_id} recorded {admission.licence!r}: two records of one "
-                f"fact disagree, and neither can be published as the terms"
+                f"{manifest.snapshot_id if manifest else 'none'} recorded "
+                f"{admission.licence!r}: two records of one fact disagree, and neither can be "
+                f"published as the terms"
             )
 
         lines.extend(
@@ -207,7 +223,7 @@ def render_notice(
 
 def render_notice_bytes(
     labels: Sequence[Label],
-    manifest: SnapshotManifest,
+    manifest: SnapshotManifest | None,
     unmatched: Sequence[UnmatchedDetection] = (),
 ) -> bytes:
     """The `NOTICE` text as UTF-8 bytes — what a caller writes to disk.
