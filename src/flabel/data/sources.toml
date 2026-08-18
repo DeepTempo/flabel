@@ -82,11 +82,15 @@ admission_basis  = "wholesale"
 # continuously by both; labelling that `verdict: malicious` teaches a model that internet-wide
 # survey traffic is an attack. Dropping the two sids takes the capture from 555 labels to 13.
 #
-# THE FEED ALREADY SAYS SO. pawpatrules marks severity in its `msg`: 9,284 rules `🚨`, 1 `👀`,
-# and 126 `ℹ` — and all 126 `ℹ` rules are exactly the misc-activity ones. They identify
+# THE FEED ALREADY SAYS SO. pawpatrules marks every rule with an emoji in its `msg`. This
+# comment used to give that distribution as three markers, which was three greps reported as a
+# census; measured properly on 2026-08-17 there are SIXTEEN, of which `🚨` 9,669, `🏴` 6,910 and
+# `☠` 3,859 are detections. What is true as written: all 126 `ℹ` rules are exactly the
+# misc-activity ones. They identify
 # software and scanners: VMware, Kaspersky, Zoom, Thunderbird, uBlock Origin, an Ingenico
 # payment terminal. None can honestly produce a malicious verdict; this is #34's third group.
-# Keyed on classtype rather than on the emoji because a msg-text convention is not an interface.
+# Keyed on classtype rather than on the emoji, because a msg-text convention is not an
+# interface. THAT DECISION IS PARTLY REVERSED BELOW — see `exclude_msg_markers` and #117.
 #
 # WHY NOT GLOBAL: of the 274 misc-activity rules in that snapshot, 146 are in other feeds and
 # include 45 `ET PHISHING` and 18 `ET MALWARE` rules. Excluding it globally would drop real
@@ -96,6 +100,46 @@ admission_basis  = "wholesale"
 # pinned corpus residue — the three sids in tests/fixtures/benign-corpus/tolerated.json are
 # trojan-activity, command-and-control and credential-theft.
 exclude_classtypes = ["misc-activity"]
+# Issue #117, and it reverses this file's own reasoning above, so the reversal is argued rather
+# than quietly made.
+#
+# WHAT FORCED IT. The classtype filter cannot reach the feed's observational rules. Measured:
+# 571 rules carry one of these five markers, 126 of them the ℹ rules exclude_classtypes already
+# removes, and **0 of the remaining 445 carry misc-activity**. They declare `bad-unknown` and
+# `attempted-recon`, which elsewhere in the ruleset carry genuine detections, so no classtype
+# policy can separate them. On the 22-capture corpus these produced 17 source entries labelling
+# `go.dev` — the official Go website, on a Google-operated gTLD — as `verdict: malicious`,
+# `label_basis: direct`. One of the rules ends its own msg with the word "observed".
+#
+# WHY THE ORIGINAL OBJECTION STILL STANDS, AND WHAT ANSWERS IT. A msg-text convention really is
+# not an interface: the feed publishes no schema for it and could change it without notice.
+# Measured across two snapshots two days apart, 0 markers changed on any surviving sid and no new
+# marker appeared — but two days is not evidence of stability. So the convention is not trusted,
+# it is WATCHED: tests/integration/marker_gate.py fails the scheduled feeds build if the marker
+# vanishes from the feed, if the excluded rules stop being excluded, or if a marker nobody has
+# classified appears. A convention change becomes a red build rather than a silent re-admission.
+#
+# WHY THESE FIVE. They are the markers that say the rule OBSERVES rather than detects:
+#   👁 suspicious-looking DNS      🔒 TLS SNI seen        🌐 request to a named kind of domain
+#   🤨 dynamic-DNS / lookalike     ℹ  software and scanner identification (already misc-activity;
+#                                     named again so an ℹ rule with another classtype is caught)
+# NOT excluded, deliberately: 🔔 (recon — its Masscan and TELNET brute-force rules were measured
+# as correct detections in #118), 👀 (one rule), and every detection marker.
+#
+# COST AND EFFECT, measured by running the shipped policy over the 2026-08-12 mirror (21,467
+# rules) and the 22-capture corpus (338 source entries). Stated carefully, because the obvious
+# number is the wrong one: 571 rules carry one of these five markers, but 126 of those are the
+# `ℹ` rules that `exclude_classtypes` already excludes, and classtype is tested first. So
+# `rules_excluded_marker` is **445** — the rules this policy removes that were otherwise going to
+# be admitted, 2.1% of the feed. 17 of 338 source entries disappear. It does not touch the pinned
+# corpus residue, and it leaves the feed's 9,669 detection-marked rules exactly as they were.
+exclude_msg_markers = ["ℹ", "👁", "🔒", "🌐", "🤨"]
+# The marker the feed puts on EVERY rule, which therefore classifies nothing. Named rather than
+# inferred: the first version of the parser treated any leading marker followed by a dash as
+# branding, so a rule written `👁 - DNS request to .dev` — no brand — reported no marker at all
+# and was ADMITTED. That is #117 reopening through a formatting change upstream could make
+# without notice. Found in review, not by a test.
+msg_brand_marker = "🐾"
 
 # --- ioc-dest: a rule matched a known-bad endpoint -> the flow is malicious ----------------
 
