@@ -37,6 +37,7 @@ from flabel.errors import (
     CorrelationError,
     ToolError,
 )
+from flabel.labels import SCHEMA_VERSION
 from flabel.models import (
     CorrelationResult,
     Detection,
@@ -519,7 +520,7 @@ def test_run_json_never_carries_an_empty_labels_array(
 
     document = json.loads((only_run_dir(output) / "run.json").read_text(encoding="utf-8"))
     assert "labels" not in document
-    assert document["schema_version"] == "1.0"
+    assert document["schema_version"] == SCHEMA_VERSION
     assert "run" in document
 
 
@@ -943,7 +944,10 @@ def test_the_end_to_end_run_labels_the_flow_the_rule_matched(
     assert len(document["labels"]) == 2
     assert len({label["flow"]["uid"] for label in document["labels"]}) == 2
     for label in document["labels"]:
-        assert label["verdict"] == "malicious"
+        names = [entry["name"] for entry in label["labels"]]
+        assert "verdict" in names, f"a label with no verdict asserts nothing: {names}"
+        verdict = next(e for e in label["labels"] if e["name"] == "verdict")
+        assert verdict["value"] == "malicious"
         assert label["best_tier"] == 2
         assert len(label["sources"]) == 1
         assert label["sources"][0]["sid"] == MATCHES_CANARY

@@ -25,6 +25,7 @@ from flabel.models import (
     Flow,
     Ja4Status,
     Label,
+    LabelEntry,
     NormalizedCapture,
     SnapshotManifest,
     SourceAdmission,
@@ -34,6 +35,7 @@ from flabel.models import (
     SuricataRunInfo,
     UnmatchedDetection,
     ZeekRunInfo,
+    verdict_entry,
 )
 
 #: Derived from the type, not restated. A hardcoded list would keep passing while silently
@@ -132,9 +134,11 @@ def test_flow_tls_fields_default_to_none():
 
 
 def test_a_label_carries_its_asserting_sources_as_a_tuple():
-    label = Label(flow=make_flow(), verdict="malicious", best_tier=2, sources=(make_entry(),))
+    sources = (make_entry(),)
+    label = Label(flow=make_flow(), best_tier=2, labels=(verdict_entry(sources),), sources=sources)
 
-    assert label.verdict == "malicious"
+    assert [entry.name for entry in label.labels] == ["verdict"]
+    assert label.labels[0].value == "malicious"
     assert isinstance(label.sources, tuple)
 
 
@@ -156,30 +160,39 @@ def make_entry(**overrides) -> SourceEntry:
 
 
 def test_a_verdict_other_than_malicious_is_rejected():
-    """Spec §13's first never-do. `Literal` alone does not enforce this at runtime."""
+    """Spec §13's first never-do. `Literal` alone does not enforce this at runtime.
+
+    Checked on the `verdict` ENTRY since schema 2.0 (#138) — the guard moved with the field, and a
+    forged entry is now the way a non-malicious verdict would arrive.
+    """
+    forged = LabelEntry(name="verdict", value="benign", tier=2, sids=(2010935,))
     with pytest.raises(ValueError, match="verdict"):
-        Label(flow=make_flow(), verdict="benign", best_tier=2, sources=(make_entry(),))
+        Label(flow=make_flow(), best_tier=2, labels=(forged,), sources=(make_entry(),))
 
 
 def test_a_label_with_no_asserting_source_is_rejected():
     """A label nothing asserted has no provenance, which is the one thing labels must have."""
     with pytest.raises(ValueError, match="sources"):
-        Label(flow=make_flow(), verdict="malicious", best_tier=2, sources=())
+        # No sources, so no verdict entry can be derived either — the guard under test is the
+        # empty `sources`, and an empty `labels` would otherwise trip the verdict check first.
+        Label(flow=make_flow(), best_tier=2, labels=(), sources=())
 
 
 def test_best_tier_must_agree_with_its_sources():
     """Two fields that can disagree is a defect in an artifact whose value is provenance."""
     with pytest.raises(ValueError, match="best_tier"):
-        Label(flow=make_flow(), verdict="malicious", best_tier=1, sources=(make_entry(tier=2),))
+        sources = (make_entry(tier=2),)
+        Label(flow=make_flow(), best_tier=1, labels=(verdict_entry(sources),), sources=sources)
 
 
 def test_best_tier_is_the_minimum_not_the_maximum():
     """Lower tier is higher trust, so the best of two sources is the smaller number."""
+    sources = (make_entry(tier=2), make_entry(tier=1, source="panw/ngfw"))
     label = Label(
         flow=make_flow(),
-        verdict="malicious",
         best_tier=1,
-        sources=(make_entry(tier=2), make_entry(tier=1, source="panw/ngfw")),
+        labels=(verdict_entry(sources),),
+        sources=sources,
     )
     assert label.best_tier == 1
 
@@ -524,3 +537,103 @@ def test_a_correlation_result_cannot_claim_fewer_detections_than_it_carries():
             flows_total=1,
             detections_total=0,
         )
+
+
+# --- the guards on a multi-label Label (#138, schema 2.0) --------------------------------------
+#
+# Each of these is a guard that shipped unexercised in the first draft of #138: the sabotage round
+# removed the check and the suite stayed green. Written afterwards, which is the wrong order and is
+# recorded here so the next reader knows the tests came from breaking the code rather than from
+# reading it.
+
+
+def one_source() -> tuple[SourceEntry, ...]:
+    return (make_entry(),)
+
+
+def test_a_label_with_no_verdict_is_rejected():
+    """A `Label` exists because something was asserted, and `verdict` is that assertion.
+
+    Without it the object is a flow plus provenance and no claim — which would serialise as a
+    label, and a consumer counting labels would count it.
+    """
+    sources = one_source()
+    threat = LabelEntry(name="threat-name", value="Some Threat", tier=1, sids=(30001,))
+    with pytest.raises(ValueError, match="verdict"):
+        Label(flow=make_flow(), best_tier=2, labels=(threat,), sources=sources)
+
+
+def test_two_verdicts_on_one_flow_are_rejected():
+    """Asserting twice is not asserting harder; it is a document that cannot be read."""
+    sources = one_source()
+    verdict = verdict_entry(sources)
+    with pytest.raises(ValueError, match="verdict"):
+        Label(flow=make_flow(), best_tier=2, labels=(verdict, verdict), sources=sources)
+
+
+def test_a_repeated_label_name_is_rejected():
+    """Craig's decision 2: one `threat-name` per flow, chosen by precedence.
+
+    Two entries of one name would mean the choice was never made, and a consumer would have to
+    invent a tiebreak the producer declined to.
+    """
+    sources = one_source()
+    first = LabelEntry(name="threat-name", value="A", tier=2, sids=(1,))
+    second = LabelEntry(name="threat-name", value="B", tier=2, sids=(2,))
+    with pytest.raises(ValueError, match="repeated"):
+        Label(
+            flow=make_flow(),
+            best_tier=2,
+            labels=tuple(sorted((verdict_entry(sources), first, second), key=lambda e: e.name)),
+            sources=sources,
+        )
+
+
+def test_the_verdict_entrys_tier_must_agree_with_best_tier():
+    """One flow's trust level, recorded twice. The repo's rule is to enforce, not deduplicate.
+
+    `best_tier` is kept at the top level because the PRD and spec name it and consumers read it;
+    that makes it a second record of the verdict entry's tier, and two records that can disagree
+    is the flaw this artifact exists to avoid.
+    """
+    sources = one_source()
+    wrong = LabelEntry(name="verdict", value="malicious", tier=1, sids=(2010935,))
+    with pytest.raises(ValueError, match="best_tier"):
+        Label(flow=make_flow(), best_tier=2, labels=(wrong,), sources=sources)
+
+
+def test_label_entries_out_of_name_order_are_rejected():
+    """Canonical output: the same data serialises the same way however it was assembled (§10)."""
+    sources = one_source()
+    threat = LabelEntry(name="threat-name", value="Some Threat", tier=2, sids=(1,))
+    with pytest.raises(ValueError, match="sorted"):
+        Label(
+            flow=make_flow(),
+            best_tier=2,
+            labels=(verdict_entry(sources), threat),  # "verdict" > "threat-name"
+            sources=sources,
+        )
+
+
+def test_a_label_entry_asserting_an_empty_value_is_rejected():
+    """An empty string serialises as a value, so it would publish a label that claims nothing."""
+    with pytest.raises(ValueError, match="empty"):
+        LabelEntry(name="threat-name", value="", tier=1, sids=(30001,))
+
+
+def test_a_label_entry_with_no_signature_behind_it_is_rejected():
+    """Goal 1: an assertion that cannot be traced to what produced it must not ship."""
+    with pytest.raises(ValueError, match="sids"):
+        LabelEntry(name="threat-name", value="Some Threat", tier=1, sids=())
+
+
+def test_label_entry_sids_must_be_sorted():
+    """This tuple reaches the file directly, so its order is part of the canonical form."""
+    with pytest.raises(ValueError, match="sorted"):
+        LabelEntry(name="verdict", value="malicious", tier=2, sids=(200, 100))
+
+
+def test_an_unknown_label_name_is_rejected():
+    """`Literal` is a hint. A name no consumer is written against would serialise happily."""
+    with pytest.raises(ValueError, match="name"):
+        LabelEntry(name="severity", value="high", tier=1, sids=(30001,))

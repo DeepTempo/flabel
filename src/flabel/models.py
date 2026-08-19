@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, get_args
@@ -97,6 +97,20 @@ TIERS_BY_MODE: dict[RunMode, tuple[int, ...]] = {
     "offline": (2,),
     "both": (1, 2),
 }
+
+#: What a label asserts about a flow (#138, Craig 2026-08-19). One `Label` carries several.
+#:
+#: `verdict` was a field on `Label` until schema 2.0, and promoting it into a list is what makes a
+#: second kind of assertion possible without another field per kind. Hyphenated to match the
+#: enumerated *values* elsewhere in this module — `indicator-reference`, `device-policy` — where
+#: field names stay snake_case.
+#:
+#: `threat-name` is **tier-1 only** today: it publishes what the inline device called the threat.
+#: The Suricata path could supply one from a rule's `msg`, and deliberately does not yet, because
+#: `msg` text is the *rule's* description rather than a threat identifier and choosing between
+#: 84,977 of them is a policy question nobody has answered. Adding it later is purely additive,
+#: which is the whole point of decision 3 in #138.
+LabelName = Literal["verdict", "threat-name"]
 
 #: How directly a label follows from its rule match. Carried on every SourceEntry so a
 #: consumer can tell a content match from an indirect reference without reading rule text.
@@ -570,21 +584,88 @@ class SourceEntry:
 
 
 @dataclass(frozen=True)
+class LabelEntry:
+    """One assertion about a flow, and what asserted it (#138, schema 2.0).
+
+    **`tier` and `sids` are provenance, not decoration.** Once a label is one entry among several,
+    the document can no longer imply that `sources[]` accounts for all of them — a `threat-name`
+    chosen from one tier-1 detection is not asserted by the other sources beside it. Goal 1 and
+    spec §13 require every assertion to name what produced it, and this is where that is carried
+    for assertions that are narrower than the whole `sources[]` list.
+    """
+
+    name: LabelName
+    value: str
+    #: The tier of the source(s) that assert *this* entry. For `verdict` that is `min(sources.tier)`
+    #: — the same number `Label.best_tier` publishes — and `Label` enforces the two agree.
+    tier: int
+    #: The signature ids behind this entry, sorted. A tuple rather than a single sid because
+    #: `verdict` is asserted by every source on the flow, and a future label may be too.
+    sids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        _check(self.name, get_args(LabelName), "name", "LabelEntry")
+        if not self.value:
+            raise ValueError(
+                f"LabelEntry.value is empty for {self.name!r}: a label asserting nothing is not a "
+                f"label, and an empty string serialises as one that is"
+            )
+        if not self.sids:
+            raise ValueError(
+                f"LabelEntry.sids is empty for {self.name!r}: an assertion with no signature "
+                f"behind it cannot be traced (Goal 1)"
+            )
+        if tuple(sorted(self.sids)) != tuple(self.sids):
+            # Canonical output means the same data serialises the same way however it was
+            # assembled (spec §10), and this tuple reaches the file directly.
+            raise ValueError(f"LabelEntry.sids for {self.name!r} is not sorted: {self.sids}")
+
+
+def verdict_entry(sources: Sequence[SourceEntry]) -> LabelEntry:
+    """The `verdict` assertion for a flow, derived from the sources that carry it.
+
+    Here rather than in `correlate` — the module that builds labels — for the reason
+    `models.label_basis` is: **a test that hand-builds this agrees with itself.** Every verdict
+    entry in the codebase, production and fixture alike, comes through this one function, so a
+    change to what a verdict entry looks like cannot pass because the fixtures were updated to
+    match it.
+
+    Every source on a flow asserts the verdict, so it carries all their sids and the best (lowest)
+    tier. The sids are deduplicated: a rule firing twice keeps both `sources[]` entries, because
+    collapsing them would say the rule fired once, but the label's sid list is the set of what is
+    behind the claim rather than a count of firings.
+    """
+    if not sources:
+        raise ValueError(
+            "a verdict needs at least one source: there is nothing else to derive it from"
+        )
+    return LabelEntry(
+        name="verdict",
+        value="malicious",
+        tier=min(entry.tier for entry in sources),
+        sids=tuple(sorted({entry.sid for entry in sources})),
+    )
+
+
+@dataclass(frozen=True)
 class Label:
-    """A malicious verdict on one flow, with every source that asserted it.
+    """Everything asserted about one flow, with every source that asserted anything.
 
     There is no benign verdict: flabel labels malicious flows and says nothing about the
     rest. `best_tier` is the *minimum* tier across sources, because a lower tier is a
     higher-trust observation.
+
+    **`labels` replaced a `verdict` field in schema 2.0** (#138). A flow can carry more than one
+    assertion — today `verdict` and, on inline runs, `threat-name` — and a field per kind would
+    have made every future kind another schema decision.
     """
 
     flow: Flow
-    verdict: Literal["malicious"]
     best_tier: int
+    labels: tuple[LabelEntry, ...]
     sources: tuple[SourceEntry, ...]
 
     def __post_init__(self) -> None:
-        _check(self.verdict, ("malicious",), "verdict", "Label")
         if not self.sources:
             raise ValueError(
                 "Label.sources is empty: a label with no asserting source has no provenance"
@@ -596,6 +677,30 @@ class Label:
             raise ValueError(
                 f"Label.best_tier is {self.best_tier} but min(sources.tier) is {expected}"
             )
+
+        names = [entry.name for entry in self.labels]
+        # A `Label` exists because something was asserted, and `verdict` is that assertion. Without
+        # it the object is a flow with provenance and no claim — which is not a label, and would
+        # serialise as one.
+        if names.count("verdict") != 1:
+            raise ValueError(
+                f"Label.labels must carry exactly one verdict entry, got {names}: a label with no "
+                f"verdict asserts nothing, and two verdicts assert twice"
+            )
+        if len(names) != len(set(names)):
+            # Craig's decision 2 (#138): one `threat-name` per flow, chosen by precedence. Two
+            # entries of one name would mean the choice was not made.
+            raise ValueError(f"Label.labels has repeated names {names}: each label appears once")
+
+        verdict = next(entry for entry in self.labels if entry.name == "verdict")
+        _check(verdict.value, ("malicious",), "verdict", "Label")
+        if verdict.tier != self.best_tier:
+            raise ValueError(
+                f"the verdict entry's tier is {verdict.tier} but Label.best_tier is "
+                f"{self.best_tier}: one flow's trust level recorded twice, disagreeing"
+            )
+        if tuple(sorted(names)) != tuple(names):
+            raise ValueError(f"Label.labels is not sorted by name: {names}")
 
 
 @dataclass(frozen=True)

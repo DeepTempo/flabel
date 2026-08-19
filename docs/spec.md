@@ -194,10 +194,17 @@ class SourceEntry:               # one asserting detection on a label
     direction: Direction
 
 @dataclass(frozen=True)
+class LabelEntry:                # one assertion about a flow (schema 2.0, #138)
+    name: Literal["verdict", "threat-name"]
+    value: str
+    tier: int                    # the tier of the source(s) asserting THIS entry
+    sids: tuple[int, ...]        # sorted; what is behind the claim
+
+@dataclass(frozen=True)
 class Label:
     flow: Flow
-    verdict: Literal["malicious"]
     best_tier: int               # min(tier); lower is higher trust
+    labels: tuple[LabelEntry, ...]   # sorted by name; exactly one `verdict`
     sources: tuple[SourceEntry, ...]
 
 @dataclass(frozen=True)
@@ -266,7 +273,14 @@ midstream pickup or a UDP flow one engine has expired and the other has not are 
 not. The field is therefore a faithful report of what the engine that raised the alert said —
 **not** a derived claim about `Label.flow`'s orientation, which would be a different field.
 
-**`schema_version` stays `"1.0"`.** An additive Phase 1 field does not bump it, for the same reason
+**`schema_version` moved to `"2.0"` on 2026-08-19 (#138), and everything below explains why it had
+not moved before.** That history is kept rather than replaced: the arguments were sound and the
+break is what ended them. `labels[]` replaced the top-level `verdict`, so a 1.0 consumer finds no
+`verdict` key — it fails rather than reading a document it partly understands. The major digit moved
+because the version exists to tell a reader whether they can parse the document, and the answer
+changed from yes to no.
+
+**`schema_version` stayed `"1.0"` for everything before that.** An additive Phase 1 field does not bump it, for the same reason
 Phase 2's tier-1 entries do not (§4): the version tracks what a consumer must understand to read
 the document, and a reader written against 1.0 reads a post-#115 file correctly and simply does not
 look at the new key. The cost is real and accepted: two files both stamped `"1.0"` can differ in
@@ -360,14 +374,38 @@ this order:
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "run": { "...": "see §9" },
   "labels": [ "...Label..." ],
   "unmatched_detections": [ "...UnmatchedDetection..." ]
 }
 ```
 
-`schema_version` is `"1.0"` and **does not change when Phase 2 adds tier-1 entries to `sources[]`** (Goal 6).
+`schema_version` is **`"2.0"`** as of 2026-08-19 (#138). It did not change when Phase 2 added
+tier-1 entries to `sources[]` (Goal 6), and it changed now because `labels[]` replaced the
+top-level `verdict` field: a 1.0 consumer finds no `verdict` key in a 2.0 document, so it fails
+rather than degrading. See §4's schema-version paragraph.
+
+**A `Label` carries several assertions, and each one names what asserts it.** `verdict` is asserted
+by every source on the flow and carries all their sids; `threat-name` is asserted by exactly one
+detection and carries only that sid. Without per-entry provenance the document would imply that
+`sources[]` accounts for all of them, which it does not once a label is narrower than the whole
+list (Goal 1, §13).
+
+**`threat-name` appears only when a tier-1 source is present, and is omitted otherwise** — not
+null. §2.5's distinction: the fact is not applicable to a Suricata-only flow, rather than measured
+and absent. Extending it to tier 2 is therefore purely additive.
+
+**Which tier-1 detection supplies it is decided by `(ts, sid)`** (Craig, 2026-08-19): lowest tier
+first, then the earliest detection, with `sid` breaking exact timestamp ties. The second key is not
+optional — "earliest" is not a total order, and two tier-1 detections can share a timestamp, which
+would make the label differ between runs of one capture. Note that tier precedence rarely decides
+anything: `threat-name` is tier-1 only, so on a replay-only run every source is tier 1 and `(ts,
+sid)` *is* the rule.
+
+When both tiers flag a flow, **tier 2's threat name does not become a label**. It remains in
+`sources[].threat` with its full provenance; what it loses is promotion. Recorded as a deliberate
+trade for one trainable value per flow rather than a set a consumer must reduce.
 
 ---
 
@@ -1140,7 +1178,7 @@ or normalise**: the same capture labelled from two directories would otherwise d
 
 ```python
 {
-  "flabel_version": str, "schema_version": "1.0",
+  "flabel_version": str, "schema_version": "2.0",
   "started_at": str, "finished_at": str, "duration_seconds": float | None,
   "mode": "replay|offline|both",          # the invocation, one value per flag (§12)
   "unmatched_threshold": float,           # the gate this run was held to — see below
@@ -1212,7 +1250,7 @@ exited.
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "run": { "...as above..." },
   "unmatched_detections": [ "...UnmatchedDetection..." ]
 }

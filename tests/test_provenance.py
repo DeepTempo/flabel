@@ -30,6 +30,7 @@ from flabel.models import (
     SourceSpec,
     label_basis,
     may_label,
+    verdict_entry,
 )
 from flabel.provenance import KNOWN_TIERS, build_source_entry
 
@@ -605,7 +606,7 @@ def make_flow(**overrides) -> Flow:
 
 def make_label() -> Label:
     entry = build_source_entry(make_detection(), make_admission(), SNAPSHOT_ID)
-    return Label(flow=make_flow(), verdict="malicious", best_tier=2, sources=(entry,))
+    return Label(flow=make_flow(), best_tier=2, labels=(verdict_entry((entry,)),), sources=(entry,))
 
 
 def make_correlation(**overrides) -> CorrelationResult:
@@ -962,7 +963,7 @@ def test_the_label_count_is_labels_not_source_entries(tmp_path):
         build_source_entry(make_detection(sid=sid), make_admission(), SNAPSHOT_ID)
         for sid in (1, 2, 3)
     )
-    label = Label(flow=make_flow(), verdict="malicious", best_tier=2, sources=entries)
+    label = Label(flow=make_flow(), best_tier=2, labels=(verdict_entry(entries),), sources=entries)
     block = full_run(tmp_path, correlation=make_correlation(labels=(label,)))
     assert block["counts"]["labels"] == 1
 

@@ -34,9 +34,19 @@ from typing import Any
 
 from flabel.models import Detection, Flow, Label, UnmatchedDetection
 
-#: Spec §4. Does **not** change when Phase 2 adds tier-1 entries to `sources[]` (Goal 6).
-#: `provenance.py` reads it from here so the document root and the run block cannot disagree.
-SCHEMA_VERSION = "1.0"
+#: Spec §4. `provenance.py` reads it from here so the document root and the run block cannot
+#: disagree.
+#:
+#: **2.0 as of 2026-08-19 (#138), and the first genuine break.** `labels[]` replaced the top-level
+#: `verdict` field, so a 1.0 consumer reading a 2.0 document finds no `verdict` key at all — it does
+#: not degrade, it fails. Every previous change was argued as additive and kept 1.0: a Phase 1 field
+#: (#115), Phase 2's tier-1 entries in `sources[]` (Goal 6), and #132's widened `run.mode`, which
+#: held because no document a consumer could already have changed shape. None of those arguments is
+#: available here.
+#:
+#: The major digit moved rather than the minor, because the version exists to tell a reader whether
+#: they can parse the document, and the answer changed from yes to no.
+SCHEMA_VERSION = "2.0"
 
 #: Spec §10's one timestamp format. `rules.utc_now` writes the same shape for `fetched_at` and
 #: `created_at`; the two `strftime` calls cannot be merged without editing a module this step
@@ -90,7 +100,7 @@ def build_document(
     `run.json` when there is no `labels.json` to put it in (issue #23).
 
     An empty `labels` is a real result and produces a real document. Nothing here requires a
-    verdict to exist.
+    label to exist — a capture where nothing fired is the ordinary case, not a failure.
     """
     return {
         "schema_version": SCHEMA_VERSION,
