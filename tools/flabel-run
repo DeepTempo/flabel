@@ -40,6 +40,11 @@ GCLOUD="${FLABEL_RUN_GCLOUD:-gcloud}"
 #
 # Overridable and separate from $SUDO so the tests can run a stub gcloud directly. $SUDO is
 # pointed at a recorder that never executes, which is right for the replay and useless here.
+#
+# Left UNQUOTED at both call sites, deliberately and following `$SUDO`'s own convention: an empty
+# value has to expand to nothing so the command runs unwrapped, which quoting would turn into an
+# attempt to execute the empty string. shellcheck flags this (SC2086) on the pre-existing `$SUDO`
+# line too.
 PUBLISH_SUDO="${FLABEL_RUN_PUBLISH_SUDO-$SUDO}"
 
 #: Written to stdout and exit 0 for an explicit --help, to stderr and exit 2 for a usage error.
@@ -214,7 +219,7 @@ fail_if_run_succeeded() {
 # holds cannot disagree with what a consumer will conclude from it. An exit code is a second
 # record of the same fact, and this is the one the bucket's contents should follow.
 publish() {
-  local rundir="$1" name tarball
+  local rundir="$1" name workdir tarball
   name="$(basename "$rundir")"
 
   if [ ! -f "$rundir/labels.json" ]; then
@@ -225,7 +230,17 @@ publish() {
   # Built in a temporary directory, not inside $RUNS. A tarball written beside the run directories
   # is picked up as one by anything that lists them — including this script's own BEFORE/AFTER
   # comparison on the next run.
-  tarball="$(mktemp -d)/$name.tar.gz"
+  # **`mktemp` is checked, and this is not defensive boilerplate.** The first version built the
+  # path as mktemp's output interpolated directly into a string, so a failed mktemp yielded
+  # `/$name.tar.gz` at the filesystem root — and the cleanups below, which then took the dirname of
+  # that path, would have recursively deleted `/`. An unchecked command substitution two lines from
+  # a recursive delete earns a guard; the cleanups now name the checked variable instead.
+  workdir="$(mktemp -d)" || workdir=""
+  if [ -z "$workdir" ] || [ ! -d "$workdir" ]; then
+    echo "flabel-run: could not create a temporary directory; $rundir was not published" >&2
+    return 1
+  fi
+  tarball="$workdir/$name.tar.gz"
   # `-C "$RUNS" "$name"` so the archive unpacks to a single directory of that name rather than to
   # whatever absolute path it happened to live at.
   #
@@ -235,7 +250,7 @@ publish() {
   # than tolerating, because "the archive is the run directory" should not depend on who built it.
   if ! COPYFILE_DISABLE=1 tar -czf "$tarball" -C "$RUNS" "$name"; then
     echo "flabel-run: FAILED to build $tarball; $rundir is intact and was not published" >&2
-    rm -rf "$(dirname "$tarball")"
+    rm -rf "$workdir"
     return 1
   fi
 
@@ -245,10 +260,10 @@ publish() {
     # the labels are on the box, and the operator believes they are in the bucket.
     echo "flabel-run: FAILED to publish $name to $RESULTS_URI/" >&2
     echo "flabel-run: the run itself SUCCEEDED — labels are intact at $rundir" >&2
-    rm -rf "$(dirname "$tarball")"
+    rm -rf "$workdir"
     return 1
   fi
-  rm -rf "$(dirname "$tarball")"
+  rm -rf "$workdir"
   echo "flabel-run: published $RESULTS_URI/$name.tar.gz"
   return 0
 }
