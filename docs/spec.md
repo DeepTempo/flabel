@@ -15,7 +15,7 @@ Terms are used exactly as defined here, in code and in output.
 | **capture** | The input file as supplied by the operator: `pcap`, `pcapng`, optionally gzipped. |
 | **normalized capture** | The single `pcap` file derived from the capture that every consumer reads. Never the original artifact. |
 | **run** | One invocation of flabel against one capture. Produces exactly one run directory. |
-| **run directory** | `{capture-name}_{datetime}/` — the complete, self-contained output of a run. |
+| **run directory** | `LABELED_{capture-name}_{datetime}/` — the complete, self-contained output of a run. The prefix marks the producer and is **not** an assertion that labels were written: the name is fixed before the outcome is known, so a failed run leaves a `LABELED_` directory holding `run.json` and no `labels.json` (#23, #134). |
 | **flow** | A Zeek connection, identified by its `uid`. The authoritative unit of identity in the system. |
 | **detection** | One alert from one source. Not yet tied to a flow. |
 | **label** | A verdict about one flow, carrying every detection that asserted it. |
@@ -1424,6 +1424,7 @@ The refusal applies on every labelling invocation, in all three modes: the invoc
 | 1 | Failure. **No `labels.json`** — but the run directory exists and holds `run.json` with `tool_failures[]` (§10), unless the failure occurred before a run directory could be created (a missing snapshot, an unreadable capture). |
 | 2 | Usage error (argparse). |
 | 3 | Not implemented. **Unused since Phase 2** — the default path is built, so nothing remains to report. Retained rather than renumbered: a caller scripting against the old contract must not have exit 3 silently start meaning something else. |
+| 4 | **`tools/flabel-run` only, never `flabel` itself.** The labelling run succeeded and its result was **not published** to `$FLABEL_RESULTS_URI` — the tarball, the upload, or the identification of which directory to publish failed. `labels.json` is intact on the box. A code of its own because reusing 1 told a batch caller to discard or re-run a capture whose labels exist (review of #134), and the wrapper is the only thing that can emit it: `flabel` has no publishing step. |
 
 Partial input is deliberately **not** a distinct code: truncated captures are common, and a non-zero exit would make every ordinary `set -e` script treat a successful run as a failure.
 
@@ -1446,6 +1447,20 @@ flabel **must never**:
 - report full coverage when any loss condition fired;
 - contact the PANW device (Phase 1 has no Tier 1 code path beyond the stub);
 - commit, transmit, or copy capture data anywhere outside the run directory.
+
+**That last rule needs its scope stated now that a run directory is published** (2026-08-19, #134).
+`tools/flabel-run` tars a successful run and uploads it to a GCS bucket, which is transmission of
+the run directory — so the rule has to be read precisely, and it holds: what it forbids is moving
+**capture data**, and no capture data is in there. The normalized pcap lives in a
+`TemporaryDirectory` and never enters the run directory at all (§10), and the shipped Suricata
+configuration writes no payloads, HTTP bodies or extracted files.
+
+What *is* published is derived metadata, and it is not anonymous: Zeek's retained logs carry the
+DNS names queried, the HTTP URIs and hosts requested, and the TLS server names offered by whoever
+appears in the capture. That is the same content `labels.json` already publishes for a labelled
+flow, now for every flow in the run. Publishing is therefore a deliberate destination decision
+rather than a side effect — which is why it lives in the wrapper, is off when
+`FLABEL_RESULTS_URI` is empty, and never happens for a run that wrote no labels.
 
 **And a consumer must never read an empty `labels[]` as "nothing malicious was found."** Since
 step 12 (issue #84) a run can succeed while structurally withholding a detection that *did*

@@ -101,6 +101,18 @@ RUN_DIR_TIMESTAMP = "%Y%m%dT%H%M%S.%fZ"
 #: `capture.pcapng.gz` yields `capture` rather than `capture.pcapng`.
 CAPTURE_SUFFIXES = (".gz", ".pcapng", ".pcap")
 
+#: Prefixed to every run directory (Craig, 2026-08-19, #134), so flabel's output is identifiable
+#: as flabel's wherever it ends up — beside the captures it was made from, in a shared bucket, or
+#: in a directory an operator is sorting by hand.
+#:
+#: **It is a producer mark, not a claim that labels exist.** The directory has to be named before
+#: the run's outcome is known, because `run.json` is written into it on the failure path (#23), so
+#: a run that dies leaves `LABELED_…/` with no `labels.json` inside. The absence of that file
+#: stays the signal, exactly as #23 requires, and `tools/flabel-run` publishes only runs that
+#: produced one. Renaming after the fact was rejected: the path is printed to the operator while
+#: the run is still going, and moving it afterwards would invalidate what they were told to watch.
+RUN_DIR_PREFIX = "LABELED_"
+
 #: The run's stages, in the order they happen, as (key, label). The display draws every one of
 #: them from the start — including the ones still to come — because a list that grows as it goes
 #: tells the operator nothing about how much is left.
@@ -307,7 +319,7 @@ def _mode(args: argparse.Namespace) -> RunMode:
 
 
 def run_directory_name(capture: Path, when: datetime) -> str:
-    """`{capture-name}_{datetime}` (spec §1), with the container suffixes stripped.
+    """`LABELED_{capture-name}_{datetime}` (spec §1), with the container suffixes stripped.
 
     Stripped because a directory called `benign.pcap_2026...` reads as a file, and because
     `.pcap.gz` is two suffixes rather than one. Only the container suffixes go: a capture named
@@ -333,7 +345,11 @@ def run_directory_name(capture: Path, when: datetime) -> str:
     # ours to reject. Dots inside the name are still the operator's naming and are left alone —
     # `my.capture.2026.pcap` keeps its dots.
     name = name.lstrip(".")
-    return f"{name or 'capture'}_{when.strftime(RUN_DIR_TIMESTAMP)}"
+    # The prefix goes on *after* the dot-stripping, not before. Prefixing first would make every
+    # name start with a letter and quietly retire the guard above — `.pcap` would become
+    # `LABELED_.pcap_…`, which is not hidden from `ls`, so the test for #95 would pass while the
+    # behaviour it protects had stopped being exercised.
+    return f"{RUN_DIR_PREFIX}{name or 'capture'}_{when.strftime(RUN_DIR_TIMESTAMP)}"
 
 
 def _make_run_directory(output_dir: Path, capture: Path, when: datetime) -> Path:

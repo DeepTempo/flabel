@@ -20,6 +20,40 @@ REPO="${FLABEL_RUN_REPO:-/opt/flabel/repo}"
 # and a test must be able to observe the command WITHOUT running it as root or at all.
 SUDO="${FLABEL_RUN_SUDO:-sudo}"
 
+# Where a successful run is published (#134). Overridable so a second lab does not need a forked
+# copy, and so the tests can point it at a stub that records instead of uploading.
+#
+# An EMPTY value switches publishing off entirely rather than being a broken destination. That is
+# what lets this wrapper stay the one way to run flabel on the box even when there is no bucket to
+# publish to — a second code path for "run but do not publish" is a second thing to keep correct.
+#
+# **Resolved after `$CONF` is sourced, not here** (review of #134). It was here, above the sourcing,
+# which meant a `FLABEL_RESULTS_URI` written into /var/lib/flabel/flabel.env was read and then
+# thrown away — so a second lab publishing to its own bucket silently published to the first lab's
+# instead, and setting it empty in the config did not switch publishing off. The config file is
+# exactly where a per-lab override belongs, which is what made the ordering a real bug rather than
+# a stylistic one. See `resolve_publishing` below.
+RESULTS_URI=""
+GCLOUD="${FLABEL_RUN_GCLOUD:-gcloud}"
+
+# **Every gcloud call runs as root, and that is not about file permissions.** Measured on
+# fl-replay 2026-08-19: only root's gcloud holds the instance service-account credential. The
+# invoking user's active account was `craig@deeptempo.ai` with no valid token on the box, so
+# `gcloud storage cp` failed with "select an already authenticated account" — while `sudo gcloud`
+# worked, as the service account IAM was actually granted to.
+#
+# It is the identity that needs root, not the files: run directories are root-owned but 0755, so
+# `tar` reads them fine unprivileged and is deliberately left unprivileged.
+#
+# Overridable and separate from $SUDO so the tests can run a stub gcloud directly. $SUDO is
+# pointed at a recorder that never executes, which is right for the replay and useless here.
+#
+# Left UNQUOTED at both call sites, deliberately and following `$SUDO`'s own convention: an empty
+# value has to expand to nothing so the command runs unwrapped, which quoting would turn into an
+# attempt to execute the empty string. shellcheck flags this (SC2086) on the pre-existing `$SUDO`
+# line too.
+PUBLISH_SUDO="${FLABEL_RUN_PUBLISH_SUDO-$SUDO}"
+
 #: Written to stdout and exit 0 for an explicit --help, to stderr and exit 2 for a usage error.
 #: Those are different events: one is the operator asking, the other is the operator being told,
 #: and a script that answers --help on stderr with a failing status cannot be piped into a pager.
@@ -64,11 +98,22 @@ environment (anything you set here WINS over /var/lib/flabel/flabel.env):
   FLABEL_REPLAY_IF1/IF2      replay interfaces (default ens5, ens6)
   FLABEL_PLAIN_PROGRESS      1 to force one-line-per-step output instead of the live display
   NO_COLOR                   same effect, by convention
+  FLABEL_RESULTS_URI         where a successful run is published as a tarball. Defaults to
+                             gs://pm-proto-496816-flabel-pcaps/results. Set it EMPTY to run
+                             without publishing at all.
 
 output:
-  One directory per run under /var/lib/flabel/runs/{capture}_{timestamp}/ holding
+  One directory per run under /var/lib/flabel/runs/LABELED_{capture}_{timestamp}/ holding
   labels.json, run.json, NOTICE, zeek/ and suricata/. A run never modifies a previous
   one. A run that fails writes run.json and NO labels.json — the absence is the signal.
+
+  LABELED_ marks who produced the directory; it does NOT mean labels are in it. The name is
+  fixed before the run's outcome is known, so a failed run is named the same way.
+
+  A run that wrote labels.json is also published to $FLABEL_RESULTS_URI as
+  LABELED_{capture}_{timestamp}.tar.gz, unpacking to one directory of that name. A run
+  with no labels.json is never published, so everything in that bucket has labels in it.
+  If the upload fails the command exits non-zero and says so — the local run is untouched.
 
 examples:
   flabel-run ./capture.pcap
@@ -105,6 +150,13 @@ _saved_env="$(export -p | grep -E '^(export |declare -x )FLABEL_' || true)"
 set -a; . "$CONF"; set +a
 eval "$_saved_env"
 
+# Now that the config has been read and the caller's environment restored over it, the publishing
+# destination is knowable. A trailing slash is stripped because `gs://bucket/results/` is the
+# natural way to write a prefix and would otherwise produce `results//LABELED_…tar.gz` — an object
+# GCS accepts and no `results/` listing matches.
+RESULTS_URI="${FLABEL_RESULTS_URI-gs://pm-proto-496816-flabel-pcaps/results}"
+RESULTS_URI="${RESULTS_URI%/}"
+
 # A gs:// argument is staged locally first. flabel reads a file, and pulling it here keeps the
 # fetch out of the timed part of the run — a slow download inside the replay window would widen
 # the gap between the replay and the log query for no reason.
@@ -115,7 +167,11 @@ if [[ "$TARGET" == gs://* ]]; then
     echo "flabel-run: already staged at $LOCAL"
   else
     echo "flabel-run: fetching $TARGET"
-    gcloud storage cp "$TARGET" "$LOCAL"
+    # Privileged for the same reason as the publish below, and this was already broken before
+    # #134 — staging a gs:// capture as a user whose gcloud has no usable credential fails the
+    # same way. Same defect, same one-line cause, fixed in the same breath rather than left as
+    # the half of it nobody had tripped over yet.
+    $PUBLISH_SUDO $GCLOUD storage cp "$TARGET" "$LOCAL"
   fi
   TARGET="$LOCAL"
 fi
@@ -128,10 +184,62 @@ fi
 # silently labels a different file that happens to share the name there.
 TARGET="$(readlink -f -- "$TARGET")"
 
-mkdir -p "$RUNS"
+# The operator's own `--output-dir` wins, because argparse takes the last occurrence and ours is
+# passed first — so publishing has to watch the directory the run will actually use (review of
+# #134). Before this, `flabel-run cap.pcap --output-dir /elsewhere` ran fine, wrote its labels to
+# /elsewhere, and published nothing while the help promised a publish.
+OUTPUT_DIR="$RUNS"
+_next_is_output=""
+for _arg in "$@"; do
+  if [ -n "$_next_is_output" ]; then OUTPUT_DIR="$_arg"; _next_is_output=""; continue; fi
+  case "$_arg" in
+    --output-dir) _next_is_output=1 ;;
+    --output-dir=*) OUTPUT_DIR="${_arg#--output-dir=}" ;;
+  esac
+done
+
+# Both are created, because both are handed to flabel — ours as `--output-dir "$RUNS"` and the
+# operator's after it — and `readlink -f` on a path that does not exist is not portable: GNU
+# coreutils resolves it, BSD/macOS FAILS, and under `set -e` that killed this script with no output
+# at all. Found while testing an operator-supplied `--output-dir`, where $RUNS had never been made.
+mkdir -p "$RUNS" "$OUTPUT_DIR"
+# Absolute BEFORE the `cd "$REPO"` below — the same bug this script already fixed for $TARGET a few
+# lines up, and it bites the same way: the listing would be taken in the caller's directory and the
+# run would write under $REPO, so every run looked like it had created several directories and none
+# of them got published (review of #134).
+#
+# `|| echo` keeps a resolution failure from being fatal: an unresolvable path is better handled by
+# the commands that use it, which say what they could not do, than by a silent exit here.
+OUTPUT_DIR="$(readlink -f -- "$OUTPUT_DIR" 2>/dev/null || echo "$OUTPUT_DIR")"
+RUNS="$(readlink -f -- "$RUNS" 2>/dev/null || echo "$RUNS")"
+
+# Which directories exist BEFORE the run, so the one it creates can be identified afterwards
+# (#134). Recorded here rather than re-deriving the name in bash: flabel's naming strips a chain
+# of container suffixes and has a documented edge case for a capture called `.pcap` (#95), and a
+# second implementation of that in shell is a second implementation that can disagree with it.
+BEFORE="$(cd "$OUTPUT_DIR" && ls -1 2>/dev/null || true)"
 
 cd "$REPO"
-exec $SUDO -E env \
+# NOT `exec` any more (#134). `exec` replaces this shell, so nothing could run after the labelling
+# command — which is where publishing has to happen, because only a finished run has a directory
+# to publish. The exit status is captured and re-raised at the end instead, so a failing run still
+# fails the wrapper with flabel's own code.
+#
+# `set -e` is deliberately suspended around this one command. With it live, a non-zero flabel would
+# kill the script here and the operator would lose the "no labels were written, details in ..."
+# reporting below.
+#
+# **Run in the background with the signals forwarded**, which `exec` used to give for free (review
+# of #134). Without `exec` a SIGTERM — from `timeout`, from systemd, from an operator's Ctrl-C —
+# killed only this shell and ORPHANED the run: `tcpreplay` kept injecting into the firewall as root
+# after the operator believed the run had stopped, and nothing published. That is a worse regression
+# than the one dropping `exec` was for.
+#
+# Backgrounding does not cost the shortfall prompt (spec §12). Job control is off in a script, so
+# the child stays in this shell's process group and keeps the terminal for stdin; `_confirm_shortfall`
+# can still read a TTY.
+set +e
+$SUDO -E env \
   PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   FLABEL_INLINE_HOST="${FLABEL_INLINE_HOST:-}" \
   FLABEL_INLINE_API_KEY_FILE="${FLABEL_INLINE_API_KEY_FILE:-}" \
@@ -140,4 +248,133 @@ exec $SUDO -E env \
   FLABEL_REPLAY_MULTIPLIER="${FLABEL_REPLAY_MULTIPLIER:-1000}" \
   FLABEL_REPLAY_TOPSPEED="${FLABEL_REPLAY_TOPSPEED:-}" \
   FLABEL_SETTLE_SECONDS="${FLABEL_SETTLE_SECONDS:-60}" \
-  uv run flabel "$TARGET" --output-dir "$RUNS" "$@"
+  uv run flabel "$TARGET" --output-dir "$RUNS" "$@" &
+CHILD=$!
+trap 'kill -TERM "$CHILD" 2>/dev/null' TERM INT HUP
+wait "$CHILD"
+STATUS=$?
+trap - TERM INT HUP
+set -e
+
+#: Exit 4 — "flabel succeeded and the result was NOT published". A code of its own, because spec §12
+#: defines 1 as "Failure. No labels.json", and reusing it here told a batch caller to discard or
+#: re-run a capture whose labels are sitting intact on the box (review of #134). 2 is argparse's and
+#: 3 is reserved by §12, so 4 is the first free value. Recorded in spec §12's table.
+EXIT_NOT_PUBLISHED=4
+
+# A publish failure must not turn a *failed* run into a differently-failed one: flabel's own exit
+# code is the more useful diagnosis, so it wins. Spelled as a function rather than
+# `${STATUS/#0/1}`, which is what this was first written as — every bug that has ever reached
+# production in this wrapper was a one-liner nobody could read.
+unpublished_if_run_succeeded() {
+  if [ "$STATUS" = "0" ]; then
+    STATUS="$EXIT_NOT_PUBLISHED"
+  fi
+}
+
+# --- publish (#134) ---------------------------------------------------------------------------
+#
+# Only a run that produced `labels.json` is published, and that is checked on the artifact rather
+# than on `$STATUS`. The two agree today, and the file is the authority: issue #23 makes the
+# presence of `labels.json` the definition of a completed run, so asking the directory what it
+# holds cannot disagree with what a consumer will conclude from it. An exit code is a second
+# record of the same fact, and this is the one the bucket's contents should follow.
+publish() {
+  local rundir="$1" name workdir tarball
+  name="$(basename "$rundir")"
+
+  if [ ! -f "$rundir/labels.json" ]; then
+    echo "flabel-run: not publishing $name — it wrote no labels.json, so there is no result" >&2
+    return 0
+  fi
+
+  # Built in a temporary directory, not inside $RUNS. A tarball written beside the run directories
+  # is picked up as one by anything that lists them — including this script's own BEFORE/AFTER
+  # comparison on the next run.
+  #
+  # `-C "$OUTPUT_DIR"`, not `-C "$RUNS"`: the two differ when the operator passed their own
+  # `--output-dir`, and tarring from the wrong one fails with "no such file or directory".
+  # **`mktemp` is checked, and this is not defensive boilerplate.** The first version built the
+  # path as mktemp's output interpolated directly into a string, so a failed mktemp yielded
+  # `/$name.tar.gz` at the filesystem root — and the cleanups below, which then took the dirname of
+  # that path, would have recursively deleted `/`. An unchecked command substitution two lines from
+  # a recursive delete earns a guard; the cleanups now name the checked variable instead.
+  workdir="$(mktemp -d)" || workdir=""
+  if [ -z "$workdir" ] || [ ! -d "$workdir" ]; then
+    echo "flabel-run: could not create a temporary directory; $rundir was not published" >&2
+    return 1
+  fi
+  tarball="$workdir/$name.tar.gz"
+  # `-C "$RUNS" "$name"` so the archive unpacks to a single directory of that name rather than to
+  # whatever absolute path it happened to live at.
+  #
+  # `COPYFILE_DISABLE=1` is for the developer machines, not the box: bsdtar on macOS adds an
+  # AppleDouble `._<name>` entry beside every real one, so the same run tarred on a laptop and on
+  # Ubuntu produced archives with different contents. A no-op under GNU tar. Worth setting rather
+  # than tolerating, because "the archive is the run directory" should not depend on who built it.
+  if ! COPYFILE_DISABLE=1 tar -czf "$tarball" -C "$OUTPUT_DIR" "$name"; then
+    echo "flabel-run: FAILED to build $tarball; $rundir is intact and was not published" >&2
+    rm -rf "$workdir"
+    return 1
+  fi
+
+  echo "flabel-run: publishing $name to $RESULTS_URI/"
+  if ! $PUBLISH_SUDO $GCLOUD storage cp "$tarball" "$RESULTS_URI/$name.tar.gz"; then
+    # Loud and non-zero. A silent failure here is the worst outcome available: the run succeeded,
+    # the labels are on the box, and the operator believes they are in the bucket.
+    echo "flabel-run: FAILED to publish $name to $RESULTS_URI/" >&2
+    echo "flabel-run: the run itself SUCCEEDED — labels are intact at $rundir" >&2
+    rm -rf "$workdir"
+    return 1
+  fi
+  rm -rf "$workdir"
+  echo "flabel-run: published $RESULTS_URI/$name.tar.gz"
+  return 0
+}
+
+if [ -n "$RESULTS_URI" ]; then
+  AFTER="$(cd "$OUTPUT_DIR" && ls -1 2>/dev/null || true)"
+  # `comm` over two sorted lists rather than a glob, so what is named is exactly what THIS
+  # invocation added. A directory that predates the run is never republished, which matters because
+  # `objectCreator` would refuse the overwrite and the 403 would name a run the operator did not
+  # just make.
+  #
+  # Filtered to directories. A stray FILE appearing under the output directory used to satisfy the
+  # count and then fail the `-d` test, landing in the ambiguous branch and printing the nonsense
+  # "1 new directories" (review of #134).
+  # One pass, an `if` rather than an `&&` chain, and arithmetic instead of `wc -l`.
+  #
+  # The first version computed COUNT with a second pipeline whose `while` body ended in
+  # `[ -n "$e" ] && [ -d ... ] && echo "$e"`. For a non-directory that chain returns 1, the loop
+  # inherits it, and `set -o pipefail` (line 10) then made the whole pipeline non-zero — so the
+  # assignment failed and `set -e` killed the script silently, exit 1 with no output at all, on a
+  # run that had labelled perfectly well. An `if` body always ends true, and counting in the same
+  # pass removes the pipeline that could fail.
+  NEW=""
+  COUNT=0
+  while IFS= read -r entry; do
+    if [ -n "$entry" ] && [ -d "$OUTPUT_DIR/$entry" ]; then
+      NEW="$entry"
+      COUNT=$((COUNT + 1))
+    fi
+  done < <(comm -13 <(printf '%s\n' "$BEFORE" | sort) <(printf '%s\n' "$AFTER" | sort))
+
+  if [ "$COUNT" = "1" ]; then
+    publish "$OUTPUT_DIR/$NEW" || unpublished_if_run_succeeded
+  elif [ "$COUNT" = "0" ]; then
+    # Normal for a rejected capture, and for a failure before the directory could be created.
+    # Not an error, and not silent: "nothing was published" is worth one line.
+    echo "flabel-run: no new run directory under $OUTPUT_DIR — nothing to publish" >&2
+  else
+    # Refused rather than guessed. Publishing the wrong directory puts one capture's labels in the
+    # bucket under another's name, which is worse than publishing nothing. Reachable if two runs
+    # share an output directory — which on the replay box also means two replays fighting over the
+    # same NICs, so the ambiguity is a symptom rather than the problem.
+    echo "flabel-run: $COUNT new run directories under $OUTPUT_DIR; cannot tell which is this" >&2
+    echo "flabel-run: run's, so nothing was published. Publish by hand:" >&2
+    echo "flabel-run:   tar -czf - -C $OUTPUT_DIR <d> | $PUBLISH_SUDO $GCLOUD storage cp - $RESULTS_URI/<d>.tar.gz" >&2
+    unpublished_if_run_succeeded
+  fi
+fi
+
+exit "$STATUS"
