@@ -929,3 +929,156 @@ def test_a_terminating_signal_is_forwarded_to_the_run(lab, tmp_path):
     assert marker.read_text() == "terminated", (
         "the run was orphaned: the wrapper died and left it running"
     )
+
+
+# --- staging with either identity (#136) -------------------------------------------------------
+
+
+def two_identity_gcloud(tmp_path: Path, *, root_ok: bool, caller_ok: bool) -> tuple[Path, Path]:
+    """A `gcloud` that succeeds or fails depending on whether it was invoked through sudo.
+
+    The privilege stub exports `VIA_SUDO=1` before exec'ing, which is how this tells the two apart
+    without needing root. Returns `(gcloud, log)`.
+    """
+    log = tmp_path / "identity-calls"
+    gcloud = tmp_path / "two-identity-gcloud"
+    # The identity rule applies to DOWNLOADS only. Uploads always succeed, because the publish is
+    # service-account-only by design and a stub that failed it too would make every fallback test
+    # exit 4 for a reason that has nothing to do with staging — which is exactly what the first
+    # version of this did.
+    gcloud.write_text(
+        f"""#!/bin/bash
+who=caller
+[ -n "${{VIA_SUDO:-}}" ] && who=root
+printf '%s %s\\n' "$who" "$*" >> {log}
+dest="${{@: -1}}"
+case "$dest" in
+  gs://*)
+    exit 0
+    ;;
+esac
+ok=0
+if [ "$who" = root ]; then ok={1 if root_ok else 0}; else ok={1 if caller_ok else 0}; fi
+if [ "$ok" = "1" ]; then
+  [ -n "$dest" ] && printf '%s' 'staged' > "$dest"
+  exit 0
+fi
+echo "HTTPError 403: $who cannot read it" >&2
+exit 1
+"""
+    )
+    gcloud.chmod(0o755)
+    return gcloud, log
+
+
+def sudo_marking_gcloud(tmp_path: Path) -> Path:
+    """A privilege stub that marks the environment and runs the command, so `gcloud` can tell."""
+    stub = tmp_path / "marking-sudo"
+    stub.write_text('#!/bin/bash\nexport VIA_SUDO=1\nexec "$@"\n')
+    stub.chmod(0o755)
+    return stub
+
+
+def test_the_service_account_is_tried_first_and_the_caller_is_not_needed(lab, tmp_path):
+    """The ordinary path is ONE attempt, so a scheduled run behaves like an interactive one."""
+    gcloud, log = two_identity_gcloud(tmp_path, root_ok=True, caller_ok=False)
+
+    result = invoke(
+        lab,
+        "gs://some-bucket/remote.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            "FLABEL_RUN_GCLOUD": str(gcloud),
+            "FLABEL_RUN_PUBLISH_SUDO": str(sudo_marking_gcloud(tmp_path)),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    fetches = [c for c in log.read_text().splitlines() if "remote.pcap" in c]
+    assert len(fetches) == 1, f"the fetch should have taken one attempt: {fetches}"
+    assert fetches[0].startswith("root "), fetches[0]
+
+
+def test_the_caller_is_the_fallback_when_the_service_account_cannot_read_it(lab, tmp_path):
+    """An object the operator can reach and the box has not been granted still works (#136).
+
+    Safe because this is a read: `run.input.sha256` records the capture, not who fetched it.
+    """
+    gcloud, log = two_identity_gcloud(tmp_path, root_ok=False, caller_ok=True)
+
+    result = invoke(
+        lab,
+        "gs://some-bucket/remote.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            "FLABEL_RUN_GCLOUD": str(gcloud),
+            "FLABEL_RUN_PUBLISH_SUDO": str(sudo_marking_gcloud(tmp_path)),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    fetches = [c for c in log.read_text().splitlines() if "remote.pcap" in c]
+    assert [c.split()[0] for c in fetches] == ["root", "caller"], fetches
+    assert "the service account could not read it" in result.stderr
+    assert (Path(lab["FLABEL_RUN_CAPTURES"]) / "remote.pcap").exists()
+
+
+def test_when_neither_identity_can_read_it_both_failures_are_reported(lab, tmp_path):
+    """The bug report that started #136 showed one 403 and named one principal.
+
+    Both identities had failed, for different reasons, and the message made a two-part access
+    problem look like a one-part one. The remedies are printed because a 403 tells an operator what
+    was refused and never what to do about it.
+    """
+    gcloud, log = two_identity_gcloud(tmp_path, root_ok=False, caller_ok=False)
+
+    result = invoke(
+        lab,
+        "gs://some-bucket/remote.pcap",
+        extra={
+            "FLABEL_RUN_GCLOUD": str(gcloud),
+            "FLABEL_RUN_PUBLISH_SUDO": str(sudo_marking_gcloud(tmp_path)),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "NEITHER identity" in result.stderr
+    assert "root cannot read it" in result.stderr, "the service account's own error must appear"
+    assert "caller cannot read it" in result.stderr, "the caller's own error must appear"
+    assert "objectViewer" in result.stderr, "the remedy must be named, not just the refusal"
+    assert uploads(lab) == [], "a run that never started publishes nothing"
+    fetches = [c for c in log.read_text().splitlines() if "remote.pcap" in c]
+    assert [c.split()[0] for c in fetches] == ["root", "caller"], fetches
+
+
+def test_a_failed_stage_stops_immediately_and_says_only_the_real_reason(lab, tmp_path):
+    """The capture is fetched before the run for exactly this reason — fail before the 60s settle.
+
+    Two properties, and only the second is unique to `stage_capture`. That no replay starts is also
+    held by the `[ -f "$TARGET" ]` check further down, so a sabotage removing this function's
+    failure propagation still leaves the run un-started — belt and braces, and worth knowing.
+
+    What *is* unique here: the failure has to be fatal AT THE FETCH, so the operator reads the
+    both-identities diagnosis and nothing else. Letting it fall through produces a second,
+    misleading "no such capture: /var/lib/flabel/captures/remote.pcap" underneath the real
+    explanation, which reads like a missing file rather than a denied one.
+    """
+    gcloud, _ = two_identity_gcloud(tmp_path, root_ok=False, caller_ok=False)
+
+    result = invoke(
+        lab,
+        "gs://some-bucket/remote.pcap",
+        extra={
+            "FLABEL_RUN_GCLOUD": str(gcloud),
+            "FLABEL_RUN_PUBLISH_SUDO": str(sudo_marking_gcloud(tmp_path)),
+        },
+    )
+
+    assert result.returncode != 0
+    assert not Path(lab["_recorded"]).exists(), "flabel was invoked despite having no capture"
+    assert "NEITHER identity" in result.stderr
+    assert "no such capture" not in result.stderr, (
+        "a denied fetch must not also report a missing file — that is the wrong diagnosis"
+    )
