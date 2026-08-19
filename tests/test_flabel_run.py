@@ -76,7 +76,18 @@ exit "${{FAKE_EXIT:-0}}"
     gcloud_log = tmp_path / "gcloud-calls"
     gcloud = tmp_path / "fake-gcloud"
     gcloud.write_text(
-        f'#!/bin/bash\nprintf "%s\\n" "$*" >> {gcloud_log}\nexit "${{FAKE_GCLOUD_EXIT:-0}}"\n'
+        f"""#!/bin/bash
+printf "%s\\n" "$*" >> {gcloud_log}
+# A staging fetch has to leave a file behind or the wrapper's existence check stops the run before
+# anything interesting happens. Only for a LOCAL destination: an upload's destination is a gs:// URI
+# and must not be created on disk.
+dest="${{@: -1}}"
+case "$dest" in
+  gs://*) : ;;
+  *) [ -n "$dest" ] && printf '%s' 'staged' > "$dest" ;;
+esac
+exit "${{FAKE_GCLOUD_EXIT:-0}}"
+"""
     )
     gcloud.chmod(0o755)
 
@@ -88,6 +99,10 @@ exit "${{FAKE_EXIT:-0}}"
         "FLABEL_RUN_SUDO": str(stub),
         "FLABEL_RUN_GCLOUD": str(gcloud),
         "FLABEL_RESULTS_URI": "gs://test-bucket/results",
+        # Empty, so the stub gcloud runs directly. In production this defaults to $SUDO, because
+        # only root's gcloud carries the instance service-account credential — see the wrapper.
+        # `test_gcloud_runs_privileged_by_default` is what holds that default in place.
+        "FLABEL_RUN_PUBLISH_SUDO": "",
         "_recorded": str(recorded),
         "_gcloud_log": str(gcloud_log),
         "_tmp": str(tmp_path),
@@ -99,6 +114,13 @@ def invoke(
 ) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, **{k: v for k, v in lab.items() if not k.startswith("_")}}
     env.update(extra or {})
+    # The sentinel exists because the fixture sets some variables to the EMPTY string on purpose —
+    # `FLABEL_RESULTS_URI=""` means "do not publish" and `FLABEL_RUN_PUBLISH_SUDO=""` means "do not
+    # elevate" — so a test that wants the wrapper's own default has to remove the name from the
+    # environment entirely, which passing "" cannot express.
+    for name, value in list(env.items()):
+        if value == "__unset__":
+            del env[name]
     return subprocess.run(
         [str(WRAPPER), *args],
         capture_output=True,
@@ -117,6 +139,46 @@ def uploads(lab: dict[str, str]) -> list[str]:
     """Every `gcloud` invocation the wrapper made, one per line, or `[]` if it made none."""
     log = Path(lab["_gcloud_log"])
     return log.read_text().splitlines() if log.exists() else []
+
+
+def recording_sudo(tmp_path: Path) -> tuple[Path, Path]:
+    """A `sudo` replacement that logs every privileged command AND fabricates the run directory.
+
+    Both halves are needed: logging is the assertion, and the run directory is what makes the
+    publish step reachable at all. The first version of this only logged, so the wrapper found no
+    new directory, published nothing, and the test failed for a reason that had nothing to do with
+    what it was checking.
+
+    Returns `(stub, log)`.
+    """
+    log = tmp_path / "privileged-calls"
+    stub = tmp_path / "recording-sudo"
+    stub.write_text(
+        f"""#!/bin/bash
+printf "%s\\n" "$*" >> {log}
+if [ -n "${{FAKE_MAKE_RUN:-}}" ] && [ -n "${{FLABEL_RUN_RUNS:-}}" ]; then
+  d="$FLABEL_RUN_RUNS/$FAKE_MAKE_RUN"
+  mkdir -p "$d"
+  printf '%s' '{{"labels":[]}}' > "$d/labels.json"
+fi
+"""
+    )
+    stub.chmod(0o755)
+    return stub, log
+
+
+def passthrough_sudo(tmp_path: Path) -> tuple[Path, Path]:
+    """A privilege stub that logs the command and then actually runs it. Returns `(stub, log)`.
+
+    Safe here in a way it would not be for `$SUDO`: `$PUBLISH_SUDO` only ever wraps `gcloud`, never
+    the labelling command, so executing its arguments runs the stub gcloud rather than a real
+    replay. That is what lets a test assert the fetch was privileged *and* let the fetch succeed.
+    """
+    log = tmp_path / "privileged-calls"
+    stub = tmp_path / "passthrough-sudo"
+    stub.write_text(f'#!/bin/bash\nprintf "%s\\n" "$*" >> {log}\nexec "$@"\n')
+    stub.chmod(0o755)
+    return stub, log
 
 
 def capture(tmp_path: Path, name: str = "some.pcap") -> Path:
@@ -501,3 +563,130 @@ def test_the_tarball_is_not_left_inside_the_runs_directory(lab, tmp_path):
 
     leftovers = list(Path(lab["FLABEL_RUN_RUNS"]).glob("*.tar.gz"))
     assert leftovers == [], f"tarball left in the runs directory: {leftovers}"
+
+
+def test_gcloud_runs_privileged_by_default(lab, tmp_path):
+    """Only root's gcloud has the instance service-account credential (measured 2026-08-19).
+
+    The bug this pins: the publish step first ran gcloud as the invoking user, whose active
+    account on `fl-replay` was a human one with no valid token — so every upload failed with
+    "select an already authenticated account", while `sudo gcloud` worked as the service account
+    IAM had actually been granted to.
+
+    Every other test in this file sets `FLABEL_RUN_PUBLISH_SUDO=""` so the stub gcloud runs
+    directly, which means none of them exercise the default. This one unsets it and asserts the
+    privilege wrapper is invoked with the gcloud command — the production wiring, checked without
+    needing root.
+    """
+    capture(tmp_path)
+    recorder, privileged = recording_sudo(tmp_path)
+
+    result = invoke(
+        lab,
+        "some.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            # Unset, so the wrapper's own default applies.
+            "FLABEL_RUN_PUBLISH_SUDO": "__unset__",
+            "FLABEL_RUN_SUDO": str(recorder),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = privileged.read_text().splitlines() if privileged.exists() else []
+    uploaded = [call for call in calls if "storage cp" in call]
+    assert uploaded, f"gcloud was not run through the privilege wrapper; calls were {calls}"
+    assert uploaded[0].endswith(f"gs://test-bucket/results/{RUN_NAME}.tar.gz"), uploaded[0]
+
+
+def test_tar_is_deliberately_not_privileged(lab, tmp_path):
+    """Run directories are root-owned but 0755, so `tar` reads them unprivileged (measured).
+
+    Stated as a test because "run gcloud as root" invites "run everything as root", and the two
+    have different reasons: gcloud needs root for its *identity*, tar would only need it for file
+    access it does not lack. Building the archive as root would also leave it root-owned in a
+    temporary directory this script then has to clean up.
+    """
+    capture(tmp_path)
+    recorder, privileged = recording_sudo(tmp_path)
+
+    invoke(
+        lab,
+        "some.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            "FLABEL_RUN_PUBLISH_SUDO": "__unset__",
+            "FLABEL_RUN_SUDO": str(recorder),
+        },
+    )
+
+    calls = privileged.read_text().splitlines() if privileged.exists() else []
+    assert not [call for call in calls if call.startswith("tar ") or " tar " in call], (
+        f"tar was run privileged, which it does not need: {calls}"
+    )
+
+
+# --- staging a gs:// capture (pre-existing path, privilege fixed in #134) ----------------------
+
+
+def test_a_gs_capture_is_staged_through_the_privilege_wrapper(lab, tmp_path):
+    """The same credential bug as the publish, in code that predates it.
+
+    `gcloud storage cp` to stage a `gs://` capture ran as the invoking user, whose gcloud on
+    `fl-replay` had no usable credential — so staging would have failed exactly as the first
+    version of the upload did. Nothing covered this path at all, which is why the sabotage that
+    reverted it passed while every other one went red.
+    """
+    stub, privileged = passthrough_sudo(tmp_path)
+
+    result = invoke(
+        lab,
+        "gs://some-bucket/remote.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            "FLABEL_RUN_PUBLISH_SUDO": str(stub),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = privileged.read_text().splitlines() if privileged.exists() else []
+    fetches = [call for call in calls if "gs://some-bucket/remote.pcap" in call]
+    assert fetches, f"the staging fetch was not privileged; calls were {calls}"
+    staged = Path(lab["FLABEL_RUN_CAPTURES"]) / "remote.pcap"
+    assert staged.exists(), "the capture was not staged locally"
+    assert str(staged) in recorded(lab), "flabel was not pointed at the staged copy"
+
+
+def test_an_already_staged_capture_is_not_fetched_again(lab, tmp_path):
+    """The wrapper's documented reuse, and the complement of the test above.
+
+    Worth holding: re-downloading inside the timed part of a run widens the gap between the replay
+    and the device's log query, which is the window the threat logs are selected by.
+    """
+    stub, privileged = passthrough_sudo(tmp_path)
+    staged_dir = Path(lab["FLABEL_RUN_CAPTURES"])
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    (staged_dir / "remote.pcap").write_bytes(b"already here")
+
+    result = invoke(
+        lab,
+        "gs://some-bucket/remote.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            "FLABEL_RUN_PUBLISH_SUDO": str(stub),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "already staged" in result.stdout + result.stderr
+    calls = privileged.read_text().splitlines() if privileged.exists() else []
+    assert not [call for call in calls if "gs://some-bucket/remote.pcap" in call], (
+        f"a staged capture was fetched again: {calls}"
+    )
+    assert (staged_dir / "remote.pcap").read_bytes() == b"already here", (
+        "the staged copy was replaced"
+    )

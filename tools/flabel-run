@@ -29,6 +29,19 @@ SUDO="${FLABEL_RUN_SUDO:-sudo}"
 RESULTS_URI="${FLABEL_RESULTS_URI-gs://pm-proto-496816-flabel-pcaps/results}"
 GCLOUD="${FLABEL_RUN_GCLOUD:-gcloud}"
 
+# **Every gcloud call runs as root, and that is not about file permissions.** Measured on
+# fl-replay 2026-08-19: only root's gcloud holds the instance service-account credential. The
+# invoking user's active account was `craig@deeptempo.ai` with no valid token on the box, so
+# `gcloud storage cp` failed with "select an already authenticated account" — while `sudo gcloud`
+# worked, as the service account IAM was actually granted to.
+#
+# It is the identity that needs root, not the files: run directories are root-owned but 0755, so
+# `tar` reads them fine unprivileged and is deliberately left unprivileged.
+#
+# Overridable and separate from $SUDO so the tests can run a stub gcloud directly. $SUDO is
+# pointed at a recorder that never executes, which is right for the replay and useless here.
+PUBLISH_SUDO="${FLABEL_RUN_PUBLISH_SUDO-$SUDO}"
+
 #: Written to stdout and exit 0 for an explicit --help, to stderr and exit 2 for a usage error.
 #: Those are different events: one is the operator asking, the other is the operator being told,
 #: and a script that answers --help on stderr with a failing status cannot be piped into a pager.
@@ -135,7 +148,11 @@ if [[ "$TARGET" == gs://* ]]; then
     echo "flabel-run: already staged at $LOCAL"
   else
     echo "flabel-run: fetching $TARGET"
-    gcloud storage cp "$TARGET" "$LOCAL"
+    # Privileged for the same reason as the publish below, and this was already broken before
+    # #134 — staging a gs:// capture as a user whose gcloud has no usable credential fails the
+    # same way. Same defect, same one-line cause, fixed in the same breath rather than left as
+    # the half of it nobody had tripped over yet.
+    $PUBLISH_SUDO $GCLOUD storage cp "$TARGET" "$LOCAL"
   fi
   TARGET="$LOCAL"
 fi
@@ -223,7 +240,7 @@ publish() {
   fi
 
   echo "flabel-run: publishing $name to $RESULTS_URI/"
-  if ! $GCLOUD storage cp "$tarball" "$RESULTS_URI/$name.tar.gz"; then
+  if ! $PUBLISH_SUDO $GCLOUD storage cp "$tarball" "$RESULTS_URI/$name.tar.gz"; then
     # Loud and non-zero. A silent failure here is the worst outcome available: the run succeeded,
     # the labels are on the box, and the operator believes they are in the bucket.
     echo "flabel-run: FAILED to publish $name to $RESULTS_URI/" >&2
@@ -258,7 +275,7 @@ if [ -n "$RESULTS_URI" ]; then
     # bucket under another's name, which is worse than publishing nothing.
     echo "flabel-run: $COUNT new directories under $RUNS; cannot tell which is this run's," >&2
     echo "flabel-run: so nothing was published. Publish by hand:" >&2
-    echo "flabel-run:   tar -czf - -C $RUNS <dir> | $GCLOUD storage cp - $RESULTS_URI/<dir>.tar.gz" >&2
+    echo "flabel-run:   tar -czf - -C $RUNS <d> | $PUBLISH_SUDO $GCLOUD storage cp - $RESULTS_URI/<d>.tar.gz" >&2
     fail_if_run_succeeded
   fi
 fi
