@@ -36,6 +36,7 @@ from flabel import correlate as correlate_module
 from flabel.correlate import ICMPV4_COUNTERPART, ICMPV6_COUNTERPART, correlate
 from flabel.errors import CorrelationError, SnapshotError, exit_code_for
 from flabel.models import (
+    DEVICE_UNNAMED_THREAT,
     Detection,
     Flow,
     SnapshotManifest,
@@ -1655,3 +1656,66 @@ def test_the_label_entries_are_in_canonical_order():
     (label,) = result.labels
     names = [entry.name for entry in label.labels]
     assert names == sorted(names)
+
+
+# --- what the review of #139 found (#140) -----------------------------------------------------
+
+
+def test_a_device_entry_with_no_threat_name_publishes_no_threat_name_label():
+    """The placeholder must not be promoted (#140).
+
+    `panw.detections` substitutes `DEVICE_UNNAMED_THREAT` so `SourceEntry.threat` is never empty —
+    spec §4 forbids that — and it is the honest record of what the device sent. Promoted to a
+    label it asserts that the threat is *called* "unnamed", in the one field the PRD calls the
+    trainable value per flow. Decision 3 again: omit, rather than fill with a stand-in.
+    """
+    result = correlate_inline([inline(threat=DEVICE_UNNAMED_THREAT)])
+
+    (label,) = result.labels
+    assert "threat-name" not in labels_by_name(label)
+    assert [entry.name for entry in label.labels] == ["verdict"]
+    assert label.sources[0].threat == DEVICE_UNNAMED_THREAT, (
+        "the placeholder stays in sources[], which is the record of what arrived"
+    )
+
+
+def test_a_named_threat_wins_over_an_unnamed_one_on_the_same_flow():
+    """The complement: skipping the placeholder must not skip the flow's real threat name.
+
+    The unnamed entry is given the EARLIER timestamp deliberately, so it would win on Craig's
+    rule if it were a candidate at all.
+    """
+    unnamed = inline(sid=30001, threat=DEVICE_UNNAMED_THREAT, ts=1_700_000_001.0)
+    named = inline(sid=30002, threat="Realtek SDK RCE", ts=1_700_000_009.0)
+
+    result = correlate_inline([unnamed, named])
+
+    (label,) = result.labels
+    assert labels_by_name(label)["threat-name"].value == "Realtek SDK RCE"
+    assert labels_by_name(label)["threat-name"].sids == (30002,)
+
+
+def test_an_unparseable_timestamp_does_not_outrank_a_real_alert():
+    """`panw._receive_epoch` yields 0.0 on a parse failure, and 0.0 beats every real epoch (#140).
+
+    So before this, one malformed `receive_time` in a threat-log response made that entry's threat
+    name the flow's published label — chosen for having failed to parse. That is the difference
+    between a fallback and a preference.
+    """
+    unparsed = inline(sid=30001, threat="Parse Failed", ts=0.0)
+    real = inline(sid=30002, threat="Real Threat", ts=1_700_000_009.0)
+
+    forwards = correlate_inline([unparsed, real])
+    backwards = correlate_inline([real, unparsed])
+
+    for result in (forwards, backwards):
+        (label,) = result.labels
+        assert labels_by_name(label)["threat-name"].value == "Real Threat"
+
+
+def test_an_unparseable_timestamp_still_supplies_the_label_when_it_is_all_there_is():
+    """Sorted last, not discarded. A flow whose only alert lost its timestamp still gets named."""
+    result = correlate_inline([inline(threat="Only Threat", ts=0.0)])
+
+    (label,) = result.labels
+    assert labels_by_name(label)["threat-name"].value == "Only Threat"

@@ -38,7 +38,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 from flabel.errors import ToolError
-from flabel.models import Detection, Direction, ToolFailure
+from flabel.models import DEVICE_UNNAMED_THREAT, Detection, Direction, ToolFailure
 
 #: The firewall is Tier 1 — a lower tier is a *higher*-trust observation, and `Label.best_tier`
 #: is the minimum across a flow's sources. `suricata.TIER` is 2 and says the same from its side.
@@ -510,7 +510,7 @@ def detections(
     declined: list[str] = []
     rulesets: dict[DetectionKey, str] = {}
     for entry in entries:
-        name = threat_name(entry) or "unnamed"
+        name = threat_name(entry) or DEVICE_UNNAMED_THREAT
         if not admits(entry):
             declined.append(
                 f"{name}: subtype={_text(entry, 'subtype') or 'none'} is not a signature match "
@@ -582,9 +582,17 @@ def _receive_epoch(entry: ET.Element) -> float:
     """`receive_time` as a POSIX timestamp.
 
     Parsed as device-local time, matching how the query filter is written. An unparseable
-    value yields 0.0 rather than raising: the timestamp scopes the query and separates repeated
-    tuples, so losing it costs a tie-break, while failing the run over it would throw away every
-    label in the capture.
+    value yields 0.0 rather than raising: failing the run over one malformed field would throw away
+    every label in the capture.
+
+    **What 0.0 costs changed with #138 and is handled in `correlate`, not here** (#140). It used to
+    cost only a tie-break; since a tier-1 detection can supply a published `threat-name`, and 0.0 is
+    the minimum of every real epoch, it would have made a parse failure outrank every genuine alert.
+    `correlate._threat_name_order` sorts it last instead. Kept as 0.0 rather than becoming `None`
+    because `Detection.ts` is non-optional and every other reader treats it as a number.
+
+    Note the granularity while you are here: `%Y/%m/%d %H:%M:%S` has no sub-second field, so two
+    threats on one flow routinely share a timestamp.
     """
     raw = _text(entry, "receive_time")
     for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M:%S %Z"):

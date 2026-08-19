@@ -165,7 +165,7 @@ def test_a_verdict_other_than_malicious_is_rejected():
     Checked on the `verdict` ENTRY since schema 2.0 (#138) — the guard moved with the field, and a
     forged entry is now the way a non-malicious verdict would arrive.
     """
-    forged = LabelEntry(name="verdict", value="benign", tier=2, sids=(2010935,))
+    forged = LabelEntry(name="verdict", value="benign", tier=2, sids=(make_entry().sid,))
     with pytest.raises(ValueError, match="verdict"):
         Label(flow=make_flow(), best_tier=2, labels=(forged,), sources=(make_entry(),))
 
@@ -597,7 +597,7 @@ def test_the_verdict_entrys_tier_must_agree_with_best_tier():
     is the flaw this artifact exists to avoid.
     """
     sources = one_source()
-    wrong = LabelEntry(name="verdict", value="malicious", tier=1, sids=(2010935,))
+    wrong = LabelEntry(name="verdict", value="malicious", tier=1, sids=(sources[0].sid,))
     with pytest.raises(ValueError, match="best_tier"):
         Label(flow=make_flow(), best_tier=2, labels=(wrong,), sources=sources)
 
@@ -637,3 +637,58 @@ def test_an_unknown_label_name_is_rejected():
     """`Literal` is a hint. A name no consumer is written against would serialise happily."""
     with pytest.raises(ValueError, match="name"):
         LabelEntry(name="severity", value="high", tier=1, sids=(30001,))
+
+
+def test_a_label_entry_citing_an_unknown_sid_is_rejected():
+    """Goal 1, enforced instead of asserted (#140).
+
+    `Label` validated the verdict entry thoroughly and the others not at all, so a `threat-name`
+    naming a sid no source on the flow carries serialised looking exactly as traceable as a real
+    one. `LabelEntry`'s docstring claims this is where traceability is carried for assertions
+    narrower than `sources[]`; that claim needed a guard behind it.
+    """
+    sources = one_source()
+    invented = LabelEntry(name="threat-name", value="Ghost", tier=2, sids=(999999,))
+    with pytest.raises(ValueError, match="cannot be traced"):
+        Label(
+            flow=make_flow(),
+            best_tier=2,
+            labels=tuple(sorted((verdict_entry(sources), invented), key=lambda e: e.name)),
+            sources=sources,
+        )
+
+
+def test_a_label_entry_claiming_a_tier_none_of_its_sources_had_is_rejected():
+    """A tier is a trust level. Claiming one the source was not reported at overstates the label.
+
+    Reachable by a wiring mistake rather than by data: `_label_entries` takes the tier off the
+    entry it selected, so a future edit taking it from the flow — or from `best_tier` — would
+    publish tier 1 for a tier-2 detection, which is the one field a consumer weights by.
+    """
+    sources = one_source()
+    # The source's OWN sid, so the only thing wrong is the tier. Hardcoding a sid made this hit
+    # the unknown-sid guard instead and pass for the wrong reason.
+    overstated = LabelEntry(name="threat-name", value="Some Threat", tier=1, sids=(sources[0].sid,))
+    with pytest.raises(ValueError, match="tier"):
+        Label(
+            flow=make_flow(),
+            best_tier=2,
+            labels=tuple(sorted((verdict_entry(sources), overstated), key=lambda e: e.name)),
+            sources=sources,
+        )
+
+
+def test_a_label_entry_citing_a_real_sid_at_its_real_tier_is_accepted():
+    """The complement, so the guard above cannot be over-applied to legitimate output."""
+    sources = one_source()
+    entry = sources[0]
+    honest = LabelEntry(name="threat-name", value="Some Threat", tier=entry.tier, sids=(entry.sid,))
+
+    label = Label(
+        flow=make_flow(),
+        best_tier=entry.tier,
+        labels=tuple(sorted((verdict_entry(sources), honest), key=lambda e: e.name)),
+        sources=sources,
+    )
+
+    assert [e.name for e in label.labels] == ["threat-name", "verdict"]
