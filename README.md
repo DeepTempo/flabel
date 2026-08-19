@@ -130,6 +130,25 @@ so everything in that bucket has labels in it.
 `labels.json` holds one entry per malicious flow, each carrying every detection that asserted it,
 and a `run` block recording the input, the ruleset, the tool versions and every loss condition.
 
+**A flow carries several labels, not one** (`schema_version` 2.0). `verdict` is always there;
+`threat-name` publishes what the inline device called the threat, and appears only on flows a
+tier-1 detection reached — it is **omitted**, not null, when Suricata alone flagged the flow. Each
+entry names the tier and the signature ids behind it, because once a label is narrower than the
+whole `sources[]` list the document can no longer imply that list explains all of them.
+
+```json
+"labels": [
+  { "name": "threat-name", "value": "Realtek SDK Command Execution",
+    "tier": 1, "sids": [30001] },
+  { "name": "verdict", "value": "malicious",
+    "tier": 1, "sids": [30001, 2044008] }
+]
+```
+
+`verdict` names every sid that asserted it; `threat-name` names the one detection it came from —
+the earliest tier-1 alert, with the lowest sid breaking exact timestamp ties. When both tiers flag
+a flow, tier 2's threat name stays in `sources[].threat` and is not promoted to a label.
+
 **A failed run writes `run.json` and no `labels.json`.** The absence of the file is the signal,
 and it cannot be misread: an empty `labels` array would say "nothing malicious was found" when in
 fact the pipeline died.

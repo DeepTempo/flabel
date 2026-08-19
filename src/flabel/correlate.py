@@ -41,11 +41,13 @@ from flabel.models import (
     Detection,
     Flow,
     Label,
+    LabelEntry,
     SnapshotManifest,
     SourceAdmission,
     SourceEntry,
     UnmatchedDetection,
     UnmatchedReason,
+    verdict_entry,
 )
 from flabel.provenance import build_device_source_entry, build_source_entry
 
@@ -183,7 +185,11 @@ def correlate(
         for detection in detections
     ]
 
-    matched: dict[str, list[SourceEntry]] = {}
+    # Detection AND entry, not just the entry (#138). Choosing a `threat-name` needs the
+    # detection's timestamp, and `SourceEntry` deliberately does not carry one — publishing a
+    # per-source timestamp is a schema addition nobody asked for, and it would invite being read
+    # as a property of the flow rather than of the alert.
+    matched: dict[str, list[tuple[Detection, SourceEntry]]] = {}
     matched_flows: dict[str, Flow] = {}
     unmatched: list[UnmatchedDetection] = []
 
@@ -200,7 +206,7 @@ def correlate(
                 UnmatchedDetection(detection=detection, reason=reason)  # type: ignore[arg-type]
             )
             continue
-        matched.setdefault(flow.uid, []).append(entry)
+        matched.setdefault(flow.uid, []).append((detection, entry))
         matched_flows[flow.uid] = flow
 
     result = CorrelationResult(
@@ -472,8 +478,46 @@ def _entry(
 # --- consolidation ---------------------------------------------------------------------------
 
 
+def _label_entries(pairs: Sequence[tuple[Detection, SourceEntry]]) -> tuple[LabelEntry, ...]:
+    """Everything this flow asserts, in canonical order (#138, schema 2.0).
+
+    **`verdict` comes from `models.verdict_entry`**, not built here, so no fixture can hand-build a
+    verdict entry that agrees with itself rather than with production. See that function for why it
+    carries every source's sid and the lowest tier.
+
+    **`threat-name` is asserted by exactly one detection**, and which one is Craig's decision 2:
+    tier precedence first, then the earliest detection. The comparator is `(ts, sid)` because
+    "earliest" is not a total order — two tier-1 detections can share a timestamp, and an
+    unordered pick would make the label differ between runs of one capture.
+
+    Tier precedence rarely decides anything here, and that is worth knowing rather than
+    discovering: `threat-name` is tier-1 only, and on a replay-only run *every* source is tier 1,
+    so `(ts, sid)` is the selection rule for the mode this label exists for.
+
+    A flow with no tier-1 source gets **no entry at all** — omitted, not null (decision 3). Spec
+    §2.5's distinction: the fact is not applicable, rather than measured and absent.
+    """
+    verdict = verdict_entry([entry for _, entry in pairs])
+
+    inline = [(detection, entry) for detection, entry in pairs if entry.tier == 1]
+    if not inline:
+        return (verdict,)
+
+    # `min` over the pairs rather than a sort, and keyed on the DETECTION: the timestamp is the
+    # alert's, and `sid` is only reached when two alerts share one.
+    detection, entry = min(inline, key=lambda pair: (pair[0].ts, pair[0].sid))
+    threat_name = LabelEntry(
+        name="threat-name", value=entry.threat, tier=entry.tier, sids=(entry.sid,)
+    )
+    # Sorted by name, which puts `threat-name` before `verdict`. Alphabetical rather than a
+    # hand-ordered precedence, for the reason every other collection here is: canonical output
+    # means the same data serialises the same way however it was assembled (spec §10), and a
+    # hand-ordered list is a second thing to keep in step as names are added.
+    return tuple(sorted((verdict, threat_name), key=lambda label: label.name))
+
+
 def _labels(
-    matched: Mapping[str, list[SourceEntry]], flows: Mapping[str, Flow]
+    matched: Mapping[str, list[tuple[Detection, SourceEntry]]], flows: Mapping[str, Flow]
 ) -> tuple[Label, ...]:
     """One `Label` per flow that any detection fired on, in spec §10's order.
 
@@ -489,13 +533,13 @@ def _labels(
     labels = [
         Label(
             flow=flows[uid],
-            verdict="malicious",
             # Lower is higher trust (spec §4), so the best tier is the minimum. `Label`
             # re-derives this and refuses a value that disagrees.
-            best_tier=min(entry.tier for entry in entries),
-            sources=tuple(sorted(entries, key=_source_order)),
+            best_tier=min(entry.tier for _, entry in pairs),
+            labels=_label_entries(pairs),
+            sources=tuple(sorted((entry for _, entry in pairs), key=_source_order)),
         )
-        for uid, entries in matched.items()
+        for uid, pairs in matched.items()
     ]
     return tuple(sorted(labels, key=lambda label: (label.flow.ts_first, label.flow.uid)))
 

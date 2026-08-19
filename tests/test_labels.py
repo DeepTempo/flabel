@@ -40,6 +40,7 @@ from flabel.models import (
     SourceAdmission,
     SourceEntry,
     UnmatchedDetection,
+    verdict_entry,
 )
 from flabel.rules import utc_now
 
@@ -120,8 +121,10 @@ def make_label(flow: Flow | None = None, *entries: SourceEntry) -> Label:
     sources = entries or (make_entry(),)
     return Label(
         flow=flow or make_flow(),
-        verdict="malicious",
         best_tier=min(entry.tier for entry in sources),
+        # Through `models.verdict_entry`, never hand-built: a fixture that assembles its own
+        # verdict entry agrees with itself rather than with what production writes (#138).
+        labels=(verdict_entry(sources),),
         sources=sources,
     )
 
@@ -273,7 +276,7 @@ def test_schema_version_is_one_constant_in_both_places_the_spec_names_it():
     Phase 2 adds tier-1 entries — so a consumer keying off either must see the same string.
     """
     decoded = json.loads(serialise(document(labels=(make_label(),))))
-    assert decoded["schema_version"] == SCHEMA_VERSION == "1.0"
+    assert decoded["schema_version"] == SCHEMA_VERSION == "2.0"
     assert decoded["run"]["schema_version"] == SCHEMA_VERSION
 
 
@@ -554,7 +557,13 @@ def test_optional_flow_fields_stay_null_rather_than_becoming_placeholders():
 def test_the_verdict_is_always_malicious():
     """Spec §13's first never-do. Asserted over the file, where a consumer reads it."""
     decoded = json.loads(serialise(document(labels=(make_label(),))))
-    assert {entry["verdict"] for entry in decoded["labels"]} == {"malicious"}
+    verdicts = {
+        label["value"]
+        for entry in decoded["labels"]
+        for label in entry["labels"]
+        if label["name"] == "verdict"
+    }
+    assert verdicts == {"malicious"}
 
 
 def test_a_dataclass_that_was_not_converted_is_refused():

@@ -160,7 +160,10 @@ def test_one_flow_and_one_detection_yield_one_label():
 
     assert len(result.labels) == 1
     label = result.labels[0]
-    assert label.verdict == "malicious"
+    assert [entry.name for entry in label.labels] == ["verdict"], (
+        "a tier-2 detection asserts a verdict and no threat-name (#138 decision 3)"
+    )
+    assert label.labels[0].value == "malicious"
     assert label.best_tier == 2
     assert len(label.sources) == 1
     entry = label.sources[0]
@@ -1516,3 +1519,139 @@ def test_a_run_with_no_detections_does_not_warn_about_a_classification_it_never_
     result = correlate([], by_uid(make_flow()), manifest, address_indicators=None)
 
     assert result.warnings == ()
+
+
+# --- threat-name, and multiple labels per flow (#138) -----------------------------------------
+#
+# `verdict` was a field until schema 2.0; a `Label` now carries a list. Every test here asserts on
+# what is IN that list and, as often, on what is absent from it — an omitted `threat-name` is the
+# published form of "this tier cannot supply one" (decision 3), so its absence is a result.
+
+
+def labels_by_name(label) -> dict[str, object]:
+    """This label's entries keyed by name. `Label` already forbids a repeated name."""
+    return {entry.name: entry for entry in label.labels}
+
+
+def inline(**overrides):
+    """A tier-1 detection, which is the only thing that produces a `threat-name` today."""
+    fields = {"tier": 1, "source": "panw", "sid": 30001, "threat": "Realtek SDK RCE"}
+    return make_detection(**{**fields, **overrides})
+
+
+def correlate_inline(detections, flow=None):
+    detections = list(detections)
+    return correlate(
+        detections,
+        by_uid(flow or make_flow()),
+        make_manifest(),
+        NO_GATE,
+        device_rulesets=device_rulesets(*detections),
+    )
+
+
+def test_a_tier_1_detection_publishes_a_threat_name_beside_the_verdict():
+    """The feature: a flow carries two assertions, each naming what asserts it."""
+    result = correlate_inline([inline()])
+
+    (label,) = result.labels
+    entries = labels_by_name(label)
+    assert sorted(entries) == ["threat-name", "verdict"]
+    threat = entries["threat-name"]
+    assert threat.value == "Realtek SDK RCE"
+    assert threat.tier == 1
+    assert threat.sids == (30001,), "a threat-name is asserted by one detection, not by the flow"
+
+
+def test_a_suricata_only_flow_carries_no_threat_name_entry():
+    """Decision 3: omitted, not null. §2.5 — not applicable is not the same as measured-as-nothing.
+
+    Asserted as an absence deliberately. A null would make every consumer check a value to learn
+    something the shape already says, and it would collide with §10's use of null for "not
+    measured".
+    """
+    result = correlate([make_detection(tier=2)], by_uid(make_flow()), make_manifest(), NO_GATE)
+
+    (label,) = result.labels
+    assert "threat-name" not in labels_by_name(label)
+    assert [entry.name for entry in label.labels] == ["verdict"]
+
+
+def test_the_earliest_tier_1_detection_supplies_the_threat_name():
+    """Craig's rule: earliest wins. Both orders are correlated, so input order cannot decide it."""
+    early = inline(sid=30001, threat="First Threat", ts=1_700_000_001.0)
+    late = inline(sid=30002, threat="Second Threat", ts=1_700_000_009.0)
+
+    forwards = correlate_inline([early, late])
+    backwards = correlate_inline([late, early])
+
+    for result in (forwards, backwards):
+        (label,) = result.labels
+        assert labels_by_name(label)["threat-name"].value == "First Threat"
+
+
+def test_an_exact_timestamp_tie_breaks_on_the_lowest_sid():
+    """ "Earliest" is not a total order, and the label has to be the same on every run.
+
+    Two tier-1 detections sharing a timestamp is not exotic: PAN-OS timestamps threat logs to the
+    second, and tier-1 times are further compressed by the replay's inversion. Without a second key
+    the pick would follow dict order, which is input order, which is not a property of the capture.
+    """
+    high = inline(sid=39999, threat="High Sid", ts=1_700_000_005.0)
+    low = inline(sid=30001, threat="Low Sid", ts=1_700_000_005.0)
+
+    forwards = correlate_inline([high, low])
+    backwards = correlate_inline([low, high])
+
+    for result in (forwards, backwards):
+        (label,) = result.labels
+        entries = labels_by_name(label)
+        assert entries["threat-name"].value == "Low Sid"
+        assert entries["threat-name"].sids == (30001,)
+
+
+def test_tier_1_wins_the_threat_name_over_tier_2_and_tier_2_keeps_its_provenance():
+    """Decision 2, including the half that is a loss.
+
+    Tier 2's threat name does not become a label — that is the trade for one trainable value per
+    flow. What it must not lose is its place in `sources[]`, because dropping it there would make
+    the document forget that Suricata fired at all.
+    """
+    device = inline(sid=30001, threat="Device Threat Name", ts=1_700_000_009.0)
+    # DELIBERATELY earlier than the tier-1 detection: tier must beat time, or the precedence in
+    # decision 2 is not what decides.
+    rule = make_detection(tier=2, sid=2011465, threat="ET MALWARE Example", ts=1_700_000_001.0)
+
+    result = correlate_inline([device, rule])
+
+    (label,) = result.labels
+    entries = labels_by_name(label)
+    assert entries["threat-name"].value == "Device Threat Name"
+    assert entries["threat-name"].tier == 1
+    assert label.best_tier == 1
+
+    threats = {source.threat for source in label.sources}
+    assert threats == {"Device Threat Name", "ET MALWARE Example"}, (
+        "tier 2 loses promotion to a label, not its entry in sources[]"
+    )
+
+
+def test_the_verdict_carries_every_source_that_asserted_it():
+    """`verdict` is the whole flow's claim, so it names every sid behind it — sorted and unique."""
+    result = correlate_inline(
+        [inline(sid=30002), inline(sid=30001), inline(sid=30002)],
+    )
+
+    (label,) = result.labels
+    verdict = labels_by_name(label)["verdict"]
+    assert verdict.sids == (30001, 30002), "sorted, and a rule firing twice is one sid"
+    assert len(label.sources) == 3, "sources[] still records all three firings"
+
+
+def test_the_label_entries_are_in_canonical_order():
+    """Goal 2 compares run directories byte for byte, so the order cannot follow assembly."""
+    result = correlate_inline([inline()])
+
+    (label,) = result.labels
+    names = [entry.name for entry in label.labels]
+    assert names == sorted(names)
