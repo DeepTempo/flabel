@@ -9,8 +9,11 @@ a claim about this module and almost nothing else: every other stage is determin
 and the one place determinism can be lost is a serialiser that lets input order, dict insertion
 order, host timezone or locale through into the output. So each rule below is a contract:
 
-* every array is explicitly ordered — `labels` by `(ts_first, uid)`, a label's `sources` by
-  `(tier, source, sid, rev, direction)`, `unmatched_detections` by `(ts, source, sid)`;
+* every array is explicitly ordered — `labels` by `(ts_first, uid)`, a label's own assertions by
+  `name`, a label's `sources` by `(tier, source, sid, rev, direction)`, `unmatched_detections` by
+  `(ts, source, sid)`. The assertions were missing from this list when #138 added them, which is
+  the failure mode this docstring exists to prevent: the order was enforced in `models.py` and the
+  document claiming to enumerate what must be ordered did not mention it (#140);
 * object keys are sorted by the encoder rather than by construction order;
 * every moment in time is one format — ISO-8601 UTC, microsecond precision, `Z` suffix — so an
   epoch float never reaches a slot a reader will parse as a string;

@@ -291,8 +291,10 @@ my-capture_2026-08-11T213045Z/
     "ts_first": "...", "ts_last": "...",
     "ja4": "t13d1516h2_8daaf6152771_02713d6af862"
   },
-  "verdict": "malicious",
   "best_tier": 2,
+  "labels": [
+    { "name": "verdict", "value": "malicious", "tier": 2, "sids": [2028831] }
+  ],
   "sources": [
     { "tier": 2, "source": "suricata", "sid": 2028831, "rev": 1,
       "ruleset": "snap-9f2c1a…", "admission_basis": "metadata-filter",
@@ -301,6 +303,17 @@ my-capture_2026-08-11T213045Z/
   ]
 }
 ```
+
+**`labels[]` replaced a top-level `verdict` in schema 2.0** (#138). The example above is a
+tier-2-only flow, so it carries no `threat-name`: that label is inline-only and is **omitted**
+rather than nulled when no tier-1 detection reached the flow. An inline flow adds
+
+```json
+{ "name": "threat-name", "value": "Realtek SDK Command Execution", "tier": 1, "sids": [30001] }
+```
+
+Each entry names the tier and sids behind **it**, because once a label is narrower than the whole
+`sources[]` list the document can no longer imply that list explains all of them.
 
 ### 6.7 CLI & Run Modes — *Phase 1*
 

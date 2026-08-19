@@ -227,7 +227,7 @@ has to create a shared type collides with its siblings in the file meant to prev
 | `SourceAdmission.url` | Otherwise a label's origin traces only to a source *name* in a TOML file that can change between runs. |
 | `SourceAdmission.rules_excluded_commented` | ET Open 8.0 ships 19,479 `#alert` lines against 51,778 active rules. Without this counter §6's `fetched == admitted + sum(excluded)` identity cannot describe the feed. `rules_fetched` therefore counts active `alert` lines only. |
 
-**The `Literal` types are enforced at runtime**, not merely annotated: `Label(verdict="benign")`
+**The `Literal` types are enforced at runtime**, not merely annotated: a forged `LabelEntry(name="verdict", value="benign", …)`
 would otherwise construct happily, and §13's first never-do is asserting a flow is benign. A
 `Label` also rejects empty `sources` (a label with no assertion has no provenance) and a
 `best_tier` disagreeing with `min(sources.tier)`.
@@ -396,12 +396,31 @@ list (Goal 1, §13).
 null. §2.5's distinction: the fact is not applicable to a Suricata-only flow, rather than measured
 and absent. Extending it to tier 2 is therefore purely additive.
 
-**Which tier-1 detection supplies it is decided by `(ts, sid)`** (Craig, 2026-08-19): lowest tier
-first, then the earliest detection, with `sid` breaking exact timestamp ties. The second key is not
-optional — "earliest" is not a total order, and two tier-1 detections can share a timestamp, which
-would make the label differ between runs of one capture. Note that tier precedence rarely decides
-anything: `threat-name` is tier-1 only, so on a replay-only run every source is tier 1 and `(ts,
-sid)` *is* the rule.
+**Which tier-1 detection supplies it is decided by `(unestablished, ts, sid)`** (Craig,
+2026-08-19): lowest tier first, then the earliest detection, with `sid` breaking timestamp ties and
+a detection whose timestamp could not be established sorted last.
+
+**`sid` is what makes this stable, not `ts`** — an earlier draft of this section claimed the
+opposite and was wrong (#140). PAN-OS writes `receive_time` to the **second**
+(`%Y/%m/%d %H:%M:%S`, no sub-second field) off the device's wall clock, and a whole capture replays
+in seconds, so two threats on one flow routinely share a timestamp: the tie-break is the common
+path rather than the edge case. What the comparator guarantees is that it is *total* — given the
+same alerts, the same threat name is chosen — not that the timestamps are precise. Nothing in
+flabel can make them so; PAN-OS supplies seconds.
+
+The leading key exists because `panw._receive_epoch` yields `0.0` for an unparseable
+`receive_time`, and `0.0` is the minimum of every real epoch — so a parse failure would otherwise
+outrank every genuine alert and name the flow. Sorted last, it supplies the label only when it is
+the only candidate.
+
+**A device entry PAN-OS sent no threat name for supplies no `threat-name` at all.** `panw`
+substitutes a placeholder so `SourceEntry.threat` is never empty (§4 forbids that), and promoting it
+would assert that the threat is *called* "unnamed". The placeholder stays in `sources[]`, which is
+the record of what arrived; the label is omitted, which is this section's own rule for a fact that
+is not available.
+
+Note that tier precedence rarely decides anything: `threat-name` is tier-1 only, so on a
+replay-only run every source is tier 1 and the rest of the comparator *is* the rule.
 
 When both tiers flag a flow, **tier 2's threat name does not become a label**. It remains in
 `sources[].threat` with its full provenance; what it loses is promotion. Recorded as a deliberate
@@ -1054,6 +1073,10 @@ Reproducibility depends entirely on this being exact.
 
 - `labels` sorted by `(flow.ts_first, flow.uid)`.
 - `sources` within a label sorted by `(tier, source, sid, rev, direction)`. `direction` joined the key with the field (issue #115): one rule matching both halves of a flow used to yield two identical entries, so the tie was unobservable, and eve.json's record order is not *guaranteed* stable between runs — the instability measured below is in `flow` records rather than `alert` records, so this closes a latent tie rather than an observed failure.
+- `labels` within a label — the assertions themselves — sorted by `name` (#138). Alphabetical
+  rather than a hand-ordered precedence, for the reason every other collection here is sorted
+  mechanically: a curated order is a second thing to keep in step as names are added. It puts
+  `threat-name` before `verdict`, which reads oddly and is the price of the rule.
 - `unmatched_detections` sorted by `(ts, source, sid)`.
 - `json.dump(..., sort_keys=True, indent=2, ensure_ascii=False)`, trailing newline.
 - Timestamps: ISO-8601 UTC with microsecond precision and a `Z` suffix. One format everywhere.

@@ -32,7 +32,8 @@ DEFAULT_THRESHOLD = 0.01
 def _check(value: object, allowed: tuple[object, ...], field: str, owner: str) -> None:
     """Reject a value outside its `Literal`.
 
-    `Literal` is a type hint, not a runtime check: without this, `Label(verdict="benign")`
+    `Literal` is a type hint, not a runtime check: without this, a forged
+    `LabelEntry(name="verdict", value="benign", ...)`
     constructs happily. Spec §13's first never-do is asserting a flow is benign, so the
     constraint is enforced rather than annotated.
 
@@ -78,6 +79,18 @@ AdmissionBasis = Literal["metadata-filter", "wholesale", "device-policy"]
 #: this exact value to render the non-obligation, which is why it lives here rather than in either
 #: of the two modules that need it.
 DEVICE_LICENCE = "proprietary:vendor-signature (not redistributed)"
+
+#: What `panw.detections` puts in `Detection.threat` when PAN-OS supplied no threat name at all.
+#:
+#: **Here rather than in `panw.py`, for the same reason `DEVICE_LICENCE` is** — two modules need to
+#: agree on it, and a string literal repeated in both is a string literal that can drift. `panw`
+#: writes it; `correlate` reads it, to keep it out of a `threat-name` label (#140).
+#:
+#: A sentinel rather than an empty string because spec §4 forbids an empty `threat`: a source entry
+#: has to say *something* about what fired, and "the device sent no name" is that something. What it
+#: must not do is get promoted to a label, where it would assert that the threat is called
+#: "unnamed".
+DEVICE_UNNAMED_THREAT = "unnamed"
 
 #: Which pipelines the operator asked for, named after the flag that selects each (#132,
 #: Craig 2026-08-18). Phase 1 recorded a single hardcoded `"offline"` because there was only one
@@ -634,6 +647,14 @@ def verdict_entry(sources: Sequence[SourceEntry]) -> LabelEntry:
     tier. The sids are deduplicated: a rule firing twice keeps both `sources[]` entries, because
     collapsing them would say the rule fired once, but the label's sid list is the set of what is
     behind the claim rather than a count of firings.
+
+    **`sids` is a set of signature ids, NOT one element per asserting source** (#140), and the
+    difference is visible: PANW threat ids and Suricata sids share no namespace, so a tier-1
+    detection and a tier-2 rule that happen to use the same number publish one sid where two
+    sources asserted. Nothing becomes untraceable — `sources[]` still carries both entries in full,
+    which is where per-source detail belongs — so this is the reading being pinned down rather than
+    a defect. Carrying `(source, sid)` pairs instead would be a second schema break for something
+    no consumer has been misled by.
     """
     if not sources:
         raise ValueError(
@@ -701,6 +722,30 @@ class Label:
             )
         if tuple(sorted(names)) != tuple(names):
             raise ValueError(f"Label.labels is not sorted by name: {names}")
+
+        # **Every entry's provenance is checked, not only the verdict's** (#140). The first version
+        # of this validated `verdict` thoroughly and the others not at all, so a `threat-name`
+        # naming a sid no source carries — or a tier no source has — serialised looking exactly as
+        # traceable as one that was real. `LabelEntry`'s docstring claims this is where Goal 1 is
+        # carried for assertions narrower than `sources[]`; that claim needs a guard behind it.
+        #
+        # Checked against `sources` rather than trusted from the builder because this is the model
+        # every producer goes through, and a hand-built `Label` in a fixture is a producer too.
+        by_sid: dict[int, set[int]] = {}
+        for source in self.sources:
+            by_sid.setdefault(source.sid, set()).add(source.tier)
+        for entry in self.labels:
+            unknown = [sid for sid in entry.sids if sid not in by_sid]
+            if unknown:
+                raise ValueError(
+                    f"Label.labels[{entry.name!r}] cites sid(s) {unknown} that no source on this "
+                    f"flow carries: the assertion cannot be traced (Goal 1)"
+                )
+            if not any(entry.tier in by_sid[sid] for sid in entry.sids):
+                raise ValueError(
+                    f"Label.labels[{entry.name!r}] claims tier {entry.tier}, which none of its "
+                    f"own sources {list(entry.sids)} was reported at"
+                )
 
 
 @dataclass(frozen=True)

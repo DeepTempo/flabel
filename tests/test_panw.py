@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from flabel import panw
+from flabel.models import DEVICE_UNNAMED_THREAT
 
 #: Six entries in the exact shape the device returned on 2026-08-17 — field names verified against
 #: a live response, which is why `category` reads `any` and the threat category is `thr_category`.
@@ -380,3 +381,36 @@ def test_the_same_signature_on_a_different_tuple_is_not_collapsed():
 def test_nothing_is_collapsed_when_nothing_repeats():
     kept, collapsed = panw.deduplicate([_det(40023, 1787004700.0), _det(54482, 1787004701.0)])
     assert len(kept) == 2 and collapsed == 0
+
+
+def test_an_entry_with_no_threat_name_uses_the_shared_placeholder():
+    """The placeholder must be the constant `correlate` filters on, not a local string (#140).
+
+    This is the whole reason `DEVICE_UNNAMED_THREAT` lives in `models.py` rather than here. If this
+    module writes a *different* stand-in, `correlate._label_entries` stops recognising it and the
+    placeholder gets promoted to a published `threat-name` — asserting that the device named the
+    threat "unnamed-x", or whatever the drifted string happens to be.
+
+    The sabotage that found this gap did exactly that: changing the literal here left every test
+    green while re-opening the bug #140 closed.
+    """
+    xml = (
+        "<result><log><logs>"
+        "<entry logid='1'>"
+        "<receive_time>2026/08/17 13:49:43</receive_time>"
+        "<subtype>vulnerability</subtype>"
+        "<src>10.0.0.1</src><dst>10.0.0.2</dst>"
+        "<sport>1234</sport><dport>80</dport><proto>tcp</proto>"
+        "<threatid></threatid><tid>91535</tid>"
+        "<severity>critical</severity><thr_category>code-execution</thr_category>"
+        "<contentver>AppThreat-9136-10199</contentver>"
+        "<direction>client-to-server</direction><action>drop</action>"
+        "</entry>"
+        "</logs></log></result>"
+    )
+
+    found, _declined, _rulesets = panw.detections(panw.iter_entries(xml))
+
+    assert [d.threat for d in found] == [DEVICE_UNNAMED_THREAT], (
+        "an unnamed threat must carry the constant correlate filters on"
+    )

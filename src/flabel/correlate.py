@@ -37,6 +37,7 @@ from flabel.errors import CorrelationError, SnapshotError
 from flabel.models import (
     CORRELATABLE_PROTOCOLS,
     DEFAULT_THRESHOLD,
+    DEVICE_UNNAMED_THREAT,
     CorrelationResult,
     Detection,
     Flow,
@@ -499,13 +500,29 @@ def _label_entries(pairs: Sequence[tuple[Detection, SourceEntry]]) -> tuple[Labe
     """
     verdict = verdict_entry([entry for _, entry in pairs])
 
-    inline = [(detection, entry) for detection, entry in pairs if entry.tier == 1]
+    inline = [
+        (detection, entry)
+        for detection, entry in pairs
+        # A device entry PAN-OS sent no threat name for must not become a `threat-name` (#140).
+        # `panw` substitutes `DEVICE_UNNAMED_THREAT` so `SourceEntry.threat` is never empty — spec
+        # §4 forbids that — and the placeholder is the honest record of what arrived. Promoting it
+        # would assert that the threat is *called* "unnamed", in the one field the PRD calls the
+        # trainable value. Decision 3 applied to the same situation: omit the label rather than fill
+        # it with a stand-in.
+        if entry.tier == 1 and entry.threat != DEVICE_UNNAMED_THREAT
+    ]
     if not inline:
         return (verdict,)
 
     # `min` over the pairs rather than a sort, and keyed on the DETECTION: the timestamp is the
     # alert's, and `sid` is only reached when two alerts share one.
-    detection, entry = min(inline, key=lambda pair: (pair[0].ts, pair[0].sid))
+    #
+    # **An unparseable `receive_time` sorts LAST, not first** (#140). `panw._receive_epoch` returns
+    # `0.0` when neither format matches, and `0.0` is the minimum of every real epoch — so before
+    # this, one malformed timestamp in a threat-log response made that entry's threat name the
+    # flow's published label, chosen for having failed to parse. Now it is picked only when it is
+    # the only candidate, which is the difference between a fallback and a preference.
+    detection, entry = min(inline, key=_threat_name_order)
     threat_name = LabelEntry(
         name="threat-name", value=entry.threat, tier=entry.tier, sids=(entry.sid,)
     )
@@ -514,6 +531,24 @@ def _label_entries(pairs: Sequence[tuple[Detection, SourceEntry]]) -> tuple[Labe
     # means the same data serialises the same way however it was assembled (spec §10), and a
     # hand-ordered list is a second thing to keep in step as names are added.
     return tuple(sorted((verdict, threat_name), key=lambda label: label.name))
+
+
+def _threat_name_order(pair: tuple[Detection, SourceEntry]) -> tuple[bool, float, int]:
+    """Which tier-1 detection supplies the `threat-name`: earliest, then lowest sid (#138, #140).
+
+    The leading flag pushes an unestablished timestamp to the back. `0.0` is a real epoch (1970)
+    and never a real threat log, so treating it as "no timestamp" costs nothing and stops a parse
+    failure from outranking every genuine alert.
+
+    **`sid` is what makes this stable, not `ts`** — and the docstring on #138 said the opposite,
+    which was wrong. PAN-OS writes `receive_time` to the SECOND (`%Y/%m/%d %H:%M:%S`, no sub-second
+    field), off the device's wall clock, and a whole capture replays in seconds — so two threats on
+    one flow routinely share a timestamp and the tie-break is the common path, not the edge case.
+    What the comparator guarantees is that it is *total*: given the same alerts, the same threat
+    name is chosen. It cannot make second-granularity timestamps more precise than they are.
+    """
+    detection, _ = pair
+    return (detection.ts == 0.0, detection.ts, detection.sid)
 
 
 def _labels(
