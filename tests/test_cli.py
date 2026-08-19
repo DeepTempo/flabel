@@ -781,11 +781,39 @@ def test_no_shortfall_asks_nothing(
 # --- run directory naming -------------------------------------------------------------------
 
 
+def capture_part(directory: str) -> str:
+    """The capture-name portion of a run directory name, with the `LABELED_` prefix removed.
+
+    A helper rather than `split("_")[0]` at six call sites, because after #134 that expression
+    returns `"LABELED"` for every input — the tests below would all still pass and none of them
+    would be testing anything. Anchored on the prefix constant so it cannot drift from it.
+    """
+    assert directory.startswith(cli.RUN_DIR_PREFIX), f"{directory} lost the producer prefix"
+    return directory[len(cli.RUN_DIR_PREFIX) :].split("_")[0]
+
+
 def test_the_run_directory_is_named_for_the_capture_and_the_time() -> None:
-    """Spec §1: `{capture-name}_{datetime}/`."""
+    """Spec §1: `LABELED_{capture-name}_{datetime}/`."""
     when = datetime(2026, 8, 13, 14, 25, 30, 123456, tzinfo=UTC)
 
-    assert cli.run_directory_name(Path("/tmp/benign.pcap"), when).startswith("benign_")
+    assert cli.run_directory_name(Path("/tmp/benign.pcap"), when).startswith("LABELED_benign_")
+
+
+def test_the_prefix_marks_the_producer_and_does_not_claim_labels_exist() -> None:
+    """#134. The name is fixed before the outcome is known, so it cannot mean "labels present".
+
+    Spelled out as a test because the word invites the opposite reading, and the run that most
+    needs the distinction — one that died and wrote only `run.json` — is named identically to one
+    that succeeded. `tools/flabel-run` is what refuses to publish the former.
+    """
+    when = datetime(2026, 8, 13, 14, 25, 30, 123456, tzinfo=UTC)
+
+    assert cli.RUN_DIR_PREFIX == "LABELED_"
+    # Same capture, same name, whatever happens later in the run: nothing about the outcome is
+    # available at naming time, and this asserts the function takes no outcome argument.
+    assert cli.run_directory_name(Path("x.pcap"), when) == cli.run_directory_name(
+        Path("x.pcap"), when
+    )
 
 
 @pytest.mark.parametrize(
@@ -809,7 +837,7 @@ def test_every_capture_suffix_is_stripped_from_the_run_directory_name(
     """
     when = datetime(2026, 8, 13, 14, 25, 30, 123456, tzinfo=UTC)
 
-    assert cli.run_directory_name(Path(name), when).split("_")[0] == expected
+    assert capture_part(cli.run_directory_name(Path(name), when)) == expected
 
 
 @pytest.mark.parametrize(
@@ -838,8 +866,17 @@ def test_a_run_directory_is_never_hidden_from_ls(name: str, expected: str) -> No
 
     directory = cli.run_directory_name(Path(name), when)
 
+    # Asserted on the part AFTER the prefix, not on the whole name. Since #134 every name begins
+    # with `LABELED_`, so `not directory.startswith(".")` is true by construction and would have
+    # retired this test while leaving it green — the exact failure mode `docs/status.yaml` keeps
+    # recording. What #95 is about is whether the *capture-derived* part can still hide the
+    # directory, and that is what is checked here.
+    remainder = directory[len(cli.RUN_DIR_PREFIX) :]
+    assert not remainder.startswith("."), (
+        f"{name!r} produced a run directory whose capture part is hidden: {directory}"
+    )
     assert not directory.startswith("."), f"{name!r} produced a hidden run directory: {directory}"
-    assert directory.split("_")[0] == expected
+    assert capture_part(directory) == expected
 
 
 def test_run_directory_names_sort_chronologically() -> None:

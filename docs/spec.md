@@ -15,7 +15,7 @@ Terms are used exactly as defined here, in code and in output.
 | **capture** | The input file as supplied by the operator: `pcap`, `pcapng`, optionally gzipped. |
 | **normalized capture** | The single `pcap` file derived from the capture that every consumer reads. Never the original artifact. |
 | **run** | One invocation of flabel against one capture. Produces exactly one run directory. |
-| **run directory** | `{capture-name}_{datetime}/` — the complete, self-contained output of a run. |
+| **run directory** | `LABELED_{capture-name}_{datetime}/` — the complete, self-contained output of a run. The prefix marks the producer and is **not** an assertion that labels were written: the name is fixed before the outcome is known, so a failed run leaves a `LABELED_` directory holding `run.json` and no `labels.json` (#23, #134). |
 | **flow** | A Zeek connection, identified by its `uid`. The authoritative unit of identity in the system. |
 | **detection** | One alert from one source. Not yet tied to a flow. |
 | **label** | A verdict about one flow, carrying every detection that asserted it. |
