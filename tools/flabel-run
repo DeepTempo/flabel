@@ -68,6 +68,8 @@ usage:
 arguments:
   <capture>        A local path, absolute or relative, or a gs:// object. A gs:// object is
                    staged into /var/lib/flabel/captures first and reused if already there.
+                   Staging is attempted as the instance service account and then as you; if
+                   neither can read it, both errors are reported.
   [flabel args]    Anything after the capture is passed straight to flabel. Most useful:
                      (no flag)                  tier 1 only: replay past the firewall and label
                                                 from its threat logs. This is the default.
@@ -117,11 +119,57 @@ output:
 
 examples:
   flabel-run ./capture.pcap
-  flabel-run gs://pm-proto-496816-flabel-pcaps/attackcollect/capture_2026-07-07.pcap
+  flabel-run gs://tempo-datasets-002-north-south/ash/capture_2026-07-10_pub-216.106.176.186.pcap
   flabel-run ./capture.pcap --both
   flabel-run ./capture.pcap --offline
   FLABEL_REPLAY_MULTIPLIER=200 FLABEL_SETTLE_SECONDS=30 flabel-run ./capture.pcap
 EOF
+}
+
+#: Fetch a `gs://` capture, trying BOTH identities the box has (#136).
+#:
+#: There are two, they fail differently, and on 2026-08-19 neither could read the object Craig
+#: asked for — so surfacing only one attempt's error made a two-part access problem look like a
+#: one-part one:
+#:
+#:   * the instance service account (via $PUBLISH_SUDO) — durable, unattended, and the identity
+#:     bucket grants are made to. Tried FIRST, so the ordinary path is one attempt and a scheduled
+#:     run behaves the same as an interactive one.
+#:   * the invoking user's own gcloud — the fallback, for an object the operator can reach and the
+#:     box has not been granted. Frequently has no credential on a shared lab VM at all, which is
+#:     exactly why it cannot be the only one tried.
+#:
+#: Trying both is safe **because this is a read**. `run.input.sha256` records the capture, not who
+#: fetched it, so which identity succeeded changes nothing a label asserts. The publish is the
+#: opposite case and stays service-account-only: what may be written, and by whom, is the whole
+#: point of the `objectCreator` grant.
+stage_capture() {
+  local uri="$1" dest="$2" root_err caller_err
+  if root_err="$($PUBLISH_SUDO $GCLOUD storage cp "$uri" "$dest" 2>&1)"; then
+    return 0
+  fi
+  if caller_err="$($GCLOUD storage cp "$uri" "$dest" 2>&1)"; then
+    echo "flabel-run: fetched as $(whoami); the service account could not read it" >&2
+    return 0
+  fi
+
+  # Both errors, both identities, and what to do about it. The 403 alone named one principal and
+  # read like the only thing that was wrong.
+  echo "flabel-run: cannot stage $uri — NEITHER identity on this host can read it." >&2
+  echo "flabel-run:" >&2
+  echo "flabel-run: as the service account (sudo):" >&2
+  printf '%s
+' "$root_err" | sed 's/^/flabel-run:   /' >&2
+  echo "flabel-run:" >&2
+  echo "flabel-run: as $(whoami):" >&2
+  printf '%s
+' "$caller_err" | sed 's/^/flabel-run:   /' >&2
+  echo "flabel-run:" >&2
+  echo "flabel-run: fix either one:" >&2
+  echo "flabel-run:   grant the instance service account objectViewer on that bucket, or" >&2
+  echo "flabel-run:   authenticate your own gcloud on this host, or" >&2
+  echo "flabel-run:   copy the capture to this host and pass a local path." >&2
+  return 1
 }
 
 case "${1:-}" in
@@ -167,11 +215,7 @@ if [[ "$TARGET" == gs://* ]]; then
     echo "flabel-run: already staged at $LOCAL"
   else
     echo "flabel-run: fetching $TARGET"
-    # Privileged for the same reason as the publish below, and this was already broken before
-    # #134 — staging a gs:// capture as a user whose gcloud has no usable credential fails the
-    # same way. Same defect, same one-line cause, fixed in the same breath rather than left as
-    # the half of it nobody had tripped over yet.
-    $PUBLISH_SUDO $GCLOUD storage cp "$TARGET" "$LOCAL"
+    stage_capture "$TARGET" "$LOCAL"
   fi
   TARGET="$LOCAL"
 fi
