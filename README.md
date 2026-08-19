@@ -111,13 +111,21 @@ is [`docs/prep-n-research.md`](docs/prep-n-research.md).
 One run produces one self-contained directory. Re-running never modifies a previous one.
 
 ```
-{capture-name}_{datetime}/
+LABELED_{capture-name}_{datetime}/
 ├── zeek/          Zeek's logs for this capture, retained as written
 ├── suricata/      eve.json and the engine's own logs
 ├── labels.json    malicious-flow verdicts, plus the run block
 ├── run.json       the run block on its own — written by every run
 └── NOTICE         attribution for every source whose rule text appears in the output
 ```
+
+`LABELED_` marks who produced the directory. It does **not** mean labels are inside: the name is
+fixed before the run's outcome is known, so a run that failed is named the same way and simply has
+no `labels.json`. That absence is the signal.
+
+On the replay box, `flabel-run` also publishes a run that *did* write `labels.json` to
+`gs://…/results/LABELED_{capture-name}_{datetime}.tar.gz`. A run with no labels is never published,
+so everything in that bucket has labels in it.
 
 `labels.json` holds one entry per malicious flow, each carrying every detection that asserted it,
 and a `run` block recording the input, the ruleset, the tool versions and every loss condition.

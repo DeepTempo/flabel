@@ -787,9 +787,16 @@ def capture_part(directory: str) -> str:
     A helper rather than `split("_")[0]` at six call sites, because after #134 that expression
     returns `"LABELED"` for every input — the tests below would all still pass and none of them
     would be testing anything. Anchored on the prefix constant so it cannot drift from it.
+
+    Split on the LAST underscore, which is the timestamp boundary, not the first (review of #134).
+    Real capture names contain underscores — the corpus has
+    `lax_capture_2026-07-10_pub-216.152.152.123` — so splitting on the first would return `"lax"`
+    and every assertion built on it would be about a truncation rather than about the name. No
+    current parametrisation happens to contain one, which is exactly why this is worth fixing
+    before someone adds a realistic name to those tables.
     """
     assert directory.startswith(cli.RUN_DIR_PREFIX), f"{directory} lost the producer prefix"
-    return directory[len(cli.RUN_DIR_PREFIX) :].split("_")[0]
+    return directory[len(cli.RUN_DIR_PREFIX) :].rsplit("_", 1)[0]
 
 
 def test_the_run_directory_is_named_for_the_capture_and_the_time() -> None:
@@ -825,6 +832,12 @@ def test_the_prefix_marks_the_producer_and_does_not_claim_labels_exist() -> None
         ("benign.pcapng.gz", "benign"),
         ("capture", "capture"),
         ("my.capture.2026.pcap", "my.capture.2026"),
+        # A real corpus name, underscores and all. The tables held none until #134's review, so
+        # the whole suite agreed with a helper that truncated at the first underscore.
+        (
+            "lax_capture_2026-07-10_pub-216.152.152.123.pcap",
+            "lax_capture_2026-07-10_pub-216.152.152.123",
+        ),
     ],
 )
 def test_every_capture_suffix_is_stripped_from_the_run_directory_name(

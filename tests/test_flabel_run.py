@@ -52,13 +52,28 @@ def lab(tmp_path: Path) -> dict[str, str]:
 printf "%s\\n" "$@" > {recorded}
 printf "CWD=%s\\n" "$PWD" >> {recorded}
 if [ -n "${{FAKE_MAKE_RUN:-}}" ]; then
-  d="$FLABEL_RUN_RUNS/$FAKE_MAKE_RUN"
+  # The run directory is created under the --output-dir this stub was ACTUALLY PASSED, taking the
+  # last occurrence exactly as argparse does. Reading $FLABEL_RUN_RUNS instead made the stub
+  # disagree with real flabel in the two cases that matter: a relative runs directory (the wrapper
+  # passes it resolved, the env var is not) and an operator-supplied --output-dir (which wins).
+  base=""
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--output-dir" ]; then base="$a"; fi
+    case "$a" in --output-dir=*) base="${{a#--output-dir=}}" ;; esac
+    prev="$a"
+  done
+  : "${{base:=$FLABEL_RUN_RUNS}}"
+  d="$base/$FAKE_MAKE_RUN"
   mkdir -p "$d/zeek"
   printf '%s' '{{"run":{{"mode":"replay"}}}}' > "$d/run.json"
   printf '%s' 'zeek log' > "$d/zeek/conn.log"
   if [ -n "${{FAKE_WRITE_LABELS:-}}" ]; then
     printf '%s' '{{"labels":[]}}' > "$d/labels.json"
   fi
+fi
+if [ -n "${{FAKE_STRAY_FILE:-}}" ] && [ -n "${{base:-}}" ]; then
+  printf '%s' 'not a run' > "$base/$FAKE_STRAY_FILE"
 fi
 if [ -n "${{FAKE_MAKE_SECOND_RUN:-}}" ]; then
   mkdir -p "$FLABEL_RUN_RUNS/$FAKE_MAKE_SECOND_RUN"
@@ -359,6 +374,11 @@ def test_a_missing_config_file_says_where_it_should_be(lab, tmp_path):
 
 RUN_NAME = "LABELED_some_20260819T120000.000000Z"
 
+#: `flabel succeeded and the result was not published`. Distinct from spec §12's exit 1 ("no
+#: labels.json"), because reusing 1 told a batch caller to discard a capture whose labels are
+#: intact on the box (review of #134).
+EXIT_NOT_PUBLISHED = 4
+
 
 def test_a_successful_run_is_published_under_the_run_directory_name(lab, tmp_path):
     """The whole feature: labels on the box become a tarball in the bucket, named to match."""
@@ -469,7 +489,9 @@ def test_a_failed_upload_does_not_report_success(lab, tmp_path):
         },
     )
 
-    assert result.returncode != 0, "a failed publish must not exit 0"
+    assert result.returncode == EXIT_NOT_PUBLISHED, (
+        "a failed publish must not exit 0, and must not claim the run failed either"
+    )
     assert "FAILED to publish" in result.stderr
     assert "labels are intact" in result.stderr
     assert (Path(lab["FLABEL_RUN_RUNS"]) / RUN_NAME / "labels.json").exists()
@@ -518,8 +540,10 @@ def test_two_new_directories_are_refused_rather_than_guessed_between(lab, tmp_pa
     )
 
     assert uploads(lab) == [], "with two candidates, nothing may be published"
-    assert "cannot tell which is this run's" in result.stderr
-    assert result.returncode != 0
+    assert "cannot tell which is this" in result.stderr
+    assert result.returncode == EXIT_NOT_PUBLISHED, (
+        "the run itself succeeded, so this is not spec §12's exit 1"
+    )
 
 
 def test_a_run_that_created_no_directory_publishes_nothing_and_says_so(lab, tmp_path):
@@ -689,4 +713,219 @@ def test_an_already_staged_capture_is_not_fetched_again(lab, tmp_path):
     )
     assert (staged_dir / "remote.pcap").read_bytes() == b"already here", (
         "the staged copy was replaced"
+    )
+
+
+# --- what the review of #134 found ------------------------------------------------------------
+
+
+def test_the_config_file_can_set_the_publishing_destination(lab, tmp_path):
+    """It could not, and the comment claimed it was the whole point of the override.
+
+    `RESULTS_URI` was resolved at the top of the script and `$CONF` is sourced ~100 lines later, so
+    a `FLABEL_RESULTS_URI` written into /var/lib/flabel/flabel.env was read and thrown away — and a
+    second lab publishing to its own bucket silently published to the first lab's, or 403'd against
+    it. The config file is exactly where a per-lab override belongs.
+    """
+    capture(tmp_path)
+    conf = Path(lab["FLABEL_RUN_CONF"])
+    conf.write_text(conf.read_text() + "export FLABEL_RESULTS_URI=gs://second-lab/results\n")
+
+    result = invoke(
+        lab,
+        "some.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            # Unset, so the config file's value is what decides.
+            "FLABEL_RESULTS_URI": "__unset__",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = uploads(lab)
+    assert len(calls) == 1, calls
+    assert calls[0].endswith(f"gs://second-lab/results/{RUN_NAME}.tar.gz"), calls[0]
+
+
+def test_the_caller_environment_still_beats_the_config_file_for_the_destination(lab, tmp_path):
+    """Moving the resolution must not invert the precedence the rest of the script guarantees."""
+    capture(tmp_path)
+    conf = Path(lab["FLABEL_RUN_CONF"])
+    conf.write_text(conf.read_text() + "export FLABEL_RESULTS_URI=gs://from-config/results\n")
+
+    result = invoke(
+        lab,
+        "some.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            "FLABEL_RESULTS_URI": "gs://from-caller/results",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert uploads(lab)[0].endswith(f"gs://from-caller/results/{RUN_NAME}.tar.gz")
+
+
+def test_publishing_can_be_switched_off_from_the_config_file(lab, tmp_path):
+    """The other half of the ordering bug: an empty value in the config did not switch it off."""
+    capture(tmp_path)
+    conf = Path(lab["FLABEL_RUN_CONF"])
+    conf.write_text(conf.read_text() + "export FLABEL_RESULTS_URI=\n")
+
+    result = invoke(
+        lab,
+        "some.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            "FLABEL_RESULTS_URI": "__unset__",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert uploads(lab) == []
+
+
+def test_a_trailing_slash_does_not_produce_a_double_slash_in_the_object_name(lab, tmp_path):
+    """`gs://bucket/results/` is the natural way to write a prefix, and GCS accepts `results//x`.
+
+    It creates an object no `results/` listing or download script matches, so it is lost rather
+    than wrong.
+    """
+    capture(tmp_path)
+
+    invoke(
+        lab,
+        "some.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            "FLABEL_RESULTS_URI": "gs://test-bucket/results/",
+        },
+    )
+
+    assert uploads(lab)[0].endswith(f"gs://test-bucket/results/{RUN_NAME}.tar.gz")
+    assert "//LABELED" not in uploads(lab)[0]
+
+
+def test_a_relative_runs_directory_survives_the_change_into_the_repo(lab, tmp_path):
+    """The same bug this script already fixed for the capture path, one variable over.
+
+    `$RUNS` was listed in the caller's directory and then written to under `$REPO`, so a run looked
+    like it had created several directories, published none of them, and failed.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    capture(work)
+
+    result = invoke(
+        lab,
+        "some.pcap",
+        extra={
+            "FLABEL_RUN_RUNS": "relruns",
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+        },
+        cwd=str(work),
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = uploads(lab)
+    assert len(calls) == 1, f"a relative runs directory broke publishing: {result.stderr}"
+    assert calls[0].endswith(f"{RUN_NAME}.tar.gz")
+
+
+def test_an_operator_supplied_output_dir_is_still_published_from(lab, tmp_path):
+    """The help lists `--output-dir` as supported AND promises a publish; both must be true.
+
+    argparse takes the last `--output-dir`, and the wrapper passes its own first — so the
+    operator's wins, the run lands elsewhere, and watching `$RUNS` saw nothing.
+    """
+    capture(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+
+    result = invoke(
+        lab,
+        "some.pcap",
+        "--output-dir",
+        str(elsewhere),
+        extra={"FAKE_MAKE_RUN": RUN_NAME, "FAKE_WRITE_LABELS": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = uploads(lab)
+    assert len(calls) == 1, f"an overridden output dir was not published from: {result.stderr}"
+    assert calls[0].endswith(f"{RUN_NAME}.tar.gz")
+
+
+def test_a_stray_file_in_the_output_directory_is_not_mistaken_for_a_run(lab, tmp_path):
+    """It used to satisfy the count, fail the `-d` test, and print "1 new directories"."""
+    capture(tmp_path)
+    runs = Path(lab["FLABEL_RUN_RUNS"])
+    runs.mkdir(parents=True, exist_ok=True)
+
+    result = invoke(
+        lab,
+        "some.pcap",
+        extra={
+            "FAKE_MAKE_RUN": RUN_NAME,
+            "FAKE_WRITE_LABELS": "1",
+            "FAKE_STRAY_FILE": "notes.txt",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = uploads(lab)
+    assert len(calls) == 1, f"a stray file confused run selection: {result.stderr}"
+    assert calls[0].endswith(f"{RUN_NAME}.tar.gz")
+
+
+def test_a_terminating_signal_is_forwarded_to_the_run(lab, tmp_path):
+    """`exec` forwarded signals for free; dropping it orphaned a root-privileged replay.
+
+    Without this, a SIGTERM — from `timeout`, systemd, or an operator — killed only the wrapper
+    while `tcpreplay` kept injecting into the firewall as root, after the operator believed the run
+    had stopped. Asserted by making the stubbed run sleep, terminating the wrapper, and checking
+    the child recorded a TERM rather than running to completion.
+    """
+    import signal
+    import time
+
+    capture(tmp_path)
+    marker = tmp_path / "child-state"
+    sleeper = tmp_path / "sleeping-sudo"
+    sleeper.write_text(
+        f"#!/bin/bash\ntrap 'printf terminated > {marker}; exit 143' TERM\n"
+        f"printf started > {marker}\nfor _ in $(seq 1 100); do sleep 0.1; done\n"
+        f"printf finished > {marker}\n"
+    )
+    sleeper.chmod(0o755)
+
+    env = {**os.environ, **{k: v for k, v in lab.items() if not k.startswith("_")}}
+    env["FLABEL_RUN_SUDO"] = str(sleeper)
+    process = subprocess.Popen(
+        [str(WRAPPER), "some.pcap"],
+        env=env,
+        cwd=str(tmp_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    for _ in range(100):
+        if marker.exists():
+            break
+        time.sleep(0.05)
+    assert marker.read_text() == "started", "the stubbed run never started"
+
+    process.send_signal(signal.SIGTERM)
+    process.wait(timeout=20)
+
+    for _ in range(100):
+        if marker.read_text() != "started":
+            break
+        time.sleep(0.05)
+    assert marker.read_text() == "terminated", (
+        "the run was orphaned: the wrapper died and left it running"
     )
