@@ -1788,6 +1788,12 @@ def test_source_uri_is_published_as_run_input_uri(tmp_path: Path, rules_dir: Pat
     run = _run_block_of(out)
     assert run["input"]["uri"] == uri
     assert run["input"]["uri_status"] == "gs"
+    # The no-guard gap a review found: before these two lines, `_input_section` could have
+    # published `null` for both on the SUCCESS path and the whole suite stayed green. The §10 test
+    # asserts key PRESENCE only, and the values were checked in `normalize` unit tests and in the
+    # dead-run null test — never in a real document.
+    assert run["input"]["link_type"] == 1, "EN10MB, measured, not null"
+    assert run["input"]["snaplens"] == [65535], "a real list of real values"
 
 
 def test_without_source_uri_the_status_says_local_rather_than_leaving_a_bare_null(
@@ -1816,6 +1822,13 @@ def test_without_source_uri_the_status_says_local_rather_than_leaving_a_bare_nul
         pytest.param("s3://bucket/object", id="wrong-scheme"),
         pytest.param("gs://bucket", id="a-bucket-is-not-an-object"),
         pytest.param("gs://", id="scheme-only"),
+        pytest.param("gs://user:pa55w0rd@bucket/obj", id="CREDENTIALS-in-the-uri"),
+        pytest.param("gs://BUCKET-Upper/obj", id="uppercase-is-illegal-in-a-bucket-name"),
+        pytest.param("gs://a b/obj", id="space-is-illegal-in-a-bucket-name"),
+        pytest.param("gs://ab/obj", id="bucket-shorter-than-three-characters"),
+        pytest.param("gs://bucket/a\nb", id="newline-forbidden-in-an-object-name"),
+        pytest.param("gs://bucket/a\x00b", id="NUL-forbidden-in-an-object-name"),
+        pytest.param("gs://bucket/" + "A" * 2000, id="over-the-1024-byte-object-cap"),
     ],
 )
 def test_a_source_uri_that_is_not_a_gs_object_is_refused_before_anything_runs(
@@ -1839,6 +1852,54 @@ def test_a_source_uri_that_is_not_a_gs_object_is_refused_before_anything_runs(
         "a rejected invocation must leave no run directory: spec §12 says a batch caller "
         "distinguishes a rejected capture from a dead run by whether one exists"
     )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("gs://bucket/dir/../other.pcap", id="dot-dot-is-a-legal-object-name"),
+        pytest.param("gs://bucket/obj?generation=1", id="question-mark-is-legal"),
+        pytest.param("gs://bucket/holiday@home.pcap", id="at-sign-is-legal-in-an-object-name"),
+        pytest.param("gs://bucket/a b.pcap", id="space-is-legal-in-an-object-name"),
+        pytest.param("gs://b-u.c_k-et/\u00e9t\u00e9.pcap", id="non-ascii-object-name"),
+    ],
+)
+def test_a_legal_gcs_object_name_is_not_refused_for_looking_odd(
+    tmp_path: Path, rules_dir: Path, value: str
+) -> None:
+    """The complement to the refusals, and the reason they are narrow.
+
+    Every value here is a legal GCS object name. `..` is not path traversal — an object name is an
+    opaque key, not a path — and `?`, `@`, spaces and non-ASCII are all permitted. Refusing them
+    would be inventing rules the service does not have, which would make the flag unusable for
+    real captures while looking rigorous.
+
+    The one to watch downstream: `..` becomes a traversal risk the moment something derives a LOCAL
+    filename from an object name, which LS-4's fetch-and-untar will. That belongs in LS-4's
+    requirements, not in a check here.
+    """
+    out = tmp_path / "out"
+    assert cli.main(offline(BENIGN, rules_dir, out, "--source-uri", value)) == 0
+    assert _run_block_of(out)["input"]["uri"] == value
+
+
+def test_a_refused_source_uri_is_not_echoed_back(
+    tmp_path: Path, rules_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A rejected value may be a credential, so the diagnostic must not repeat it.
+
+    `gs://user:pass@bucket/obj` is refused precisely BECAUSE it looks like credentials — and the
+    old message interpolated the value with `!r`, which would have put the secret on stderr, into
+    CI logs, and into whatever captured the run's output.
+    """
+    secret = "gs://svc:s3cr3t-t0ken@bucket/obj"
+    assert (
+        cli.main(offline(BENIGN, rules_dir, tmp_path / "out", "--source-uri", secret)) == EXIT_USAGE
+    )
+
+    captured = capsys.readouterr()
+    assert "s3cr3t-t0ken" not in captured.err + captured.out
+    assert "credential" in captured.err, "the message should say why the bucket rule matters"
 
 
 def test_flabel_does_not_verify_that_the_source_uri_holds_the_bytes_it_hashed(

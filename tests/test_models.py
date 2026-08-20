@@ -251,7 +251,7 @@ def test_a_complete_capture_has_no_truncation_offset():
         input_status="complete",
         packets_read=14,
         link_type=1,
-        snaplen=65535,
+        snaplens=(65535,),
     )
     assert capture.truncated_at_offset is None
     assert capture.discarded_link_types == ()
@@ -269,7 +269,7 @@ def test_an_unknown_capture_format_is_rejected():
             input_status="complete",
             packets_read=0,
             link_type=1,
-            snaplen=65535,
+            snaplens=(65535,),
         )
 
 
@@ -682,6 +682,28 @@ def test_a_label_kind_with_an_unknown_arity_is_rejected():
     """The same reason `_check` exists at all: `Literal` is a hint, not a runtime constraint."""
     with pytest.raises(ValueError, match="arity"):
         models.LabelKind(arity="several", tiers=(1,))
+
+
+def test_known_tiers_has_exactly_one_definition():
+    """`provenance.KNOWN_TIERS` is a re-export, and nothing asserted it.
+
+    Re-inlining `(1, 2)` in `provenance.py` passed CI — which is precisely the drift the move to
+    `models` claims to have eliminated. Identity, not equality: two equal tuples would satisfy the
+    weaker check while being exactly the two copies this is meant to prevent.
+    """
+    from flabel import provenance
+
+    assert provenance.KNOWN_TIERS is models.KNOWN_TIERS
+
+
+def test_tiers_by_mode_names_no_tier_that_does_not_exist():
+    """The fourth unlinked place. §6.2 claimed to consolidate all of them; it consolidated three.
+
+    `TIERS_BY_MODE` still spells `(1,)`, `(2,)` and `(1, 2)` out by hand, so adding a tier means
+    editing it too — and nothing said so until this test.
+    """
+    union = set().union(*(set(tiers) for tiers in models.TIERS_BY_MODE.values()))
+    assert union == set(models.KNOWN_TIERS)
 
 
 def test_the_label_kinds_table_is_well_formed():

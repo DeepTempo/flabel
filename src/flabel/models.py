@@ -926,10 +926,17 @@ class NormalizedCapture:
     #: two captures can be merged needs what stayed. Measured 2026-08-20: Zeek refuses a merged
     #: file whose interfaces disagree on link type or snapshot length.
     link_type: int
-    #: Snapshot length of the input as it was handed over, in bytes. Was unpacked from the pcap
-    #: header and discarded. Where several retained interfaces disagree, the largest — there is no
-    #: single true value, and the largest is what a merge would have to accommodate.
-    snaplen: int
+    #: Every DISTINCT snapshot length declared by the retained interfaces, ascending. Plural
+    #: because a `mergecap`-produced pcapng carries one interface description block per input file
+    #: and nothing makes them agree — so a single number would have to invent a winner, and the
+    #: first version of this published the largest. That erased the very fact the field exists to
+    #: expose: Zeek refuses a merge across differing snapshot lengths, so a consumer asking "can
+    #: these two captures merge?" needs to know that ONE of them disagrees with itself. One
+    #: element is the ordinary case. Mirrors `discarded_link_types`, already an array here.
+    #:
+    #: `link_type` stays singular deliberately: after normalisation a pcap can hold only one, so
+    #: the retained type is genuinely one fact. The input's snapshot length is not.
+    snaplens: tuple[int, ...]
     #: Byte offset of the first short record, or None when the capture is complete. A
     #: truncated pcap proceeds as partial input; a truncated pcapng is a hard failure.
     truncated_at_offset: int | None = None

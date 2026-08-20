@@ -15,7 +15,9 @@ the network.
 
 from __future__ import annotations
 
+import ast
 import gzip
+import inspect
 import re
 import shutil
 import struct
@@ -720,10 +722,12 @@ def test_the_retained_link_type_and_snaplen_are_published(tmp_path):
     # which contains no such line — the test then failed for the wrong reason too.
     reported = re.search(r"Packet size limit:\s+file hdr:\s+(\d+)", capinfos(BENIGN, "-l"))
     assert reported, "capinfos did not report a snapshot length"
-    assert result.snaplen == int(reported.group(1))
+    assert result.snaplens == (int(reported.group(1)),)
     assert result.link_type == 1, "EN10MB, the retained type"
 
 
+@needs_tshark
+@pytest.mark.requires_tools
 def test_the_retained_link_type_is_the_kept_one_not_the_discarded_one(tmp_path):
     """The assertion most likely to pass for the wrong reason.
 
@@ -737,9 +741,47 @@ def test_the_retained_link_type_is_the_kept_one_not_the_discarded_one(tmp_path):
 
     assert result.discarded_link_types == ("LINUX_SLL",)
     assert result.link_type == 1, "EN10MB was kept; 113 (LINUX_SLL) was discarded"
-    assert result.snaplen > 0
+    assert result.snaplens == (65535,)
 
 
+@needs_tshark
+@pytest.mark.requires_tools
+def test_interfaces_disagreeing_on_snaplen_publish_both_rather_than_a_winner(tmp_path):
+    """The test that was missing, and its absence is why the first version shipped wrong.
+
+    `mergecap` writes one interface description block per input file and nothing makes them agree.
+    The first implementation published the LARGEST, which asserted a coverage the file does not
+    have — half these packets are capped at 96 — and erased the disagreement, which is the one
+    fact the field exists to expose, since Zeek refuses a merge across differing snapshot lengths.
+
+    No fixture in this suite could show that: every IDB used the default 65535, so `max` could have
+    been `min` or `matching[0]` with everything still green.
+    """
+    capture = awkward.write_disagreeing_snaplen_pcapng(tmp_path / "mix.pcapng", (96, 65535))
+    result = normalize(capture, tmp_path / "out")
+
+    assert result.snaplens == (96, 65535), "both, ascending — not a chosen winner"
+    assert result.link_type == 1, "one link type, so nothing is discarded"
+    assert result.discarded_link_types == ()
+    assert result.input_status == "complete", "a snaplen disagreement is not a loss of packets"
+
+
+@needs_tshark
+@pytest.mark.requires_tools
+def test_agreeing_interfaces_publish_one_snaplen(tmp_path):
+    """The complement: `snaplens` is plural in shape, not plural in the ordinary case.
+
+    Without this, "publish the distinct set" could be satisfied by code that always reported every
+    snaplen in the file regardless of which interfaces were retained.
+    """
+    capture = awkward.write_disagreeing_snaplen_pcapng(tmp_path / "same.pcapng", (65535, 65535))
+    result = normalize(capture, tmp_path / "out")
+
+    assert result.snaplens == (65535,), "deduplicated, so a normal capture reads as one value"
+
+
+@needs_tshark
+@pytest.mark.requires_tools
 def test_multi_datalink_keeps_the_dominant_type_and_records_the_discards(tmp_path):
     """Spec §8 step 7 and §11's second loss condition.
 
@@ -1080,3 +1122,58 @@ def test_a_capture_with_no_readable_packets_is_refused(make, tmp_path: Path):
 
     with pytest.raises(CaptureError, match="no readable packets"):
         normalize(capture, workdir)
+
+
+def test_a_test_that_reaches_a_real_tool_cannot_silently_lose_its_marker():
+    """The gate for what #145 broke, narrowed to a predicate that is actually true.
+
+    Inserting a new test between `@needs_tshark @pytest.mark.requires_tools` and the function they
+    decorated moved both markers onto the new test and left
+    `test_multi_datalink_keeps_the_dominant_type_and_records_the_discards` bare. Two protections
+    went with them: those tests hard-fail rather than skip on a machine without the tool, and
+    `conftest`'s MINIMUM_TOOL_TESTS counter — which exists, in its own words, "to catch tests that
+    stop *existing*, which no skip is ever reported for" — saw a net change of about zero, because
+    the step added two tool tests and unmarked one. **A count is the wrong shape: it is blind to a
+    swap.** This asserts the property directly.
+
+    Two predicates, both narrow enough to be true rather than merely plausible. "Calls
+    `normalize()`" was the first attempt and it over-fired on thirty tests, because most of this
+    module drives `normalize` down paths that raise *before* any subprocess starts — a bad header,
+    a missing file, corrupt gzip. Needing a tool is not the same as calling the entry point.
+    """
+    source = inspect.getsource(sys.modules[__name__])
+    module = ast.parse(source)
+    missing: list[str] = []
+    for node in module.body:
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            continue
+        if node.name == "test_a_test_that_reaches_a_real_tool_cannot_silently_lose_its_marker":
+            # This function's own source contains the literals it searches for, so it matches
+            # itself. Excluded by name rather than by a cleverer predicate, because a gate that
+            # needs cleverness to avoid self-reference is a gate nobody will trust.
+            continue
+        body = ast.get_source_segment(source, node) or ""
+        decorators = {ast.unparse(d) for d in node.decorator_list}
+        marked = any("requires_tools" in d for d in decorators)
+        tshark = any("needs_tshark" in d for d in decorators)
+        # **Using the multi-datalink fixture does not imply running tshark** — the fixture is
+        # just bytes. What implies it is expecting `normalize` to SUCCEED on them. Two tests in
+        # this module use the fixture and legitimately carry no marker: one raises before editcap
+        # is reached (no `-T` name for the kept type), and the other EMPTIES PATH on purpose, so
+        # marking it `requires_tools` would be actively wrong. `pytest.raises` is what tells the
+        # two cases apart, and it is the predicate rather than an allowlist because a list of
+        # exceptions is a list someone has to keep true.
+        expects_failure = "pytest.raises" in body
+        if (
+            "write_multi_datalink_pcapng" in body
+            and not expects_failure
+            and not (marked and tshark)
+        ):
+            missing.append(f"{node.name} (multi-datalink: needs_tshark + requires_tools)")
+        # capinfos is a real subprocess wherever it is used as an oracle.
+        elif "capinfos(" in body and not marked:
+            missing.append(f"{node.name} (capinfos: requires_tools)")
+    assert not missing, (
+        "these tests drive a real tool but are not marked, so they hard-fail instead of skipping "
+        f"without it and conftest's tool-test counter cannot see them: {missing}"
+    )

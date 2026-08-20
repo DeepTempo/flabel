@@ -1217,8 +1217,11 @@ or normalise**: the same capture labelled from two directories would otherwise d
             "uri_status": "gs|local" | None,       # so a null `uri` is one fact, not two
             "bytes": int, "input_status": "complete|partial",
             "packets_read": int,
-            "link_type": int,                      # the link type RETAINED, not discarded
-            "snaplen": int,                        # of the input as handed over
+            "link_type": int | None,               # the link type RETAINED, not discarded
+            "snaplens": [int] | None,              # DISTINCT, ascending, of the input as handed
+                                                   # over. Plural: a mergecap pcapng's interfaces
+                                                   # need not agree, and a single number would
+                                                   # have to invent a winner
             "truncated_at_offset": int | None,
             "discarded_link_types": [str], "discarded_packets": int,
             "normalization": [str]},

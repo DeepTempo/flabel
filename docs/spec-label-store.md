@@ -264,7 +264,15 @@ One row per sighting: `capture_sha256`, `uri`, `uri_status`, `filename`, `bytes`
 | :-- | :-- |
 | `gs` | staged from GCS; `uri` is populated |
 | `local` | the operator passed a local path; there is no origin URI to record |
-| `not-recorded` | this run predates `--source-uri` — **every run currently in the archive** |
+| `not-recorded` | this run predates `--source-uri` — **every run currently in the archive** — *or* the run died before ingest returned, so `uri_status` is `null` in the block |
+
+**A dead run publishes `uri_status: null`, and that maps to `not-recorded`.** flabel writes `gs` or
+`local`; a run that died before ingest returned publishes the whole `input` section as nulls,
+following `path`. Revision 2 of this document typed the field `"gs" | "local"` and enumerated three
+values, which left that fourth state — produced by code this plan itself mandated — with no mapping,
+so `flabel-ingest` would have had to guess. Folded into `not-recorded` rather than given a value of
+its own: from the store's point of view "no origin was recorded" is the same fact however it came
+about, and the run block is still there to say which.
 
 ### 4.3 `flow_labels`
 
@@ -429,9 +437,9 @@ correctly — the precedent #115 set for `direction`.
 | Field | Type | Why |
 | :-- | :-- | :-- |
 | `uri` | `str \| null` | The origin the capture was staged from. **Without it the requirement cannot be met at all**: `tools/flabel-run:211-220` stages a `gs://` object and then assigns `TARGET="$LOCAL"`, so `run.input.path` records the staged local path and the bucket URI is discarded with the shell variable. |
-| `uri_status` | `"gs" \| "local"` | So a null `uri` is not two facts in one field (§4.2). flabel writes `gs` or `local`; only `flabel-ingest` writes `not-recorded`, for a run whose block has no such key. |
-| `link_type` | `int` | The link type **retained**. Already determined internally to decide what to discard, but only `discarded_link_types` is published. §8 needs the kept one. |
-| `snaplen` | `int` | Unpacked and discarded at `ingest.py:255` (`_snaplen`). Zeek refuses a merge across differing snaplens (§8). |
+| `uri_status` | `"gs" \| "local" \| null` | So a null `uri` is not two facts in one field (§4.2). flabel writes `gs` or `local`; only `flabel-ingest` writes `not-recorded`, for a run whose block has no such key. |
+| `link_type` | `int \| null` | The link type **retained**. Already determined internally to decide what to discard, but only `discarded_link_types` is published. §8 needs the kept one. |
+| `snaplens` | `[int] \| null` | Every **distinct** snapshot length of the retained interfaces, ascending. Plural, and that is the correction: a first version published `snaplen: int` as the largest where interfaces disagreed, which asserted a coverage the file did not have and erased the disagreement — the one fact the field exists to expose, since Zeek refuses a merge across differing snapshot lengths. A `mergecap` pcapng carries one interface description block per input file and nothing makes them agree (measured: 96 and 65535). `link_type` stays singular because after normalisation a pcap can hold only one. |
 
 `--source-uri` is **validated, not merely recorded**: a value that is not a well-formed `gs://` URI
 exits 2 before any tool runs. flabel does **not** verify the URI holds the bytes it hashed — that

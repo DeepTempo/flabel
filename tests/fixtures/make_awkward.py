@@ -97,6 +97,7 @@ def pcapng_bytes(
     records: list[tuple[int, float, bytes]],
     linktypes: tuple[int, ...] = (LINKTYPE_ETHERNET,),
     order: str = "<",
+    snaplens: tuple[int, ...] | None = None,
 ) -> bytes:
     """A complete pcapng: one SHB, one IDB per link type, then the records in order.
 
@@ -105,8 +106,11 @@ def pcapng_bytes(
     filter has to handle.
     """
     blob = section_header_block(order)
-    for linktype in linktypes:
-        blob += interface_description_block(linktype, order=order)
+    lengths = snaplens if snaplens is not None else (65535,) * len(linktypes)
+    if len(lengths) != len(linktypes):
+        raise ValueError("snaplens must have one entry per interface")
+    for linktype, snaplen in zip(linktypes, lengths, strict=True):
+        blob += interface_description_block(linktype, snaplen=snaplen, order=order)
     for interface_id, timestamp, frame in records:
         blob += enhanced_packet_block(interface_id, timestamp, frame, order)
     return blob
@@ -258,6 +262,32 @@ def write_multi_datalink_pcapng(
     """A pcapng carrying two link types. Ethernet dominates unless told otherwise."""
     records = multi_datalink_records(ethernet, other)
     path.write_bytes(pcapng_bytes(records, (LINKTYPE_ETHERNET, other_linktype)))
+    return path
+
+
+def write_disagreeing_snaplen_pcapng(path: Path, snaplens: tuple[int, int] = (96, 65535)) -> Path:
+    """Two Ethernet interfaces declaring DIFFERENT snapshot lengths.
+
+    This is what `mergecap` produces: one interface description block per input file, and nothing
+    makes them agree. Until this fixture existed, every IDB in this module used the default 65535,
+    so `ingest`'s handling of a disagreement could be changed freely — max to min, or to the first
+    value — with the whole suite still green.
+
+    Both interfaces carry the SAME link type on purpose: the point is a snaplen disagreement with
+    no link-type discard confusing it, so nothing is dropped and `input_status` stays complete.
+    """
+    # `build_packets()` yields (timestamp, frame) pairs, so the interface id is prepended here
+    # rather than the frames being used raw.
+    records = [
+        (index % 2, timestamp, frame) for index, (timestamp, frame) in enumerate(build_packets())
+    ]
+    path.write_bytes(
+        pcapng_bytes(
+            records,
+            (LINKTYPE_ETHERNET, LINKTYPE_ETHERNET),
+            snaplens=snaplens,
+        )
+    )
     return path
 
 

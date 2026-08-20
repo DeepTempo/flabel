@@ -518,7 +518,7 @@ def _input_section(
 
     `path` is `original_path`, never the normalized copy. The normalized copy lives in a
     per-run temporary directory, so it means nothing to a reader and differs on every run by
-    construction — which would break Goal 2 from inside the one input field spec §10 excludes
+    construction — which would break Goal 2 from inside one of the input fields spec §10 excludes
     from the comparison precisely to keep it comparable.
 
     `format` and `bytes` use their spec §10 names: the model calls them `capture_format` and
@@ -548,7 +548,7 @@ def _input_section(
                 "input_status",
                 "packets_read",
                 "link_type",
-                "snaplen",
+                "snaplens",
                 "truncated_at_offset",
                 "discarded_link_types",
                 "discarded_packets",
@@ -565,7 +565,7 @@ def _input_section(
         "input_status": capture.input_status,
         "packets_read": capture.packets_read,
         "link_type": capture.link_type,
-        "snaplen": capture.snaplen,
+        "snaplens": list(capture.snaplens),
         "truncated_at_offset": capture.truncated_at_offset,
         "discarded_link_types": list(capture.discarded_link_types),
         "discarded_packets": capture.discarded_packets,

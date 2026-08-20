@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import traceback
 from collections.abc import Sequence
@@ -1074,19 +1075,58 @@ def _rules(argv: Sequence[str]) -> int:
 # --- entry point --------------------------------------------------------------------------------
 
 
-def _is_gs_uri(value: str) -> bool:
-    """`gs://<bucket>/<object>`, with both halves non-empty.
+#: GCS bucket naming, which is what makes this checkable rather than a matter of taste: 3-63
+#: characters of lowercase letters, digits, dots, hyphens and underscores, beginning and ending
+#: alphanumeric. https://cloud.google.com/storage/docs/buckets#naming
+GS_BUCKET = re.compile(r"[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]")
 
-    Deliberately narrow. A bucket with no object names a container rather than a capture, and an
-    empty string is what an unset shell variable expands to — `--source-uri "$MAYBE_URI"` is
-    exactly how this flag will be passed from `flabel-run`, so the empty case is the likely one
-    rather than the perverse one.
+#: GCS caps an object name at 1024 bytes of UTF-8. The bound is the service's, not ours, plus the
+#: `gs://` and the longest legal bucket — so a value over it is unfetchable by definition.
+MAX_SOURCE_URI_BYTES = 5 + 63 + 1 + 1024
+
+
+def _source_uri_fault(value: str) -> str | None:
+    """Why `value` cannot be a GCS object URI, or None if it can be.
+
+    **Every rule here is GCS's, not invented.** The spec's standard for this flag is that a value
+    which cannot be fetched is worse than none because it *looks* like provenance — so the check
+    has to mean "unfetchable", and the only defensible source for that is the service's own
+    constraints. It deliberately does NOT reject `..`, spaces, `?`, `@` or non-ASCII inside the
+    *object* name: those are all legal GCS object names and harmless to record.
+
+    The bucket rules are what catch a credential — `gs://user:pass@bucket/obj` fails because `:`
+    and `@` cannot appear in a bucket name. That matters more than tidiness: the run directory is
+    published to a shared bucket and loaded into BigQuery, so a token pasted here stops being a
+    line of shell history and becomes a durable artifact, against this repo's never-commit-secrets
+    rule. The control-character rule is GCS's too (CR and LF are forbidden in object names) and it
+    also keeps a URI from mangling the terminal it is echoed to.
     """
     if not value.startswith("gs://"):
-        return False
-    remainder = value[len("gs://") :]
-    bucket, _, obj = remainder.partition("/")
-    return bool(bucket) and bool(obj)
+        return "it does not begin with gs://"
+    if len(value.encode("utf-8")) > MAX_SOURCE_URI_BYTES:
+        return (
+            f"it is {len(value.encode('utf-8'))} bytes; GCS caps an object name at 1024, so a "
+            f"longer value names nothing"
+        )
+    bucket, _, obj = value[len("gs://") :].partition("/")
+    if not bucket:
+        return "it names no bucket"
+    if not GS_BUCKET.fullmatch(bucket):
+        # **The bucket is not quoted back.** It was, and a test caught the leak: the one input this
+        # rule exists to catch is `gs://user:secret@bucket/obj`, where the "bucket" portion IS the
+        # credential. Naming the rule is enough to fix the invocation; repeating the value would
+        # put the secret on stderr and into CI logs, which is what this whole check is preventing.
+        return (
+            "the part before the first '/' is not a legal GCS bucket name (3-63 characters of "
+            "lowercase letters, digits, dots, hyphens and underscores, starting and ending "
+            "alphanumeric). Credentials in the URI fail here, and must never be recorded into a "
+            "published run directory — the value is deliberately not repeated back"
+        )
+    if not obj:
+        return "it names a bucket but no object"
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        return "it contains a control character, which a GCS object name may not"
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1124,7 +1164,10 @@ def main(argv: list[str] | None = None) -> int:
                 "\n"
                 "then label against the snapshot it produced, with --ruleset-snapshot <id>."
             )
-        if args.source_uri is not None and not _is_gs_uri(args.source_uri):
+        source_uri_fault = (
+            _source_uri_fault(args.source_uri) if args.source_uri is not None else None
+        )
+        if source_uri_fault is not None:
             # Validated rather than merely recorded. The field's whole purpose is that another
             # process can fetch the origin object, so a value that cannot be fetched is worse
             # than none: it *looks* like provenance. Refused before any tool runs, so a typo
@@ -1134,9 +1177,9 @@ def main(argv: list[str] | None = None) -> int:
             # network I/O on a path spec §13 forbids it on. `run.input.sha256` remains the
             # identity; `uri` is a faithful record of what the operator asserted.
             raise UsageError(
-                f"--source-uri {args.source_uri!r} is not a gs:// object URI. Expected "
-                f"gs://<bucket>/<object>; a bucket alone is not an object, and a local path "
-                f"belongs in the capture argument."
+                f"--source-uri is not a usable gs:// object URI: {source_uri_fault}. Expected "
+                f"gs://<bucket>/<object>; a local path belongs in the capture argument. The "
+                f"value is not echoed back, in case it carries a credential."
             )
         rules_flags = [
             name

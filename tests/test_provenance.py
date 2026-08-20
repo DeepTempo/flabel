@@ -548,7 +548,7 @@ def make_capture(tmp_path: Path, **overrides) -> NormalizedCapture:
         "input_status": "complete",
         "packets_read": 120,
         "link_type": 1,
-        "snaplen": 65535,
+        "snaplens": (65535,),
         "normalization": ("convert: editcap -F pcap",),
     }
     return NormalizedCapture(**{**fields, **overrides})
@@ -1534,7 +1534,7 @@ def test_a_run_that_died_before_ingest_reports_the_four_new_keys_as_null(tmp_pat
     )
 
     section = block["input"]
-    for key in ("uri", "uri_status", "link_type", "snaplen"):
+    for key in ("uri", "uri_status", "link_type", "snaplens"):
         assert key in section, f"{key} was dropped, which spec §10 forbids"
         assert section[key] is None, f"{key} should be null on a run that never read a capture"
 

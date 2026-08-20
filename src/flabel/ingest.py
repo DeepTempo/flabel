@@ -438,30 +438,36 @@ def _by_link_type(counts: dict[int, int]) -> tuple[tuple[int, int], ...]:
 # --- link types ----------------------------------------------------------------------------
 
 
-def retained_snaplen(walked: _Walk, link_type: int) -> int:
-    """Snapshot length of the interface(s) whose link type was kept.
+def retained_snaplens(walked: _Walk, link_type: int) -> tuple[int, ...]:
+    """Every distinct snapshot length declared by the interfaces carrying `link_type`, ascending.
 
-    **The largest, where several disagree.** A pcapng written by `mergecap` carries one interface
-    description block per input file and they need not agree, so there is no single true value —
-    and the largest is what a later merge would have to accommodate. Measured 2026-08-20: Zeek
-    refuses a file whose interfaces disagree on snapshot length, which is why this is published
-    rather than left for a consumer to rediscover.
+    **Plural, and it published the largest before.** A `mergecap` pcapng carries one interface
+    description block per input file and they need not agree — measured: two Ethernet interfaces at
+    96 and 65535 — so any single number invents a winner. Reporting the maximum asserted a coverage
+    the file did not have (half its packets capped at 96) and erased the disagreement, which is the
+    one thing the field was added to expose, since Zeek refuses a merge across differing snapshot
+    lengths.
 
-    Falls back to the maximum across all interfaces when the positional lists disagree in length,
-    which a malformed pcapng could produce; reporting the largest is safe in the same direction.
+    An empty result means the walk recorded no interface snaplens at all, which no reachable input
+    produces; it is returned rather than raised because this is a reporting helper and a run that
+    got this far has already been read successfully.
     """
     if not walked.interface_snaplens:
-        return 0
+        return ()
     if len(walked.interface_snaplens) != len(walked.interface_link_types):
-        return max(walked.interface_snaplens)
-    matching = [
+        # Positionally misaligned, which the two walkers cannot currently produce — they append in
+        # lockstep. Kept as a total function rather than an assertion: every distinct value is a
+        # superset of the right answer, so a future walker that breaks alignment over-reports
+        # rather than lying.
+        return tuple(sorted(set(walked.interface_snaplens)))
+    matching = {
         snaplen
         for snaplen, kind in zip(
             walked.interface_snaplens, walked.interface_link_types, strict=True
         )
         if kind == link_type
-    ]
-    return max(matching) if matching else max(walked.interface_snaplens)
+    }
+    return tuple(sorted(matching or set(walked.interface_snaplens)))
 
 
 def link_type_name(link_type: int) -> str:
@@ -645,11 +651,25 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
         capture_format: CaptureFormat = _format_name(container, compressed)
 
         walked = walk(source, container, subject)
+        if walked.packets == 0:
+            # Checked HERE as well as after the emit, and one step earlier than the comment below
+            # argues for (#145). The later check needs `discarded_packets`, so it cannot move — but
+            # zero complete records means zero usable packets whatever the discards, and refusing
+            # now skips a pointless tshark/editcap run. It also guarantees the invariant the two
+            # link-type lookups below rely on: at least one packet means at least one link type,
+            # so neither needs a sentinel. `0` would be a bad sentinel anyway — it is DLT_NULL,
+            # a valid link type, so it could not be told from a real measurement.
+            raise CaptureError(
+                f"{capture} holds no readable packets (0 complete records), so there is nothing "
+                f"to label. A capture truncated before its first whole record reads this way "
+                f"too — check it with `capinfos {capture}`."
+            )
         output = workdir / NORMALIZED_NAME
         if container == "pcap":
             discarded_link_types: tuple[str, ...] = ()
             discarded_packets = 0
-            retained_link_type = walked.link_types[0] if walked.link_types else 0
+            # A pcap's link type comes from its file header, so this is always present.
+            retained_link_type = walked.link_types[0]
             _emit_pcap(source, output, walked, normalization, intermediates)
         else:
             discarded_link_types, discarded_packets, retained_link_type = _emit_pcapng(
@@ -692,7 +712,7 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
             input_status="partial" if partial else "complete",
             packets_read=walked.packets,
             link_type=retained_link_type,
-            snaplen=retained_snaplen(walked, retained_link_type),
+            snaplens=retained_snaplens(walked, retained_link_type),
             truncated_at_offset=walked.truncated_at_offset,
             discarded_link_types=discarded_link_types,
             discarded_packets=discarded_packets,
@@ -811,7 +831,9 @@ def _emit_pcapng(
         _run_tool("editcap", argv)
         normalization.append("convert: editcap -F pcap")
         _verify_converted(output, walked.packets, "editcap", argv)
-        return (), 0, walked.link_types[0] if walked.link_types else 0
+        # Non-empty because `link_types` is derived from packet counts and `normalize` has
+        # already refused a capture with no packets.
+        return (), 0, walked.link_types[0]
 
     # Dominant by packet count, ties broken by the lowest link type. A tie has no meaningful
     # winner, so the rule is chosen to be *stable*: reproducibility (Goal 2) needs two runs
