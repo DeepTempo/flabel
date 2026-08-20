@@ -160,6 +160,12 @@ def only_run_dir(output_dir: Path) -> Path:
     return directories[0]
 
 
+def _run_block_of(output_dir: Path) -> dict:
+    """The `run` block of the one run directory's `labels.json`."""
+    document = json.loads((only_run_dir(output_dir) / "labels.json").read_text(encoding="utf-8"))
+    return document["run"]
+
+
 def snapshot_id_of(rules_dir: Path) -> str:
     """The id of the one snapshot under `rules_dir`, which is also its directory name."""
     directories = [path for path in rules_dir.iterdir() if path.is_dir()]
@@ -1765,6 +1771,92 @@ def test_rules_list_names_a_damaged_snapshot_it_omitted(
 
 
 # --- --sources is refused on a labelling run, not ignored (#71) ---------------------------------
+
+
+def test_source_uri_is_published_as_run_input_uri(tmp_path: Path, rules_dir: Path) -> None:
+    """The whole point of LS-1 (#145).
+
+    `tools/flabel-run` stages a `gs://` capture and then assigns `TARGET="$LOCAL"`, so before this
+    the bucket URI existed nowhere in the run directory and the requirement — every labelled flow
+    naming the object it came from — was unmeetable from flabel's output.
+    """
+    out = tmp_path / "out"
+    uri = "gs://tempo-datasets-002-north-south/lax_capture_2026-07-08.pcap"
+    code = cli.main(offline(BENIGN, rules_dir, out, "--source-uri", uri))
+
+    assert code == 0
+    run = _run_block_of(out)
+    assert run["input"]["uri"] == uri
+    assert run["input"]["uri_status"] == "gs"
+
+
+def test_without_source_uri_the_status_says_local_rather_than_leaving_a_bare_null(
+    tmp_path: Path, rules_dir: Path
+) -> None:
+    """A null `uri` would otherwise be two facts in one field.
+
+    spec §10 is emphatic that `null` means "not measured". Without `uri_status`, "the operator
+    passed a local path, so there is no origin URI" and "this run predates the field" are the same
+    value — in the one field the requirement depends on. The store reserves a third value,
+    `not-recorded`, for the second case, and only ingestion writes it.
+    """
+    out = tmp_path / "out"
+    assert cli.main(offline(BENIGN, rules_dir, out)) == 0
+
+    run = _run_block_of(out)
+    assert run["input"]["uri"] is None
+    assert run["input"]["uri_status"] == "local"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("", id="empty-which-is-an-unset-shell-variable"),
+        pytest.param("notagsuri", id="no-scheme"),
+        pytest.param("s3://bucket/object", id="wrong-scheme"),
+        pytest.param("gs://bucket", id="a-bucket-is-not-an-object"),
+        pytest.param("gs://", id="scheme-only"),
+    ],
+)
+def test_a_source_uri_that_is_not_a_gs_object_is_refused_before_anything_runs(
+    tmp_path: Path, rules_dir: Path, value: str
+) -> None:
+    """Validated, not merely recorded — and refused early.
+
+    The field exists so another process can fetch the origin object, so a value that cannot be
+    fetched is worse than none: it looks like provenance. Refusing before any tool runs matters on
+    the replay box, where the alternative is discovering the typo after a replay and a 60-second
+    settle have already been spent.
+
+    The empty case is the likely one rather than the perverse one: `flabel-run` will pass
+    `--source-uri "$MAYBE_URI"`, and an unset shell variable expands to exactly this.
+    """
+    out = tmp_path / "out"
+    code = cli.main(offline(BENIGN, rules_dir, out, "--source-uri", value))
+
+    assert code == EXIT_USAGE
+    assert not out.exists() or not any(out.iterdir()), (
+        "a rejected invocation must leave no run directory: spec §12 says a batch caller "
+        "distinguishes a rejected capture from a dead run by whether one exists"
+    )
+
+
+def test_flabel_does_not_verify_that_the_source_uri_holds_the_bytes_it_hashed(
+    tmp_path: Path, rules_dir: Path
+) -> None:
+    """A deliberate non-behaviour, asserted so it is not mistaken for a guarantee.
+
+    Checking would be network I/O, which spec §13 forbids on this path. `run.input.sha256` stays
+    the identity; `uri` is a faithful record of what the operator asserted. A URI naming an object
+    that does not exist is therefore accepted — and that is the honest contract, not a hole.
+    """
+    out = tmp_path / "out"
+    code = cli.main(
+        offline(BENIGN, rules_dir, out, "--source-uri", "gs://no-such-bucket-4f2a/absent.pcap")
+    )
+
+    assert code == 0
+    assert _run_block_of(out)["input"]["uri"] == "gs://no-such-bucket-4f2a/absent.pcap"
 
 
 def test_sources_on_a_labelling_run_is_refused(tmp_path: Path, rules_dir: Path) -> None:

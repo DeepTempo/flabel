@@ -71,7 +71,12 @@ EXCLUDED_RUN_KEYS = ("started_at", "finished_at", "duration_seconds")
 #: the run. Excluding it is what lets the same capture labelled from two directories compare
 #: equal; `input.sha256` still identifies the file, so a *different* capture is still a
 #: difference.
-EXCLUDED_INPUT_KEYS = ("path",)
+#: `uri` joins `path` for the same reason, one level out (#145): the same capture staged from
+#: `gs://a/x.pcap` and from `gs://b/x.pcap` is the same capture, and `input.sha256` still
+#: identifies the bytes — so a *different* capture is still a difference. Without this, Goal 2
+#: fails on a capture labelled from two origins, which would be a false alarm about the pipeline.
+#: `uri_status` is NOT excluded: gs-versus-local is a real difference in what was measured.
+EXCLUDED_INPUT_KEYS = ("path", "uri")
 
 COMMENT = "#"
 

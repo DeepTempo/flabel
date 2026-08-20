@@ -1213,8 +1213,12 @@ or normalise**: the same capture labelled from two directories would otherwise d
   "unmatched_threshold": float,           # the gate this run was held to — see below
   "tiers_attempted": [1|2], "tiers_unavailable": [1|2],
   "input": {"path": str, "sha256": str, "format": "pcap|pcapng|pcap.gz|pcapng.gz",
+            "uri": str | None,                     # gs:// origin, from --source-uri
+            "uri_status": "gs|local" | None,       # so a null `uri` is one fact, not two
             "bytes": int, "input_status": "complete|partial",
             "packets_read": int,
+            "link_type": int,                      # the link type RETAINED, not discarded
+            "snaplen": int,                        # of the input as handed over
             "truncated_at_offset": int | None,
             "discarded_link_types": [str], "discarded_packets": int,
             "normalization": [str]},
@@ -1441,6 +1445,8 @@ flabel --both <capture>               Tier 1 and Tier 2, labelling from both.
     --rules-dir <dir>                 default: ./.flabel/rules. Tier 2 only — REFUSED on a
                                       replay-only run, with --ruleset-snapshot.
     --sources <file>                  REFUSED here — exit 2. See below.
+    --source-uri <gs://…>             default: none. Recorded as `run.input.uri`; VALIDATED,
+                                      and refused with exit 2 if it is not a gs:// object URI.
     --unmatched-threshold <float>     default: 0.01
 flabel rules update [--sources <f>] [--rules-dir <d>]
 flabel rules list  [--rules-dir <d>]
@@ -1472,6 +1478,29 @@ default is resolved at use, so a bare replay-only run is unaffected.
 
 `--offline --both` is refused by argparse's own mutually-exclusive group, because the two requests
 cannot both be honoured and picking a winner would make the losing flag silently ineffective.
+
+**`--source-uri` is the second flag added after the contract was declared closed** (#145), and the
+reasoning is recorded here as #132's was. §11 says the contract is closed; what that protects is a
+caller scripting against it, and an *optional* flag whose default reproduces today's behaviour
+byte-for-byte breaks no such caller — `uri: null, uri_status: "local"` is exactly what a run without
+it publishes.
+
+It exists because the alternative is not "record it elsewhere", it is "cannot record it at all".
+`tools/flabel-run` stages a `gs://` capture and then assigns `TARGET="$LOCAL"`, so `run.input.path`
+holds the staged local path and the bucket URI is discarded with the shell variable. No amount of
+reading a run directory recovers it, and the requirement it serves — every labelled flow naming the
+object it came from — is unmeetable without it.
+
+**It is validated rather than merely recorded**, and refused before any tool runs. The field's whole
+purpose is that another process can fetch the origin object, so a value that cannot be fetched is
+worse than none: it *looks* like provenance. On the replay box the alternative is discovering a typo
+after a replay and a 60-second settle have been spent. The empty string is refused explicitly
+because `flabel-run` will pass `--source-uri "$MAYBE_URI"` and an unset variable expands to it.
+
+**What is deliberately NOT checked is whether the URI holds the bytes that were hashed.** That would
+be network I/O on a path §13 forbids it on. `run.input.sha256` remains the identity of the input;
+`uri` is a faithful record of what the operator asserted about where it came from. A URI naming an
+object that does not exist is accepted, and that is the honest contract rather than a hole in it.
 
 **`--sources` is refused on the labelling path, not ignored** (2026-08-15, issue #71). It is still *declared* there, so the refusal can explain itself rather than argparse saying `unrecognized arguments`. Passing it exits 2 before any tool runs and before a run directory exists.
 

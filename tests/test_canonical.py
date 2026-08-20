@@ -696,3 +696,46 @@ def test_reporting_that_difference_does_not_itself_raise(tmp_path: Path):
 
     for line in canonical.differences(first, second):
         line.encode("utf-8")  # raises UnicodeEncodeError if a raw surrogate escaped
+
+
+def test_the_same_capture_staged_from_two_origins_compares_equal():
+    """`input.uri` joins `input.path` in the exclusion list, for the same reason one level out.
+
+    A capture fetched from `gs://a/x.pcap` and from `gs://b/x.pcap` is the SAME capture —
+    `input.sha256` says so — and Goal 2 compares two runs over one capture. Without the
+    exclusion the gate would fail on a difference in where the operator got the bytes, which is
+    a false alarm about the pipeline rather than a finding about it.
+
+    `uri_status` is deliberately NOT excluded: gs-versus-local is a real difference in what was
+    measured, not an artefact of where it was run.
+    """
+    base = {
+        "run": {
+            "input": {
+                "path": "/var/lib/flabel/captures/x.pcap",
+                "uri": "gs://bucket-a/x.pcap",
+                "uri_status": "gs",
+                "sha256": "a" * 64,
+                "link_type": 1,
+                "snaplen": 65535,
+            }
+        }
+    }
+    elsewhere = {
+        "run": {
+            "input": {
+                "path": "/home/craig/x.pcap",
+                "uri": "gs://bucket-b/x.pcap",
+                "uri_status": "gs",
+                "sha256": "a" * 64,
+                "link_type": 1,
+                "snaplen": 65535,
+            }
+        }
+    }
+
+    assert canonical.canonical_document(base) == canonical.canonical_document(elsewhere)
+
+    # ...and a capture that really is different still differs.
+    other_bytes = {"run": {"input": {**elsewhere["run"]["input"], "sha256": "b" * 64}}}
+    assert canonical.canonical_document(base) != canonical.canonical_document(other_bytes)

@@ -701,6 +701,45 @@ def test_conversion_is_reproducible(tmp_path):
 
 @needs_tshark
 @pytest.mark.requires_tools
+def test_the_retained_link_type_and_snaplen_are_published(tmp_path):
+    """Both were computed and thrown away, and the consolidator needs them (#145).
+
+    `ingest.py` unpacked `_snaplen` from the pcap header and discarded it, and only *discarded*
+    link types reached the run block — never the one that was kept. Measured 2026-08-20: Zeek
+    refuses a merged capture whose interfaces disagree on either
+    ("an interface has a type 1 different from the type of the first interface",
+    "an interface has a snapshot length 262144 different from..."), so a future tool grouping
+    flows by mergeable capture cannot do it from `discarded_link_types` alone.
+
+    `capinfos` is the independent oracle, as it is for packet counts in this file — asserting
+    against the tool rather than against our own parse of the same bytes.
+    """
+    result = normalize(BENIGN, tmp_path / "out")
+
+    # `-l` is the snapshot length; `-s` is the FILE size, which is what I reached for first and
+    # which contains no such line — the test then failed for the wrong reason too.
+    reported = re.search(r"Packet size limit:\s+file hdr:\s+(\d+)", capinfos(BENIGN, "-l"))
+    assert reported, "capinfos did not report a snapshot length"
+    assert result.snaplen == int(reported.group(1))
+    assert result.link_type == 1, "EN10MB, the retained type"
+
+
+def test_the_retained_link_type_is_the_kept_one_not_the_discarded_one(tmp_path):
+    """The assertion most likely to pass for the wrong reason.
+
+    On a single-link-type fixture, "the retained type" and "the only type" are the same number,
+    so the test would hold against code that reported either. This uses the two-link-type
+    fixture, where EN10MB is kept and LINUX_SLL (113) is discarded, so reporting the wrong one
+    is visible.
+    """
+    capture = awkward.write_multi_datalink_pcapng(tmp_path / "multi.pcapng")
+    result = normalize(capture, tmp_path / "out")
+
+    assert result.discarded_link_types == ("LINUX_SLL",)
+    assert result.link_type == 1, "EN10MB was kept; 113 (LINUX_SLL) was discarded"
+    assert result.snaplen > 0
+
+
 def test_multi_datalink_keeps_the_dominant_type_and_records_the_discards(tmp_path):
     """Spec §8 step 7 and §11's second loss condition.
 

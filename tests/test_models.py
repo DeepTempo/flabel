@@ -250,6 +250,8 @@ def test_a_complete_capture_has_no_truncation_offset():
         bytes_total=4096,
         input_status="complete",
         packets_read=14,
+        link_type=1,
+        snaplen=65535,
     )
     assert capture.truncated_at_offset is None
     assert capture.discarded_link_types == ()
@@ -266,6 +268,8 @@ def test_an_unknown_capture_format_is_rejected():
             bytes_total=1,
             input_status="complete",
             packets_read=0,
+            link_type=1,
+            snaplen=65535,
         )
 
 

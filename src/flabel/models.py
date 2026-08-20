@@ -921,6 +921,15 @@ class NormalizedCapture:
     bytes_total: int
     input_status: InputStatus
     packets_read: int
+    #: The link type the normalized capture RETAINED, as a libpcap number. Published because
+    #: `discarded_link_types` says what went and never what stayed — and a tool deciding whether
+    #: two captures can be merged needs what stayed. Measured 2026-08-20: Zeek refuses a merged
+    #: file whose interfaces disagree on link type or snapshot length.
+    link_type: int
+    #: Snapshot length of the input as it was handed over, in bytes. Was unpacked from the pcap
+    #: header and discarded. Where several retained interfaces disagree, the largest — there is no
+    #: single true value, and the largest is what a merge would have to accommodate.
+    snaplen: int
     #: Byte offset of the first short record, or None when the capture is complete. A
     #: truncated pcap proceeds as partial input; a truncated pcapng is a hard failure.
     truncated_at_offset: int | None = None

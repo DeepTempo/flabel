@@ -256,6 +256,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--source-uri",
+        default=None,
+        metavar="URI",
+        help=(
+            "Where this capture came from, recorded as run.input.uri. A gs:// URI. Without it "
+            "the run block records only the local path, and a downstream consumer cannot say "
+            "which object in a bucket a labelled flow belongs to."
+        ),
+    )
+    parser.add_argument(
         "--sources",
         type=Path,
         default=None,
@@ -396,6 +406,10 @@ class _Progress:
     #: be read as evidence of what was lost. Not defaulted — a run always has a mode, and a
     #: default here would let a caller publish someone else's.
     mode: RunMode
+    #: The origin URI the operator named, or None. On `_Progress` for `unmatched_threshold`'s
+    #: reason: every path that writes a run block needs it, including the ones that died before
+    #: ingest returned.
+    source_uri: str | None = None
     #: Whether the tier-1 stage returned. Distinct from `mode` including tier 1: the difference
     #: between the two is exactly `tiers_unavailable`, which is the field that tells a reader a
     #: `--both` run lost its device half rather than never having had one.
@@ -454,6 +468,7 @@ def _run_block(started_at: str, progress: _Progress) -> dict[str, Any]:
         unmatched_threshold=progress.unmatched_threshold,
         tool_failures=progress.tool_failures,
         warnings=progress.warnings,
+        source_uri=progress.source_uri,
     )
 
 
@@ -707,7 +722,9 @@ def _label(args: argparse.Namespace) -> int:
     mode = _mode(args)
     tier1_wanted = 1 in TIERS_BY_MODE[mode]
     tier2_wanted = 2 in TIERS_BY_MODE[mode]
-    progress = _Progress(unmatched_threshold=args.unmatched_threshold, mode=mode)
+    progress = _Progress(
+        unmatched_threshold=args.unmatched_threshold, mode=mode, source_uri=args.source_uri
+    )
 
     # Resolved first, before the snapshot, because it is free and it is the precondition
     # specific to the mode the operator actually invoked. A tier-1 run with no device configured
@@ -1057,6 +1074,21 @@ def _rules(argv: Sequence[str]) -> int:
 # --- entry point --------------------------------------------------------------------------------
 
 
+def _is_gs_uri(value: str) -> bool:
+    """`gs://<bucket>/<object>`, with both halves non-empty.
+
+    Deliberately narrow. A bucket with no object names a container rather than a capture, and an
+    empty string is what an unset shell variable expands to — `--source-uri "$MAYBE_URI"` is
+    exactly how this flag will be passed from `flabel-run`, so the empty case is the likely one
+    rather than the perverse one.
+    """
+    if not value.startswith("gs://"):
+        return False
+    remainder = value[len("gs://") :]
+    bucket, _, obj = remainder.partition("/")
+    return bool(bucket) and bool(obj)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse, dispatch, and map every deliberate failure to its exit code (spec §12)."""
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -1091,6 +1123,20 @@ def main(argv: list[str] | None = None) -> int:
                 "    flabel rules update --sources <file>\n"
                 "\n"
                 "then label against the snapshot it produced, with --ruleset-snapshot <id>."
+            )
+        if args.source_uri is not None and not _is_gs_uri(args.source_uri):
+            # Validated rather than merely recorded. The field's whole purpose is that another
+            # process can fetch the origin object, so a value that cannot be fetched is worse
+            # than none: it *looks* like provenance. Refused before any tool runs, so a typo
+            # costs a retry rather than a replay and a 60-second settle.
+            #
+            # What is NOT checked is whether the URI holds the bytes we hashed — that would be
+            # network I/O on a path spec §13 forbids it on. `run.input.sha256` remains the
+            # identity; `uri` is a faithful record of what the operator asserted.
+            raise UsageError(
+                f"--source-uri {args.source_uri!r} is not a gs:// object URI. Expected "
+                f"gs://<bucket>/<object>; a bucket alone is not an object, and a local path "
+                f"belongs in the capture argument."
             )
         rules_flags = [
             name

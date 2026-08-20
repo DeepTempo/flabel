@@ -177,6 +177,9 @@ class _Walk:
     #: numbering `tshark`'s `frame.interface_id` uses, so it is what a selection filter is
     #: built from. Several interfaces may share one link type.
     interface_link_types: tuple[int, ...] = ()
+    #: Snapshot length declared for each interface, positionally aligned with
+    #: `interface_link_types`. One entry for a pcap, which has a single file header.
+    interface_snaplens: tuple[int, ...] = ()
 
     @property
     def link_types(self) -> tuple[int, ...]:
@@ -252,7 +255,8 @@ def _walk_pcap(path: Path, subject: str) -> _Walk:
                 f"capture to read — this is not recoverable truncation."
             )
         order, _nanosecond = PCAP_MAGICS[header[:4]]
-        _, version_major, _version_minor, _, _, _snaplen, link_type = struct.unpack(
+        # `snaplen` was `_snaplen` — read and thrown away. It is published now (#145).
+        _, version_major, _version_minor, _, _, snaplen, link_type = struct.unpack(
             order + "IHHiIII", header
         )
         if version_major != 2:
@@ -266,7 +270,7 @@ def _walk_pcap(path: Path, subject: str) -> _Walk:
         while offset < size:
             record_header = handle.read(PCAP_RECORD_HEADER_BYTES)
             if len(record_header) < PCAP_RECORD_HEADER_BYTES:
-                return _Walk(packets, offset, ((link_type, packets),), (link_type,))
+                return _Walk(packets, offset, ((link_type, packets),), (link_type,), (snaplen,))
             _, _, captured_length, _ = struct.unpack(order + "IIII", record_header)
             if captured_length > MAX_PACKET_BYTES:
                 raise CaptureError(
@@ -275,12 +279,12 @@ def _walk_pcap(path: Path, subject: str) -> _Walk:
                     f"header is not readable — the file is corrupt rather than truncated."
                 )
             if offset + PCAP_RECORD_HEADER_BYTES + captured_length > size:
-                return _Walk(packets, offset, ((link_type, packets),), (link_type,))
+                return _Walk(packets, offset, ((link_type, packets),), (link_type,), (snaplen,))
             offset += PCAP_RECORD_HEADER_BYTES + captured_length
             handle.seek(offset)
             packets += 1
 
-    return _Walk(packets, None, ((link_type, packets),), (link_type,))
+    return _Walk(packets, None, ((link_type, packets),), (link_type,), (snaplen,))
 
 
 def _walk_pcapng(path: Path, subject: str) -> _Walk:
@@ -293,6 +297,7 @@ def _walk_pcapng(path: Path, subject: str) -> _Walk:
     size = path.stat().st_size
     order = "<"
     interface_link_types: list[int] = []
+    interface_snaplens: list[int] = []
     section_base = 0
     counts: dict[int, int] = {}
     packets = 0
@@ -307,7 +312,13 @@ def _walk_pcapng(path: Path, subject: str) -> _Walk:
                         f"{subject}: file is {size} bytes — too short to hold a pcapng "
                         f"section header block."
                     )
-                return _Walk(packets, offset, _by_link_type(counts), tuple(interface_link_types))
+                return _Walk(
+                    packets,
+                    offset,
+                    _by_link_type(counts),
+                    tuple(interface_link_types),
+                    tuple(interface_snaplens),
+                )
 
             block_type = struct.unpack(order + "I", head[:4])[0]
             if offset == 0 or block_type == BLOCK_SECTION_HEADER:
@@ -337,7 +348,13 @@ def _walk_pcapng(path: Path, subject: str) -> _Walk:
                     f"header is not readable — the file is corrupt rather than truncated."
                 )
             if offset + total_length > size:
-                return _Walk(packets, offset, _by_link_type(counts), tuple(interface_link_types))
+                return _Walk(
+                    packets,
+                    offset,
+                    _by_link_type(counts),
+                    tuple(interface_link_types),
+                    tuple(interface_snaplens),
+                )
             if body_length < MIN_BODY_BYTES.get(block_type, 0):
                 raise CaptureError(
                     f"{subject}: {name} block at offset {offset} has a {body_length}-byte "
@@ -356,7 +373,9 @@ def _walk_pcapng(path: Path, subject: str) -> _Walk:
                 )
 
             if block_type == BLOCK_INTERFACE_DESCRIPTION:
-                interface_link_types.append(struct.unpack(order + "H", body[:2])[0])
+                link_type, _reserved, snaplen = struct.unpack(order + "HHI", body[:8])
+                interface_link_types.append(link_type)
+                interface_snaplens.append(snaplen)
             elif is_packet:
                 index = section_base + _packet_interface(block_type, body, order)
                 if index >= len(interface_link_types):
@@ -371,7 +390,9 @@ def _walk_pcapng(path: Path, subject: str) -> _Walk:
             offset += total_length
             handle.seek(offset)
 
-    return _Walk(packets, None, _by_link_type(counts), tuple(interface_link_types))
+    return _Walk(
+        packets, None, _by_link_type(counts), tuple(interface_link_types), tuple(interface_snaplens)
+    )
 
 
 def _section_byte_order(handle, subject: str, offset: int) -> str:
@@ -415,6 +436,32 @@ def _by_link_type(counts: dict[int, int]) -> tuple[tuple[int, int], ...]:
 
 
 # --- link types ----------------------------------------------------------------------------
+
+
+def retained_snaplen(walked: _Walk, link_type: int) -> int:
+    """Snapshot length of the interface(s) whose link type was kept.
+
+    **The largest, where several disagree.** A pcapng written by `mergecap` carries one interface
+    description block per input file and they need not agree, so there is no single true value —
+    and the largest is what a later merge would have to accommodate. Measured 2026-08-20: Zeek
+    refuses a file whose interfaces disagree on snapshot length, which is why this is published
+    rather than left for a consumer to rediscover.
+
+    Falls back to the maximum across all interfaces when the positional lists disagree in length,
+    which a malformed pcapng could produce; reporting the largest is safe in the same direction.
+    """
+    if not walked.interface_snaplens:
+        return 0
+    if len(walked.interface_snaplens) != len(walked.interface_link_types):
+        return max(walked.interface_snaplens)
+    matching = [
+        snaplen
+        for snaplen, kind in zip(
+            walked.interface_snaplens, walked.interface_link_types, strict=True
+        )
+        if kind == link_type
+    ]
+    return max(matching) if matching else max(walked.interface_snaplens)
 
 
 def link_type_name(link_type: int) -> str:
@@ -602,9 +649,10 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
         if container == "pcap":
             discarded_link_types: tuple[str, ...] = ()
             discarded_packets = 0
+            retained_link_type = walked.link_types[0] if walked.link_types else 0
             _emit_pcap(source, output, walked, normalization, intermediates)
         else:
-            discarded_link_types, discarded_packets = _emit_pcapng(
+            discarded_link_types, discarded_packets, retained_link_type = _emit_pcapng(
                 source, output, walked, normalization, workdir, subject, capture, intermediates
             )
 
@@ -643,6 +691,8 @@ def normalize(capture: Path, workdir: Path) -> NormalizedCapture:
             bytes_total=capture.stat().st_size,
             input_status="partial" if partial else "complete",
             packets_read=walked.packets,
+            link_type=retained_link_type,
+            snaplen=retained_snaplen(walked, retained_link_type),
             truncated_at_offset=walked.truncated_at_offset,
             discarded_link_types=discarded_link_types,
             discarded_packets=discarded_packets,
@@ -740,10 +790,12 @@ def _emit_pcapng(
     subject: str,
     origin: Path,
     intermediates: list[Path],
-) -> tuple[tuple[str, ...], int]:
+) -> tuple[tuple[str, ...], int, int]:
     """Convert a pcapng to pcap, discarding minority link types if there is more than one.
 
-    Returns the discarded link-type names and packet count for provenance.
+    Returns the discarded link-type names, the discarded packet count, and **the link type that
+    was retained** — the last of these because the selection rule below is the only place that
+    decides it, and re-deriving it in `normalize` would be a second copy of the rule (#145).
     """
     if walked.truncated_at_offset is not None:
         raise CaptureError(
@@ -759,7 +811,7 @@ def _emit_pcapng(
         _run_tool("editcap", argv)
         normalization.append("convert: editcap -F pcap")
         _verify_converted(output, walked.packets, "editcap", argv)
-        return (), 0
+        return (), 0, walked.link_types[0] if walked.link_types else 0
 
     # Dominant by packet count, ties broken by the lowest link type. A tie has no meaningful
     # winner, so the rule is chosen to be *stable*: reproducibility (Goal 2) needs two runs
@@ -816,7 +868,7 @@ def _emit_pcapng(
     normalization.append(
         f"split: discarded {discarded_packets} packets of link type(s) {', '.join(discarded)}"
     )
-    return discarded, discarded_packets
+    return discarded, discarded_packets, kept_link_type
 
 
 # --- cleanup -------------------------------------------------------------------------------
