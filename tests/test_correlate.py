@@ -33,12 +33,14 @@ from pathlib import Path
 import pytest
 
 from flabel import correlate as correlate_module
+from flabel import models
 from flabel.correlate import ICMPV4_COUNTERPART, ICMPV6_COUNTERPART, correlate
 from flabel.errors import CorrelationError, SnapshotError, exit_code_for
 from flabel.models import (
     DEVICE_UNNAMED_THREAT,
     Detection,
     Flow,
+    LabelKind,
     SnapshotManifest,
     SourceAdmission,
     SourceSpec,
@@ -1562,6 +1564,42 @@ def test_a_tier_1_detection_publishes_a_threat_name_beside_the_verdict():
     assert threat.value == "Realtek SDK RCE"
     assert threat.tier == 1
     assert threat.sids == (30001,), "a threat-name is asserted by one detection, not by the flow"
+
+
+def test_which_tiers_may_supply_a_threat_name_is_read_from_the_table_not_hardcoded(monkeypatch):
+    """Pins the DERIVATION, not the constant (#145).
+
+    `_label_entries` used to filter `entry.tier == 1`, which put the tier-1-only rule in two
+    places — here and `LABEL_KINDS` — that could disagree. The asymmetry was the problem:
+    widening the table alone did nothing, while widening this alone made `LabelEntry` raise and
+    took the whole run to exit 1 on a capture that had produced labels the day before.
+
+    Patching the table to permit tier 2 must therefore be sufficient to promote a tier-2 threat
+    name. If this test fails, the rule has been hardcoded again somewhere.
+    """
+    permissive = dict(correlate_module.LABEL_KINDS)
+    permissive["threat-name"] = LabelKind(arity="single", tiers=(1, 2))
+    # BOTH names, because `models` and `correlate` each hold a reference to the one table object.
+    # Editing `LABEL_KINDS` in `models.py` — the real widening — changes what both of them see;
+    # rebinding only correlate's name would let it promote an entry that `LabelEntry` then
+    # rejects, which is not a state production can reach.
+    monkeypatch.setattr(models, "LABEL_KINDS", permissive)
+    monkeypatch.setattr(correlate_module, "LABEL_KINDS", permissive)
+
+    result = correlate(
+        [make_detection(tier=2, sid=2000001, threat="ET MALWARE Example")],
+        by_uid(make_flow()),
+        make_manifest(),
+        NO_GATE,
+    )
+
+    (label,) = result.labels
+    entries = labels_by_name(label)
+    assert "threat-name" in entries, (
+        "widening LABEL_KINDS did not widen what correlate promotes, so the tier rule is still "
+        "written in two places"
+    )
+    assert entries["threat-name"].tier == 2
 
 
 def test_a_suricata_only_flow_carries_no_threat_name_entry():

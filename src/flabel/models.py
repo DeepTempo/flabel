@@ -15,6 +15,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, get_args
 
 #: Spec §9's default: past 1% of detections unplaceable, the labels no longer describe the
@@ -124,6 +125,73 @@ TIERS_BY_MODE: dict[RunMode, tuple[int, ...]] = {
 #: 84,977 of them is a policy question nobody has answered. Adding it later is purely additive,
 #: which is the whole point of decision 3 in #138.
 LabelName = Literal["verdict", "threat-name"]
+
+#: The tiers that exist. Defined here, not in `provenance`, for the reason `DEFAULT_THRESHOLD` is:
+#: this module imports nothing from the package, so it is the one place every other module can
+#: share a definition through. Before this it was written in four unlinked places — `provenance`,
+#: `TIERS_BY_MODE`, `LABEL_KINDS` and a test literal — so adding a tier was a four-file edit with
+#: nothing asserting they agreed.
+KNOWN_TIERS = (1, 2)
+
+#: How many values one assertion of a kind may carry. `single` is every kind today; `multi` exists
+#: because MITRE technique ids are the next kind expected and a flow plausibly carries several.
+LabelArity = Literal["single", "multi"]
+
+
+@dataclass(frozen=True)
+class LabelKind:
+    """What a label kind permits: how many values, and which tiers may assert it.
+
+    **Declared here so it is enforced in one place rather than known in several.** Before this,
+    "`threat-name` is tier-1 only" lived in spec §4 as prose and in `correlate`'s selection rule
+    as behaviour, and nothing rejected a tier-2 `threat-name` — which is how four tests in
+    `test_models.py` came to build one as incidental scaffolding, one of them then passing for a
+    reason it did not claim.
+    """
+
+    arity: LabelArity
+    #: Ascending. A tier absent here cannot assert this kind at all.
+    tiers: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        _check(self.arity, get_args(LabelArity), "arity", "LabelKind")
+        if not isinstance(self.tiers, tuple):
+            raise ValueError(
+                f"LabelKind.tiers must be a tuple, got {type(self.tiers).__name__}: a list is "
+                f"mutable and a bare int makes `tier not in tiers` raise TypeError on every entry"
+            )
+        if not self.tiers:
+            raise ValueError("LabelKind.tiers is empty: a kind no tier may assert cannot exist")
+        # `bool` first, because `True == 1` and the tier would serialise as `true` — the same
+        # exclusion `provenance.build_source_entry` already makes for `Detection.tier`.
+        if any(isinstance(tier, bool) or not isinstance(tier, int) for tier in self.tiers):
+            raise ValueError(f"LabelKind.tiers must be plain ints, got {self.tiers!r}")
+        unknown = [tier for tier in self.tiers if tier not in KNOWN_TIERS]
+        if unknown:
+            # Identical consequence to an empty tuple — every entry of the kind unconstructible,
+            # surfacing as a per-entry error rather than as the table being wrong — so it is the
+            # same guard, and it was missing.
+            raise ValueError(
+                f"LabelKind.tiers names tier(s) {unknown} that do not exist; known: "
+                f"{list(KNOWN_TIERS)}"
+            )
+        if list(self.tiers) != sorted(set(self.tiers)):
+            raise ValueError(
+                f"LabelKind.tiers must be ascending and unique, got {self.tiers!r}: the field "
+                f"documents itself as ascending, and a duplicate means nothing"
+            )
+
+
+#: The one authority for what a label kind is. `LabelName` above carries the static typing a
+#: `Mapping` cannot, so both exist and a test asserts they describe the same set — otherwise
+#: adding a kind to one and not the other leaves `blfile` and `LabelEntry` disagreeing with
+#: nothing red. Extending `threat-name` to tier 2, or adding a `multi` kind, is an edit here.
+LABEL_KINDS: Mapping[str, LabelKind] = MappingProxyType(
+    {
+        "verdict": LabelKind(arity="single", tiers=(1, 2)),
+        "threat-name": LabelKind(arity="single", tiers=(1,)),
+    }
+)
 
 #: How directly a label follows from its rule match. Carried on every SourceEntry so a
 #: consumer can tell a content match from an indirect reference without reading rule text.
@@ -608,7 +676,10 @@ class LabelEntry:
     """
 
     name: LabelName
-    value: str
+    #: A `str` for a `single` kind, an ordered `tuple[str, ...]` for a `multi` one. Which applies
+    #: follows from `name` through `LABEL_KINDS`, so a consumer never has to branch on the value
+    #: it happens to find.
+    value: str | tuple[str, ...]
     #: The tier of the source(s) that assert *this* entry. For `verdict` that is `min(sources.tier)`
     #: — the same number `Label.best_tier` publishes — and `Label` enforces the two agree.
     tier: int
@@ -618,6 +689,52 @@ class LabelEntry:
 
     def __post_init__(self) -> None:
         _check(self.name, get_args(LabelName), "name", "LabelEntry")
+        if self.name not in LABEL_KINDS:
+            # Unreachable while the drift test holds, and explicit anyway: the failure would
+            # otherwise be a bare `KeyError` where every other guard here raises a sentence.
+            raise ValueError(
+                f"LabelEntry.name {self.name!r} has no entry in LABEL_KINDS, so its arity and "
+                f"permitted tiers are unknown"
+            )
+        kind = LABEL_KINDS[self.name]
+        if self.tier not in kind.tiers:
+            # Declared in `LABEL_KINDS` and therefore enforced. spec §4 says `threat-name` is
+            # tier-1 only, and prose is not a guard: a tier-2 threat name whose sid a real
+            # tier-2 source carries would otherwise pass every other check here.
+            raise ValueError(
+                f"LabelEntry {self.name!r} claims tier {self.tier}, but that kind permits only "
+                f"tier(s) {list(kind.tiers)}"
+            )
+        if kind.arity == "single" and not isinstance(self.value, str):
+            raise ValueError(
+                f"LabelEntry {self.name!r} has arity 'single' but its value is "
+                f"{type(self.value).__name__}: one assertion, one value"
+            )
+        if kind.arity == "multi":
+            # **A tuple, not merely "not a str"**, which is what this checked first and which let a
+            # list, a set and a generator through. A list makes provenance mutable, against this
+            # module's own rule that a claim which can be edited after the fact is not provenance;
+            # a set and a generator both fail inside `labels.py` *after* the pipeline succeeded,
+            # and the old guard's own `all()` exhausted the generator on the way past.
+            if not isinstance(self.value, tuple):
+                raise ValueError(
+                    f"LabelEntry {self.name!r} has arity 'multi' but its value is "
+                    f"{type(self.value).__name__}, not a tuple: {self.value!r}"
+                )
+            if not all(isinstance(item, str) and item for item in self.value):
+                raise ValueError(
+                    f"LabelEntry {self.name!r} has a non-string or empty item: {self.value!r}. "
+                    f"An empty value asserts nothing, which the single-arity path already forbids"
+                )
+            if list(self.value) != sorted(set(self.value)):
+                # Sorted and unique for `sids`' reason, seven lines below: this tuple reaches the
+                # file directly, and canonical output means the same data serialises the same way
+                # however it was assembled (spec §10). A kind whose order is *meaningful* would
+                # need that declared on `LabelKind`; none is, and inventing the field now would be
+                # speculative.
+                raise ValueError(
+                    f"LabelEntry {self.name!r} value is not sorted and unique: {self.value!r}"
+                )
         if not self.value:
             raise ValueError(
                 f"LabelEntry.value is empty for {self.name!r}: a label asserting nothing is not a "
@@ -804,6 +921,22 @@ class NormalizedCapture:
     bytes_total: int
     input_status: InputStatus
     packets_read: int
+    #: The link type the normalized capture RETAINED, as a libpcap number. Published because
+    #: `discarded_link_types` says what went and never what stayed — and a tool deciding whether
+    #: two captures can be merged needs what stayed. Measured 2026-08-20: Zeek refuses a merged
+    #: file whose interfaces disagree on link type or snapshot length.
+    link_type: int
+    #: Every DISTINCT snapshot length declared by the retained interfaces, ascending. Plural
+    #: because a `mergecap`-produced pcapng carries one interface description block per input file
+    #: and nothing makes them agree — so a single number would have to invent a winner, and the
+    #: first version of this published the largest. That erased the very fact the field exists to
+    #: expose: Zeek refuses a merge across differing snapshot lengths, so a consumer asking "can
+    #: these two captures merge?" needs to know that ONE of them disagrees with itself. One
+    #: element is the ordinary case. Mirrors `discarded_link_types`, already an array here.
+    #:
+    #: `link_type` stays singular deliberately: after normalisation a pcap can hold only one, so
+    #: the retained type is genuinely one fact. The input's snapshot length is not.
+    snaplens: tuple[int, ...]
     #: Byte offset of the first short record, or None when the capture is complete. A
     #: truncated pcap proceeds as partial input; a truncated pcapng is a hard failure.
     truncated_at_offset: int | None = None

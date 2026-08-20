@@ -696,3 +696,64 @@ def test_reporting_that_difference_does_not_itself_raise(tmp_path: Path):
 
     for line in canonical.differences(first, second):
         line.encode("utf-8")  # raises UnicodeEncodeError if a raw surrogate escaped
+
+
+def test_the_same_capture_staged_from_two_origins_compares_equal():
+    """`input.uri` joins `input.path` in the exclusion list, for the same reason one level out.
+
+    A capture fetched from `gs://a/x.pcap` and from `gs://b/x.pcap` is the SAME capture —
+    `input.sha256` says so — and Goal 2 compares two runs over one capture. Without the
+    exclusion the gate would fail on a difference in where the operator got the bytes, which is
+    a false alarm about the pipeline rather than a finding about it.
+
+    `uri_status` is deliberately NOT excluded: gs-versus-local is a real difference in what was
+    measured, not an artefact of where it was run.
+    """
+    base = {
+        "run": {
+            "input": {
+                "path": "/var/lib/flabel/captures/x.pcap",
+                "uri": "gs://bucket-a/x.pcap",
+                "uri_status": "gs",
+                "sha256": "a" * 64,
+                "link_type": 1,
+                "snaplen": 65535,
+            }
+        }
+    }
+    elsewhere = {
+        "run": {
+            "input": {
+                "path": "/home/craig/x.pcap",
+                "uri": "gs://bucket-b/x.pcap",
+                "uri_status": "gs",
+                "sha256": "a" * 64,
+                "link_type": 1,
+                "snaplen": 65535,
+            }
+        }
+    }
+
+    assert canonical.canonical_document(base) == canonical.canonical_document(elsewhere)
+
+    # `uri_status` too, and this is the case a sabotage found untested: both documents above say
+    # "gs", so removing the exclusion changed nothing. Staging from a bucket versus copying the
+    # same bytes locally leaves `sha256` identical by construction and every label byte-identical
+    # — it differs by HOW the operator staged, not by anything measured. The concrete cost of
+    # getting it wrong: reproducing a pre-#145 run (recorded `local`) with a wrapper that passes
+    # `--source-uri` would fail the gate on a non-difference, and canonical.py's own docstrings
+    # argue that a gate which cries wolf gets switched off.
+    staged_locally = {
+        "run": {
+            "input": {
+                **base["run"]["input"],
+                "uri": None,
+                "uri_status": "local",
+            }
+        }
+    }
+    assert canonical.canonical_document(base) == canonical.canonical_document(staged_locally)
+
+    # ...and a capture that really is different still differs.
+    other_bytes = {"run": {"input": {**elsewhere["run"]["input"], "sha256": "b" * 64}}}
+    assert canonical.canonical_document(base) != canonical.canonical_document(other_bytes)

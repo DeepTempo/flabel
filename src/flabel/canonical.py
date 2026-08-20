@@ -71,7 +71,18 @@ EXCLUDED_RUN_KEYS = ("started_at", "finished_at", "duration_seconds")
 #: the run. Excluding it is what lets the same capture labelled from two directories compare
 #: equal; `input.sha256` still identifies the file, so a *different* capture is still a
 #: difference.
-EXCLUDED_INPUT_KEYS = ("path",)
+#: `uri` joins `path` for the same reason, one level out (#145): the same capture staged from
+#: `gs://a/x.pcap` and from `gs://b/x.pcap` is the same capture, and `input.sha256` still
+#: identifies the bytes — so a *different* capture is still a difference. Without this, Goal 2
+#: fails on a capture labelled from two origins, which would be a false alarm about the pipeline.
+#: `uri_status` is excluded for the same reason, and an earlier comment here claimed the opposite
+#: — that gs-versus-local is "a real difference in what was measured". It is not: staging identical
+#: bytes from a bucket or copying them locally leaves `sha256` identical by construction and every
+#: label byte-identical. It differs by HOW the operator staged, which is this list's own criterion
+#: one step out. The concrete cost of getting it wrong: reproducing a pre-#145 run (recorded
+#: `local`) with a wrapper that passes `--source-uri` would fail the gate on a non-difference, and
+#: a gate that cries wolf gets switched off.
+EXCLUDED_INPUT_KEYS = ("path", "uri", "uri_status")
 
 COMMENT = "#"
 
@@ -187,7 +198,9 @@ def canonical_document(document: Mapping[str, Any]) -> dict[str, Any]:
         run = {key: value for key, value in run.items() if key not in EXCLUDED_RUN_KEYS}
         section = run.get("input")
         if isinstance(section, Mapping):
-            # `input` is `null` on a run that died before ingest, which is not an error here.
+            # Guarded for an OLD document rather than a current one: `_input_section` always
+            # returns a dict, with every value null on a run that died before ingest. The comment
+            # here used to say `input` itself is null, which it never is.
             run["input"] = {
                 key: value for key, value in section.items() if key not in EXCLUDED_INPUT_KEYS
             }

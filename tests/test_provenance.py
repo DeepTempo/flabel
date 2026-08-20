@@ -547,6 +547,8 @@ def make_capture(tmp_path: Path, **overrides) -> NormalizedCapture:
         "bytes_total": 4096,
         "input_status": "complete",
         "packets_read": 120,
+        "link_type": 1,
+        "snaplens": (65535,),
         "normalization": ("convert: editcap -F pcap",),
     }
     return NormalizedCapture(**{**fields, **overrides})
@@ -1513,6 +1515,28 @@ def flatten(block: dict, prefix: str = "") -> set[str]:
         if isinstance(value, dict):
             paths |= flatten(value, f"{path}.")
     return paths
+
+
+def test_a_run_that_died_before_ingest_reports_the_four_new_keys_as_null(tmp_path):
+    """spec §10 forbids dropping a key, so a dead run publishes them as null rather than absent.
+
+    `uri` and `uri_status` are null even though the caller KNOWS them — the operator typed the
+    URI. That is deliberate and follows `path`, which is null on this branch for the same reason:
+    the section's subject is the capture as handed over, and a run that could not read it knows
+    nothing about it. One field behaving differently from its neighbours would be worse than the
+    small loss.
+    """
+    block = build_run_block(
+        started_at="2026-08-20T10:00:00.000000Z",
+        finished_at="2026-08-20T10:00:01.000000Z",
+        mode="offline",
+        source_uri="gs://bucket/object.pcap",
+    )
+
+    section = block["input"]
+    for key in ("uri", "uri_status", "link_type", "snaplens"):
+        assert key in section, f"{key} was dropped, which spec §10 forbids"
+        assert section[key] is None, f"{key} should be null on a run that never read a capture"
 
 
 def test_the_run_block_carries_exactly_the_keys_spec_10_declares(tmp_path):

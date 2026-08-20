@@ -66,6 +66,19 @@ three test files, two spec sections — roughly a day. Planned for rather than d
   closed, so this needs its reasoning recorded as #132's did)
 - `tests/test_models.py`, `tests/test_ingest.py`, `tests/test_cli.py`, **`tests/test_provenance.py`**
 
+**Four files outside this list were touched, and the list is amended rather than the fact hidden**:
+`src/flabel/correlate.py` and `tests/test_correlate.py` (the first review's HIGH 1 — the tier rule
+was enforced in two places), `tests/test_canonical.py` (implied by this step's own two-origins
+test), `tests/fixtures/make_awkward.py` (a fixture whose interfaces disagree on snaplen, without
+which the second review's HIGH 2 was untestable), and `docs/spec-label-store.md`. `CLAUDE.md` says
+not to edit outside the step without asking; each of these came from a review finding rather than
+improvisation, and recording them here is what keeps the next reader from comparing against a stale
+list.
+
+**After this step lands, `--source-uri` exists and nothing passes it.** The headline requirement
+stays unmet in production until LS-5 wires the wrapper. Said out loud so the step is not mistaken
+for the deliverable.
+
 **Expect the build red before green.** `test_the_run_block_carries_exactly_the_keys_spec_10_declares`
 (`test_provenance.py`, ~line 1518) asserts set **equality** between the built block and §10's literal,
 and its `full_run` fixture must change too. That is the mechanism working.
@@ -88,9 +101,23 @@ which this creates the two-copies hazard it is meant to prevent.
 - Two runs of one capture from different origins compare equal through `canonical`.
 - `get_args(LabelName) == tuple(LABEL_KINDS)`; arity and permitted tiers are **enforced**, not declared.
 
-**Sabotage** — remove `LABEL_KINDS` from the name check and confirm a forged `LabelEntry(name="mitre")`
-starts constructing. Point `link_type` at the discarded type. Drop `input.uri` from
-`EXCLUDED_INPUT_KEYS` and confirm the two-origin test goes red.
+**Sabotage** — the wording here was originally *"remove `LABEL_KINDS` from the name check and
+confirm a forged `LabelEntry(name="mitre")` starts constructing"*, and that is **not executable**:
+`_check(self.name, get_args(LabelName), …)` runs first, so the table is never consulted for an
+unknown name. What was run instead, sixteen sabotages across the two parts, all sixteen red after
+two rounds of fixing:
+
+*Part A* — drop the kind-tier check · drop the single-arity check · drop the multi-arity check ·
+add a kind to `LABEL_KINDS` absent from `LabelName` · drop `LabelKind`'s empty-tiers guard · drop
+its arity `_check` · make `correlate` hardcode the tier again · drop `MappingProxyType`.
+*Part B* — report the **discarded** link type · discard `snaplen` again · drop `uri` from the run
+block · pin `uri_status` to `local` · drop the null keys on a dead run · stop excluding `uri` from
+`canonical` · accept any `--source-uri` · accept a bucket with no object.
+
+**Three passed on the first attempt and each was a finding**: `LabelKind`'s empty-tiers and arity
+guards had no test at all (nothing in the codebase builds a bad kind), and the multi-arity
+empty-item test used `("T1190", "")` — which the *sorted* guard catches first, so it passed without
+the empty-item check existing. See `passing-tests-near-new-guards-are-suspect` for the general rule.
 
 **Depends on** nothing.
 

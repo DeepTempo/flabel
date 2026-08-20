@@ -60,12 +60,17 @@ from flabel.models import (
     label_basis,
     may_label,
 )
+from flabel.models import (
+    KNOWN_TIERS as models_known_tiers,
+)
 
 #: Tiers that mean something. Tier 1 is a PANW NGFW verdict, tier 2 is open-source screening;
 #: lower is higher trust, and `Label.best_tier` ranks labels by it. Phase 1 only ever produces
 #: 2, but the closed set is `{1, 2}` so that Phase 2 adding tier-1 entries stays additive
 #: (spec §2.7) rather than requiring this constant to change.
-KNOWN_TIERS = (1, 2)
+#: Re-exported from `models`, which is where it now lives: this was one of four unlinked places
+#: recording which tiers exist, and `models` is the one module every other can import (#145).
+KNOWN_TIERS = models_known_tiers
 
 
 def build_source_entry(
@@ -392,6 +397,7 @@ def build_run_block(
     warnings: Sequence[str] = (),
     toolchain_path: Path = TOOLCHAIN_MANIFEST,
     flabel_version: str = __version__,
+    source_uri: str | None = None,
 ) -> dict[str, Any]:
     """The run block of spec §10, ready to serialise and complete for any outcome.
 
@@ -428,7 +434,7 @@ def build_run_block(
         "unmatched_threshold": unmatched_threshold,
         "tiers_attempted": list(attempted),
         "tiers_unavailable": list(unavailable),
-        "input": _input_section(capture),
+        "input": _input_section(capture, source_uri),
         "ruleset": _ruleset_section(manifest),
         "tools": _tools_section(zeek, suricata, versions, ja4_version),
         "counts": _counts_section(correlation, suricata),
@@ -505,27 +511,44 @@ def _duration(started_at: str, finished_at: str) -> tuple[float | None, tuple[st
 # established. See the section note at the top of this block for why that is not `0` or `{}`.
 
 
-def _input_section(capture: NormalizedCapture | None) -> dict[str, Any]:
+def _input_section(
+    capture: NormalizedCapture | None, source_uri: str | None = None
+) -> dict[str, Any]:
     """The capture as the operator handed it over (spec §10).
 
     `path` is `original_path`, never the normalized copy. The normalized copy lives in a
     per-run temporary directory, so it means nothing to a reader and differs on every run by
-    construction — which would break Goal 2 from inside the one input field spec §10 excludes
+    construction — which would break Goal 2 from inside one of the input fields spec §10 excludes
     from the comparison precisely to keep it comparable.
 
     `format` and `bytes` use their spec §10 names: the model calls them `capture_format` and
     `bytes_total` only because the obvious names shadow builtins, and the output should not
     inherit a Python workaround.
+
+    **`uri` is a parameter, not a field of `NormalizedCapture`** (#145). It is not a property of
+    the capture file — it is where the operator said the bytes came from, and `ingest.normalize`
+    has no knowledge of a `gs://` URI. `uri_status` exists so a null `uri` is one fact and not
+    two: spec §10 is emphatic that `null` means "not measured", so without it "there was no URI,
+    the operator passed a local path" and "this run predates the field" would be the same value
+    in the field the whole document exists to make traceable.
     """
     if capture is None:
+        # Every key null, including `uri` and `uri_status`, which the caller *does* know. The
+        # section's subject is the capture as handed over, and a run that could not read it knows
+        # nothing about it — which is the convention `path` already sets. spec §10 forbids
+        # dropping a key, so they are present and null rather than absent.
         return dict.fromkeys(
             (
                 "path",
+                "uri",
+                "uri_status",
                 "sha256",
                 "format",
                 "bytes",
                 "input_status",
                 "packets_read",
+                "link_type",
+                "snaplens",
                 "truncated_at_offset",
                 "discarded_link_types",
                 "discarded_packets",
@@ -534,11 +557,15 @@ def _input_section(capture: NormalizedCapture | None) -> dict[str, Any]:
         )
     return {
         "path": str(capture.original_path),
+        "uri": source_uri,
+        "uri_status": "gs" if source_uri else "local",
         "sha256": capture.sha256,
         "format": capture.capture_format,
         "bytes": capture.bytes_total,
         "input_status": capture.input_status,
         "packets_read": capture.packets_read,
+        "link_type": capture.link_type,
+        "snaplens": list(capture.snaplens),
         "truncated_at_offset": capture.truncated_at_offset,
         "discarded_link_types": list(capture.discarded_link_types),
         "discarded_packets": capture.discarded_packets,
