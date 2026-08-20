@@ -38,6 +38,7 @@ from flabel.models import (
     CORRELATABLE_PROTOCOLS,
     DEFAULT_THRESHOLD,
     DEVICE_UNNAMED_THREAT,
+    LABEL_KINDS,
     CorrelationResult,
     Detection,
     Flow,
@@ -509,7 +510,12 @@ def _label_entries(pairs: Sequence[tuple[Detection, SourceEntry]]) -> tuple[Labe
         # would assert that the threat is *called* "unnamed", in the one field the PRD calls the
         # trainable value. Decision 3 applied to the same situation: omit the label rather than fill
         # it with a stand-in.
-        if entry.tier == 1 and entry.threat != DEVICE_UNNAMED_THREAT
+        # **The permitted tier is read from `LABEL_KINDS`, not hardcoded** (#145). It was
+        # `entry.tier == 1`, which put the tier-1-only rule in two places that could disagree —
+        # and the asymmetry mattered: widening the table alone did nothing, while widening this
+        # alone made `LabelEntry` raise and killed the run. Now extending `threat-name` to tier 2
+        # is the one edit spec §4 says it is.
+        if entry.tier in LABEL_KINDS["threat-name"].tiers and entry.threat != DEVICE_UNNAMED_THREAT
     ]
     if not inline:
         return (verdict,)

@@ -202,7 +202,7 @@ class SourceEntry:               # one asserting detection on a label
 @dataclass(frozen=True)
 class LabelEntry:                # one assertion about a flow (schema 2.0, #138)
     name: Literal["verdict", "threat-name"]
-    value: str
+    value: str | tuple[str, ...]   # a str for a `single` kind; see models.LABEL_KINDS
     tier: int                    # the tier of the source(s) asserting THIS entry
     sids: tuple[int, ...]        # sorted; what is behind the claim
 

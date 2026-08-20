@@ -680,11 +680,61 @@ def test_a_label_kind_with_an_unknown_arity_is_rejected():
         models.LabelKind(arity="several", tiers=(1,))
 
 
-def test_every_label_kind_permits_at_least_one_tier():
-    """A kind no tier may assert cannot be produced, and would fail every entry silently."""
+def test_the_label_kinds_table_is_well_formed():
+    """A table validator, not a spot check.
+
+    `LabelKind.__post_init__` fires while someone is editing this file, which is the right time —
+    but only for the cases it knows about. This asserts the shipped table against
+    `models.KNOWN_TIERS` rather than a literal, so adding a tier is one edit and this test follows.
+    """
     for name, kind in models.LABEL_KINDS.items():
+        assert isinstance(kind.tiers, tuple), f"{name}: tiers must be a tuple"
         assert kind.tiers, f"{name} permits no tier"
-        assert set(kind.tiers) <= {1, 2}, f"{name} permits a tier that does not exist"
+        assert set(kind.tiers) <= set(models.KNOWN_TIERS), (
+            f"{name} permits a tier that cannot exist"
+        )
+        assert list(kind.tiers) == sorted(set(kind.tiers)), (
+            f"{name}: tiers not ascending and unique"
+        )
+        assert kind.arity in get_args(models.LabelArity)
+
+
+def test_the_label_kinds_table_cannot_be_mutated_at_runtime():
+    """It is the label vocabulary. Any module holding a reference could otherwise rewrite it.
+
+    Untested until a review pointed out that the monkeypatch test below substitutes a plain dict,
+    so nothing asserted the real table's immutability — a later "simplify" dropping
+    `MappingProxyType` would have passed CI.
+    """
+    with pytest.raises(TypeError):
+        models.LABEL_KINDS["verdict"] = models.LabelKind(arity="multi", tiers=(1, 2))
+
+
+@pytest.mark.parametrize(
+    "tiers",
+    [
+        pytest.param((3,), id="a-tier-that-does-not-exist"),
+        pytest.param((0,), id="tier-zero"),
+        pytest.param((2, 1), id="descending"),
+        pytest.param((1, 1), id="duplicated"),
+        pytest.param((True,), id="a-bool-that-serialises-as-true"),
+        pytest.param([1], id="a-list-not-a-tuple"),
+        pytest.param(1, id="a-bare-int"),
+        pytest.param(("1",), id="a-string"),
+    ],
+)
+def test_a_label_kind_with_malformed_tiers_is_rejected(tiers):
+    """Found by review, and `tiers=(3,)` is the one that matters.
+
+    It has *identical* consequences to `tiers=()` — every entry of that kind unconstructible,
+    surfacing as a confusing per-entry error rather than as the table being wrong — which is the
+    stated rationale for the empty-tiers guard, word for word. One raised and the other did not.
+
+    `(True,)` follows `provenance`'s existing convention: it guards `isinstance(tier, bool)`
+    because `True == 1` and the tier would serialise into `labels.json` as `true`.
+    """
+    with pytest.raises((ValueError, TypeError)):
+        models.LabelKind(arity="single", tiers=tiers)
 
 
 def test_a_label_entry_at_a_tier_its_kind_does_not_permit_is_rejected():
@@ -696,7 +746,7 @@ def test_a_label_entry_at_a_tier_its_kind_does_not_permit_is_rejected():
     entirely. Extending `threat-name` to tier 2 stays purely additive: it is one edit to
     `LABEL_KINDS`.
     """
-    with pytest.raises(ValueError, match="tier"):
+    with pytest.raises(ValueError, match="permits only tier"):
         LabelEntry(name="threat-name", value="Some Threat", tier=2, sids=(30001,))
 
 
@@ -730,6 +780,49 @@ def test_the_multi_arity_branch_works_before_any_multi_kind_exists(monkeypatch):
     assert several.value == ("T1059", "T1190")
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(["T1059", "T1190"], id="a-list-makes-provenance-mutable"),
+        pytest.param({"T1059", "T1190"}, id="a-set-is-unordered-and-unserialisable"),
+        # `("", "T1190")` and NOT `("T1190", "")`: the latter is unsorted, so the sorted guard
+        # catches it first and this case would pass without the empty-item guard existing at all.
+        # Found by sabotage — removing the empty-item check left the suite green.
+        pytest.param(("", "T1190"), id="an-empty-item-asserts-nothing"),
+        pytest.param(("T1190", "T1059"), id="unsorted-breaks-canonical-output"),
+        pytest.param(("T1059", "T1059"), id="duplicated"),
+    ],
+)
+def test_a_multi_arity_value_must_be_a_sorted_unique_tuple_of_non_empty_strings(monkeypatch, value):
+    """The multi guard originally admitted every one of these.
+
+    It checked "not a str, and all items are str", which lets a list, a set and a generator
+    through. Three things that matters for: `models`' own docstring says everything here is frozen
+    because *a claim that can be edited after the fact is not provenance*; a set or a generator
+    fails inside `labels.py` AFTER the pipeline has succeeded, which is the late-failure class
+    `serialise_bytes` exists to prevent; and `sids` seven lines below is required sorted because
+    *this tuple reaches the file directly* — a multi value reaches it the same way.
+    """
+    patched = dict(models.LABEL_KINDS)
+    patched["threat-name"] = models.LabelKind(arity="multi", tiers=(1,))
+    monkeypatch.setattr(models, "LABEL_KINDS", patched)
+    with pytest.raises(ValueError):
+        LabelEntry(name="threat-name", value=value, tier=1, sids=(30001,))
+
+
+def test_a_multi_arity_generator_value_is_rejected(monkeypatch):
+    """Separately, because the old guard's own `all()` EXHAUSTED it before anything could fail.
+
+    The entry then constructed holding a spent generator, and `dataclasses.asdict` died with
+    "cannot pickle 'generator' object" — one stage after the mistake was made.
+    """
+    patched = dict(models.LABEL_KINDS)
+    patched["threat-name"] = models.LabelKind(arity="multi", tiers=(1,))
+    monkeypatch.setattr(models, "LABEL_KINDS", patched)
+    with pytest.raises(ValueError):
+        LabelEntry(name="threat-name", value=(x for x in ("T1190",)), tier=1, sids=(30001,))
+
+
 def test_a_label_entry_citing_an_unknown_sid_is_rejected():
     """Goal 1, enforced instead of asserted (#140).
 
@@ -760,7 +853,9 @@ def test_a_label_entry_claiming_a_tier_none_of_its_sources_had_is_rejected():
     # The source's OWN sid, so the only thing wrong is the tier. Hardcoding a sid made this hit
     # the unknown-sid guard instead and pass for the wrong reason.
     overstated = LabelEntry(name="threat-name", value="Some Threat", tier=1, sids=(sources[0].sid,))
-    with pytest.raises(ValueError, match="tier"):
+    # The distinctive phrase, not just "tier": the kind-permits-tier guard added in #145 also
+    # contains that word, and this whole change exists because a test passed on the wrong guard.
+    with pytest.raises(ValueError, match="none of its own sources"):
         Label(
             flow=make_flow(),
             best_tier=2,

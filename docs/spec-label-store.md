@@ -464,8 +464,32 @@ and a test asserts `get_args(LabelName) == tuple(LABEL_KINDS)`; without it, this
 justification creates the two-copies hazard it invokes.
 
 `arity` and `tiers` must be **enforced**, not merely declared — a declared-but-unchecked field is the
-drift this section exists to prevent. `LabelEntry.__post_init__` checks arity; `Label.__post_init__`
-checks that an entry's tier is permitted for its name.
+drift this section exists to prevent. **Both checks live in `LabelEntry.__post_init__`.** This
+sentence previously put the tier check in `Label.__post_init__`; the code is right and the sentence
+was wrong. A kind's permitted tiers are a property of the entry alone — name and tier, no flow
+context — so construction is the earliest point it can be refused, where `Label` would let an
+impossible entry exist first. Amended to match what was built rather than the code bent to match
+prose, and the choice is not free: enforcing at construction made four existing tests unable to
+build a tier-2 `threat-name`, one of which had been passing on the wrong guard.
+
+**A `multi` value must be a sorted, unique `tuple` of non-empty strings.** A first implementation
+checked only "not a `str`, and every item is a `str`", which admitted a list (mutable provenance,
+against `models`' own rule), a set and a generator (both fail inside `labels.py` *after* the
+pipeline has succeeded), an empty item, and unsorted or duplicated values. `sids` is required sorted
+for the same reason — the tuple reaches the file directly, and canonical output means the same data
+serialises the same way however it was assembled (spec §10). A kind whose order is *meaningful*
+would need that declared on `LabelKind`; none is, so the field is not invented yet.
+
+**`correlate` reads the table rather than repeating it.** `_label_entries` filtered
+`entry.tier == 1`, putting the tier-1-only rule in two places whose disagreement was asymmetric:
+widening the table alone did nothing, while widening `correlate` alone made `LabelEntry` raise and
+took the run to exit 1 on a capture that had produced labels the day before. It now reads
+`LABEL_KINDS["threat-name"].tiers`, so spec §4's claim that extending to tier 2 is "purely additive"
+is true rather than aspirational.
+
+**`KNOWN_TIERS` lives in `models`**, for the reason `DEFAULT_THRESHOLD` does: that module imports
+nothing from the package, so it is the one place every other module can share a definition through.
+Which tiers exist was previously written in four unlinked places.
 
 ### 6.3 CLI contracts
 
@@ -752,6 +776,14 @@ The store and `blfile` **must never**:
 - **The headline requirement is unmet for every run already in the archive**, which all predate
   `--source-uri`. `uri_status: not-recorded` and `selection.flows_without_origin` make it visible
   instead of silent (§4.2, §6.4).
+- **A construction-time rule makes an old row unreadable rather than reportable.** `LABEL_KINDS` is
+  enforced when a `LabelEntry` is built, and LS-7 and LS-8 build them from archived rows. A
+  historical row whose (kind, tier) pair falls outside the table would raise on data an older
+  writer legally produced — which is how a backfill becomes unrunnable. Nothing in the archive is at
+  risk today: `correlate` has filtered `threat-name` to tier 1 since #138, and `verdict` has only
+  ever carried 1 or 2. **LS-7 must decide deliberately** whether a row it cannot construct is a hard
+  failure or a counted exclusion; §3.2's `ip_proto` case — refuse the row, count it, record it on
+  the run — is the precedent, and §4.5's `run_exclusions` is where it belongs.
 - **Two inherited defects.** `flow.ts_last` can exclude a last-packet detection (#60); duplicate
   `SourceEntry` values are unbounded (#58), so a composed `sources` list can carry repeats.
 - **The cross-tier merge path has never met real data** (#144) — 432/432 and 367/367 single-source. It

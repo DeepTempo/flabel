@@ -60,12 +60,17 @@ from flabel.models import (
     label_basis,
     may_label,
 )
+from flabel.models import (
+    KNOWN_TIERS as models_known_tiers,
+)
 
 #: Tiers that mean something. Tier 1 is a PANW NGFW verdict, tier 2 is open-source screening;
 #: lower is higher trust, and `Label.best_tier` ranks labels by it. Phase 1 only ever produces
 #: 2, but the closed set is `{1, 2}` so that Phase 2 adding tier-1 entries stays additive
 #: (spec §2.7) rather than requiring this constant to change.
-KNOWN_TIERS = (1, 2)
+#: Re-exported from `models`, which is where it now lives: this was one of four unlinked places
+#: recording which tiers exist, and `models` is the one module every other can import (#145).
+KNOWN_TIERS = models_known_tiers
 
 
 def build_source_entry(

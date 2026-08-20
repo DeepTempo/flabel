@@ -126,6 +126,13 @@ TIERS_BY_MODE: dict[RunMode, tuple[int, ...]] = {
 #: which is the whole point of decision 3 in #138.
 LabelName = Literal["verdict", "threat-name"]
 
+#: The tiers that exist. Defined here, not in `provenance`, for the reason `DEFAULT_THRESHOLD` is:
+#: this module imports nothing from the package, so it is the one place every other module can
+#: share a definition through. Before this it was written in four unlinked places — `provenance`,
+#: `TIERS_BY_MODE`, `LABEL_KINDS` and a test literal — so adding a tier was a four-file edit with
+#: nothing asserting they agreed.
+KNOWN_TIERS = (1, 2)
+
 #: How many values one assertion of a kind may carry. `single` is every kind today; `multi` exists
 #: because MITRE technique ids are the next kind expected and a flow plausibly carries several.
 LabelArity = Literal["single", "multi"]
@@ -148,8 +155,31 @@ class LabelKind:
 
     def __post_init__(self) -> None:
         _check(self.arity, get_args(LabelArity), "arity", "LabelKind")
+        if not isinstance(self.tiers, tuple):
+            raise ValueError(
+                f"LabelKind.tiers must be a tuple, got {type(self.tiers).__name__}: a list is "
+                f"mutable and a bare int makes `tier not in tiers` raise TypeError on every entry"
+            )
         if not self.tiers:
             raise ValueError("LabelKind.tiers is empty: a kind no tier may assert cannot exist")
+        # `bool` first, because `True == 1` and the tier would serialise as `true` — the same
+        # exclusion `provenance.build_source_entry` already makes for `Detection.tier`.
+        if any(isinstance(tier, bool) or not isinstance(tier, int) for tier in self.tiers):
+            raise ValueError(f"LabelKind.tiers must be plain ints, got {self.tiers!r}")
+        unknown = [tier for tier in self.tiers if tier not in KNOWN_TIERS]
+        if unknown:
+            # Identical consequence to an empty tuple — every entry of the kind unconstructible,
+            # surfacing as a per-entry error rather than as the table being wrong — so it is the
+            # same guard, and it was missing.
+            raise ValueError(
+                f"LabelKind.tiers names tier(s) {unknown} that do not exist; known: "
+                f"{list(KNOWN_TIERS)}"
+            )
+        if list(self.tiers) != sorted(set(self.tiers)):
+            raise ValueError(
+                f"LabelKind.tiers must be ascending and unique, got {self.tiers!r}: the field "
+                f"documents itself as ascending, and a duplicate means nothing"
+            )
 
 
 #: The one authority for what a label kind is. `LabelName` above carries the static typing a
@@ -659,6 +689,13 @@ class LabelEntry:
 
     def __post_init__(self) -> None:
         _check(self.name, get_args(LabelName), "name", "LabelEntry")
+        if self.name not in LABEL_KINDS:
+            # Unreachable while the drift test holds, and explicit anyway: the failure would
+            # otherwise be a bare `KeyError` where every other guard here raises a sentence.
+            raise ValueError(
+                f"LabelEntry.name {self.name!r} has no entry in LABEL_KINDS, so its arity and "
+                f"permitted tiers are unknown"
+            )
         kind = LABEL_KINDS[self.name]
         if self.tier not in kind.tiers:
             # Declared in `LABEL_KINDS` and therefore enforced. spec §4 says `threat-name` is
@@ -673,13 +710,31 @@ class LabelEntry:
                 f"LabelEntry {self.name!r} has arity 'single' but its value is "
                 f"{type(self.value).__name__}: one assertion, one value"
             )
-        if kind.arity == "multi" and (
-            isinstance(self.value, str) or not all(isinstance(item, str) for item in self.value)
-        ):
-            raise ValueError(
-                f"LabelEntry {self.name!r} has arity 'multi' but its value is not a sequence of "
-                f"strings: {self.value!r}"
-            )
+        if kind.arity == "multi":
+            # **A tuple, not merely "not a str"**, which is what this checked first and which let a
+            # list, a set and a generator through. A list makes provenance mutable, against this
+            # module's own rule that a claim which can be edited after the fact is not provenance;
+            # a set and a generator both fail inside `labels.py` *after* the pipeline succeeded,
+            # and the old guard's own `all()` exhausted the generator on the way past.
+            if not isinstance(self.value, tuple):
+                raise ValueError(
+                    f"LabelEntry {self.name!r} has arity 'multi' but its value is "
+                    f"{type(self.value).__name__}, not a tuple: {self.value!r}"
+                )
+            if not all(isinstance(item, str) and item for item in self.value):
+                raise ValueError(
+                    f"LabelEntry {self.name!r} has a non-string or empty item: {self.value!r}. "
+                    f"An empty value asserts nothing, which the single-arity path already forbids"
+                )
+            if list(self.value) != sorted(set(self.value)):
+                # Sorted and unique for `sids`' reason, seven lines below: this tuple reaches the
+                # file directly, and canonical output means the same data serialises the same way
+                # however it was assembled (spec §10). A kind whose order is *meaningful* would
+                # need that declared on `LabelKind`; none is, and inventing the field now would be
+                # speculative.
+                raise ValueError(
+                    f"LabelEntry {self.name!r} value is not sorted and unique: {self.value!r}"
+                )
         if not self.value:
             raise ValueError(
                 f"LabelEntry.value is empty for {self.name!r}: a label asserting nothing is not a "
