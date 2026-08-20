@@ -55,7 +55,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --locked --dev
+      # `--extra db` for the store's PURE tests (schema declaration, drift detection,
+      # credential-vs-drift exit codes). They call no BigQuery API — spec-label-store §2
+      # records that the `requires_bigquery` tests run nowhere — but they import the
+      # client's exception types, so the extra has to be installed for them to run at all.
+      - run: uv sync --locked --dev --extra db
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
@@ -90,7 +94,11 @@ jobs:
         run: cat /etc/flabel-toolchain.json
 
       # uv is baked into the image, so no setup action is needed here.
-      - run: uv sync --locked --dev
+      # `--extra db` for the store's PURE tests (schema declaration, drift detection,
+      # credential-vs-drift exit codes). They call no BigQuery API — spec-label-store §2
+      # records that the `requires_bigquery` tests run nowhere — but they import the
+      # client's exception types, so the extra has to be installed for them to run at all.
+      - run: uv sync --locked --dev --extra db
 
       # --require-tool-tests: fail unless a real-tool test actually ran, so a skipped
       #                       integration layer can never be mistaken for a passing build.
