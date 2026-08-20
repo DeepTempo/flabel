@@ -95,15 +95,21 @@ So `uid` collides across captures *and* is unstable for a given flow. It is a pe
 ```python
 def flow_key(capture_sha256: str, flow: Flow) -> str:
     """Content-derived identity of a flow within a capture. Never reads flow.uid."""
-    lo, hi = sorted((
-        (ip_address(flow.src_ip).packed, flow.src_port),
-        (ip_address(flow.dst_ip).packed, flow.dst_port),
-    ))
-    material = "|".join((
-        capture_sha256, flow.proto.lower(),
-        _endpoint(lo), _endpoint(hi),
-        iso_micros(flow.ts_first),          # the format from docs/spec.md §10
-    ))
+    lo, hi = sorted(
+        (
+            (ip_address(flow.src_ip).packed, flow.src_port),
+            (ip_address(flow.dst_ip).packed, flow.dst_port),
+        )
+    )
+    material = "|".join(
+        (
+            capture_sha256,
+            flow.proto.lower(),
+            _endpoint(lo),
+            _endpoint(hi),
+            iso_micros(flow.ts_first),  # the format from docs/spec.md §10
+        )
+    )
     return sha256(material.encode()).hexdigest()[:16]
 ```
 
@@ -318,7 +324,7 @@ tiers:
 
 ```python
 LABEL_KINDS: Mapping[str, LabelKind] = {
-    "verdict":     LabelKind(arity="single", tiers=(1, 2)),
+    "verdict": LabelKind(arity="single", tiers=(1, 2)),
     "threat-name": LabelKind(arity="single", tiers=(1,)),
 }
 ```
@@ -427,6 +433,7 @@ Four required behaviours, each because the silent version is worse:
 
 ```python
 from google.auth.compute_engine import Credentials
+
 client = bigquery.Client(credentials=Credentials(), project=GCP_PROJECT)
 ```
 
