@@ -4,6 +4,10 @@
 
 Test-first throughout (`/tdd`). No code is written in this stage.
 
+**This plan is complete and closed.** Later phases have their own: Phase 3 (the label store and
+`blfile`) is `docs/PLAN-label-store.md`. Phase 2 was built on a branch without re-entering the stage
+pipeline (Craig, 2026-08-17) and has no plan document.
+
 ## Shape of the work
 
 ```

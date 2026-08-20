@@ -4,6 +4,12 @@
 
 The bar for this document: hand it to a stranger and they build the same thing.
 
+**Phase 3 (the label store and `blfile`) is specified separately, in `docs/spec-label-store.md`.**
+It lives in its own document rather than as a section here because what it specifies lives in a
+separate package: flabel has `dependencies = []` and `tests/test_architecture.py` keeps a closed list
+of network-capable modules, and a BigQuery client is both. This document stays the authority for
+everything flabel emits — including the three additive `run.input` fields §10 gains for it.
+
 ---
 
 ## 1. Vocabulary
