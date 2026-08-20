@@ -13,9 +13,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
-from types import MappingProxyType
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, get_args
 
 #: Spec §9's default: past 1% of detections unplaceable, the labels no longer describe the
