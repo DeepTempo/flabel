@@ -26,6 +26,7 @@ from flabel.models import (
     Ja4Status,
     Label,
     LabelEntry,
+    LabelName,
     NormalizedCapture,
     SnapshotManifest,
     SourceAdmission,
@@ -551,6 +552,17 @@ def one_source() -> tuple[SourceEntry, ...]:
     return (make_entry(),)
 
 
+def one_tier_1_source() -> tuple[SourceEntry, ...]:
+    """A tier-1 source, for the tests that need a legitimate `threat-name`.
+
+    `threat-name` permits only tier 1 (`LABEL_KINDS`), so a test using it as scaffolding needs a
+    tier-1 source or the entry cannot be built at all. Four tests below used a tier-2 one and got
+    away with it while nothing enforced the kind's tiers — and one of them would then have raised
+    on the tier rather than on the thing it was testing.
+    """
+    return (make_entry(tier=1, source="panw/device", sid=30001),)
+
+
 def test_a_label_with_no_verdict_is_rejected():
     """A `Label` exists because something was asserted, and `verdict` is that assertion.
 
@@ -577,13 +589,13 @@ def test_a_repeated_label_name_is_rejected():
     Two entries of one name would mean the choice was never made, and a consumer would have to
     invent a tiebreak the producer declined to.
     """
-    sources = one_source()
-    first = LabelEntry(name="threat-name", value="A", tier=2, sids=(1,))
-    second = LabelEntry(name="threat-name", value="B", tier=2, sids=(2,))
+    sources = one_tier_1_source()
+    first = LabelEntry(name="threat-name", value="A", tier=1, sids=(sources[0].sid,))
+    second = LabelEntry(name="threat-name", value="B", tier=1, sids=(sources[0].sid,))
     with pytest.raises(ValueError, match="repeated"):
         Label(
             flow=make_flow(),
-            best_tier=2,
+            best_tier=1,
             labels=tuple(sorted((verdict_entry(sources), first, second), key=lambda e: e.name)),
             sources=sources,
         )
@@ -604,12 +616,12 @@ def test_the_verdict_entrys_tier_must_agree_with_best_tier():
 
 def test_label_entries_out_of_name_order_are_rejected():
     """Canonical output: the same data serialises the same way however it was assembled (§10)."""
-    sources = one_source()
-    threat = LabelEntry(name="threat-name", value="Some Threat", tier=2, sids=(1,))
+    sources = one_tier_1_source()
+    threat = LabelEntry(name="threat-name", value="Some Threat", tier=1, sids=(sources[0].sid,))
     with pytest.raises(ValueError, match="sorted"):
         Label(
             flow=make_flow(),
-            best_tier=2,
+            best_tier=1,
             labels=(verdict_entry(sources), threat),  # "verdict" > "threat-name"
             sources=sources,
         )
@@ -639,6 +651,85 @@ def test_an_unknown_label_name_is_rejected():
         LabelEntry(name="severity", value="high", tier=1, sids=(30001,))
 
 
+def test_label_kinds_and_the_label_name_literal_describe_the_same_set():
+    """The two-copies guard for #145.
+
+    `LABEL_KINDS` carries arity and permitted tiers; `LabelName` carries static typing, which a
+    `Mapping` cannot provide. So both exist, and this is what stops them drifting — the hazard
+    spec-label-store §6.2 invokes to justify the table in the first place. Without it, adding a
+    kind to one and not the other leaves `blfile` and `LabelEntry` disagreeing about what a
+    label is, with nothing red.
+    """
+    assert tuple(get_args(LabelName)) == tuple(models.LABEL_KINDS)
+
+
+def test_a_label_kind_permitting_no_tier_is_rejected():
+    """Found by sabotage: this guard shipped with no test, because nothing builds a bad kind.
+
+    Only reachable by editing `LABEL_KINDS`, which is exactly when it matters — a kind no tier may
+    assert makes every entry of that kind unconstructible, and the error would surface as a
+    confusing per-entry failure rather than as the table being wrong.
+    """
+    with pytest.raises(ValueError, match="tiers is empty"):
+        models.LabelKind(arity="single", tiers=())
+
+
+def test_a_label_kind_with_an_unknown_arity_is_rejected():
+    """The same reason `_check` exists at all: `Literal` is a hint, not a runtime constraint."""
+    with pytest.raises(ValueError, match="arity"):
+        models.LabelKind(arity="several", tiers=(1,))
+
+
+def test_every_label_kind_permits_at_least_one_tier():
+    """A kind no tier may assert cannot be produced, and would fail every entry silently."""
+    for name, kind in models.LABEL_KINDS.items():
+        assert kind.tiers, f"{name} permits no tier"
+        assert set(kind.tiers) <= {1, 2}, f"{name} permits a tier that does not exist"
+
+
+def test_a_label_entry_at_a_tier_its_kind_does_not_permit_is_rejected():
+    """`threat-name` is tier-1 only (spec §4), and that was declared but never enforced.
+
+    Not hypothetical: before this guard existed, four tests in this file built
+    `LabelEntry(name="threat-name", tier=2)` as incidental scaffolding, and one of them —
+    the unknown-sid test — would have gone on passing while raising for a different reason
+    entirely. Extending `threat-name` to tier 2 stays purely additive: it is one edit to
+    `LABEL_KINDS`.
+    """
+    with pytest.raises(ValueError, match="tier"):
+        LabelEntry(name="threat-name", value="Some Threat", tier=2, sids=(30001,))
+
+
+def test_a_single_arity_label_entry_rejects_a_sequence_value():
+    """Arity is declared per kind, so it has to be checked per kind.
+
+    `value` is typed `str`, and a type hint is not a check — the same reason `_check` exists.
+    A list reaching a single-arity kind would serialise as a JSON array in the one field the
+    PRD calls the trainable value, and every consumer branches on type from then on.
+    """
+    with pytest.raises(ValueError, match="arity|single"):
+        LabelEntry(name="verdict", value=["malicious"], tier=2, sids=(30001,))
+
+
+def test_the_multi_arity_branch_works_before_any_multi_kind_exists(monkeypatch):
+    """Both arities are enforced, so declaring `multi` on a kind is one edit and not a rewrite.
+
+    Every kind is `single` today, which would leave the `multi` branch unexecuted — a declared
+    value with no behaviour behind it, which is the drift `LABEL_KINDS` exists to prevent. So the
+    table is patched to make one kind `multi` and both directions are checked. When MITRE lands,
+    this is the test that says the guard was already working.
+    """
+    patched = dict(models.LABEL_KINDS)
+    patched["threat-name"] = models.LabelKind(arity="multi", tiers=(1,))
+    monkeypatch.setattr(models, "LABEL_KINDS", patched)
+
+    with pytest.raises(ValueError, match="multi"):
+        LabelEntry(name="threat-name", value="T1190", tier=1, sids=(30001,))
+
+    several = LabelEntry(name="threat-name", value=("T1059", "T1190"), tier=1, sids=(30001,))
+    assert several.value == ("T1059", "T1190")
+
+
 def test_a_label_entry_citing_an_unknown_sid_is_rejected():
     """Goal 1, enforced instead of asserted (#140).
 
@@ -647,12 +738,12 @@ def test_a_label_entry_citing_an_unknown_sid_is_rejected():
     one. `LabelEntry`'s docstring claims this is where traceability is carried for assertions
     narrower than `sources[]`; that claim needed a guard behind it.
     """
-    sources = one_source()
-    invented = LabelEntry(name="threat-name", value="Ghost", tier=2, sids=(999999,))
+    sources = one_tier_1_source()
+    invented = LabelEntry(name="threat-name", value="Ghost", tier=1, sids=(999999,))
     with pytest.raises(ValueError, match="cannot be traced"):
         Label(
             flow=make_flow(),
-            best_tier=2,
+            best_tier=1,
             labels=tuple(sorted((verdict_entry(sources), invented), key=lambda e: e.name)),
             sources=sources,
         )
@@ -680,7 +771,7 @@ def test_a_label_entry_claiming_a_tier_none_of_its_sources_had_is_rejected():
 
 def test_a_label_entry_citing_a_real_sid_at_its_real_tier_is_accepted():
     """The complement, so the guard above cannot be over-applied to legitimate output."""
-    sources = one_source()
+    sources = one_tier_1_source()
     entry = sources[0]
     honest = LabelEntry(name="threat-name", value="Some Threat", tier=entry.tier, sids=(entry.sid,))
 

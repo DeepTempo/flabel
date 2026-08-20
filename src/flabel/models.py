@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, get_args
@@ -124,6 +125,43 @@ TIERS_BY_MODE: dict[RunMode, tuple[int, ...]] = {
 #: 84,977 of them is a policy question nobody has answered. Adding it later is purely additive,
 #: which is the whole point of decision 3 in #138.
 LabelName = Literal["verdict", "threat-name"]
+
+#: How many values one assertion of a kind may carry. `single` is every kind today; `multi` exists
+#: because MITRE technique ids are the next kind expected and a flow plausibly carries several.
+LabelArity = Literal["single", "multi"]
+
+
+@dataclass(frozen=True)
+class LabelKind:
+    """What a label kind permits: how many values, and which tiers may assert it.
+
+    **Declared here so it is enforced in one place rather than known in several.** Before this,
+    "`threat-name` is tier-1 only" lived in spec §4 as prose and in `correlate`'s selection rule
+    as behaviour, and nothing rejected a tier-2 `threat-name` — which is how four tests in
+    `test_models.py` came to build one as incidental scaffolding, one of them then passing for a
+    reason it did not claim.
+    """
+
+    arity: LabelArity
+    #: Ascending. A tier absent here cannot assert this kind at all.
+    tiers: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        _check(self.arity, get_args(LabelArity), "arity", "LabelKind")
+        if not self.tiers:
+            raise ValueError("LabelKind.tiers is empty: a kind no tier may assert cannot exist")
+
+
+#: The one authority for what a label kind is. `LabelName` above carries the static typing a
+#: `Mapping` cannot, so both exist and a test asserts they describe the same set — otherwise
+#: adding a kind to one and not the other leaves `blfile` and `LabelEntry` disagreeing with
+#: nothing red. Extending `threat-name` to tier 2, or adding a `multi` kind, is an edit here.
+LABEL_KINDS: Mapping[str, LabelKind] = MappingProxyType(
+    {
+        "verdict": LabelKind(arity="single", tiers=(1, 2)),
+        "threat-name": LabelKind(arity="single", tiers=(1,)),
+    }
+)
 
 #: How directly a label follows from its rule match. Carried on every SourceEntry so a
 #: consumer can tell a content match from an indirect reference without reading rule text.
@@ -608,7 +646,10 @@ class LabelEntry:
     """
 
     name: LabelName
-    value: str
+    #: A `str` for a `single` kind, an ordered `tuple[str, ...]` for a `multi` one. Which applies
+    #: follows from `name` through `LABEL_KINDS`, so a consumer never has to branch on the value
+    #: it happens to find.
+    value: str | tuple[str, ...]
     #: The tier of the source(s) that assert *this* entry. For `verdict` that is `min(sources.tier)`
     #: — the same number `Label.best_tier` publishes — and `Label` enforces the two agree.
     tier: int
@@ -618,6 +659,27 @@ class LabelEntry:
 
     def __post_init__(self) -> None:
         _check(self.name, get_args(LabelName), "name", "LabelEntry")
+        kind = LABEL_KINDS[self.name]
+        if self.tier not in kind.tiers:
+            # Declared in `LABEL_KINDS` and therefore enforced. spec §4 says `threat-name` is
+            # tier-1 only, and prose is not a guard: a tier-2 threat name whose sid a real
+            # tier-2 source carries would otherwise pass every other check here.
+            raise ValueError(
+                f"LabelEntry {self.name!r} claims tier {self.tier}, but that kind permits only "
+                f"tier(s) {list(kind.tiers)}"
+            )
+        if kind.arity == "single" and not isinstance(self.value, str):
+            raise ValueError(
+                f"LabelEntry {self.name!r} has arity 'single' but its value is "
+                f"{type(self.value).__name__}: one assertion, one value"
+            )
+        if kind.arity == "multi" and (
+            isinstance(self.value, str) or not all(isinstance(item, str) for item in self.value)
+        ):
+            raise ValueError(
+                f"LabelEntry {self.name!r} has arity 'multi' but its value is not a sequence of "
+                f"strings: {self.value!r}"
+            )
         if not self.value:
             raise ValueError(
                 f"LabelEntry.value is empty for {self.name!r}: a label asserting nothing is not a "
