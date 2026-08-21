@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
+import traceback
 from collections.abc import Sequence
 
 from flabeldb import client as client_module
@@ -35,6 +36,14 @@ EXIT_DRIFT = 1
 #: indistinguishable from "the dataset is wrong", which is the confusion `live_schema`'s
 #: NotFound-only rule exists to prevent one layer down.
 EXIT_USAGE = 2
+#: A defect in `flabel-db` itself, or any failure it does not recognise.
+#: **Exists so that exit 1 can only ever mean drift.** The previous default was a bare `raise`,
+#: which reaches the interpreter and exits 1 — so an unrecognised failure, including a bug in this
+#: code, told `tools/flabel-deploy` that the dataset had drifted and sent the operator to look at a
+#: schema that was never read. Measured 2026-08-21: the name-matching detector below missed 15 of
+#: the 18 exception classes in `google.auth.exceptions`, so that default was the common case, not
+#: the edge one.
+EXIT_INTERNAL = 3
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -202,24 +211,38 @@ def _show(bq, dataset: str, run_id: str | None, capture: str | None) -> int:
     return EXIT_OK
 
 
-#: Failure types that mean "we never reached the dataset". Matched by NAME rather than by importing
-#: google.auth here, so this module still imports without the `db` extra.
-CREDENTIAL_FAILURES = frozenset(
-    {
-        "RefreshError",
-        "DefaultCredentialsError",
-        "TransportError",
-        "Forbidden",
-        "Unauthorized",
-        "PermissionDenied",
-        "Unauthenticated",
-    }
-)
+def _credential_failure_types() -> tuple[type[BaseException], ...]:
+    """The exception types that mean "we never reached the dataset", for `isinstance`.
+
+    **Imported lazily, not matched by name.** The name-matching frozenset this replaces existed so
+    the module would import without the `db` extra, and it bought that at the cost of being wrong:
+    `type(error).__name__ in {...}` matches an exact class, so every subclass escaped. Measured
+    against the installed library 2026-08-21 — `google.auth.exceptions` holds 18 exception classes,
+    the frozenset named 3, and **15 escaped**, `ReauthFailError` among them. That one is a
+    `RefreshError` subclass and is the exact failure spec-label-store §7.1 quotes from the box.
+
+    A lazy import keeps the no-extra import working and lets `isinstance` do the subclassing, so
+    all 18 are covered by `GoogleAuthError` alone.
+
+    The api_core three are named individually rather than by a shared base, because measurement
+    says a base would be wrong in both directions: `RetryError` is **not** a `GoogleAPICallError`
+    (it derives straight from `GoogleAPIError`), while `NotFound` shares `ClientError` with
+    `Forbidden` — and `NotFound` is the one API error that IS a fact about the dataset.
+    `PermissionDenied` and `Unauthenticated` need no entry: they are subclasses of `Forbidden` and
+    `Unauthorized`, which is the whole point of matching by type.
+    """
+    try:
+        from google.api_core.exceptions import Forbidden, RetryError, Unauthorized
+        from google.auth.exceptions import GoogleAuthError
+    except ImportError:  # pragma: no cover - no extra means no google exception could be raised
+        return ()
+    return (GoogleAuthError, Forbidden, Unauthorized, RetryError)
 
 
 def _is_credential_failure(error: BaseException) -> bool:
     """Whether `error` means the identity failed rather than the dataset being wrong."""
-    return type(error).__name__ in CREDENTIAL_FAILURES
+    types = _credential_failure_types()
+    return bool(types) and isinstance(error, types)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -253,7 +276,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return EXIT_USAGE
-        raise
+        # NOT `raise`. A bare re-raise exits 1, which is EXIT_DRIFT, so any failure we do not
+        # recognise would report drift in a dataset nothing finished reading. The traceback is kept
+        # because a defect is a bug report; only the exit code changes.
+        traceback.print_exc()
+        print(
+            f"\nflabel-db: internal error — {type(error).__name__}: {error}\n"
+            f"\nThis is a DEFECT in flabel-db, not a report about {args.dataset}. Exit "
+            f"{EXIT_INTERNAL} is not {EXIT_DRIFT}: nothing above says the dataset drifted.",
+            file=sys.stderr,
+        )
+        return EXIT_INTERNAL
 
 
 if __name__ == "__main__":  # pragma: no cover

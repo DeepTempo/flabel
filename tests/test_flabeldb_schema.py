@@ -417,11 +417,16 @@ def test_a_credential_failure_exits_usage_and_not_drift(monkeypatch, capsys):
     assert "Traceback" not in captured.err
 
 
-def test_an_unexpected_failure_is_not_swallowed_as_a_credential_problem(monkeypatch):
-    """The complement: only named credential failures are converted.
+def test_an_unexpected_failure_is_not_swallowed_as_a_credential_problem(monkeypatch, capsys):
+    """The complement: only real credential failures are converted.
 
     A blanket `except Exception -> EXIT_USAGE` would turn a real defect in `differences()` into a
     tidy message about authentication, which is the same absence-as-signal error one level up.
+
+    It must not propagate either. A bare `raise` here reaches the interpreter and exits **1**,
+    which is `EXIT_DRIFT` — so a defect in our own code would tell `tools/flabel-deploy` that the
+    dataset drifted. It exits `EXIT_INTERNAL`, with the traceback kept, because a defect is a bug
+    report and not a fact about the store.
     """
     from flabeldb import cli, client
 
@@ -432,8 +437,13 @@ def test_an_unexpected_failure_is_not_swallowed_as_a_credential_problem(monkeypa
 
     monkeypatch.setattr(client, "live_schema", explode)
 
-    with pytest.raises(ZeroDivisionError):
-        cli.main(["verify"])
+    assert cli.main(["verify"]) == cli.EXIT_INTERNAL
+    captured = capsys.readouterr()
+    assert "Traceback" in captured.err, "a defect must stay debuggable"
+    assert "ZeroDivisionError" in captured.err
+    assert "NOT a report about the dataset" not in captured.err, (
+        "a real defect was dressed up as an authentication problem"
+    )
 
 
 # --- the API's own type names ------------------------------------------------------------------
@@ -519,3 +529,128 @@ def test_the_declaration_round_trips_through_the_apis_own_vocabulary(table):
 
     everything = {name: schema.TABLES[name].fields for name in schema.TABLES}
     assert schema.differences({**everything, table: live}) == ()
+
+
+# --- the credential detector, and the exit code an unknown failure must never take -------------
+#
+# The detector matched `type(error).__name__` against a frozenset of seven names. Exact names, so
+# **every subclass escaped it.** Measured against the installed library 2026-08-21:
+# `google.auth.exceptions` holds 18 exception classes, the frozenset matched 3 by name, and 15
+# escaped — including `ReauthFailError`, which is a `RefreshError` subclass and is the exact failure
+# spec-label-store §7.1 quotes from the box. All 18 subclass `GoogleAuthError`, so one isinstance
+# check covers what 18 names could not.
+#
+# But the real defect was the DEFAULT. Anything unmatched hit a bare `raise`, which reaches the
+# interpreter and exits 1 — `EXIT_DRIFT`. So an unrecognised failure, including a defect in our own
+# code, told `tools/flabel-deploy` that the dataset had drifted. `EXIT_INTERNAL` exists so that
+# cannot happen: exit 1 now means drift and nothing else.
+
+
+def test_the_exit_codes_are_four_distinct_values():
+    from flabeldb import cli
+
+    codes = (cli.EXIT_OK, cli.EXIT_DRIFT, cli.EXIT_USAGE, cli.EXIT_INTERNAL)
+    assert len(set(codes)) == len(codes), f"two exit codes collide: {codes}"
+
+
+def test_an_internal_error_can_never_be_read_as_drift():
+    """The collision that matters: `flabel-deploy` stops on EXIT_DRIFT and blames the schema."""
+    from flabeldb import cli
+
+    assert cli.EXIT_INTERNAL != cli.EXIT_DRIFT
+    assert cli.EXIT_INTERNAL != 1
+
+
+def _failing_verify(monkeypatch, error):
+    """`flabel-db verify` where the live read raises `error`."""
+    from flabeldb import cli, client
+
+    monkeypatch.setattr(client, "client", lambda **_: type("Bq", (), {"project": "p"})())
+    monkeypatch.setattr(client, "live_schema", lambda *a, **k: (_ for _ in ()).throw(error))
+    return cli.main(["verify"])
+
+
+def _google_auth_exception_classes():
+    """Every exception class in `google.auth.exceptions`, discovered rather than listed.
+
+    Discovered on purpose: a hand-written list is what the frozenset was, and it went stale the
+    moment the library gained a subclass. This test cannot.
+    """
+    import inspect
+
+    import google.auth.exceptions as module
+
+    return sorted(
+        name
+        for name, obj in vars(module).items()
+        if inspect.isclass(obj) and issubclass(obj, BaseException)
+    )
+
+
+@needs_client
+@pytest.mark.parametrize("name", _google_auth_exception_classes())
+def test_every_google_auth_failure_exits_usage_and_not_drift(name, monkeypatch, capsys):
+    """All 18, not the 3 the frozenset happened to name."""
+    import google.auth.exceptions as module
+
+    from flabeldb import cli
+
+    error_type = getattr(module, name)
+    try:
+        error = error_type("could not authenticate")
+    except TypeError:  # pragma: no cover - a class needing other arguments
+        error = error_type()
+
+    assert _failing_verify(monkeypatch, error) == cli.EXIT_USAGE, (
+        f"{name} was not recognised as a credential failure and landed on an exit code that "
+        f"says something about the dataset"
+    )
+    assert "NOT a report about the dataset" in capsys.readouterr().err
+
+
+@needs_client
+def test_the_reauth_failure_spec_7_1_quotes_from_the_box_is_recognised(monkeypatch):
+    """`ReauthFailError` — a `RefreshError` SUBCLASS, so the name-matching frozenset missed it."""
+    from google.auth.exceptions import ReauthFailError, RefreshError
+
+    from flabeldb import cli
+
+    assert issubclass(ReauthFailError, RefreshError), "the library changed shape; revisit this"
+    error = ReauthFailError("Reauthentication is needed. Please run `gcloud auth login`")
+    assert _failing_verify(monkeypatch, error) == cli.EXIT_USAGE
+
+
+@needs_client
+@pytest.mark.parametrize(
+    "name", ["Forbidden", "PermissionDenied", "Unauthorized", "Unauthenticated", "RetryError"]
+)
+def test_the_api_core_failures_that_mean_we_never_read_the_dataset_exit_usage(name, monkeypatch):
+    """`RetryError` is measured NOT to be a `GoogleAPICallError`, so it has to be named itself."""
+    import google.api_core.exceptions as module
+
+    from flabeldb import cli
+
+    error_type = getattr(module, name)
+    try:
+        error = error_type("denied")
+    except TypeError:
+        error = error_type("denied", cause=None)
+
+    assert _failing_verify(monkeypatch, error) == cli.EXIT_USAGE
+
+
+@needs_client
+def test_a_not_found_is_not_a_credential_failure(monkeypatch):
+    """`NotFound` shares `ClientError` with `Forbidden`, so the match names types, not a base.
+
+    It is also the one API error that IS a fact about the dataset, which is why `live_schema`
+    catches it and nothing else.
+    """
+    from google.api_core.exceptions import ClientError, Forbidden, NotFound
+
+    from flabeldb import cli
+
+    assert issubclass(NotFound, ClientError) and issubclass(Forbidden, ClientError), (
+        "the library changed shape; a base-class match would now be safe, but check"
+    )
+    assert _failing_verify(monkeypatch, NotFound("no such dataset")) == cli.EXIT_INTERNAL
