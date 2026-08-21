@@ -197,7 +197,7 @@ That was a gap, not an argument: the instrument *is* the guard here, and it can 
 | :-- | :-- | :-- |
 | Run the overwrite probe as a principal that **holds** `storage.objects.delete` | a different answer than the SA gets, or the probe is not measuring permission | **caught the defect** — the human overwrite succeeds where the SA gets `403`, and revision 1 had no such control |
 | Give the overwrite probe a **matching** generation instead of `0` | if `412` was about permission it should stay `412` | `403`. This is what invalidated #158 |
-| `flabel-db --dataset <absent> verify` | must read differently from "tables missing" | distinct branch, distinct message — `_verify` handles `NotFound` on the dataset separately from a missing table |
+| `flabel-db --dataset <absent> verify` | must read differently from "tables missing" | **run, not inferred**: `dataset ... does not exist ... This is NOT a report about its tables: nothing in it was read`, against `flabel DIFFERS ... table is missing`. Both exit `1` **by design** — `_verify`'s own comment says reporting missing tables here would be "advice that cannot work", and a deploy gate must stop either way |
 
 The first two are the round that mattered, and they went red. Recorded rather than smoothed over,
 because a sabotage that changes the conclusion is the mechanism working.
