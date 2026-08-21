@@ -176,3 +176,60 @@ def test_a_narrowed_type_is_named_as_a_rebuild_and_apply_does_not_exit_zero(bq, 
     capsys.readouterr()
     assert cli._apply(bq, DATASET) == cli.EXIT_OK, "the rebuild the message asked for did not work"
 
+
+# --- the identity, measured rather than asserted about ------------------------------------------
+
+
+def test_the_store_writes_as_the_instance_service_account(bq):
+    """Invariant 7 against the real metadata server, not a monkeypatch.
+
+    The pure tests in `test_flabeldb_credentials.py` prove `credentials()` reaches for the instance
+    identity and never ADC. This proves the identity it reaches is the one the box actually has —
+    compared against what the metadata server reports rather than a literal, because this repo is
+    public and internal identifiers are never committed.
+    """
+    import google.auth.compute_engine
+
+    from flabeldb import client
+
+    found = client.credentials()
+    assert isinstance(found, google.auth.compute_engine.Credentials)
+
+    expected = _metadata_service_account()
+    if not expected:
+        pytest.skip("no metadata server: this assertion is about a GCE instance identity")
+
+    request = __import__("google.auth.transport.requests", fromlist=["requests"]).Request()
+    found.refresh(request)
+    assert found.service_account_email == expected, (
+        "the store would write as an identity other than the instance service account"
+    )
+    assert found.token, "the instance identity minted no token"
+
+
+def test_the_client_reaches_the_dataset_as_that_identity(bq):
+    """The end of the chain: no `sudo`, no reauthentication, a real read.
+
+    `gcloud` on the box needs root because its credential store is per-user; a client library does
+    not. That difference is the whole reason LS-3 was resumed on `fl-replay`.
+    """
+    dataset = bq.get_dataset(f"{bq.project}.{DATASET}")
+    assert dataset.location.lower() == "us-central1", (
+        f"{DATASET} is in {dataset.location}, but the results bucket is US-CENTRAL1 regional and a "
+        f"load job needs a compatible dataset location"
+    )
+
+
+def _metadata_service_account() -> str | None:
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+        headers={"Metadata-Flavor": "Google"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return response.read().decode().strip()
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
