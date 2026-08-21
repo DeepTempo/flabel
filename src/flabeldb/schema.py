@@ -26,6 +26,38 @@ NULLABLE = "NULLABLE"
 REQUIRED = "REQUIRED"
 REPEATED = "REPEATED"
 
+#: What `tables.get` calls a type, mapped to what we declare it as.
+#:
+#: **BigQuery answers in a different vocabulary than it accepts.** Measured against
+#: `flabel_scratch` on 2026-08-21, on tables `flabel-db apply` had just created from this very
+#: file: the API returned `INTEGER` for every `INT64` and `RECORD` for every `STRUCT`. Unnormalised,
+#: that produced **24 differences against a clean dataset** — and before that, a `RECORD` reaching
+#: `Column.__post_init__` raised `only a STRUCT may carry subfields`, uncaught, which exits 1 =
+#: `EXIT_DRIFT`. So `verify` could never succeed against a table that exists, and the deploy gate
+#: would have blocked every deploy while naming a schema problem that did not exist.
+#:
+#: `INTEGER` and `RECORD` are measured. `FLOAT` and `BOOLEAN` are BigQuery's documented legacy
+#: names for types this schema does not currently use — included so that the day a column gains
+#: one, it is already right, and marked so nobody mistakes them for something we have seen.
+TYPE_ALIASES: Mapping[str, str] = MappingProxyType(
+    {
+        "INTEGER": "INT64",  # measured
+        "RECORD": "STRUCT",  # measured
+        "FLOAT": "FLOAT64",  # documented; unused here
+        "BOOLEAN": "BOOL",  # documented; unused here
+    }
+)
+
+
+def canonical_type(field_type: str) -> str:
+    """`field_type` in the vocabulary this module declares in.
+
+    An unknown name is returned **unchanged rather than guessed**: normalisation exists to stop two
+    spellings of one type reading as drift, and a normaliser that invented a mapping would do the
+    opposite — hide real drift as a match.
+    """
+    return TYPE_ALIASES.get(field_type, field_type)
+
 
 @dataclass(frozen=True)
 class Column:
@@ -37,6 +69,12 @@ class Column:
     fields: tuple[Column, ...] = ()
 
     def __post_init__(self) -> None:
+        # Canonicalised HERE, at construction, rather than in `differences()` — because this is the
+        # one place every Column passes through, whether it came from this file's declaration or
+        # from `client.from_bigquery` reading the live table. Normalising at the single choke point
+        # is what makes the comparison like-with-like on both sides without either side knowing
+        # about the other. The dataclass is frozen, so the write goes through object.__setattr__.
+        object.__setattr__(self, "field_type", canonical_type(self.field_type))
         if self.mode not in (NULLABLE, REQUIRED, REPEATED):
             raise ValueError(f"{self.name}: {self.mode!r} is not a BigQuery mode")
         if self.fields and self.field_type != "STRUCT":

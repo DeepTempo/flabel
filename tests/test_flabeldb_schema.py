@@ -434,3 +434,88 @@ def test_an_unexpected_failure_is_not_swallowed_as_a_credential_problem(monkeypa
 
     with pytest.raises(ZeroDivisionError):
         cli.main(["verify"])
+
+
+# --- the API's own type names ------------------------------------------------------------------
+#
+# `tables.get` does not answer in the vocabulary we declare in. Measured against
+# `pm-proto-496816.flabel_scratch` on 2026-08-21, immediately after a clean `flabel-db apply`: the
+# API returned INTEGER for every INT64 and RECORD for every STRUCT, and `verify` produced **24
+# differences against a dataset it had itself just created** — after first dying with
+# `ValueError: flow: only a STRUCT may carry subfields`, uncaught, which exits 1 = EXIT_DRIFT.
+# So the deploy gate would have blocked every deploy while reporting a schema problem that did not
+# exist. The match path had never executed: every test above builds the live side out of
+# `schema.TABLES`, so it compares the declaration to a copy of itself.
+
+#: The alias pairs, as `(what the API says, what we declare)`.
+#: INTEGER and RECORD are **measured** on the live service. FLOAT64 and BOOL do not appear anywhere
+#: in this schema, so their aliases are BigQuery's documented legacy names rather than something
+#: this project has seen — they are here so the day a column gains one, it is already right.
+LEGACY_TYPE_NAMES = (
+    ("INTEGER", "INT64"),
+    ("RECORD", "STRUCT"),
+    ("FLOAT", "FLOAT64"),
+    ("BOOLEAN", "BOOL"),
+)
+
+
+@pytest.mark.parametrize("legacy, ours", LEGACY_TYPE_NAMES)
+def test_the_apis_legacy_type_name_is_the_same_type_as_ours(legacy, ours):
+    """Two spellings of one type must not read as drift. `INTEGER` is measured, not assumed."""
+    assert schema.canonical_type(legacy) == schema.canonical_type(ours) == ours
+
+
+def test_a_type_name_we_do_not_know_is_left_alone_rather_than_guessed():
+    """Normalisation must not silently invent a type — that would hide real drift as a match."""
+    assert schema.canonical_type("GEOGRAPHY") == "GEOGRAPHY"
+
+
+def test_a_record_carrying_subfields_is_accepted_because_that_is_what_the_api_returns():
+    """The exact ValueError that killed the live `verify`: `only a STRUCT may carry subfields`."""
+    found = schema.column("flow", "RECORD", fields=[schema.column("proto", "STRING")])
+    assert found.field_type == "STRUCT", "a RECORD is a STRUCT, and should be stored as one"
+    assert found.fields[0].name == "proto"
+
+
+def test_a_struct_by_either_name_still_needs_subfields():
+    """Normalising the name must not cost us the guard on the other side of it."""
+    with pytest.raises(ValueError, match="describes nothing"):
+        schema.column("flow", "RECORD")
+
+
+def test_a_non_struct_carrying_subfields_is_still_refused():
+    with pytest.raises(ValueError, match="only a STRUCT may carry subfields"):
+        schema.column("flow", "STRING", fields=[schema.column("proto", "STRING")])
+
+
+def as_the_api_returns_it(fields):
+    """`fields`, respelled the way `tables.get` spells them — the measured legacy names."""
+    bigquery = __import__("google.cloud.bigquery", fromlist=["bigquery"])
+    to_legacy = {ours: legacy for legacy, ours in LEGACY_TYPE_NAMES}
+    return [
+        bigquery.SchemaField(
+            item.name,
+            to_legacy.get(item.field_type, item.field_type),
+            mode=item.mode,
+            fields=as_the_api_returns_it(item.fields) if item.fields else (),
+        )
+        for item in fields
+    ]
+
+
+@needs_client
+@pytest.mark.parametrize("table", TABLES)
+def test_the_declaration_round_trips_through_the_apis_own_vocabulary(table):
+    """`differences(from_bigquery(to_bigquery(declared))) == ()`, with the legacy names injected.
+
+    This is the test whose absence let PR #157 go green with a `verify` that could not succeed.
+    It is pure — no API call — but it needs the client's `SchemaField`, so it skips without the
+    extra and runs in CI, which installs it.
+    """
+    from flabeldb import client
+
+    declared = schema.TABLES[table].fields
+    live = client.from_bigquery(as_the_api_returns_it(client.to_bigquery(declared)))
+
+    everything = {name: schema.TABLES[name].fields for name in schema.TABLES}
+    assert schema.differences({**everything, table: live}) == ()
