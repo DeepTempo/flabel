@@ -49,6 +49,49 @@ TYPE_ALIASES: Mapping[str, str] = MappingProxyType(
 )
 
 
+#: Every type a column in this declaration may be given, in the vocabulary we declare in.
+#:
+#: Checked by `Table.__post_init__` and **deliberately not by `Column.__post_init__`**, which is
+#: the whole lesson of Critical 1. A `Column` is built by this file's declaration AND by
+#: `client.from_bigquery` reading a live table, so a guard there fires on live data: a `RECORD`
+#: coming back from `tables.get` raised `only a STRUCT may carry subfields`, uncaught, which exits
+#: 1 = `EXIT_DRIFT`, so `verify` could never succeed against a table that exists. A type name this
+#: file has never heard of must be REPORTED as drift, not crashed on. `Table` is built by the
+#: declaration only — `LiveTable` exists to keep it that way — so the strict check goes there.
+DECLARABLE_TYPES = frozenset(
+    {
+        "STRING",
+        "BYTES",
+        "INT64",
+        "FLOAT64",
+        "NUMERIC",
+        "BIGNUMERIC",
+        "BOOL",
+        "TIMESTAMP",
+        "DATE",
+        "TIME",
+        "DATETIME",
+        "INTERVAL",
+        "GEOGRAPHY",
+        "JSON",
+        "STRUCT",
+    }
+)
+
+#: The column types `partition_field` may name.
+#:
+#: These are the three that BigQuery's **time-unit** partitioning accepts — and time-unit is all
+#: `cli._apply` can build, because it emits `bigquery.TimePartitioning(field=...)` for any declared
+#: `partition_field` and nothing else. INT64 range partitioning is a real BigQuery feature that
+#: this code does not emit, so declaring one would produce a table `apply` cannot create. The guard
+#: therefore tracks what `apply` can do rather than what the service can; widen it here and in
+#: `_apply` together, or not at all.
+PARTITIONABLE_TYPES = frozenset({"DATE", "DATETIME", "TIMESTAMP"})
+
+#: BigQuery clusters on at most four columns. A fifth fails at `CREATE TABLE`.
+MAX_CLUSTERING_KEYS = 4
+
+
 def canonical_type(field_type: str) -> str:
     """`field_type` in the vocabulary this module declares in.
 
@@ -106,9 +149,22 @@ class Table:
     description: str = ""
 
     def __post_init__(self) -> None:
+        if not self.fields:
+            raise ValueError("a table with no columns describes nothing")
         names = [item.name for item in self.fields]
         if len(names) != len(set(names)):
             raise ValueError(f"repeated column name in {names}")
+        # Type names are validated HERE and not in `Column`, because a `Column` is also built by
+        # `client.from_bigquery` reading a live table — see `DECLARABLE_TYPES` for why that
+        # distinction is Critical 1's lesson rather than a style choice.
+        _check_types(self.fields)
+        if len(self.clustering) > MAX_CLUSTERING_KEYS:
+            raise ValueError(
+                f"{list(self.clustering)} is {len(self.clustering)} clustering keys; BigQuery "
+                f"accepts at most four"
+            )
+        if len(set(self.clustering)) != len(self.clustering):
+            raise ValueError(f"{list(self.clustering)} names a clustering key twice")
         for key in (*self.clustering, *((self.partition_field,) if self.partition_field else ())):
             if "." in key:
                 raise ValueError(
@@ -117,6 +173,30 @@ class Table:
                 )
             if key not in names:
                 raise ValueError(f"{key!r} is not a column of this table")
+        if self.partition_field is not None:
+            # The guard that was missing. Refusing `flow.ts_first` while accepting `run_id` — a
+            # STRING — moved one of two identical failures into CI and left the other at
+            # `CREATE TABLE`.
+            partitioned = next(item for item in self.fields if item.name == self.partition_field)
+            if partitioned.field_type not in PARTITIONABLE_TYPES:
+                raise ValueError(
+                    f"{self.partition_field!r} is a {partitioned.field_type} column, so it cannot "
+                    f"be the partition field; time-unit partitioning takes "
+                    f"{sorted(PARTITIONABLE_TYPES)}"
+                )
+            if partitioned.mode == REPEATED:
+                raise ValueError(
+                    f"{self.partition_field!r} is REPEATED, so it cannot be the partition field"
+                )
+
+
+def _check_types(fields: Sequence[Column], prefix: str = "") -> None:
+    """Raise if any declared column, at any depth, names a type BigQuery does not have."""
+    for item in fields:
+        if item.field_type not in DECLARABLE_TYPES:
+            raise ValueError(f"{prefix}{item.name}: {item.field_type!r} is not a BigQuery type")
+        if item.fields:
+            _check_types(item.fields, prefix=f"{prefix}{item.name}.")
 
 
 def _flow() -> Column:

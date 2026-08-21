@@ -932,3 +932,198 @@ def test_a_credential_failure_reaching_the_dataset_is_still_not_drift(monkeypatc
 
     assert cli.main(["verify"]) == cli.EXIT_USAGE
     assert "NOT a report about the dataset" in capsys.readouterr().err
+
+
+# --- the declaration guards, which had never executed --------------------------------------------
+#
+# `Column.__post_init__` and `Table.__post_init__` reject a malformed declaration, and until now
+# every one of those branches was unexecuted: the tests above assert properties OF the declaration
+# by re-implementing the guard's own logic (`test_every_partition_field_is_top_level` walks TABLES
+# and checks for a dot), which passes whether or not the guard exists.
+#
+# The gap that matters is not the untested branch, it is the MISSING one. `partition_field` reaching
+# into a STRUCT is refused; `partition_field="run_id"`, a STRING, is accepted — and both fail at
+# `CREATE TABLE` with the same consequence, a table that cannot be created from its own declaration.
+#
+# WHERE a guard lives is load-bearing, and Critical 1 is why. `Column` is built by the declaration
+# AND by `client.from_bigquery` reading a live table, so a guard there fires on live data: a
+# `RECORD` reaching it raised `only a STRUCT may carry subfields`, which exits 1 = EXIT_DRIFT, so
+# `verify` could never succeed against a table that exists. `Table` is built by the declaration
+# only — `LiveTable` exists to keep it that way — so strict guards belong there.
+
+
+def a_table(**changes) -> schema.Table:
+    """A minimal valid `Table`, with `changes` applied. Valid, so a failure names one cause."""
+    fields = changes.pop(
+        "fields",
+        (
+            schema.column("run_id", "STRING", mode=schema.REQUIRED),
+            schema.column("finished_at", "TIMESTAMP"),
+            schema.column("flow", "STRUCT", fields=(schema.column("zeek_uid", "STRING"),)),
+        ),
+    )
+    return schema.Table(fields=fields, **changes)
+
+
+def test_the_minimal_table_this_sections_fixtures_build_on_is_itself_valid():
+    """Otherwise every `pytest.raises` below could be passing for the wrong reason."""
+    assert a_table().fields
+
+
+# --- guards that existed and were never executed --------------------------------------------
+
+
+def test_a_mode_that_is_not_a_bigquery_mode_is_refused():
+    with pytest.raises(ValueError, match="is not a BigQuery mode"):
+        schema.column("run_id", "STRING", mode="MANDATORY")
+
+
+def test_two_columns_of_the_same_name_are_refused():
+    """A dict-shaped comparison would silently keep the last one and report no drift."""
+    with pytest.raises(ValueError, match="repeated column name"):
+        a_table(
+            fields=(
+                schema.column("run_id", "STRING"),
+                schema.column("run_id", "TIMESTAMP"),
+            )
+        )
+
+
+@pytest.mark.parametrize("key", ["flow.ts_first", "flow.zeek_uid"])
+def test_a_partition_field_reaching_into_a_struct_is_refused(key):
+    """Measured 2026-08-20 at `CREATE TABLE`: "can only be a top-level field"."""
+    with pytest.raises(ValueError, match="reaches inside a STRUCT"):
+        a_table(partition_field=key)
+
+
+def test_a_clustering_key_reaching_into_a_struct_is_refused():
+    """The same rule, the other input. Measured 2026-08-21 against the live service: clustering
+    `flow_labels` on `zeek_uid` fails with "The field specified for clustering cannot be found in
+    the schema", because it is inside the `flow` STRUCT."""
+    with pytest.raises(ValueError, match="reaches inside a STRUCT"):
+        a_table(clustering=("flow.zeek_uid",))
+
+
+def test_a_partition_field_that_is_not_a_column_at_all_is_refused():
+    with pytest.raises(ValueError, match="is not a column of this table"):
+        a_table(partition_field="ingested_at")
+
+
+def test_a_clustering_key_that_is_not_a_column_at_all_is_refused():
+    with pytest.raises(ValueError, match="is not a column of this table"):
+        a_table(clustering=("capture_sha256",))
+
+
+# --- guards that were missing -----------------------------------------------------------------
+
+
+def test_partitioning_on_a_string_is_refused_the_way_a_nested_field_already_was():
+    """THE POINT OF THIS SECTION. `partition_field="flow.ts_first"` was refused and
+    `partition_field="run_id"` — a STRING — was accepted, with the identical consequence.
+
+    `_apply` builds `bigquery.TimePartitioning(field=...)` for any declared `partition_field`, and
+    time-unit partitioning takes a DATE, DATETIME or TIMESTAMP column. A STRING there fails at
+    `CREATE TABLE`, which is exactly the failure the nesting guard exists to move into CI.
+    """
+    with pytest.raises(ValueError, match="partition"):
+        a_table(partition_field="run_id")
+
+
+@pytest.mark.parametrize("field_type", ["TIMESTAMP", "DATE", "DATETIME"])
+def test_the_three_types_time_unit_partitioning_accepts_are_accepted(field_type):
+    """The complement, so the guard cannot be satisfied by refusing everything."""
+    table = a_table(
+        fields=(schema.column("when", field_type),),
+        partition_field="when",
+    )
+    assert table.partition_field == "when"
+
+
+def test_partitioning_on_an_int64_is_refused_because_apply_cannot_build_it():
+    """INT64 range partitioning is a real BigQuery feature and `_apply` does not emit it — it
+    builds `TimePartitioning` unconditionally. Declaring one would produce a table this code
+    cannot create, so the guard tracks what `apply` can do, not what BigQuery can.
+    """
+    with pytest.raises(ValueError, match="partition"):
+        a_table(fields=(schema.column("n", "INT64"),), partition_field="n")
+
+
+def test_partitioning_on_a_repeated_column_is_refused():
+    """A REPEATED TIMESTAMP passes the type check and is still not a partition key — BigQuery
+    partitions on one value per row, and a repeated column has none or many."""
+    with pytest.raises(ValueError, match="REPEATED"):
+        a_table(
+            fields=(schema.column("when", "TIMESTAMP", mode=schema.REPEATED),),
+            partition_field="when",
+        )
+
+
+def test_a_fifth_clustering_key_is_refused():
+    """BigQuery caps clustering at four columns. A fifth fails at `CREATE TABLE`."""
+    fields = tuple(schema.column(f"c{index}", "STRING") for index in range(5))
+    with pytest.raises(ValueError, match="four"):
+        schema.Table(fields=fields, clustering=tuple(f"c{index}" for index in range(5)))
+
+
+def test_four_clustering_keys_are_accepted():
+    fields = tuple(schema.column(f"c{index}", "STRING") for index in range(4))
+    table = schema.Table(fields=fields, clustering=tuple(f"c{index}" for index in range(4)))
+    assert len(table.clustering) == 4
+
+
+def test_the_same_clustering_key_twice_is_refused():
+    """Not a layout BigQuery has any meaning for, and it would read as a 2-key table."""
+    with pytest.raises(ValueError, match="twice|repeated|duplicate"):
+        a_table(clustering=("run_id", "run_id"))
+
+
+def test_a_table_with_no_columns_is_refused():
+    """`differences()` would report a clean match between two tables that describe nothing."""
+    with pytest.raises(ValueError, match="no columns"):
+        schema.Table(fields=())
+
+
+def test_a_type_name_that_is_not_a_bigquery_type_is_refused_in_the_declaration():
+    """A typo here reaches `CREATE TABLE`, which is the failure the guards exist to move earlier."""
+    with pytest.raises(ValueError, match="not a BigQuery type"):
+        a_table(fields=(schema.column("run_id", "VARCHAR"),))
+
+
+def test_the_type_name_is_validated_inside_a_struct_too():
+    """Nesting is where a declaration-walking check is easiest to write wrong."""
+    with pytest.raises(ValueError, match="not a BigQuery type"):
+        a_table(fields=(schema.column("flow", "STRUCT", fields=(schema.column("n", "TEXT"),)),))
+
+
+def test_an_unknown_type_from_the_LIVE_read_is_drift_and_not_an_exception():
+    """CRITICAL 1's LESSON, pinned. The type-name guard must be declaration-only.
+
+    A `RECORD` from `tables.get` reaching `Column.__post_init__` raised, uncaught, and exited 1 =
+    EXIT_DRIFT — so `verify` could not succeed against a table that exists and the deploy gate
+    would have blocked every deploy naming a schema problem that did not exist. The day BigQuery
+    returns a type this file has never heard of, `verify` must REPORT it, not crash on it.
+    """
+    from flabeldb import client
+
+    class Field:
+        name, field_type, mode, fields = "run_id", "SOMETHING_NEW", "REQUIRED", ()
+
+    live = client.from_bigquery([Field()])
+    assert live[0].field_type == "SOMETHING_NEW", "an unknown type was guessed at, or refused"
+
+    found = schema.differences(altered("run_exclusions", fields=live))
+    assert found, "an undeclared type from the live read verified clean"
+
+
+def test_every_declared_table_passes_every_guard():
+    """`TABLES` is built at import, so this is really a statement that the guards above are not so
+    strict that the declaration itself could not be written. It fails loudly if a new guard is
+    added that the store's own schema violates."""
+    for name, table in schema.TABLES.items():
+        rebuilt = schema.Table(
+            fields=table.fields,
+            partition_field=table.partition_field,
+            clustering=table.clustering,
+            description=table.description,
+        )
+        assert rebuilt == table, name
