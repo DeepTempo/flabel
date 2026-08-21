@@ -484,6 +484,7 @@ def gate_failure() -> CorrelationError:
     return CorrelationError("1 of 1 detections unplaced (100.0%)", result=result)
 
 
+@pytest.mark.requires_tools
 def test_the_gate_failure_writes_the_unmatched_records_into_run_json(
     tmp_path: Path, rules_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1606,6 +1607,7 @@ def test_an_empty_capture_is_refused_fast_and_leaves_nothing_behind(
     )
 
 
+@pytest.mark.requires_tools
 def test_every_output_artifact_goes_through_the_atomic_write(tmp_path: Path):
     """13b's fix is in the call sites, and nothing asserted they use it.
 
@@ -1773,6 +1775,7 @@ def test_rules_list_names_a_damaged_snapshot_it_omitted(
 # --- --sources is refused on a labelling run, not ignored (#71) ---------------------------------
 
 
+@pytest.mark.requires_tools
 def test_source_uri_is_published_as_run_input_uri(tmp_path: Path, rules_dir: Path) -> None:
     """The whole point of LS-1 (#145).
 
@@ -1796,6 +1799,7 @@ def test_source_uri_is_published_as_run_input_uri(tmp_path: Path, rules_dir: Pat
     assert run["input"]["snaplens"] == [65535], "a real list of real values"
 
 
+@pytest.mark.requires_tools
 def test_without_source_uri_the_status_says_local_rather_than_leaving_a_bare_null(
     tmp_path: Path, rules_dir: Path
 ) -> None:
@@ -1864,6 +1868,7 @@ def test_a_source_uri_that_is_not_a_gs_object_is_refused_before_anything_runs(
         pytest.param("gs://b-u.c_k-et/\u00e9t\u00e9.pcap", id="non-ascii-object-name"),
     ],
 )
+@pytest.mark.requires_tools
 def test_a_legal_gcs_object_name_is_not_refused_for_looking_odd(
     tmp_path: Path, rules_dir: Path, value: str
 ) -> None:
@@ -1902,6 +1907,7 @@ def test_a_refused_source_uri_is_not_echoed_back(
     assert "credential" in captured.err, "the message should say why the bucket rule matters"
 
 
+@pytest.mark.requires_tools
 def test_flabel_does_not_verify_that_the_source_uri_holds_the_bytes_it_hashed(
     tmp_path: Path, rules_dir: Path
 ) -> None:
