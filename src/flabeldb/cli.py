@@ -198,12 +198,10 @@ def _verify(bq, dataset: str) -> int:
     job ids are namespaced `project:location.jobid`, so the location is part of the idempotency
     namespace too (spec §10 M2, M4).
     """
-    from google.api_core.exceptions import NotFound
-
     found: list[str] = []
     try:
         location = bq.get_dataset(f"{bq.project}.{dataset}").location
-    except NotFound:
+    except _not_found_types():
         # `NotFound` on a TABLE means the table is absent, which is drift. On the DATASET it means
         # the container is not there, and reporting five missing tables plus "run apply" would be
         # advice that cannot work — apply cannot create a dataset either (that is LS-6).
@@ -266,6 +264,26 @@ def _show(bq, dataset: str, run_id: str | None, capture: str | None) -> int:
             f"{row['capture_sha256'][:16]}…  {row['finished_at']}"
         )
     return EXIT_OK
+
+
+def _not_found_types() -> tuple[type[BaseException], ...]:
+    """`NotFound`, or an EMPTY TUPLE when the `db` extra is absent.
+
+    Lazy for the same reason `_credential_failure_types` below is, and the reason is not
+    hypothetical: importing `google.api_core.exceptions` at the top of `_verify` made three tests
+    exit `EXIT_INTERNAL` on a checkout without the extra — they monkeypatch `client.client` and
+    never needed a real library — and the `no-db-extra` CI job caught it on the first push after
+    that job existed. `flabel-db` must import and run its own error paths with nothing installed;
+    that is spec §7.5 and what `dependencies = []` means one package over.
+
+    An empty tuple in an `except` clause is valid and catches nothing, which is exactly right:
+    with no `google` installed there is no client, so no `NotFound` can be raised to miss.
+    """
+    try:
+        from google.api_core.exceptions import NotFound
+    except ImportError:  # pragma: no cover - exercised by the no-db-extra CI job, not locally
+        return ()
+    return (NotFound,)
 
 
 def _credential_failure_types() -> tuple[type[BaseException], ...]:
