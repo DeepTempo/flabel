@@ -44,7 +44,7 @@ Spec §7.3's table, against what the dataset's ACL actually carries:
 | :-- | :-- | :-- | :-- |
 | `${INSTANCE_SA}` | `bigquery.dataEditor` on the dataset | `WRITER  userByEmail=${INSTANCE_SA}` | §3.2 — a load job landed rows |
 | `craig@deeptempo.ai` | `bigquery.dataOwner` on the dataset | `OWNER  userByEmail=craig@deeptempo.ai` | ACL read |
-| `${INSTANCE_SA}` | `bigquery.jobUser` on the project | **effectively held; source not yet read** — see §5 | §3.2 — a query job and a load job both ran |
+| `${INSTANCE_SA}` | `bigquery.jobUser` on the project | `roles/bigquery.jobUser`, **held explicitly** | project IAM policy, and §3.2 — a query job and a load job both ran |
 | readers | `bigquery.dataViewer` | **deliberately absent** | — |
 
 `dataViewer` is missing on purpose. Spec §9 lists "who may read the dataset" as open and undecided:
@@ -58,9 +58,25 @@ defaults on any new dataset, and they are not nothing: anyone holding project **
 on the store without appearing in it by name. Least privilege at the dataset is therefore bounded by
 project-level roles, not by this ACL.
 
-The explicit `userByEmail` binding for `${INSTANCE_SA}` may be redundant *today* for exactly that
-reason. It is worth keeping regardless: it survives a later tightening of the project roles, which a
-reliance on `projectWriters` would not.
+**In BigQuery the instance SA holds `roles/bigquery.jobUser` at the project level and nothing
+else** — read from the project IAM policy, so §7.3's table is satisfied as written rather than
+bypassed by a broad role.
+
+An earlier draft of this document suspected the opposite, on the reasoning that the account can also
+*list* datasets, which `jobUser` and `dataEditor` do not grant between them. **That reasoning was
+wrong**, and it is recorded because the conclusion it nearly reached — that the store's access control
+was being bypassed — was much more serious than the truth. `datasets.list` returns the datasets the
+caller already has access to, and the SA holds an explicit `WRITER` entry on both `flabel` and
+`flabel_scratch`; the call enumerates nothing project-wide. It returned exactly those two.
+
+So the explicit `userByEmail` binding is **not** redundant. With no project-level BigQuery role beyond
+`jobUser`, it is the only thing granting the SA write access to the store, and removing it would stop
+ingestion.
+
+Outside BigQuery the same account holds `compute.instanceAdmin.v1`, `compute.viewer` and
+`iam.serviceAccountUser` at the project level. Out of scope for this step, and recorded because "the
+instance service account is narrowly scoped" would be the wrong conclusion to carry away from the
+BigQuery half on its own.
 
 ---
 
@@ -78,6 +94,9 @@ throughout §3 is **3,136,681 bytes, generation `1787169551649296`**.
 Bucket *listing* is refused — `403, storage.buckets.list denied`. Correct and expected: §7.2 measured
 the grant as `objectCreator` + `objectViewer` at the **bucket** level with no project-level storage
 role, and object access does not imply bucket enumeration.
+
+The bucket reads as `location: US-CENTRAL1`, `location_type: region` — which is the measurement spec
+§10 M4 rests on, and therefore the reason the dataset's location in §1 is not a free choice.
 
 ### 3.2 A load job succeeds — the direction ingest depends on
 
@@ -126,6 +145,18 @@ LS-8 both *re-read* tarballs, with reproducibility resting on `capture_sha256` r
 An overwritable archive means a published run's bytes are not immutable. `tools/flabel-run` publishes
 under a timestamped name with a plain copy, so a name collision replaces silently rather than failing.
 
+**Soft delete bounds the damage to seven days, and it is the only thing that does.** The bucket
+carries `softDeletePolicy.retentionDurationSeconds = 604800`, effective 2026-08-17. Object
+**versioning is not enabled, and there is no retention policy.** Soft delete retains the generation an
+overwrite or a delete displaced, so a replaced tarball is restorable — for seven days, and only if
+somebody notices inside them. Verified live rather than read off the policy: `results/` currently holds
+one soft-deleted generation, `LABELED_iamcheck_<ts>.tar.gz#<generation>`, left by an IAM probe on
+2026-08-19.
+
+That changes the shape of the exposure without removing it. It is not permanent loss; it is **silent**
+loss with a seven-day window and nothing watching. Since nothing compares a re-read tarball against
+what was published, the seven days would elapse unnoticed.
+
 Not fixed here. Nothing in LS-6's file list can fix it, and the candidate fixes belong elsewhere:
 object versioning or a retention policy on `${BUCKET}` (infrastructure), or publishing with
 `--if-generation-match=0` so a collision is an error (`tools/flabel-run`, which is LS-5's file).
@@ -158,21 +189,14 @@ document is the measurement it would be amended from.
 
 ## 5. Open, and not decided here
 
-- **The archive's mutability** (#158, §3.4). Needs a decision between bucket versioning, a retention
-  policy, and a publisher-side precondition — the first two are infrastructure and the third is LS-5's
-  file. Not LS-6's to make.
+- **The archive's mutability** (#158, §3.4). Soft delete gives seven days; versioning, a retention
+  policy and a publisher-side precondition are the durable options — the first two are infrastructure
+  and the third is LS-5's file. Not LS-6's decision to make.
 - **`flabel-db show` misreports an empty provisioned dataset.** Against `flabel` it exits **3**
   (`EXIT_INTERNAL`) on `NotFound: Table ... flabel.runs`, printing "This is a DEFECT in flabel-db,
   not a report about flabel." A provisioned dataset whose tables do not exist yet is an ordinary
   operator state between LS-6 and LS-4, not a defect. `_verify` handles exactly this case correctly
   and says the tables are missing; `_show` should too. LS-3's file, so not fixed here — **#159**.
-- **Where `${INSTANCE_SA}`'s project-level BigQuery access comes from** (§2). The account can run
-  jobs *and* list datasets, and `dataEditor` + `jobUser` grant neither listing nor, together, anything
-  beyond the dataset — which points at a broader project role, most likely the GCE default service
-  account's stock `Editor`. If that is what it is, spec §7.3's least-privilege table is not being
-  satisfied but bypassed, and that is a §9-grade note rather than a footnote. Reading
-  `projects get-iam-policy` needs the human credential, which hit a non-interactive reauth wall
-  (§7.1's own failure mode) while this was written.
 - **Who may read the dataset** (§2, spec §9). Still nobody's decision.
 
 ---
@@ -201,6 +225,16 @@ gcloud storage cp ./any-small-file "$OBJ" --if-generation-match=0 --account=$SA
 
 # §3.5  location and table state, through the tool the deploy gate uses
 uv run --no-sync flabel-db --dataset flabel verify
+
+# §2 and §3.4 need the HUMAN credential, not the SA — the SA cannot read either.
+# `gcloud auth login` first; a stale token fails non-interactively, which is §7.1's own
+# failure mode and the reason these two were the last things measured.
+gcloud projects get-iam-policy "$GCP_PROJECT" \
+  --flatten="bindings[].members" --filter="bindings.members:$SA" \
+  --format="value(bindings.role)"
+gcloud storage buckets describe "gs://${GCP_PROJECT}-flabel-pcaps" \
+  --format="yaml(location,location_type,versioning,retention_policy,soft_delete_policy)"
+gcloud storage ls --soft-deleted "gs://${GCP_PROJECT}-flabel-pcaps/results/**"
 ```
 
 The dataset ACL, the query job and the load-job probe of §3.2 were driven through
