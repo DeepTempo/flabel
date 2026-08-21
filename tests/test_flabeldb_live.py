@@ -349,3 +349,133 @@ def test_the_dataset_location_is_checked_against_the_real_dataset(bq, capsys):
         rebuild(bq, name)
     capsys.readouterr()
     assert cli._verify(bq, DATASET) == cli.EXIT_OK, capsys.readouterr().err
+
+
+# --- the view, against the real engine ----------------------------------------------------------
+#
+# The pure view tests grep the SQL for vocabulary. This is the behavioural test the plan specified
+# and that was never written: four captures, each isolating one decision, asserting the exact set
+# of rows the real engine returns.
+#
+# MEASURED 2026-08-21, running all five sabotages against `flabel_scratch`. The two suites are
+# COMPLEMENTARY, and neither subsumes the other:
+#
+#     sabotage                                  grep tests   these tests
+#     ---------------------------------------   ----------   -----------
+#     ORDER BY drops run_id                     CAUGHT       passed
+#     ORDER BY finished_at ASC                  passed       CAUGHT (2)
+#     EXISTS instead of NOT EXISTS              passed       CAUGHT (5)
+#     UNNEST(tiers_attempted)                   CAUGHT       CAUGHT (2)
+#     WHERE recency >= 1                        passed       CAUGHT (3)
+#
+# So three of the five inversions were invisible to a suite that only greps — which is why these
+# exist. But the first row is the one to keep in mind, and it is why the grep tests STAY: with the
+# tie-break gone, the winner of a same-second tie is whatever the engine felt like returning, and
+# it returned the run this test expects. A behavioural test cannot reliably catch the absence of a
+# tie-break, because the sabotaged view is not wrong on every execution — it is merely no longer a
+# function of the data. `test_the_view_orders_by_run_id_as_well_as_finished_at` catches it
+# deterministically by reading the statement, and that is the right tool for that one decision.
+
+
+VIEW_RUNS = (
+    # capture, run_id, finished_at, tiers_attempted, tiers_attested
+    # A — two runs finishing in the SAME SECOND. The run_id tie-break decides, nothing else can.
+    ("cap-a", "run-a1", "2026-08-21 12:00:00", [2], [2]),
+    ("cap-a", "run-a2", "2026-08-21 12:00:00", [2], [2]),
+    # B — plain recency. Catches an ORDER BY that sorts ascending.
+    ("cap-b", "run-b-old", "2026-08-20 09:00:00", [2], [2]),
+    ("cap-b", "run-b-new", "2026-08-21 09:00:00", [2], [2]),
+    # C — the newest run is RETRACTED, so the older one is authoritative again.
+    ("cap-c", "run-c-old", "2026-08-20 09:00:00", [2], [2]),
+    ("cap-c", "run-c-new", "2026-08-21 09:00:00", [2], [2]),
+    # D — tier 2 was ATTEMPTED and not ATTESTED (#142's shape: Suricata loaded none of the
+    #     snapshot). It must supply tier 1 and must NOT supply tier 2.
+    ("cap-d", "run-d", "2026-08-21 09:00:00", [1, 2], [1]),
+)
+
+#: What the view must return. Written out in full rather than derived, because a derivation would
+#: be a second implementation of the rule under test.
+VIEW_EXPECTED = {
+    ("cap-a", 2, "run-a2"),
+    ("cap-b", 2, "run-b-new"),
+    ("cap-c", 2, "run-c-old"),
+    ("cap-d", 1, "run-d"),
+}
+
+
+@pytest.fixture(scope="module")
+def authoritative_rows(bq):
+    """The world of `VIEW_RUNS` loaded into a real dataset, and what the view says about it."""
+    from flabeldb import cli
+
+    rebuild(bq, "runs")
+    rebuild(bq, "run_exclusions")
+
+    values = ", ".join(
+        f"('{run_id}', '{capture}', 'offline', {attempted}, {attested}, TIMESTAMP '{finished} UTC')"
+        for capture, run_id, finished, attempted, attested in VIEW_RUNS
+    )
+    bq.query(
+        f"INSERT INTO `{bq.project}.{DATASET}.runs` "
+        f"(run_id, capture_sha256, mode, tiers_attempted, tiers_attested, finished_at) "
+        f"VALUES {values}"
+    ).result()
+    bq.query(
+        f"INSERT INTO `{bq.project}.{DATASET}.run_exclusions` "
+        f"(run_id, reason, excluded_at) VALUES "
+        f"('run-c-new', 'retracted by the view test', CURRENT_TIMESTAMP())"
+    ).result()
+
+    for name, sql in cli.view_sql(DATASET):
+        assert name == "authoritative_runs"
+        bq.query(sql).result()
+
+    rows = bq.query(
+        f"SELECT capture_sha256, tier, run_id FROM `{bq.project}.{DATASET}.authoritative_runs`"
+    ).result()
+    return {(row.capture_sha256, row.tier, row.run_id) for row in rows}
+
+
+def test_the_view_returns_exactly_one_authoritative_run_per_capture_and_tier(authoritative_rows):
+    """The whole contract in one assertion. Every sabotage in the plan's list fails here."""
+    assert authoritative_rows == VIEW_EXPECTED
+
+
+def test_two_runs_finishing_in_the_same_second_are_broken_by_run_id(authoritative_rows):
+    """#138's correction on a second comparator. On a box that replays a capture in seconds, two
+    runs finishing in the same second is the ORDINARY case, not an edge one.
+
+    **This test cannot be relied on to catch a missing tie-break**, and that is a property of the
+    thing under test rather than a weakness here. Measured: with `run_id` removed from the ORDER
+    BY, the engine still returned `run-a2` and this passed. That is exactly the defect — the winner
+    stops being a function of the data and becomes whatever the engine returned — but it means the
+    deterministic guard is the one that reads the statement, and it lives in
+    `test_flabeldb_schema.py`. Kept because it pins the CORRECT answer, and because a tie-break
+    that sorted the wrong way would fail here every time.
+    """
+    for_a = {row for row in authoritative_rows if row[0] == "cap-a"}
+    assert for_a == {("cap-a", 2, "run-a2")}, (
+        "the same-second tie was decided by something other than the run_id, or not at all"
+    )
+
+
+def test_the_newer_run_wins_when_the_timestamps_actually_differ(authoritative_rows):
+    """Catches an ORDER BY that sorts the right column the wrong way."""
+    assert ("cap-b", 2, "run-b-new") in authoritative_rows
+    assert ("cap-b", 2, "run-b-old") not in authoritative_rows
+
+
+def test_a_retracted_run_hands_authority_back_to_the_older_one(authoritative_rows):
+    """§4.5: retraction is a record, not a delete, so it is joined away on every read. `EXISTS` in
+    place of `NOT EXISTS` still greps as "run_exclusions" and inverts the whole meaning."""
+    assert ("cap-c", 2, "run-c-old") in authoritative_rows
+    assert ("cap-c", 2, "run-c-new") not in authoritative_rows
+
+
+def test_a_tier_that_was_attempted_but_not_attested_supplies_nothing(authoritative_rows):
+    """§2.4, and #142's exact shape: a run whose Suricata loaded NONE of the snapshot exits 0 and
+    would otherwise supersede good tier-2 knowledge with an empty result."""
+    assert ("cap-d", 1, "run-d") in authoritative_rows
+    assert not [row for row in authoritative_rows if row[0] == "cap-d" and row[1] == 2], (
+        "an unattested tier supplied an authoritative row"
+    )
