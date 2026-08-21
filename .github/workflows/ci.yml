@@ -90,16 +90,27 @@ jobs:
   # Outside the container on purpose: the toolchain is irrelevant here and the requires_tools layer
   # is deselected, because what this job proves is about imports and collection, not about Zeek.
   # `test` above is what proves the tool layer.
-  no-db-extra:
-    name: Suite is green without the db extra
+  bare-runner:
+    name: Suite is green on a bare machine — no db extra, no toolchain
+    # THIS IS THE ONLY JOB THAT RUNS OUTSIDE THE TOOLCHAIN CONTAINER, and that turns out to be
+    # half its value. It was added to catch the suite being red without the `db` extra; on its
+    # very first run it also caught ELEVEN tests that drive Zeek or Suricata for real without
+    # `@pytest.mark.requires_tools` (2026-08-21). Nothing could have noticed before, because
+    # every other job has the tools present, so an unmarked tool test passes there forever.
+    #
+    # So this job guards two invariants at once, and both matter:
+    #   1. `flabel` is installable and testable with NOTHING — `dependencies = []` is a promise.
+    #   2. `requires_tools` is applied wherever it is needed, checked by CONSEQUENCE rather than
+    #      by a heuristic. An unmarked tool test fails here and nowhere else.
+    #
+    # Do not "fix" a failure here by adding `--extra db` or by installing the toolchain. Either
+    # one silently deletes the invariant the failure is reporting.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      # No `--extra db`. That is the entire point of this job; do not "fix" a failure here by
-      # adding it.
       - run: uv sync --locked --dev
       - run: uv run pytest -q -m "not requires_tools"
 

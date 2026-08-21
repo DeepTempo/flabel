@@ -117,20 +117,37 @@ def ci_job(name: str) -> str:
     return "".join(line for line in block if not line.lstrip().startswith("#"))
 
 
-def test_ci_has_a_job_that_syncs_without_the_db_extra():
+def test_ci_has_a_job_that_runs_on_a_bare_machine():
     """Without this job, nothing exercises the state the guard exists for.
 
     This branch made `--extra db` unconditional in both pre-existing jobs, so the default checkout
     — `uv sync`, no extras — was the one state CI could no longer see.
+
+    Renamed from `no-db-extra` on 2026-08-21, because the job turned out to guard **two**
+    invariants and the old name claimed only one. It is the only job outside the toolchain
+    container, so it is also the only place an unmarked `requires_tools` test can fail: on its
+    first run it caught eleven of them in `test_cli.py` and `test_suricata.py`, which every other
+    job had been passing for weeks because the tools are always present there.
     """
-    job = ci_job("no-db-extra")
+    job = ci_job("bare-runner")
 
     assert "uv sync" in job, "the job does not sync at all"
     assert "--extra db" not in job, (
-        "the no-db-extra job passes --extra db, which defeats its entire purpose"
+        "the bare-runner job passes --extra db, which defeats half its purpose"
     )
     assert "pytest" in job, "the job syncs but never runs the suite, so it proves nothing"
     assert "--locked" in job, "plain `uv sync` silently re-resolves; CI must use --locked"
+    # The second invariant, which the rename is about. Installing the toolchain here would make
+    # the job green again while deleting the only check on the `requires_tools` marker.
+    assert "container" not in job, (
+        "the bare-runner job runs in a container; it must run on a BARE machine, because that is "
+        "what makes an unmarked requires_tools test fail somewhere"
+    )
+    for tool in ("zeek", "suricata", "wireshark"):
+        assert tool not in job.lower(), (
+            f"the bare-runner job installs {tool}. An unmarked requires_tools test would then "
+            f"pass here as it does everywhere else, and nothing would ever catch it."
+        )
 
 
 def test_the_other_ci_jobs_still_install_the_extra():
