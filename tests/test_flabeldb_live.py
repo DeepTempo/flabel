@@ -233,3 +233,119 @@ def _metadata_service_account() -> str | None:
             return response.read().decode().strip()
     except (urllib.error.URLError, TimeoutError, OSError):
         return None
+
+
+# --- the layout, against a real table -----------------------------------------------------------
+
+
+def test_bigquery_will_not_cluster_on_zeek_uid_at_all(bq):
+    """A measured correction to the handoff, worth keeping as a test.
+
+    The handoff cites "`flow_labels` clustered on `zeek_uid` verifies clean" as the example of
+    verify's blindness. The blindness was real — `differences()` compared field lists and nothing
+    else — but **that particular state is unreachable through the API**. Measured 2026-08-21:
+
+        400 The field specified for clustering cannot be found in the schema.
+            Invalid field: zeek_uid.
+
+    because `zeek_uid` lives inside the `flow` STRUCT and BigQuery clusters on top-level fields
+    only. So the store's one named never-do is guarded twice over, by `Table.__post_init__` on the
+    way in and by BigQuery itself. The reachable clustering drift is a top-level column, which is
+    what the next test uses.
+    """
+    from flabeldb import client
+
+    rebuild(bq, "flow_labels")
+    live = bq.get_table(f"{bq.project}.{DATASET}.flow_labels")
+    live.clustering_fields = ["zeek_uid"]
+    with pytest.raises(Exception, match="clustering"):
+        bq.update_table(live, ["clustering_fields"])
+    del client
+
+
+def test_verify_sees_the_clustering_drift_it_used_to_be_blind_to(bq, capsys):
+    """Clustering on a top-level column that is not the declared key — a reachable console edit.
+
+    `differences()` compared field lists only, so any clustering was invisible to the gate.
+    Clustering is one of the few things BigQuery lets `apply` patch, so once visible it is
+    repairable rather than a rebuild.
+    """
+    from flabeldb import cli
+
+    rebuild(bq, "flow_labels")
+    reference = f"{bq.project}.{DATASET}.flow_labels"
+    live = bq.get_table(reference)
+    live.clustering_fields = ["run_id"]
+    bq.update_table(live, ["clustering_fields"])
+    assert bq.get_table(reference).clustering_fields == ["run_id"], "the setup did not take"
+
+    assert cli._verify(bq, DATASET) == cli.EXIT_DRIFT
+    error = capsys.readouterr().err
+    assert "run_id" in error
+    assert "flow_labels" in error
+
+    # and apply repairs it, because clustering is patchable (measured)
+    assert cli._apply(bq, DATASET) == cli.EXIT_OK
+    assert bq.get_table(reference).clustering_fields == list(
+        schema.TABLES["flow_labels"].clustering
+    )
+    capsys.readouterr()
+    assert cli._verify(bq, DATASET) == cli.EXIT_OK
+
+
+def test_verify_sees_a_stale_description_on_a_real_table(bq, capsys):
+    from flabeldb import cli
+
+    rebuild(bq, "run_exclusions")
+    reference = f"{bq.project}.{DATASET}.run_exclusions"
+    live = bq.get_table(reference)
+    live.description = "someone edited this in the console"
+    bq.update_table(live, ["description"])
+
+    assert cli._verify(bq, DATASET) == cli.EXIT_DRIFT
+    assert "description" in capsys.readouterr().err
+
+    assert cli._apply(bq, DATASET) == cli.EXIT_OK
+    assert bq.get_table(reference).description == schema.TABLES["run_exclusions"].description
+
+
+def test_verify_sees_reversed_columns_on_a_real_table_and_apply_names_the_rebuild(bq, capsys):
+    """Order drift is permanent until a rebuild, so the gate seeing it is the whole value.
+
+    Measured: `update_table` accepts a reordered schema with a 200 and the live order does not
+    change — so `apply` must NAME this rather than claim it fixed it.
+    """
+    from flabeldb import cli, client
+
+    bigquery = client._bigquery()
+    table = schema.TABLES["run_exclusions"]
+    reference = f"{bq.project}.{DATASET}.run_exclusions"
+    bq.delete_table(reference, not_found_ok=True)
+    reversed_table = bigquery.Table(
+        reference, schema=list(reversed(client.to_bigquery(table.fields)))
+    )
+    reversed_table.description = table.description
+    reversed_table.clustering_fields = list(table.clustering)
+    bq.create_table(reversed_table)
+
+    assert cli._verify(bq, DATASET) == cli.EXIT_DRIFT
+    assert "order" in capsys.readouterr().err.lower()
+
+    assert cli._apply(bq, DATASET) == cli.EXIT_DRIFT
+    output = capsys.readouterr()
+    assert "rebuild" in (output.out + output.err).lower()
+
+    rebuild(bq, "run_exclusions")
+    capsys.readouterr()
+    assert cli._verify(bq, DATASET) == cli.EXIT_OK
+
+
+def test_the_dataset_location_is_checked_against_the_real_dataset(bq, capsys):
+    """A location is immutable, so the gate is the only place this can be caught."""
+    from flabeldb import cli, client
+
+    assert bq.get_dataset(f"{bq.project}.{DATASET}").location.lower() == client.LOCATION
+    for name in schema.TABLES:
+        rebuild(bq, name)
+    capsys.readouterr()
+    assert cli._verify(bq, DATASET) == cli.EXIT_OK, capsys.readouterr().err

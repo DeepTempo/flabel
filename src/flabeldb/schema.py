@@ -403,20 +403,40 @@ def _merge_fields(
         merged.append(item)
         changes.append(f"{table}.{path}: add column ({item.field_type} {item.mode})")
 
-    # Order. Compared over the columns present on BOTH sides, so that a genuine addition or an
-    # undeclared column is reported as itself rather than as a reordering as well.
+    # THE TRAP. `update_table` returns 200 for a reordered schema and the live order does not
+    # change, so calling this patchable would make `apply` claim a fix it never made and leave
+    # `verify` reporting drift forever. Same helper `differences()` uses, so the gate and the repair
+    # cannot disagree.
+    reordered = _order_difference(table, declared, live, prefix)
+    if reordered:
+        rebuild.append(reordered)
+    return merged, changes, rebuild
+
+
+def _order_difference(
+    table: str, declared: Sequence[Column], live: Sequence[Column], prefix: str = ""
+) -> str | None:
+    """A message if the columns present on both sides sit in a different order, else `None`.
+
+    Compared over the columns present on BOTH sides, so an added or dropped column is reported as
+    itself and not also as a reordering — one fact, one message.
+
+    Order is load-bearing for a reason `apply` cannot fix: `update_table` accepts a reordered schema
+    and **silently ignores it** (measured 2026-08-21), so once a table's order diverges from the
+    declaration it stays diverged until the table is rebuilt. One helper serves `differences()` and
+    `patch_plan()` so the gate and the repair can never disagree about what counts as reordered.
+    """
     declared_names = [item.name for item in declared]
+    live_names = {item.name for item in live}
     common_live = [item.name for item in live if item.name in declared_names]
     common_declared = [name for name in declared_names if name in live_names]
-    if common_live != common_declared:
-        # THE TRAP. `update_table` returns 200 for a reordered schema and the live order does not
-        # change (measured 2026-08-21). Calling this patchable would make `apply` claim a fix it
-        # never made and leave `verify` reporting drift forever.
-        rebuild.append(
-            f"{table}: {prefix or 'column'} order is {common_live}, declared {common_declared} — "
-            f"BigQuery accepts a reordered schema and silently ignores it"
-        )
-    return merged, changes, rebuild
+    if common_live == common_declared:
+        return None
+    where = f"{table}.{prefix[:-1]}" if prefix else table
+    return (
+        f"{where}: column order is {common_live}, declared {common_declared} — BigQuery accepts a "
+        f"reordered schema and silently ignores it, so this needs the table rebuilt"
+    )
 
 
 def patch_plan(name: str, declared: Table, live: LiveTable) -> Patch:
@@ -469,25 +489,57 @@ def field_of(table: str, name: str) -> Column:
     raise KeyError(f"{table} has no column {name!r}")
 
 
-def differences(live: Mapping[str, Sequence[Column]]) -> tuple[str, ...]:
+def differences(live: Mapping[str, LiveTable]) -> tuple[str, ...]:
     """Every way `live` disagrees with the declaration, as sentences.
 
     Pure, and that is what makes it CI-checkable: `client.py` reads the live schema and hands the
-    result here. Four kinds of drift are reported separately because "detects a difference" is
-    satisfied by code that notices only one — and the drift this exists for is a column patched by
-    hand in the console, which could be any of them. A changed **mode** is the one most likely to
-    slip: `REPEATED` and `NULLABLE` on the same type read alike, and are the difference between a
-    list and a scalar.
+    result here. Every kind of drift is reported separately, because "detects a difference" is
+    satisfied by code that notices only one — and the drift this exists for is a table patched by
+    hand in the console, which could be any of them:
+
+        a column added, dropped, retyped, or its MODE changed — `REPEATED` and `NULLABLE` on the
+            same type read alike in a casual comparison, and are the difference between a list and
+            a scalar
+        the column ORDER, at every level of nesting
+        the PARTITION field, the CLUSTERING keys (in order), and the table DESCRIPTION
+        a table present in the dataset that the declaration does not name
+
+    The last four were invisible until 2026-08-21, because this compared field lists only. Measured
+    against this declaration at the time: reversing all 13 columns of `runs` yielded zero
+    differences, and any clustering at all went unnoticed.
+
+    The dataset's own LOCATION is checked by `cli._verify` rather than here, because `LOCATION`
+    belongs to the client — it is part of the store's identity — and this module stays pure.
 
     Ordered by table then column, so two runs report the same differences in the same order.
     """
     found: list[str] = []
     for name in sorted(TABLES):
-        declared = TABLES[name].fields
+        declared = TABLES[name]
         if name not in live:
             found.append(f"{name}: table is missing from the dataset")
             continue
-        found.extend(_field_differences(name, declared, tuple(live[name])))
+        actual = live[name]
+        found.extend(_field_differences(name, declared.fields, tuple(actual.fields)))
+        # Everything below was invisible to the gate. Measured against this declaration:
+        # `flow_labels` clustered on `zeek_uid` — the store's single named never-do — verified
+        # clean, and reversing all 13 columns of `runs` yielded zero differences.
+        if declared.partition_field != actual.partition_field:
+            found.append(
+                f"{name}: partitioned on {actual.partition_field!r}, declared "
+                f"{declared.partition_field!r}"
+            )
+        if tuple(declared.clustering) != tuple(actual.clustering):
+            found.append(
+                f"{name}: clustered on {list(actual.clustering)}, declared "
+                f"{list(declared.clustering)} — clustering is hierarchical, so the ORDER of the "
+                f"keys is part of the layout, not a set"
+            )
+        if declared.description != actual.description:
+            found.append(
+                f"{name}: description differs from the declaration (the declaration is the truth; "
+                f"a console edit is not)"
+            )
     for name in sorted(set(live) - set(TABLES)):
         found.append(f"{name}: table exists in the dataset but is not declared")
     return tuple(found)
@@ -512,4 +564,7 @@ def _field_differences(
             found.extend(_field_differences(table, item.fields, actual.fields, prefix=f"{path}."))
     for leftover in sorted(by_name):
         found.append(f"{table}.{prefix}{leftover}: unexpected column, not in the declaration")
+    reordered = _order_difference(table, declared, live, prefix)
+    if reordered:
+        found.append(reordered)
     return found

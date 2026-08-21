@@ -165,7 +165,44 @@ def _apply(bq, dataset: str) -> int:
 
 
 def _verify(bq, dataset: str) -> int:
-    found = schema.differences(client_module.live_schema(bq, dataset))
+    """Compare the live dataset against the declaration, and exit 1 on ANY difference.
+
+    Compares more than the field list. Measured against this declaration: `flow_labels` clustered
+    on `zeek_uid` — the store's single named never-do, because a Zeek uid under `-D` is positional —
+    verified CLEAN, and reversing all 13 columns of `runs` yielded zero differences.
+
+    The dataset's LOCATION is checked here rather than in `schema.py`, which is pure and must not
+    import the client: `LOCATION` lives with the client because it is part of the store's identity.
+    It is checked at all because it cannot be fixed later — a dataset's location is immutable, the
+    results bucket is US-CENTRAL1 *regional* so a load job needs a compatible dataset, and BigQuery
+    job ids are namespaced `project:location.jobid`, so the location is part of the idempotency
+    namespace too (spec §10 M2, M4).
+    """
+    from google.api_core.exceptions import NotFound
+
+    found: list[str] = []
+    try:
+        location = bq.get_dataset(f"{bq.project}.{dataset}").location
+    except NotFound:
+        # `NotFound` on a TABLE means the table is absent, which is drift. On the DATASET it means
+        # the container is not there, and reporting five missing tables plus "run apply" would be
+        # advice that cannot work — apply cannot create a dataset either (that is LS-6).
+        print(
+            f"flabel-db: dataset {bq.project}.{dataset} does not exist (or this identity cannot "
+            f"see it).\n"
+            f"\nThis is NOT a report about its tables: nothing in it was read. Check --dataset and "
+            f"--project for a typo; the dataset itself is created by LS-6, not by `apply`.",
+            file=sys.stderr,
+        )
+        return EXIT_DRIFT
+    if (location or "").lower() != client_module.LOCATION:
+        found.append(
+            f"{dataset}: dataset location is {location!r}, declared "
+            f"{client_module.LOCATION!r} — a location is IMMUTABLE, so this needs the dataset "
+            f"recreated, not patched"
+        )
+    found += list(schema.differences(client_module.live_schema(bq, dataset)))
+    found = tuple(found)
     if not found:
         print(f"flabel-db: {dataset} matches the declaration ({len(schema.TABLES)} tables)")
         return EXIT_OK

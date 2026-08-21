@@ -130,7 +130,7 @@ def live_table(table) -> schema.LiveTable:
     )
 
 
-def live_schema(bq, dataset: str) -> Mapping[str, tuple[schema.Column, ...]]:
+def live_schema(bq, dataset: str) -> Mapping[str, schema.LiveTable]:
     """Every declared table that exists in `dataset`, in our own shape.
 
     A table absent from the dataset is simply absent from the result; `schema.differences` reports
@@ -139,7 +139,7 @@ def live_schema(bq, dataset: str) -> Mapping[str, tuple[schema.Column, ...]]:
     """
     from google.api_core.exceptions import NotFound
 
-    found: dict[str, tuple[schema.Column, ...]] = {}
+    found: dict[str, schema.LiveTable] = {}
     for name in schema.TABLES:
         try:
             table = bq.get_table(f"{bq.project}.{dataset}.{name}")
@@ -150,5 +150,7 @@ def live_schema(bq, dataset: str) -> Mapping[str, tuple[schema.Column, ...]]:
             # nothing about authentication. That is spec §2.5's failure exactly, in the one command
             # whose job is to report the truth about the dataset. Anything else propagates.
             continue
-        found[name] = from_bigquery(table.schema)
+        # The WHOLE table, not just its fields. `differences()` compares partitioning, clustering,
+        # descriptions and column order too, and none of that is in the field list.
+        found[name] = live_table(table)
     return found

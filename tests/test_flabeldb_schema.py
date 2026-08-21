@@ -132,8 +132,31 @@ def test_zeek_uid_is_stored_but_is_not_a_clustering_or_partition_key():
 # --- verify -----------------------------------------------------------------------------------
 
 
+def fake_bq(location: str = "us-central1"):
+    """A stand-in client that answers `get_dataset`, which `_verify` asks before anything else.
+
+    It asks because the dataset's LOCATION is immutable and part of the store's identity: the
+    results bucket is US-CENTRAL1 regional, and BigQuery job ids are namespaced
+    `project:location.jobid`.
+    """
+
+    class Bq:
+        project = "p"
+
+        def get_dataset(self, _reference):
+            return type("Dataset", (), {"location": location})()
+
+    return Bq()
+
+
 def test_verify_is_silent_when_the_live_schema_matches():
-    live = {name: schema.TABLES[name].fields for name in schema.TABLES}
+    """Note this compares the declaration to a copy of ITSELF, so it cannot fail on its own.
+
+    Kept because it pins the no-drift path, but the test that actually exercises the comparison is
+    `test_the_declaration_round_trips_through_the_apis_own_vocabulary` below, and the one that
+    exercises it against BigQuery is in `test_flabeldb_live.py`.
+    """
+    live = {name: schema.TABLES[name] for name in schema.TABLES}
     assert schema.differences(live) == ()
 
 
@@ -174,8 +197,13 @@ def test_verify_detects_each_kind_of_drift(mutate, expected):
     type reads as the same column in a casual comparison, and it is the difference between a list
     and a scalar.
     """
-    live = {name: schema.TABLES[name].fields for name in schema.TABLES}
-    live["runs"] = tuple(mutate(tuple(live["runs"])))
+    live = {name: schema.TABLES[name] for name in schema.TABLES}
+    live["runs"] = schema.LiveTable(
+        fields=tuple(mutate(tuple(schema.TABLES["runs"].fields))),
+        partition_field=schema.TABLES["runs"].partition_field,
+        clustering=schema.TABLES["runs"].clustering,
+        description=schema.TABLES["runs"].description,
+    )
 
     found = schema.differences(live)
     assert found, "verify saw no difference"
@@ -186,7 +214,7 @@ def test_verify_detects_each_kind_of_drift(mutate, expected):
 
 def test_verify_reports_a_table_that_does_not_exist_at_all():
     """The failure mode of a half-run `apply`, which is likelier than a patched column."""
-    live = {name: schema.TABLES[name].fields for name in schema.TABLES}
+    live = {name: schema.TABLES[name] for name in schema.TABLES}
     del live["run_exclusions"]
 
     found = schema.differences(live)
@@ -330,8 +358,8 @@ def test_verify_exits_non_zero_on_drift_and_names_it(monkeypatch, capsys):
     """
     from flabeldb import cli, client
 
-    short = dict.fromkeys(schema.TABLES, ())
-    monkeypatch.setattr(client, "client", lambda **_: type("Bq", (), {"project": "p"})())
+    short = {name: schema.LiveTable(fields=()) for name in schema.TABLES}
+    monkeypatch.setattr(client, "client", lambda **_: fake_bq())
     monkeypatch.setattr(client, "live_schema", lambda _bq, _dataset: short)
 
     assert cli.main(["verify"]) == cli.EXIT_DRIFT
@@ -342,8 +370,8 @@ def test_verify_exits_zero_when_the_dataset_matches(monkeypatch, capsys):
     """The complement, so drift detection cannot be satisfied by always failing."""
     from flabeldb import cli, client
 
-    matching = {name: schema.TABLES[name].fields for name in schema.TABLES}
-    monkeypatch.setattr(client, "client", lambda **_: type("Bq", (), {"project": "p"})())
+    matching = {name: schema.TABLES[name] for name in schema.TABLES}
+    monkeypatch.setattr(client, "client", lambda **_: fake_bq())
     monkeypatch.setattr(client, "live_schema", lambda _bq, _dataset: matching)
 
     assert cli.main(["verify"]) == cli.EXIT_OK
@@ -406,7 +434,7 @@ def test_a_credential_failure_exits_usage_and_not_drift(monkeypatch, capsys):
 
     from flabeldb import cli, client
 
-    monkeypatch.setattr(client, "client", lambda **_: type("Bq", (), {"project": "p"})())
+    monkeypatch.setattr(client, "client", lambda **_: fake_bq())
 
     def refuse(*_args, **_kwargs):
         raise RefreshError("Reauthentication is needed")
@@ -432,7 +460,7 @@ def test_an_unexpected_failure_is_not_swallowed_as_a_credential_problem(monkeypa
     """
     from flabeldb import cli, client
 
-    monkeypatch.setattr(client, "client", lambda **_: type("Bq", (), {"project": "p"})())
+    monkeypatch.setattr(client, "client", lambda **_: fake_bq())
 
     def explode(*_args, **_kwargs):
         raise ZeroDivisionError("a real defect")
@@ -529,8 +557,15 @@ def test_the_declaration_round_trips_through_the_apis_own_vocabulary(table):
     declared = schema.TABLES[table].fields
     live = client.from_bigquery(as_the_api_returns_it(client.to_bigquery(declared)))
 
-    everything = {name: schema.TABLES[name].fields for name in schema.TABLES}
-    assert schema.differences({**everything, table: live}) == ()
+    declaration = schema.TABLES[table]
+    everything = {name: schema.TABLES[name] for name in schema.TABLES}
+    round_tripped = schema.LiveTable(
+        fields=live,
+        partition_field=declaration.partition_field,
+        clustering=declaration.clustering,
+        description=declaration.description,
+    )
+    assert schema.differences({**everything, table: round_tripped}) == ()
 
 
 # --- the credential detector, and the exit code an unknown failure must never take -------------
@@ -567,7 +602,7 @@ def _failing_verify(monkeypatch, error):
     """`flabel-db verify` where the live read raises `error`."""
     from flabeldb import cli, client
 
-    monkeypatch.setattr(client, "client", lambda **_: type("Bq", (), {"project": "p"})())
+    monkeypatch.setattr(client, "client", lambda **_: fake_bq())
     monkeypatch.setattr(client, "live_schema", lambda *a, **k: (_ for _ in ()).throw(error))
     return cli.main(["verify"])
 
@@ -664,3 +699,236 @@ def test_a_not_found_is_not_a_credential_failure(monkeypatch):
         "the library changed shape; a base-class match would now be safe, but check"
     )
     assert _failing_verify(monkeypatch, NotFound("no such dataset")) == cli.EXIT_INTERNAL
+
+
+# --- verify beyond the field list ---------------------------------------------------------------
+#
+# `differences()` compared field lists and nothing else, so everything BigQuery lays a table out
+# with was invisible to the gate. Two consequences, both measured against this declaration:
+#
+#   - `flow_labels` clustered on `zeek_uid` verified CLEAN. That is the store's single named
+#     never-do: under Zeek's `-D` a uid is positional, so it means "connection #N in this capture"
+#     and clustering on it groups unrelated flows from different captures.
+#   - Reversing all 13 columns of `runs` yielded ZERO differences, because the comparison indexed
+#     the live side by name.
+#
+# Column order matters for a reason apply cannot fix: `update_table` accepts a reordered schema and
+# silently ignores it (measured), so order drift is permanent until the table is rebuilt. A gate
+# that cannot see it lets a hand-built table diverge from the declaration for good.
+
+
+def declared_live() -> dict:
+    """The live side as a perfect copy of the declaration.
+
+    A `Table` is used directly as the live shape: it carries the same four attributes `LiveTable`
+    does, which is what lets `differences()` read either.
+    """
+    return {name: schema.TABLES[name] for name in schema.TABLES}
+
+
+def altered(name: str, **changes) -> dict:
+    """`declared_live()` with one table replaced by a `LiveTable` differing in `changes`."""
+    table = schema.TABLES[name]
+    live = declared_live()
+    live[name] = schema.LiveTable(
+        fields=changes.pop("fields", table.fields),
+        partition_field=changes.pop("partition_field", table.partition_field),
+        clustering=changes.pop("clustering", table.clustering),
+        description=changes.pop("description", table.description),
+    )
+    assert not changes, f"unknown keys: {sorted(changes)}"
+    return live
+
+
+def test_the_declaration_verifies_clean_against_itself():
+    assert schema.differences(declared_live()) == ()
+
+
+def test_clustering_on_zeek_uid_is_reported():
+    """The store's ONE named never-do: spec §4.3, because under `-D` a uid is positional —
+    "connection #N" in every capture — so clustering on it groups unrelated flows.
+
+    Measured 2026-08-21: BigQuery will not actually accept this state, because `zeek_uid` sits
+    inside the `flow` STRUCT and clustering takes top-level fields only ("400 The field specified
+    for clustering cannot be found in the schema"). So this tests the COMPARISON against a state the
+    API would refuse — kept because the comparison is what was blind, and a future top-level
+    `zeek_uid` column would make it reachable. The reachable case is the parametrised test below,
+    and `test_flabeldb_live.py` pins BigQuery's refusal itself.
+    """
+    found = schema.differences(altered("flow_labels", clustering=("zeek_uid",)))
+
+    assert found, "clustering on zeek_uid verified clean"
+    assert any("cluster" in message.lower() for message in found)
+    assert any("zeek_uid" in message for message in found)
+
+
+def test_reversing_every_column_of_runs_is_reported():
+    """13 columns reversed, zero differences reported. The comparison indexed live by name."""
+    reversed_fields = tuple(reversed(schema.TABLES["runs"].fields))
+    assert len(reversed_fields) == 13, "the runs declaration changed; update this count"
+
+    found = schema.differences(altered("runs", fields=reversed_fields))
+
+    assert found, "reversing all 13 columns yielded no differences"
+    assert any("order" in message.lower() for message in found)
+
+
+def test_reordering_a_structs_subfields_is_reported():
+    """Nesting is where a name-indexed comparison is easiest to fool."""
+    flow = schema.field_of("flow_labels", "flow")
+    swapped = schema.column("flow", "STRUCT", fields=tuple(reversed(flow.fields)))
+    fields = tuple(
+        swapped if item.name == "flow" else item for item in schema.TABLES["flow_labels"].fields
+    )
+
+    found = schema.differences(altered("flow_labels", fields=fields))
+
+    assert any("order" in message.lower() for message in found)
+
+
+@pytest.mark.parametrize(
+    "table, change, word",
+    [
+        pytest.param("runs", {"partition_field": None}, "partition", id="partition-dropped"),
+        pytest.param("runs", {"partition_field": "ingested_at"}, "partition", id="partition-moved"),
+        pytest.param(
+            "flow_labels", {"partition_field": "run_id"}, "partition", id="partition-added"
+        ),
+        pytest.param("runs", {"clustering": ()}, "cluster", id="clustering-dropped"),
+        pytest.param("runs", {"clustering": ("mode",)}, "cluster", id="clustering-narrowed"),
+        pytest.param(
+            "runs", {"clustering": ("mode", "capture_sha256")}, "cluster", id="clustering-reordered"
+        ),
+        pytest.param(
+            "captures",
+            {"description": "edited in the console"},
+            "description",
+            id="description-changed",
+        ),
+        pytest.param("captures", {"description": ""}, "description", id="description-dropped"),
+    ],
+)
+def test_the_layout_verify_was_blind_to_is_reported(table, change, word):
+    found = schema.differences(altered(table, **change))
+
+    assert found, f"{change} verified clean"
+    assert any(word in message.lower() for message in found), f"no message mentions {word}: {found}"
+    assert any(table in message for message in found)
+
+
+def test_clustering_order_is_significant_and_not_a_set():
+    """BigQuery clusters hierarchically: ('a','b') and ('b','a') are different physical layouts."""
+    found = schema.differences(altered("runs", clustering=("mode", "capture_sha256")))
+    assert found
+
+
+def test_an_added_column_is_not_also_reported_as_a_reordering():
+    """One fact, one message. Order is compared over the columns present on BOTH sides."""
+    fields = (*schema.TABLES["run_exclusions"].fields, schema.column("smuggled", "STRING"))
+    found = schema.differences(altered("run_exclusions", fields=fields))
+
+    assert any("smuggled" in message for message in found)
+    assert not any("order" in message.lower() for message in found), (
+        f"an appended column was also reported as a reordering: {found}"
+    )
+
+
+def test_a_dropped_column_is_not_also_reported_as_a_reordering():
+    fields = schema.TABLES["run_exclusions"].fields[:-1]
+    found = schema.differences(altered("run_exclusions", fields=fields))
+
+    assert any("missing" in message for message in found)
+    assert not any("order" in message.lower() for message in found), (
+        f"a dropped column was also reported as a reordering: {found}"
+    )
+
+
+# --- the dataset itself, not just its tables ----------------------------------------------------
+
+
+@needs_client
+def test_a_dataset_in_the_wrong_location_is_drift(monkeypatch, capsys):
+    """A location is IMMUTABLE, so this is the one drift that can never be patched at all.
+
+    It matters beyond tidiness: the results bucket is US-CENTRAL1 *regional* and a load job needs a
+    compatible dataset location, and BigQuery job ids are namespaced `project:location.jobid`, so
+    the location is part of the idempotency namespace (spec §10 M2, M4).
+    """
+    from flabeldb import cli, client
+
+    monkeypatch.setattr(client, "client", lambda **_: fake_bq(location="us-east1"))
+    monkeypatch.setattr(
+        client, "live_schema", lambda *_: {name: schema.TABLES[name] for name in schema.TABLES}
+    )
+
+    assert cli.main(["verify"]) == cli.EXIT_DRIFT
+    error = capsys.readouterr().err
+    assert "us-east1" in error and "us-central1" in error
+    assert "IMMUTABLE" in error or "immutable" in error
+
+
+@needs_client
+def test_the_location_comparison_is_not_case_sensitive(monkeypatch, capsys):
+    """BigQuery returned `us-central1` lowercase for this dataset (measured), but it reports
+    multi-regions as `US`/`EU`, so the comparison is deliberately case-insensitive rather than
+    relying on the casing one dataset happened to have."""
+    from flabeldb import cli, client
+
+    monkeypatch.setattr(client, "client", lambda **_: fake_bq(location="US-CENTRAL1"))
+    monkeypatch.setattr(
+        client, "live_schema", lambda *_: {name: schema.TABLES[name] for name in schema.TABLES}
+    )
+
+    assert cli.main(["verify"]) == cli.EXIT_OK, capsys.readouterr().err
+
+
+@needs_client
+def test_a_dataset_that_does_not_exist_is_not_reported_as_five_missing_tables(monkeypatch, capsys):
+    """Measured live 2026-08-21 against a project whose dataset does not exist: `verify` listed
+    five tables as "missing from the dataset" and then advised running `apply`.
+
+    Both halves are wrong. Nothing was read, so nothing is known about tables; and `apply` cannot
+    create a dataset — that is LS-6 — so the advice sends the operator in a circle. `NotFound` on a
+    table means the table is absent; on the dataset it means the container is not there.
+    """
+    from google.api_core.exceptions import NotFound
+
+    from flabeldb import cli, client
+
+    class Bq:
+        project = "p"
+
+        def get_dataset(self, reference):
+            raise NotFound(f"Not found: Dataset {reference}")
+
+    monkeypatch.setattr(client, "client", lambda **_: Bq())
+
+    assert cli.main(["--dataset", "flabl_typo", "verify"]) == cli.EXIT_DRIFT
+    error = capsys.readouterr().err
+    assert "flabl_typo" in error
+    assert "does not exist" in error
+    assert "missing from the dataset" not in error, "it reported tables it never looked at"
+    assert "Run `flabel-db apply`" not in error, (
+        "it told the operator to run apply, which cannot create a dataset — that is the drift "
+        "path's advice, and this is not drift in a dataset"
+    )
+    assert "not by `apply`" in error, "it should say plainly that apply is not the fix here"
+
+
+@needs_client
+def test_a_credential_failure_reaching_the_dataset_is_still_not_drift(monkeypatch, capsys):
+    """`get_dataset` is now the FIRST call, so it is where an expired credential surfaces."""
+    from google.auth.exceptions import RefreshError
+
+    from flabeldb import cli, client
+
+    class Bq:
+        project = "p"
+
+        def get_dataset(self, _reference):
+            raise RefreshError("Reauthentication is needed")
+
+    monkeypatch.setattr(client, "client", lambda **_: Bq())
+
+    assert cli.main(["verify"]) == cli.EXIT_USAGE
+    assert "NOT a report about the dataset" in capsys.readouterr().err
