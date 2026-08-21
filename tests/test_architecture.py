@@ -176,3 +176,127 @@ def test_only_named_modules_may_touch_the_network():
             f"perform network I/O, which is what keeps `--offline` offline by construction "
             f"rather than by convention."
         )
+
+
+# --- flabeldb: the sibling package ------------------------------------------------------------
+#
+# `flabel` and `flabeldb` are separate distributions of one repo, and the boundary between them is
+# the reason the second exists: `flabel` declares `dependencies = []` and only two of its modules
+# may touch the network. A BigQuery client is both a dependency and network I/O.
+#
+# A boundary that exists only as a convention stops meaning anything the moment a sibling package
+# is importable, so it is asserted in both directions.
+
+FLABELDB = pathlib.Path(__file__).resolve().parents[1] / "src" / "flabeldb"
+
+
+def test_flabel_never_imports_the_store_or_a_google_client():
+    """Both directions of the boundary, checked with the name `imported_modules` actually yields.
+
+    **`imported_modules` records TOP-LEVEL names only** (`alias.name.split(".")[0]`), so a guard
+    written against `"google.cloud"` or `"google.auth"` would pass forever — it can only ever see
+    `"google"`. The plan for this step said exactly that, and it would have been a guard that could
+    not fire: the same failure class as the 2026-08-19 sabotage where changing a placeholder literal
+    left every test green.
+    """
+    forbidden = {"flabeldb", "google"}
+    offenders: dict[str, set[str]] = {}
+    for path in sorted(PACKAGE.rglob("*.py")):
+        found = imported_modules(path) & forbidden
+        if found:
+            offenders[str(path.relative_to(PACKAGE))] = found
+    assert not offenders, (
+        f"modules under src/flabel import {offenders}. flabel has dependencies = [] and a closed "
+        f"list of network modules; the store is a separate package for exactly that reason."
+    )
+
+
+def test_the_store_never_imports_flabel_except_for_shared_models():
+    """The other direction, and it is a narrower rule rather than a symmetric one.
+
+    `flabeldb` legitimately reads `flabel.models` — `LABEL_KINDS` is the one authority for what a
+    label kind is, and spec §5.2 requires the merge to use `models.Label`'s own constructors rather
+    than reimplementing their invariants. What it must not do is reach into the pipeline: importing
+    `ingest`, `zeek`, `suricata`, `correlate` or `cli` would make the store a second consumer of
+    modules whose contracts are written for one run at a time.
+    """
+    allowed = {"flabel.models", "flabel.errors"}
+    offenders: dict[str, set[str]] = {}
+    for path in sorted(FLABELDB.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        reached = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                if node.module.startswith("flabel.") and node.module not in allowed:
+                    reached.add(node.module)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("flabel.") and alias.name not in allowed:
+                        reached.add(alias.name)
+        if reached:
+            offenders[str(path.relative_to(FLABELDB))] = reached
+    assert not offenders, (
+        f"the store reaches into flabel's pipeline: {offenders}. Only {sorted(allowed)} are "
+        f"shared — the models because they are the one authority for what a label is."
+    )
+
+
+def test_store_modules_are_all_accounted_for():
+    """`flabeldb` gets its own unclassified-module guard.
+
+    `PACKAGE` is hard-coded to `src/flabel`, so `test_pure_modules_are_all_accounted_for` cannot
+    see this package at all — which would let it grow modules with no architectural check of any
+    kind, the exact state the boundary above is meant to prevent. Found by review of LS-1's plan.
+    """
+    pure = {"schema.py", "__init__.py"}
+    impure = {"client.py", "cli.py"}
+    present = {
+        str(path.relative_to(FLABELDB))
+        for path in FLABELDB.rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
+    unclassified = present - pure - impure
+    assert not unclassified, (
+        f"unclassified module(s) in src/flabeldb: {sorted(unclassified)}. Add each to `pure` or "
+        f"`impure` here — a module in neither has no guard, which is how the boundary erodes."
+    )
+    missing = (pure | impure) - present
+    assert not missing, (
+        f"listed but absent: {sorted(missing)}. Renamed or deleted modules must be updated here "
+        f"rather than left to drop their guard silently (#95)."
+    )
+
+
+#: What a pure module of `flabeldb` may not import. `FORBIDDEN_IN_PURE` plus `google`, because for
+#: this package the client library is the thing purity is *about* — `schema.py` is pure so that CI
+#: can check it, and CI has no GCP credential, so an import of `google` there would move the
+#: comparison behind a client and out of reach of every test that runs on every push.
+FORBIDDEN_IN_STORE_PURE = FORBIDDEN_IN_PURE | {"google"}
+
+
+@pytest.mark.parametrize("module", sorted({"schema.py", "__init__.py"}))
+def test_the_stores_pure_modules_are_actually_pure(module):
+    """The classification above was DECORATIVE: it named `schema.py` pure and checked nothing.
+
+    `FORBIDDEN_IN_PURE` was only ever applied to `src/flabel`, so `schema.py` could have imported
+    `google.cloud.bigquery` — or `subprocess` — with the whole suite green, while its own docstring
+    says purity is what lets CI check it. A guard that exists as a comment is the failure mode this
+    file was written for.
+    """
+    found = imported_modules(FLABELDB / module) & FORBIDDEN_IN_STORE_PURE
+    assert not found, (
+        f"src/flabeldb/{module} is classified pure and imports {sorted(found)}. The store's pure "
+        f"modules are what CI can check without a GCP credential; behind a client they are not."
+    )
+
+
+def test_the_schema_declaration_needs_no_client():
+    """`schema.py` is pure, and that is what makes the store's shape CI-checkable.
+
+    Spec §2's testing line records that the `requires_bigquery` tests run nowhere — CI has no GCP
+    credential, the metadata server is absent from GitHub Actions, and the repo is public so no key
+    may be committed. Anything put behind a client is therefore unverified by the gate that guards
+    merges, so the schema and its comparison stay out of one deliberately.
+    """
+    imports = imported_modules(FLABELDB / "schema.py")
+    assert "google" not in imports, "schema.py must not need a client to declare a table"

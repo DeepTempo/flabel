@@ -133,6 +133,40 @@ the empty-item check existing. See `passing-tests-near-new-guards-are-suspect` f
 - `src/flabeldb/views/authoritative_runs.sql` — **the only view.** `current_labels` is gone (spec §5.2).
 - `tests/test_architecture.py`, `tests/test_flabeldb_schema.py`
 
+**Files outside this list were touched, and the list is amended rather than the fact hidden** — the
+same precedent LS-1 set above. `.github/workflows/ci.yml` gains a `no-db-extra` job: this step made
+`--extra db` unconditional in both existing jobs, so nothing could notice that the suite was red
+without the extra, which is what `uv sync` gives by default. `tests/conftest.py` and `pyproject.toml`
+gain the `requires_bigquery` and `requires_db_extra` markers and the `--bigquery` opt-in, because
+`--strict-markers` is on and the live tests must not run by default — they delete and recreate
+tables, and fl-replay's metadata server would otherwise let a bare `pytest` rewrite a dataset. New
+test files `tests/test_flabeldb_{apply,credentials,live,db_extra}.py` and `tests/db_extra.py`.
+`docs/spec-label-store.md` §4.2 said `snaplen` where LS-1 had made the field plural — the drift was
+LS-1's, found while declaring the column, and corrected here rather than left for a reader to trip
+over. `docs/status.yaml` carries the tracker as always, and `docs/RESUME-ls-3.md` is a new handoff
+document written when the work moved to `fl-replay`.
+
+CLAUDE.md says not to edit outside the step without asking; each of these came from a review finding
+rather than improvisation.
+
+**A measurement worth carrying forward, from the sabotage round on 2026-08-21.** The plan's stated
+sabotages for the view were run against `flabel_scratch`, and the grep tests and the behavioural
+tests turned out to be complementary rather than one replacing the other:
+
+| sabotage | grep tests | behavioural tests |
+| :-- | :-: | :-: |
+| `ORDER BY` drops `run_id` | **caught** | passed |
+| `ORDER BY finished_at ASC` | passed | **caught** |
+| `EXISTS` for `NOT EXISTS` | passed | **caught** |
+| `UNNEST(tiers_attempted)` | **caught** | **caught** |
+| `WHERE recency >= 1` | passed | **caught** |
+
+Three of five were invisible to a suite that only greps, which is why the behavioural tests were
+written. But the first row is why the grep tests stay: with the tie-break gone the engine still
+returned the expected run, because the sabotaged view is not wrong on every execution — it has
+merely stopped being a function of the data. **No behavioural test can reliably catch the absence
+of a tie-break.** Reading the statement is the right tool for that one decision.
+
 **What changes**
 The five tables of spec §4 — `runs`, `captures`, `flow_labels`, `unmatched`, `run_exclusions` — as
 client schema objects. `flabel-db apply | verify | show`. Credentials per §7.1.

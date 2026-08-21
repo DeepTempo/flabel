@@ -55,7 +55,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --locked --dev
+      # `--extra db` for the store's PURE tests (schema declaration, drift detection,
+      # credential-vs-drift exit codes). They call no BigQuery API — spec-label-store §2
+      # records that the `requires_bigquery` tests run nowhere — but they import the
+      # client's exception types, so the extra has to be installed for them to run at all.
+      - run: uv sync --locked --dev --extra db
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
@@ -72,6 +76,43 @@ jobs:
           missing = [p for p in ['flabel/data/sources.toml'] if p not in names]
           sys.exit(f'missing from {wheel}: {missing}') if missing else print('package data present')
           "
+
+  # The suite must be green on a checkout WITHOUT the `db` extra, and this job is the only
+  # thing that can notice. `uv sync` installs no extras, and `flabel` declares dependencies = []
+  # deliberately, so no-extra is the DEFAULT state — yet both other jobs pass `--extra db`, which
+  # made the one state worth guarding the one state nothing exercised.
+  #
+  # It caught a real defect the moment it existed. `importlib.util.find_spec` on a DOTTED name
+  # imports the parent package to find its __path__ and RAISES when the parent is absent, instead
+  # of returning None. Three test files spelled the extra's guard that way, so without the extra
+  # the files did not skip — they failed to COLLECT, and the suite was red.
+  #
+  # Outside the container on purpose: the toolchain is irrelevant here and the requires_tools layer
+  # is deselected, because what this job proves is about imports and collection, not about Zeek.
+  # `test` above is what proves the tool layer.
+  bare-runner:
+    name: Suite is green on a bare machine — no db extra, no toolchain
+    # THIS IS THE ONLY JOB THAT RUNS OUTSIDE THE TOOLCHAIN CONTAINER, and that turns out to be
+    # half its value. It was added to catch the suite being red without the `db` extra; on its
+    # very first run it also caught ELEVEN tests that drive Zeek or Suricata for real without
+    # `@pytest.mark.requires_tools` (2026-08-21). Nothing could have noticed before, because
+    # every other job has the tools present, so an unmarked tool test passes there forever.
+    #
+    # So this job guards two invariants at once, and both matter:
+    #   1. `flabel` is installable and testable with NOTHING — `dependencies = []` is a promise.
+    #   2. `requires_tools` is applied wherever it is needed, checked by CONSEQUENCE rather than
+    #      by a heuristic. An unmarked tool test fails here and nowhere else.
+    #
+    # Do not "fix" a failure here by adding `--extra db` or by installing the toolchain. Either
+    # one silently deletes the invariant the failure is reporting.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --locked --dev
+      - run: uv run pytest -q -m "not requires_tools"
 
   test:
     runs-on: ubuntu-latest
@@ -90,7 +131,11 @@ jobs:
         run: cat /etc/flabel-toolchain.json
 
       # uv is baked into the image, so no setup action is needed here.
-      - run: uv sync --locked --dev
+      # `--extra db` for the store's PURE tests (schema declaration, drift detection,
+      # credential-vs-drift exit codes). They call no BigQuery API — spec-label-store §2
+      # records that the `requires_bigquery` tests run nowhere — but they import the
+      # client's exception types, so the extra has to be installed for them to run at all.
+      - run: uv sync --locked --dev --extra db
 
       # --require-tool-tests: fail unless a real-tool test actually ran, so a skipped
       #                       integration layer can never be mistaken for a passing build.

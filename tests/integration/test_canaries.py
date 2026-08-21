@@ -500,6 +500,21 @@ def test_every_integration_test_declares_that_it_needs_the_tools():
     search also matches the call names written inside this test's own assertion message. The
     first draft of this guard did exactly that and reported four tests that were fine — a gate
     that cries wolf is one somebody deletes.
+
+    **Scoped to `tests/integration/` deliberately, and widening it was TRIED AND MEASURED
+    (2026-08-21).** Every test in this directory is a real end-to-end run, so "calls the entry
+    point" and "needs the tools" are the same statement here. Elsewhere they come apart: most of
+    `test_cli.py`, `test_zeek.py` and `test_suricata.py` call the same entry points precisely in
+    order to SIMULATE a tool that is missing or broken, and they must keep running on a bare
+    machine because that is the behaviour under test. Widening this predicate across `tests/`
+    flagged **83 functions of which 7 were real** — a 12:1 false-positive rate, and exactly the
+    wolf-crying the paragraph above warns about.
+
+    The general guard is therefore not static but DYNAMIC: the `bare-runner` job in `ci.yml` is
+    the only CI job outside the toolchain container, so an unmarked tool test fails there and
+    nowhere else. It found all eleven on its first run, with no false positives, because it
+    checks the consequence rather than guessing at the cause. This guard stays as the cheap
+    local check for the one directory where the heuristic is exact.
     """
     import ast
 

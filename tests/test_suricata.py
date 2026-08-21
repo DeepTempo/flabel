@@ -894,6 +894,7 @@ def test_a_capture_that_matches_nothing_is_an_empty_result_not_a_failure(tmp_pat
     assert info.rules_loaded == 1
 
 
+@pytest.mark.requires_tools
 def test_attribution_comes_from_the_sid_index_not_from_raw_rule_text(tmp_path):
     """`sid_index.json` is the authority, and `raw/` is not read at all.
 

@@ -254,7 +254,12 @@ every value is new. It is therefore excluded from any reproducibility claim, and
 ### 4.2 `captures`
 
 One row per sighting: `capture_sha256`, `uri`, `uri_status`, `filename`, `bytes`, `format`,
-`link_type`, `snaplen`, `observed_by_run_id`, `observed_at`. `CLUSTER BY capture_sha256`.
+`link_type`, `snaplens`, `observed_by_run_id`, `observed_at`. `CLUSTER BY capture_sha256`.
+
+**`snaplens` is plural**, following LS-1: a `mergecap` pcapng's interfaces need not agree on
+snapshot length, so a scalar would invent a winner and erase the disagreement — which is the fact
+the field exists to expose. This column list said `snaplen` until LS-3; the drift was introduced by
+LS-1 changing the field and not this table.
 
 **`uri_status` exists because a null `uri` would otherwise mean two different things** — the failure
 `docs/spec.md` §10 is emphatic about (`null` is "not measured", `[]` is "measured as none"). Revision
