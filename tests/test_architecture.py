@@ -267,6 +267,29 @@ def test_store_modules_are_all_accounted_for():
     )
 
 
+#: What a pure module of `flabeldb` may not import. `FORBIDDEN_IN_PURE` plus `google`, because for
+#: this package the client library is the thing purity is *about* — `schema.py` is pure so that CI
+#: can check it, and CI has no GCP credential, so an import of `google` there would move the
+#: comparison behind a client and out of reach of every test that runs on every push.
+FORBIDDEN_IN_STORE_PURE = FORBIDDEN_IN_PURE | {"google"}
+
+
+@pytest.mark.parametrize("module", sorted({"schema.py", "__init__.py"}))
+def test_the_stores_pure_modules_are_actually_pure(module):
+    """The classification above was DECORATIVE: it named `schema.py` pure and checked nothing.
+
+    `FORBIDDEN_IN_PURE` was only ever applied to `src/flabel`, so `schema.py` could have imported
+    `google.cloud.bigquery` — or `subprocess` — with the whole suite green, while its own docstring
+    says purity is what lets CI check it. A guard that exists as a comment is the failure mode this
+    file was written for.
+    """
+    found = imported_modules(FLABELDB / module) & FORBIDDEN_IN_STORE_PURE
+    assert not found, (
+        f"src/flabeldb/{module} is classified pure and imports {sorted(found)}. The store's pure "
+        f"modules are what CI can check without a GCP credential; behind a client they are not."
+    )
+
+
 def test_the_schema_declaration_needs_no_client():
     """`schema.py` is pure, and that is what makes the store's shape CI-checkable.
 

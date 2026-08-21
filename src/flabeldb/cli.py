@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import re
 import sys
 import traceback
 from collections.abc import Sequence
@@ -45,6 +46,20 @@ EXIT_USAGE = 2
 #: the edge one.
 EXIT_INTERNAL = 3
 
+#: What a `--project` or `--dataset` may contain.
+#:
+#: **Defence in depth, and it is worth the line even though the input is an operator's.** Neither
+#: value can be parameterised: a dataset name is part of a table path, not a value, so `view_sql`
+#: and `_show` reach SQL by interpolation and no `ScalarQueryParameter` can carry them. The view
+#: path in `apply` runs `CREATE OR REPLACE VIEW` as `dataOwner`, so an interpolated statement there
+#: executes with the rights to replace anything in the dataset. The row filters in `_show` ARE
+#: parameterised and stay that way; this covers the two identifiers that cannot be.
+#:
+#: The pattern is the union of what the two id spaces allow — a project id takes hyphens, a dataset
+#: name takes underscores — rather than two patterns, because being stricter than BigQuery here
+#: would reject a name the service accepts and there is no gain in that.
+IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]+$")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -64,8 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_parser("apply", help="create or patch tables and views to match the declaration")
     actions.add_parser("verify", help="compare live against declared; exit 1 on any difference")
     show = actions.add_parser("show", help="what the store holds")
-    show.add_argument("--run-id", default=None)
-    show.add_argument("--capture", default=None, metavar="SHA256")
+    # MUTUALLY EXCLUSIVE, because `_show` reads them as a chain and `--run-id` wins: passing both
+    # silently dropped `--capture` and printed a result for a narrower question than the one asked.
+    # This repo's own rule is that a flag is never silently ignored (#132's mode flags are the
+    # precedent), and here the ignored flag makes the OUTPUT wrong rather than merely surprising.
+    which = show.add_mutually_exclusive_group()
+    which.add_argument("--run-id", default=None)
+    which.add_argument("--capture", default=None, metavar="SHA256")
     return parser
 
 
@@ -284,6 +304,17 @@ def _is_credential_failure(error: BaseException) -> bool:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    for flag, value in (("--project", args.project), ("--dataset", args.dataset)):
+        # Checked BEFORE the client is built, so a malformed name never reaches a credential, a
+        # billing project, or a statement.
+        if value is not None and not IDENTIFIER.match(value):
+            print(
+                f"flabel-db: {flag} {value!r} is not a BigQuery identifier (letters, digits, "
+                f"underscores and hyphens). It is interpolated into SQL — a dataset name is part "
+                f"of a table path, not a value, so it cannot be a query parameter.",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
     try:
         bq = client_module.client(project=args.project, local_adc=args.local_adc)
     except RuntimeError as error:

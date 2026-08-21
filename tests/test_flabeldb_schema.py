@@ -1127,3 +1127,82 @@ def test_every_declared_table_passes_every_guard():
             description=table.description,
         )
         assert rebuilt == table, name
+
+
+# --- the two identifiers that cannot be query parameters ----------------------------------------
+#
+# `_show`'s row filters are parameterised. `--project` and `--dataset` cannot be: a dataset name is
+# part of a table PATH, not a value, so `view_sql`, `_verify` and `_show` all reach SQL by
+# interpolation. `apply`'s view path runs `CREATE OR REPLACE VIEW` as `dataOwner`, which is the
+# rights to replace anything in the dataset. The input is an operator's own, so this is defence in
+# depth rather than a hole being closed — but it is one regex against a statement that runs with
+# those rights.
+
+
+@pytest.mark.parametrize(
+    "flag, value",
+    [
+        ("--dataset", "flabel`; DROP TABLE x; --"),
+        ("--dataset", "flabel.other"),
+        ("--dataset", "flabel scratch"),
+        ("--dataset", ""),
+        ("--project", "p`.`q"),
+        ("--project", "p; SELECT 1"),
+    ],
+)
+def test_a_dataset_or_project_that_is_not_an_identifier_is_refused(flag, value, capsys):
+    """EXIT_USAGE, not EXIT_DRIFT: nothing was read, so nothing can be said about the dataset."""
+    from flabeldb import cli
+
+    assert cli.main([flag, value, "verify"]) == cli.EXIT_USAGE
+    assert "identifier" in capsys.readouterr().err
+
+
+def test_the_check_happens_before_a_client_is_ever_built(monkeypatch, capsys):
+    """Otherwise a malformed name reaches a credential and a billing project before being caught."""
+    from flabeldb import cli, client
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("a client was built for an invalid identifier")
+
+    monkeypatch.setattr(client, "client", fail)
+    assert cli.main(["--dataset", "bad name", "verify"]) == cli.EXIT_USAGE
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("value", ["flabel", "flabel_scratch", "pm-proto-496816", "a1"])
+def test_the_names_this_project_actually_uses_are_accepted(value):
+    """The complement: a guard that rejected the real dataset would be found only in production."""
+    from flabeldb import cli
+
+    assert cli.IDENTIFIER.match(value), f"{value!r} is a name this project uses"
+
+
+def test_the_default_dataset_passes_its_own_check():
+    """The one name that must never be rejected, since it is used when the flag is absent."""
+    from flabeldb import cli, client
+
+    assert cli.IDENTIFIER.match(client.DEFAULT_DATASET)
+
+
+# --- show: a flag is never silently ignored ------------------------------------------------------
+
+
+def test_run_id_and_capture_cannot_both_be_given():
+    """`_show` reads them as a chain and `--run-id` wins, so passing both silently answered a
+    narrower question than the one asked. Argparse refuses it now, which is exit 2 from argparse
+    itself — the same treatment #132 gave the mode flags."""
+    from flabeldb import cli
+
+    with pytest.raises(SystemExit) as raised:
+        cli.build_parser().parse_args(["show", "--run-id", "r", "--capture", "c"])
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize("argv", [["show"], ["show", "--run-id", "r"], ["show", "--capture", "c"]])
+def test_each_of_the_three_ways_to_ask_is_still_accepted(argv):
+    """The complement, so the exclusion cannot be satisfied by refusing the useful cases."""
+    from flabeldb import cli
+
+    args = cli.build_parser().parse_args(argv)
+    assert args.action == "show"
