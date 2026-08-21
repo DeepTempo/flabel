@@ -68,4 +68,10 @@ markers = [
     # `flabel_scratch`, which reaches the instance service account through the metadata server.
     # `flabel-db verify` is a pre-deploy gate for the same reason (spec-label-store §2).
     "requires_bigquery: talks to a real BigQuery dataset; run by hand on fl-replay, never in CI",
+    # The `db` extra is NOT installed by a bare `uv sync` — flabel itself declares
+    # dependencies = [] so that it has none. These tests import the BigQuery client's types
+    # (no API call), so they skip without it. tests/conftest.py does the skipping, because
+    # the detection is the part that was wrong: find_spec on a dotted name RAISES when the
+    # parent is absent, which made the suite red on a checkout without the extra.
+    "requires_db_extra: needs the `db` extra installed (google.cloud.bigquery)",
 ]

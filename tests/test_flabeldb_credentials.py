@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import pytest
 
-needs_client = pytest.mark.skipif(
-    __import__("importlib.util", fromlist=["util"]).find_spec("google.cloud.bigquery") is None,
-    reason="the db extra is not installed — `uv sync --extra db` (spec-label-store §7.5)",
-)
+#: The `db` extra. A MARKER, not a skipif: the detection is the fragile part —
+#: `find_spec` on a dotted name RAISES when the parent is absent rather than returning
+#: None, so three copies of that check made the suite red on a checkout without the extra.
+#: tests/conftest.py now owns it, once. These tests import the client's exception TYPES
+#: and call no API; CI installs the extra precisely so they are not skipped there.
+needs_client = pytest.mark.requires_db_extra
 
 
 @pytest.fixture

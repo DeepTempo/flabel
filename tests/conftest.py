@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from db_extra import module_is_available
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: Every executable the suite shells out to. Absence of any one of them skips the whole
@@ -200,6 +202,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "requires_bigquery: talks to a real BigQuery dataset; opt in with --bigquery",
     )
+    config.addinivalue_line(
+        "markers",
+        "requires_db_extra: needs the `db` extra installed (google.cloud.bigquery)",
+    )
 
 
 def missing_tools() -> list[str]:
@@ -220,6 +226,15 @@ def strict_toolchain(pytestconfig: pytest.Config) -> bool:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if not module_is_available("google.cloud.bigquery"):
+        # The `db` extra. Skipped rather than errored, and skipped HERE rather than by a skipif in
+        # each test file, because the check is the fragile part: three files each spelled it with
+        # `find_spec` on a dotted name, which raises rather than returning None.
+        skip_db = pytest.mark.skip(reason="the db extra is not installed — `uv sync --extra db`")
+        for item in items:
+            if "requires_db_extra" in item.keywords:
+                item.add_marker(skip_db)
+
     if not config.getoption("--bigquery"):
         # Skipped rather than deselected, so the count stays visible: these are the only tests that
         # execute the code where flabeldb meets BigQuery, and LS-3 shipped green without them.

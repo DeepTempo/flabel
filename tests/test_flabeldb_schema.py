@@ -24,10 +24,12 @@ from flabeldb import schema
 #: Three tests below import the client's exception TYPES (not the client). They are pure — no API
 #: call — but they cannot run without the `db` extra, so they skip rather than error on a checkout
 #: that has not installed it. CI does install it, precisely so they are not skipped there.
-needs_client = pytest.mark.skipif(
-    __import__("importlib.util", fromlist=["util"]).find_spec("google.cloud.bigquery") is None,
-    reason="the db extra is not installed — `uv sync --extra db` (spec-label-store §7.5)",
-)
+#: The `db` extra. A MARKER, not a skipif: the detection is the fragile part —
+#: `find_spec` on a dotted name RAISES when the parent is absent rather than returning
+#: None, so three copies of that check made the suite red on a checkout without the extra.
+#: tests/conftest.py now owns it, once. These tests import the client's exception TYPES
+#: and call no API; CI installs the extra precisely so they are not skipped there.
+needs_client = pytest.mark.requires_db_extra
 
 DATASET = "flabel"
 TABLES = ("runs", "captures", "flow_labels", "unmatched", "run_exclusions")
@@ -577,6 +579,14 @@ def _google_auth_exception_classes():
     moment the library gained a subclass. This test cannot.
     """
     import inspect
+
+    from db_extra import module_is_available
+
+    if not module_is_available("google.auth.exceptions"):
+        # Collection happens before any skip can apply, so this MUST NOT import google. Returning
+        # empty makes the parametrised test an empty parameter set, which pytest skips. Found by
+        # actually syncing without the extra — the item-5 measurement caught this very function.
+        return []
 
     import google.auth.exceptions as module
 

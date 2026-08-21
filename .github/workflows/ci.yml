@@ -77,6 +77,32 @@ jobs:
           sys.exit(f'missing from {wheel}: {missing}') if missing else print('package data present')
           "
 
+  # The suite must be green on a checkout WITHOUT the `db` extra, and this job is the only
+  # thing that can notice. `uv sync` installs no extras, and `flabel` declares dependencies = []
+  # deliberately, so no-extra is the DEFAULT state — yet both other jobs pass `--extra db`, which
+  # made the one state worth guarding the one state nothing exercised.
+  #
+  # It caught a real defect the moment it existed. `importlib.util.find_spec` on a DOTTED name
+  # imports the parent package to find its __path__ and RAISES when the parent is absent, instead
+  # of returning None. Three test files spelled the extra's guard that way, so without the extra
+  # the files did not skip — they failed to COLLECT, and the suite was red.
+  #
+  # Outside the container on purpose: the toolchain is irrelevant here and the requires_tools layer
+  # is deselected, because what this job proves is about imports and collection, not about Zeek.
+  # `test` above is what proves the tool layer.
+  no-db-extra:
+    name: Suite is green without the db extra
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # No `--extra db`. That is the entire point of this job; do not "fix" a failure here by
+      # adding it.
+      - run: uv sync --locked --dev
+      - run: uv run pytest -q -m "not requires_tools"
+
   test:
     runs-on: ubuntu-latest
     container:
