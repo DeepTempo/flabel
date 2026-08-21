@@ -1170,7 +1170,9 @@ def test_the_check_happens_before_a_client_is_ever_built(monkeypatch, capsys):
     capsys.readouterr()
 
 
-@pytest.mark.parametrize("value", ["flabel", "flabel_scratch", "pm-proto-496816", "a1"])
+#: A hyphenated project id, an underscored dataset name, and the two shortest legal forms.
+#: Shapes rather than this project's actual ids — the repo is public.
+@pytest.mark.parametrize("value", ["flabel", "flabel_scratch", "some-proto-123456", "a1"])
 def test_the_names_this_project_actually_uses_are_accepted(value):
     """The complement: a guard that rejected the real dataset would be found only in production."""
     from flabeldb import cli
