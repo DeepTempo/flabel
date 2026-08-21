@@ -69,22 +69,89 @@ def view_sql(dataset: str) -> list[tuple[str, str]]:
 
 
 def _apply(bq, dataset: str) -> int:
+    """Create every declared table that is absent, and patch every one that can be patched.
+
+    **`create_table(exists_ok=True)` does not patch.** On a conflict the client returns `get_table`
+    and `update_table` appears nowhere in the method — verified in the library source, then measured
+    on `flabel_scratch` 2026-08-21: a table created with one column and re-applied with two kept one
+    column and its original description, while `apply` printed a success line for it. So after
+    LS-6 provisions the dataset, the old `apply` would have changed nothing while `verify` kept
+    reporting drift, and the subcommand help said `create or patch`.
+
+    BigQuery permits **additive changes and relaxations only**, so some drift cannot be patched at
+    all. Craig decided 2026-08-20 that apply patches what it can and says plainly what it cannot,
+    rather than failing obscurely: a narrowed type, a dropped column, a tightened mode, a
+    reordering or any partitioning change needs the table rebuilt, and this names it and exits
+    `EXIT_DRIFT` — because the dataset does not match the declaration when it returns, and
+    `tools/flabel-deploy` must stop.
+
+    Which changes fall on which side is decided by `schema.patch_plan`, which is pure so CI can
+    check it; this function executes that plan and nothing more.
+    """
+    from google.api_core.exceptions import NotFound
+
     bigquery = client_module._bigquery()
     reference = f"{bq.project}.{dataset}"
+    rebuild: list[str] = []
     for name, table in schema.TABLES.items():
-        target = bigquery.Table(
-            f"{reference}.{name}", schema=client_module.to_bigquery(table.fields)
-        )
-        target.description = table.description
-        if table.partition_field:
-            target.time_partitioning = bigquery.TimePartitioning(field=table.partition_field)
-        if table.clustering:
-            target.clustering_fields = list(table.clustering)
-        bq.create_table(target, exists_ok=True)
-        print(f"flabel-db: table {name}")
+        try:
+            existing = bq.get_table(f"{reference}.{name}")
+        except NotFound:
+            target = bigquery.Table(
+                f"{reference}.{name}", schema=client_module.to_bigquery(table.fields)
+            )
+            target.description = table.description
+            if table.partition_field:
+                target.time_partitioning = bigquery.TimePartitioning(field=table.partition_field)
+            if table.clustering:
+                target.clustering_fields = list(table.clustering)
+            # `exists_ok` guards only the race between the get above and this call. It is NOT the
+            # patch mechanism — believing that it was is the defect this function was rewritten for.
+            bq.create_table(target, exists_ok=True)
+            print(f"flabel-db: table {name} created")
+            continue
+
+        plan = schema.patch_plan(name, table, client_module.live_table(existing))
+        if plan.is_noop:
+            print(f"flabel-db: table {name} matches the declaration")
+            continue
+        if plan.mask:
+            if "schema" in plan.mask:
+                existing.schema = client_module.to_bigquery(plan.fields)
+            if "clustering_fields" in plan.mask:
+                # `None`, not `[]`, is how clustering is removed (measured).
+                existing.clustering_fields = list(table.clustering) or None
+            if "description" in plan.mask:
+                existing.description = table.description
+            bq.update_table(existing, list(plan.mask))
+            for message in plan.changes:
+                print(f"flabel-db: patched {message}")
+        for message in plan.rebuild:
+            rebuild.append(message)
+
     for name, sql in view_sql(dataset):
         bq.query(sql).result()
         print(f"flabel-db: view {name}")
+
+    if rebuild:
+        # stdout is block-buffered when piped, so without this the summary below lands BEFORE the
+        # per-table lines it summarises and reads as though nothing was patched. Measured on
+        # fl-replay 2026-08-21.
+        sys.stdout.flush()
+        print(
+            f"\nflabel-db: {len(rebuild)} change(s) in {dataset} CANNOT be patched and need the "
+            f"table REBUILT:",
+            file=sys.stderr,
+        )
+        for message in rebuild:
+            print(f"  {message}", file=sys.stderr)
+        print(
+            "\nBigQuery permits additive changes and relaxations only. Rebuilding means creating "
+            "the table anew from the declaration and reloading it — `--rebuild` is Phase 3b, so "
+            "today it is a deliberate manual step. Everything else above was patched.",
+            file=sys.stderr,
+        )
+        return EXIT_DRIFT
     return EXIT_OK
 
 

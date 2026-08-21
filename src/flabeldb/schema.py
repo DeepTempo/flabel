@@ -291,6 +291,176 @@ TABLES: Mapping[str, Table] = MappingProxyType(
 )
 
 
+@dataclass(frozen=True)
+class LiveTable:
+    """A table as `tables.get` reports it.
+
+    Deliberately **not** a `Table`: `Table.__post_init__` validates the declaration, and a live
+    table is exactly the thing that may be invalid — a console edit can leave it clustered on a
+    column that no longer exists, and raising while reading it would turn "the dataset is wrong"
+    into a traceback instead of a report.
+    """
+
+    fields: tuple[Column, ...]
+    partition_field: str | None = None
+    clustering: tuple[str, ...] = ()
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class Patch:
+    """How to bring one live table to the declaration.
+
+    `mask` is the `update_table` field mask — nothing is sent unless it is named there, so an
+    unchanged property is never written. `fields` is the schema to send when `"schema"` is in the
+    mask: it is the **live order with additions appended**, because BigQuery ignores a reordering
+    (measured) and sending the declaration's order would claim a change that does not happen.
+    """
+
+    mask: tuple[str, ...] = ()
+    fields: tuple[Column, ...] = ()
+    changes: tuple[str, ...] = ()
+    rebuild: tuple[str, ...] = ()
+
+    @property
+    def is_noop(self) -> bool:
+        """Whether the live table already matches the declaration."""
+        return not self.mask and not self.rebuild
+
+
+#: The one mode change BigQuery accepts, as `(live, declared)`. Measured 2026-08-21: every other
+#: pairing — including NULLABLE->REPEATED and REPEATED->NULLABLE — is refused with
+#: "Field a has changed mode from X to Y".
+_RELAXATION = (REQUIRED, NULLABLE)
+
+
+def _merge_fields(
+    table: str, declared: Sequence[Column], live: Sequence[Column], prefix: str = ""
+) -> tuple[list[Column], list[str], list[str]]:
+    """The schema to send, what that patches, and what it cannot.
+
+    Additions are appended after every live column, at each level of nesting, for the same measured
+    reason the top level is: a reordered schema is accepted and ignored.
+    """
+    by_name = {item.name: item for item in declared}
+    merged: list[Column] = []
+    changes: list[str] = []
+    rebuild: list[str] = []
+
+    for actual in live:
+        path = f"{prefix}{actual.name}"
+        item = by_name.get(actual.name)
+        if item is None:
+            rebuild.append(
+                f"{table}.{path}: column is not declared, and BigQuery cannot drop a column"
+            )
+            merged.append(actual)
+            continue
+        if actual.field_type != item.field_type:
+            rebuild.append(
+                f"{table}.{path}: type is {actual.field_type}, declared {item.field_type} — "
+                f"BigQuery cannot change a column's type"
+            )
+            merged.append(actual)
+            continue
+        mode = actual.mode
+        if actual.mode != item.mode:
+            if (actual.mode, item.mode) == _RELAXATION:
+                mode = item.mode
+                changes.append(f"{table}.{path}: relax mode {actual.mode} -> {item.mode}")
+            else:
+                rebuild.append(
+                    f"{table}.{path}: mode is {actual.mode}, declared {item.mode} — BigQuery "
+                    f"allows only {_RELAXATION[0]} -> {_RELAXATION[1]}"
+                )
+                merged.append(actual)
+                continue
+        subfields = actual.fields
+        if item.fields or actual.fields:
+            subfields, sub_changes, sub_rebuild = _merge_fields(
+                table, item.fields, actual.fields, prefix=f"{path}."
+            )
+            changes.extend(sub_changes)
+            rebuild.extend(sub_rebuild)
+            subfields = tuple(subfields)
+        merged.append(
+            Column(name=actual.name, field_type=actual.field_type, mode=mode, fields=subfields)
+        )
+
+    live_names = {item.name for item in live}
+    for item in declared:
+        if item.name in live_names:
+            continue
+        path = f"{prefix}{item.name}"
+        if item.mode == REQUIRED:
+            # Measured: refused at the top level and inside a STRUCT alike. A REQUIRED column
+            # cannot be added to a table that already has rows it would have to be non-null in.
+            rebuild.append(
+                f"{table}.{path}: column is missing and is declared {REQUIRED} — BigQuery cannot "
+                f"append a {REQUIRED} column"
+            )
+            continue
+        merged.append(item)
+        changes.append(f"{table}.{path}: add column ({item.field_type} {item.mode})")
+
+    # Order. Compared over the columns present on BOTH sides, so that a genuine addition or an
+    # undeclared column is reported as itself rather than as a reordering as well.
+    declared_names = [item.name for item in declared]
+    common_live = [item.name for item in live if item.name in declared_names]
+    common_declared = [name for name in declared_names if name in live_names]
+    if common_live != common_declared:
+        # THE TRAP. `update_table` returns 200 for a reordered schema and the live order does not
+        # change (measured 2026-08-21). Calling this patchable would make `apply` claim a fix it
+        # never made and leave `verify` reporting drift forever.
+        rebuild.append(
+            f"{table}: {prefix or 'column'} order is {common_live}, declared {common_declared} — "
+            f"BigQuery accepts a reordered schema and silently ignores it"
+        )
+    return merged, changes, rebuild
+
+
+def patch_plan(name: str, declared: Table, live: LiveTable) -> Patch:
+    """What `apply` can change about `live` to reach `declared`, and what needs a table rebuild.
+
+    Pure, and that is the point: `apply`'s judgement about what BigQuery permits is the part most
+    worth checking, and the `requires_bigquery` tests that would check it do not run in CI. The
+    executor in `cli.py` does as it is told here and nothing more.
+
+    Additive changes and relaxations only — that is the whole of what BigQuery permits on an
+    existing table, so a narrowed type, a dropped column, a tightened mode, a reordering or any
+    partitioning change is named as a rebuild rather than attempted and failed obscurely
+    (Craig, 2026-08-20).
+    """
+    merged, changes, rebuild = _merge_fields(name, declared.fields, live.fields)
+    mask: list[str] = []
+    if changes:
+        mask.append("schema")
+
+    if declared.partition_field != live.partition_field:
+        # Measured: all three directions refused — "Cannot convert non partitioned table to
+        # partitioned table", "Cannot change partitioning/clustering spec", "Cannot change
+        # partitioned table to non partitioned table".
+        rebuild.append(
+            f"{name}: partitioned on {live.partition_field!r}, declared "
+            f"{declared.partition_field!r} — BigQuery cannot add, remove or repoint partitioning"
+        )
+    if tuple(declared.clustering) != tuple(live.clustering):
+        mask.append("clustering_fields")
+        changes.append(
+            f"{name}: clustering is {list(live.clustering)}, declared {list(declared.clustering)}"
+        )
+    if declared.description != live.description:
+        mask.append("description")
+        changes.append(f"{name}: description differs from the declaration")
+
+    return Patch(
+        mask=tuple(mask),
+        fields=tuple(merged) if "schema" in mask else (),
+        changes=tuple(changes),
+        rebuild=tuple(rebuild),
+    )
+
+
 def field_of(table: str, name: str) -> Column:
     """The named column of the named table. Raises `KeyError` if either is absent."""
     for item in TABLES[table].fields:

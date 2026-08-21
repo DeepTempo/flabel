@@ -115,6 +115,21 @@ def from_bigquery(fields: Sequence) -> tuple[schema.Column, ...]:
     )
 
 
+def live_table(table) -> schema.LiveTable:
+    """A client `Table` as our own shape, so the pure planner and comparison can read it.
+
+    `time_partitioning` and `clustering_fields` are `None` rather than empty when unset, which is
+    the kind of difference that reads as drift if it reaches a comparison unnormalised.
+    """
+    partitioning = table.time_partitioning
+    return schema.LiveTable(
+        fields=from_bigquery(table.schema),
+        partition_field=partitioning.field if partitioning else None,
+        clustering=tuple(table.clustering_fields or ()),
+        description=table.description or "",
+    )
+
+
 def live_schema(bq, dataset: str) -> Mapping[str, tuple[schema.Column, ...]]:
     """Every declared table that exists in `dataset`, in our own shape.
 

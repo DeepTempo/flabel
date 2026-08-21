@@ -62,4 +62,10 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers -p pytester"
 markers = [
     "requires_tools: invokes the real Zeek/Suricata/Wireshark toolchain (see docs/spec.md §2)",
+    # Registered under --strict-markers so the live BigQuery tests are a real, selectable set
+    # rather than a typo that silently never runs. They do NOT run in CI (no credential, and the
+    # repo is public so no key may be committed) — they are run by hand on fl-replay against
+    # `flabel_scratch`, which reaches the instance service account through the metadata server.
+    # `flabel-db verify` is a pre-deploy gate for the same reason (spec-label-store §2).
+    "requires_bigquery: talks to a real BigQuery dataset; run by hand on fl-replay, never in CI",
 ]
