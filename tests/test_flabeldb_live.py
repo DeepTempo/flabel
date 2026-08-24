@@ -27,6 +27,7 @@ server on `fl-replay` would otherwise make a bare `pytest` rewrite a dataset.
 from __future__ import annotations
 
 import os
+import uuid
 
 import pytest
 
@@ -479,3 +480,188 @@ def test_a_tier_that_was_attempted_but_not_attested_supplies_nothing(authoritati
     assert not [row for row in authoritative_rows if row[0] == "cap-d" and row[1] == 2], (
         "an unattested tier supplied an authoritative row"
     )
+
+
+# --- §5.3's recovery, against the real service --------------------------------------------------
+#
+# **This is the step's proof, and nothing pure substitutes for it.** Revision 1 said "re-running
+# the same ingest completes it"; §10 M1 measured that a load job which FAILS consumes its job id
+# permanently, so that was false and a half-loaded run was unrecoverable except by full rebuild.
+# The pure tests in `test_flabeldb_ingest.py` cover the walk's logic; these cover the claim that
+# the logic and BigQuery agree about what a burnt id is.
+
+
+#: A fresh namespace for every session, and it is not optional.
+#:
+#: **A BigQuery job id is permanent** (§10 M1) — that is the fact this whole recovery path exists
+#: for. So a test that asserts on attempt NUMBERS cannot reuse a `run_id` between sessions: the
+#: second run finds yesterday's attempt 1 already failed and attempt 2 already succeeded, and the
+#: walk correctly answers something different from what the first run measured. Found by running
+#: these twice; the first pass was green and the second was not.
+#:
+#: Deliberately non-deterministic, unlike everything else in this repo. The rows these produce are
+#: not compared across sessions — the attempt numbers are — so a fresh namespace is the property
+#: that matters and a fixed one would be actively wrong.
+SESSION = uuid.uuid4().hex[:8]
+
+
+def a_parsed_run(run_id_salt: str):
+    """A minimal `ParsedRun` whose rows satisfy the declaration. Built here rather than fetched:
+    the tarball is `ingest_one`'s concern, and what these tests interrupt is the ORDERING."""
+    import hashlib
+
+    from flabeldb import parse
+
+    # sha256 of the salt, not `hash()`: str hashing is salted per interpreter (PYTHONHASHSEED), so
+    # the same fixture would name a different capture on every run and the `run_id` with it — which
+    # is the one thing these tests need to hold across two calls.
+    digest = hashlib.sha256(f"{SESSION}-{run_id_salt}".encode()).hexdigest()
+    capture = digest
+    # Six DIGITS of microseconds, derived from the same digest. The first version interpolated the
+    # salt itself, which produced `2026-08-24T00:00:00.burnt1Z` — BigQuery refused the load with
+    # "Could not parse ... as a timestamp", loudly and before writing anything, which is the
+    # behaviour you want from a bad row but a poor way to learn your fixture is malformed.
+    micros = f"{int(digest[:8], 16) % 1_000_000:06d}"
+    document = {
+        "run": {
+            "mode": "offline",
+            "started_at": f"2026-08-24T00:00:00.{micros}Z",
+            "finished_at": "2026-08-24T00:01:00.000000Z",
+            "flabel_version": "0.0.0",
+            "tiers_attempted": [2],
+            "tool_failures": [],
+            "counts": {"rules_loaded": 10, "rules_failed": 0, "rules_skipped": 0},
+            "ruleset": {"snapshot_id": "b8b1e00ed2285240", "total_admitted": 10},
+            "input": {"sha256": capture, "path": "/x/y.pcap", "bytes": 1, "snaplens": [96]},
+        },
+        "labels": [
+            {
+                "best_tier": 2,
+                "flow": {
+                    "proto": "tcp",
+                    "src_ip": "10.0.0.1",
+                    "src_port": 1234,
+                    "dst_ip": "10.0.0.2",
+                    "dst_port": 80,
+                    "ts_first": "2026-08-24T00:00:01.000000Z",
+                    "ts_last": "2026-08-24T00:00:02.000000Z",
+                    "uid": "CabcDEF",
+                },
+                "labels": [{"name": "verdict", "value": "malicious", "tier": 2, "sids": [1]}],
+                "sources": [{"tier": 2, "source": "et/open", "sid": 1, "rev": 1}],
+            }
+        ],
+        "unmatched_detections": [],
+    }
+    return parse.rows(document, ingested_at="2026-08-24T12:00:00.000000Z")
+
+
+def counts_for(bq, run_id: str) -> dict[str, int]:
+    from flabeldb import ingest
+
+    found = {}
+    for table in ingest.LOAD_ORDER:
+        column = ingest.RUN_COLUMN[table]
+        sql = (
+            f"SELECT COUNT(*) AS c FROM `{bq.project}.{DATASET}.{table}` "
+            f"WHERE {column} = '{run_id}'"
+        )
+        found[table] = list(bq.query(sql).result())[0].c
+    return found
+
+
+def test_a_run_interrupted_before_the_commit_marker_is_invisible_then_completes_cleanly(bq):
+    """§5.3's whole promise, in one test.
+
+    Stop after `flow_labels`. Its rows are in the table and the `runs` row is not, so **nothing can
+    reach them** — every read joins through the commit marker. Re-run: the run completes, and the
+    row counts are what a single clean ingest would have produced, not double.
+    """
+    from flabeldb import ingest
+
+    for name in ingest.LOAD_ORDER:
+        rebuild(bq, name)
+    parsed = a_parsed_run("recov1")
+    run_id = parsed.run["run_id"]
+
+    interrupted = ingest.load_run(bq, DATASET, parsed, stop_after="flow_labels")
+    assert interrupted["status"] == "interrupted"
+
+    half = counts_for(bq, run_id)
+    assert half["flow_labels"] == 1, "the interrupted load did not land its rows"
+    assert half["runs"] == 0, "the commit marker landed despite the interruption"
+    assert not ingest.already_committed(bq, DATASET, run_id), (
+        "a run with no `runs` row read as committed, so the guard is not reading the marker"
+    )
+
+    completed = ingest.load_run(bq, DATASET, a_parsed_run("recov1"))
+    assert completed["status"] == "ingested"
+
+    final = counts_for(bq, run_id)
+    assert final == {"flow_labels": 1, "unmatched": 0, "captures": 1, "runs": 1}, final
+
+
+def test_re_ingesting_a_committed_run_is_free_and_changes_nothing(bq):
+    """The primary guard (§7.4), against the service. Without it the second call would clear and
+    reload every table — correct in the end, and a great deal of billed work per published run."""
+    from flabeldb import ingest
+
+    for name in ingest.LOAD_ORDER:
+        rebuild(bq, name)
+    parsed = a_parsed_run("idem1")
+    run_id = parsed.run["run_id"]
+
+    assert ingest.load_run(bq, DATASET, parsed)["status"] == "ingested"
+    before = counts_for(bq, run_id)
+
+    again = ingest.load_run(bq, DATASET, a_parsed_run("idem1"))
+    assert again["status"] == "already-present"
+    assert counts_for(bq, run_id) == before
+
+
+def test_a_burnt_job_id_is_walked_past_rather_than_locking_the_run_out(bq):
+    """**§10 M1, end to end.** Force a load to fail by sending a row the table cannot take, then
+    confirm the walk takes attempt 2 and the run ingests.
+
+    Revision 1's "just re-run it" died here: the failed job keeps its id forever, so an id derived
+    from `(run_id, table)` alone would make this run permanently un-ingestable.
+    """
+    from flabeldb import ingest
+
+    for name in ingest.LOAD_ORDER:
+        rebuild(bq, name)
+    parsed = a_parsed_run("burnt1")
+    run_id = parsed.run["run_id"]
+
+    # Attempt 1 for `runs`, deliberately poisoned: a column the table does not declare.
+    doomed = ingest.job_id(run_id, "runs", 1)
+    with pytest.raises(Exception):  # noqa: B017 - the client's own load error, whatever it is
+        ingest.load_rows(bq, DATASET, "runs", [{"not_a_column": "x"}], doomed)
+
+    assert ingest.probe_job(bq, doomed) == ingest.FAILED, (
+        "a load that failed did not read as FAILED, so the walk cannot know to step past it"
+    )
+    assert ingest.next_attempt(lambda job: ingest.probe_job(bq, job), run_id, "runs") == 2
+
+    completed = ingest.load_run(bq, DATASET, a_parsed_run("burnt1"))
+    assert completed["status"] == "ingested"
+    assert counts_for(bq, run_id)["runs"] == 1
+
+
+def test_a_load_that_succeeded_is_not_repeated_on_a_re_run(bq):
+    """The other half of the walk: `SUCCEEDED` means done. Without it, recovering a half-loaded
+    run would double the rows of every table that had already landed."""
+    from flabeldb import ingest
+
+    for name in ingest.LOAD_ORDER:
+        rebuild(bq, name)
+    parsed = a_parsed_run("dedupe1")
+    run_id = parsed.run["run_id"]
+
+    ingest.load_run(bq, DATASET, parsed, stop_after="flow_labels")
+    assert counts_for(bq, run_id)["flow_labels"] == 1
+
+    # Re-run. Step 2 clears the half-loaded rows and step 3 reloads them under a FRESH id, so the
+    # count is what one clean ingest produces — not zero (cleared then skipped) and not two.
+    ingest.load_run(bq, DATASET, a_parsed_run("dedupe1"))
+    assert counts_for(bq, run_id)["flow_labels"] == 1, "recovery did not restore exactly one row"

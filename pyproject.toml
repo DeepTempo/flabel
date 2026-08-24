@@ -12,11 +12,20 @@ dependencies = []
 # tests/test_architecture.py asserts in both directions.
 db = [
     "google-cloud-bigquery>=3.25",
+    # `flabel-ingest` fetches the PUBLISHED tarball from gs:// rather than reading the local run
+    # directory (spec-label-store §7.2), so that every ingested run is provably rebuildable and the
+    # live and backfill paths share one source. The client library rather than `gcloud`: LS-6
+    # measured that gcloud needs `sudo` on fl-replay because its credential store is per-user,
+    # while a client library reaches the metadata server unprivileged — and rather than the raw
+    # JSON API, so the identity comes from `client.credentials()` like everything else does
+    # (spec invariant 7: the identity is named, never discovered).
+    "google-cloud-storage>=2.18",
 ]
 
 [project.scripts]
 flabel = "flabel.cli:main"
 flabel-db = "flabeldb.cli:main"
+flabel-ingest = "flabeldb.ingest:main"
 
 [build-system]
 requires = ["hatchling"]

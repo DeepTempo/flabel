@@ -246,3 +246,246 @@ def test_a_job_still_IN_FLIGHT_is_neither_and_raises(state):
     means a previous invocation is still going — which is an operator's problem, named."""
     with pytest.raises(RuntimeError, match="still running"):
         ingest.classify_job(Job(state=state))
+
+
+# --- extracting the published tarball ------------------------------------------------------------
+
+
+def _tarball(tmp_path, name="LABELED_x_20260824T000000Z", extra=None):
+    """A tarball shaped exactly as `tools/flabel-run` builds one: `tar -czf - -C <dir> <name>`,
+    so it unpacks to a single directory of that name."""
+    import tarfile
+
+    root = tmp_path / "src" / name
+    (root / "zeek").mkdir(parents=True)
+    (root / "labels.json").write_text('{"run": {}, "labels": [], "unmatched_detections": []}')
+    (root / "NOTICE").write_text("notice")
+    for path, body in (extra or {}).items():
+        target = tmp_path / "src" / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
+    archive = tmp_path / f"{name}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(root, arcname=name)
+    return archive
+
+
+def test_a_published_tarball_unpacks_to_its_single_run_directory(tmp_path):
+    archive = _tarball(tmp_path)
+    found = ingest.extract(archive, tmp_path / "out")
+
+    assert found.name == "LABELED_x_20260824T000000Z"
+    assert (found / "labels.json").is_file()
+
+
+def test_an_archive_with_no_run_directory_is_refused(tmp_path):
+    """`flabel-run` builds `-C <dir> <name>`, so exactly one top-level directory. Anything else is
+    not one of ours and guessing which directory to read would be a guess about provenance."""
+    import tarfile
+
+    archive = tmp_path / "flat.tar.gz"
+    loose = tmp_path / "labels.json"
+    loose.write_text("{}")
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(loose, arcname="labels.json")
+
+    with pytest.raises(ValueError, match="one directory"):
+        ingest.extract(archive, tmp_path / "out")
+
+
+def test_a_member_escaping_the_destination_is_refused(tmp_path):
+    """Path traversal in a tar member. The archive comes from our own bucket, but "we wrote it"
+    is exactly the assumption that makes this the classic unreviewed extract — and the bucket is
+    writable by two project Owners (#164), which is the whole point of that issue."""
+    import io
+    import tarfile
+
+    archive = tmp_path / "evil.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        info = tarfile.TarInfo("../escaped.txt")
+        info.size = 4
+        tar.addfile(info, io.BytesIO(b"boom"))
+
+    with pytest.raises(ValueError, match="outside"):
+        ingest.extract(archive, tmp_path / "out")
+
+
+def test_an_absolute_member_path_is_refused(tmp_path):
+    import io
+    import tarfile
+
+    archive = tmp_path / "abs.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        info = tarfile.TarInfo("/etc/passwd")
+        info.size = 4
+        tar.addfile(info, io.BytesIO(b"boom"))
+
+    with pytest.raises(ValueError, match="outside"):
+        ingest.extract(archive, tmp_path / "out")
+
+
+def test_a_symlink_member_is_refused(tmp_path):
+    """A symlink pointing out of the tree turns a later write into a write anywhere. Refused
+    rather than filtered: nothing `flabel-run` produces contains one."""
+    import tarfile
+
+    archive = tmp_path / "link.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        info = tarfile.TarInfo("run/evil")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+        tar.addfile(info)
+
+    with pytest.raises(ValueError, match="symlink|link"):
+        ingest.extract(archive, tmp_path / "out")
+
+
+def test_an_archive_of_an_EMPTY_directory_is_refused(tmp_path):
+    """**Found by sabotage**, and the only case the `nested` check catches on its own.
+
+    Removing that check left every other extraction test green, because a flat archive of one FILE
+    is still caught downstream by the `is_dir` fallback — with a message close enough that the
+    assertion matched. An archive holding one empty DIRECTORY passes both: it is a single top-level
+    name, and it is a directory. Without `nested` it extracts happily and hands back a run
+    directory with nothing in it, so the failure surfaces later as a missing `labels.json` and
+    blames the run rather than the archive.
+    """
+    import tarfile
+
+    empty = tmp_path / "src" / "LABELED_empty_20260824T000000Z"
+    empty.mkdir(parents=True)
+    archive = tmp_path / "empty.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(empty, arcname=empty.name)
+
+    with pytest.raises(ValueError, match="one directory"):
+        ingest.extract(archive, tmp_path / "out")
+
+
+# --- the CLI surface, per §6.3 -------------------------------------------------------------------
+
+
+def test_the_parser_matches_the_documented_contract():
+    """§6.3: `flabel-ingest <gs://…tar.gz>`, `--backfill`, `--skip-tier n`, `--local-adc`."""
+    args = ingest.build_parser().parse_args(["gs://b/o.tar.gz"])
+    assert args.uri == "gs://b/o.tar.gz"
+    assert args.backfill is False
+    assert args.skip_tier == []
+    assert args.local_adc is False
+
+
+def test_skip_tier_is_repeatable_and_integer():
+    args = ingest.build_parser().parse_args(
+        ["gs://b/o.tar.gz", "--skip-tier", "1", "--skip-tier", "2"]
+    )
+    assert args.skip_tier == [1, 2]
+
+
+def test_skip_tier_refuses_a_tier_that_does_not_exist():
+    """`models.KNOWN_TIERS` is the one authority. A typo'd `--skip-tier 3` that silently did
+    nothing would leave the operator believing a tier was suppressed when it was not."""
+    with pytest.raises(SystemExit) as raised:
+        ingest.build_parser().parse_args(["gs://b/o.tar.gz", "--skip-tier", "3"])
+    assert raised.value.code == 2
+
+
+def test_a_uri_that_is_not_gs_exits_usage_before_any_client_is_built(monkeypatch, capsys):
+    """Validated, not merely recorded — the treatment §6.1 gave `--source-uri`."""
+    from flabeldb import client
+
+    def fail(*_a, **_k):
+        raise AssertionError("a client was built for an invalid URI")
+
+    monkeypatch.setattr(client, "client", fail)
+    assert ingest.main(["/local/run"]) == ingest.EXIT_USAGE
+    assert "gs://" in capsys.readouterr().err
+
+
+def test_the_exit_codes_are_distinct_and_1_can_only_mean_one_thing():
+    """Same discipline as `flabel-db` (#157's finding): an unrecognised failure must never share a
+    code with a real outcome, or a batch caller cannot tell them apart."""
+    codes = {ingest.EXIT_OK, ingest.EXIT_FAILED, ingest.EXIT_USAGE, ingest.EXIT_INTERNAL}
+    assert len(codes) == 4
+    assert ingest.EXIT_OK == 0
+
+
+# --- which column identifies a run, per table ----------------------------------------------------
+
+
+def test_every_table_ingest_writes_declares_the_column_clear_orphans_filters_on():
+    """**Found by running it against a real tarball**, which is the only way it could be found.
+
+    `clear_orphans` deleted `WHERE run_id = @run_id` from every table in `LOAD_ORDER`, and
+    `captures` HAS NO `run_id` COLUMN — a capture row is a SIGHTING (§4.2), so its reference is
+    `observed_by_run_id`. BigQuery answered `400 Unrecognized name: run_id`, and the whole ingest
+    exited 3 before loading anything.
+
+    Nothing pure could have caught it: the column list is in `schema.py`, the SQL is in
+    `ingest.py`, and neither module reads the other. So the two are joined here — every column
+    `clear_orphans` filters on must be declared by the table it filters.
+    """
+    from flabeldb import schema
+
+    for table in ingest.LOAD_ORDER:
+        column = ingest.RUN_COLUMN[table]
+        declared = {field.name for field in schema.TABLES[table].fields}
+        assert column in declared, (
+            f"clear_orphans would filter {table} on {column!r}, which it does not declare. "
+            f"BigQuery answers 400 Unrecognized name and the run does not ingest."
+        )
+
+
+def test_the_run_column_map_covers_exactly_the_tables_that_are_loaded():
+    """A table in `LOAD_ORDER` with no entry is a KeyError mid-ingest, after some tables have
+    already loaded — the worst moment for it. One with a spare entry is dead weight that reads
+    like a table we write and do not."""
+    assert set(ingest.RUN_COLUMN) == set(ingest.LOAD_ORDER)
+
+
+def test_captures_is_the_one_that_differs_and_that_is_why_the_map_exists():
+    assert ingest.RUN_COLUMN["captures"] == "observed_by_run_id"
+    assert ingest.RUN_COLUMN["runs"] == "run_id"
+
+
+# --- the walk that `load_run` actually uses ------------------------------------------------------
+#
+# **Found by driving the recovery path against the real service.** §5.3's step 3 says a job that
+# "exists and succeeded means this table is done" — and its step 2 has just DELETED that table's
+# rows, unconditionally, because a new run and a half-loaded run are indistinguishable. After the
+# delete, "done" is false. Measured: `flow_labels` ended a recovery with ZERO rows — cleared by
+# step 2, skipped by step 3 — and the `runs` commit marker landed on top of the emptiness.
+
+
+def test_after_a_clear_a_SUCCEEDED_id_is_used_not_done():
+    """The distinction the live failure turned up. `next_attempt` answers §5.3 literally;
+    `first_unused_attempt` answers the question that matters once the rows have been cleared."""
+    states = {ingest.job_id(RUN_ID, "flow_labels", 1): ingest.SUCCEEDED}
+
+    assert ingest.next_attempt(probe_from(states), RUN_ID, "flow_labels") is None
+    assert ingest.first_unused_attempt(probe_from(states), RUN_ID, "flow_labels") == 2
+
+
+def test_the_unused_walk_steps_past_both_kinds_of_used_id():
+    states = {
+        ingest.job_id(RUN_ID, "runs", 1): ingest.SUCCEEDED,
+        ingest.job_id(RUN_ID, "runs", 2): ingest.FAILED,
+        ingest.job_id(RUN_ID, "runs", 3): ingest.SUCCEEDED,
+    }
+    assert ingest.first_unused_attempt(probe_from(states), RUN_ID, "runs") == 4
+
+
+def test_a_fresh_run_still_uses_attempt_one():
+    assert ingest.first_unused_attempt(probe_from({}), RUN_ID, "runs") == 1
+
+
+def test_the_unused_walk_is_bounded_too():
+    calls = 0
+
+    def all_used(_job: str) -> str:
+        nonlocal calls
+        calls += 1
+        assert calls <= ingest.MAX_ATTEMPTS + 5, "the walk is unbounded"
+        return ingest.SUCCEEDED
+
+    with pytest.raises(RuntimeError, match="attempt ids are used"):
+        ingest.first_unused_attempt(all_used, RUN_ID, "runs")
