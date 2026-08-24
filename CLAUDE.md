@@ -7,6 +7,24 @@ This repo follows the 7-stage pipeline tracked in `docs/status.yaml`. Use `/proj
 
 The original design brief is `docs/prep-n-research.md`. It marks open questions as `{RESEARCH}` (must be answered with cited justification) and `{GRILL}` (must be nailed down in PRD / eng review). Do not silently resolve them.
 
+### The order of work on a step
+Tests and code, then the sabotage round, then **a fresh `eng-reviewer` pass on the diff**, then act
+on its findings, and only then open the PR or hand the work back. The review is a **gate, and a gate
+placed after the merge is not a gate** — that is not a style preference, it is what happened: LS-5
+was green on CI, sabotage-checked five ways, merged as #169, and reviewed afterwards, at which point
+the review found that `tools/flabel-run` invoked `flabel-ingest` by a bare name that is on nobody's
+`PATH`, so every successful run on the box would have exited 5 with the label store permanently
+empty (#171, #172).
+
+**Never review your own work** — spawn the agent. Give it the diff as a file and the specific
+hazards to chase; a generic "review this" is much weaker. **Verify its findings yourself** before
+acting on them: the same report that correctly found #171 also claimed files were on `main` when
+they were only uncommitted locally, because the agent has no git access.
+
+A green suite around a new seam is evidence about the tests, not about the code. The #171 defect was
+invisible because the fixture overrode that one value in **every** test — the one value that was
+wrong in production was the one value never exercised.
+
 ## Commands
 - Install: `uv sync`  · also needs Zeek, Suricata, Wireshark (`brew install zeek suricata wireshark`)
 - Test:    `uv run pytest -q`   (tests invoke Zeek/Suricata for real — see Conventions)

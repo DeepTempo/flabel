@@ -69,8 +69,15 @@ Only LS-2 is now genuinely parallel, against LS-6 and LS-4.
 goes red. A sabotage that *passes* is a finding: of #138's twelve guards, seven had no test at all and
 only breaking them found it. Restore from file copies, never `git checkout <file>`.
 
-**Definition of done for a step**: tests pass locally, CI green on the branch, a fresh `eng-reviewer`
-pass on the diff, and the sabotage round recorded in the PR body.
+**Definition of done for a step**, and the list is now *ordered*: tests pass locally, CI green on the
+branch, the sabotage round run and recorded, **then a fresh `eng-reviewer` pass on the diff and its
+findings acted on — before the PR is opened**, not after it merges.
+
+The ordering was implicit and it did not hold. LS-5 met every other item on this list, merged as
+#169, and was reviewed afterwards; the review found a CRITICAL that all of it had missed — a bare
+`flabel-ingest` on nobody's `PATH`, which would have left the store permanently empty while every
+run reported exit 5 (#171, fixed in #172). Reviewing after the merge turns the gate into a
+post-mortem.
 
 ---
 
