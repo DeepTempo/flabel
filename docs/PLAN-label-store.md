@@ -8,7 +8,7 @@ Spec: `docs/spec-label-store.md`. Design reasoning: `inline-labeling/label-store
 were then executed against the live service. The step list is resequenced rather than renumbered —
 issues #145–#153 keep their step ids, so nothing has to be re-filed.
 
-## Progress — Phase 3a is 4 of 7
+## Progress — Phase 3a is 5 of 7
 
 | Step | Issue | State |
 | :-- | :-- | :-- |
@@ -16,14 +16,20 @@ issues #145–#153 keep their step ids, so nothing has to be re-filed.
 | LS-3 `flabeldb` + schema | [#147](https://github.com/DeepTempo/flabel/issues/147) | ✅ merged (PR #157) |
 | LS-6 dataset + IAM | [#149](https://github.com/DeepTempo/flabel/issues/149) | ✅ merged (PR #160) |
 | LS-4 `flabel-ingest` | [#148](https://github.com/DeepTempo/flabel/issues/148) | ✅ merged (PRs #166, #167, #168) |
-| LS-2 `flabel-deploy` ⟂ | [#146](https://github.com/DeepTempo/flabel/issues/146) | not started |
-| **LS-5 wire `flabel-run`** | [#150](https://github.com/DeepTempo/flabel/issues/150) | **next** |
+| **LS-2 `flabel-deploy` ⟂** | [#146](https://github.com/DeepTempo/flabel/issues/146) | **next** |
+| LS-5 wire `flabel-run` | [#150](https://github.com/DeepTempo/flabel/issues/150) | ✅ merged (PR #169) |
 | LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | not started |
 
 LS-4 landed two corrections to documents outside its own scope, both found by running it rather
 than reading it: spec §5.3 step 3 contradicted its own step 2 (a table cleared by step 2 and then
 skipped by step 3 as "already done" ended with zero rows under a live commit marker), and §7.4's
 guard 4 — the duplicate-`run_id` assertion — had never been implemented at all.
+
+LS-5 closed the gap between "`--source-uri` exists" (LS-1) and "anything passes it": the wrapper now
+carries the original `gs://` argument and calls `flabel-ingest` after a successful publish. Its one
+`requires_bigquery` test pins the behaviour revision 1's deleted publish-on-exit-0 bullet was reaching
+for — **an empty `labels[]` is a result, not an absence**, so a capture since found clean takes the
+tier and stops reading as malicious.
 
 The `flabel` dataset was provisioned 2026-08-24 — five tables and `authoritative_runs`, all empty —
 closing [#163](https://github.com/DeepTempo/flabel/issues/163), which no step owned. It is what LS-2's
@@ -320,6 +326,26 @@ of scope, so pre-deploy is where the gate lives and Phase 3's DoD says so.
 
 **Sabotage** — make the `pgrep` guard non-fatal. Note #136's trap: check the sabotage fails for the
 *stated* reason, not because a later check caught it independently.
+
+**Thirteen were run, and #136's trap caught four of the tests rather than the code.** The plan's own
+sabotage — the non-fatal `pgrep` guard — came back as a bare `assert 0 == 1`, because every
+"does not proceed to X" test asserted the exit code *before* the commands issued. A script that
+pulled, synced and then exited 1 would have satisfied that first assertion completely. The four
+tests now assert the command list first, so the sabotage names the escape instead of the symptom.
+
+**Two guards were measured inert, and both were found only by sabotaging them:**
+
+- `install -m 0755` — removing the flag left the test green, because `install`'s own default mode
+  is already 0755. The flag is documentation; the test is red for `-m 0644`, which is the mistake
+  that can actually be made.
+- the `[ -f "$INSTALL_TO" ]` before the `md5sum` comparison — the expected failure was "the first
+  deploy on a fresh box breaks", and it does not: `set -e` is suppressed inside an `if` condition,
+  so the failing `md5sum` yields an empty string and the install proceeds correctly. What the guard
+  actually buys is that a successful first deploy does not print an `md5sum: ... No such file` line
+  to stderr on its way to succeeding, and the test now pins that.
+
+Both belong to `passing-tests-near-new-guards-are-suspect`, and neither would have been visible by
+reading the diff.
 
 **Depends on** LS-3. `⟂ LS-6`, `⟂ LS-4`.
 

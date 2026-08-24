@@ -1,0 +1,196 @@
+#!/bin/bash
+# flabel-deploy — bring the replay box up to the checked-out commit.
+#
+#   flabel-deploy
+#   flabel-deploy --help
+#
+# Exists because deployment is three steps and the two-step version already cost us: the box sat
+# **two merges behind with #137 undeployed**, because reinstalling the wrapper was a step someone
+# had to remember (spec-label-store §7.5). A `git pull` alone updates the checkout and changes
+# nothing the box actually runs.
+#
+# Four things happen, in this order, and the order is the contract:
+#
+#   0. Refuse if a labelling run is still going.  `install` overwrites IN PLACE and bash reads a
+#      script as it executes, so deploying under a live run can change a script mid-flight.
+#   1. `git pull --ff-only`
+#   2. `uv sync --extra db`
+#   3. `flabel-db verify` — the PRE-DEPLOY GATE. It lives here rather than in CI because CI has no
+#      GCP credential, the metadata server does not exist in GitHub Actions, and this repo is
+#      public so no key may be committed (Craig, 2026-08-20; spec-label-store §7.4 item 5).
+#   4. Reinstall the wrapper, but only if it actually differs.
+#
+# A failing step stops the one after it. A box that keeps running yesterday's wrapper is a known
+# state; a box half-way through a deploy is not.
+set -euo pipefail
+
+# Overridable so the tests need neither /opt nor root, and so a second lab does not need a forked
+# copy. Defaults are what `docs/phase-2-replay-box-provision.sh` lays down.
+REPO="${FLABEL_DEPLOY_REPO:-/opt/flabel/repo}"
+INSTALL_TO="${FLABEL_DEPLOY_INSTALL_TO:-/usr/local/bin/flabel-run}"
+
+# The external commands, overridable for the same reason. `uv` covers both the sync and the verify:
+# `flabel-db` is a console script of the `db` extra, so it is reached through `uv run` in the repo
+# rather than from PATH, which is also why step 2 must precede step 3.
+GIT="${FLABEL_DEPLOY_GIT:-git}"
+UV="${FLABEL_DEPLOY_UV:-uv}"
+PGREP="${FLABEL_DEPLOY_PGREP:-pgrep}"
+
+# **No colon**, following `flabel-run`'s `PUBLISH_SUDO` convention exactly: unset means `sudo`, and
+# an EMPTY value means run unwrapped. `${VAR:-sudo}` cannot express that — it treats empty as unset
+# and would elevate anyway, which is what makes the distinction worth the awkward syntax.
+#
+# Only the `install` is elevated. The pull, the sync and the verify run as whoever invoked this;
+# on the box that is root anyway, because /opt/flabel/repo is root-owned.
+#
+# Left UNQUOTED at the call site, deliberately, so an empty value expands to nothing rather than to
+# an attempt to execute the empty string. shellcheck flags this (SC2086) on `flabel-run`'s
+# equivalent line too.
+SUDO="${FLABEL_DEPLOY_SUDO-sudo}"
+
+# What counts as "the box is busy". Overridable so the guard can be exercised against the REAL
+# `pgrep` in the tests — a stubbed pgrep would encode our assumption about what pgrep matches,
+# which is precisely the thing that needs verifying here.
+BUSY_PATTERN="${FLABEL_DEPLOY_BUSY_PATTERN:-tcpreplay|flabel|uv run}"
+
+#: To stdout and exit 0 for an explicit --help, to stderr and exit 2 for a usage error. Those are
+#: different events — one is the operator asking, the other is the operator being told — and
+#: `flabel-run` already draws the line in the same place.
+usage() {
+  cat <<'EOF'
+flabel-deploy — bring the replay box up to the checked-out commit.
+
+usage:
+  flabel-deploy
+  flabel-deploy --help
+
+It takes no arguments. What it does, in order, stopping at the first failure:
+
+  0. refuses while a labelling run is still going (install overwrites in place)
+  1. git pull --ff-only          in $FLABEL_DEPLOY_REPO
+  2. uv sync --extra db
+  3. uv run flabel-db verify     the pre-deploy gate: the live dataset against the declaration
+  4. reinstalls tools/flabel-run, but only if it differs from what is installed
+
+environment:
+  FLABEL_DEPLOY_REPO           the deployment checkout      (/opt/flabel/repo)
+  FLABEL_DEPLOY_INSTALL_TO     where the wrapper goes       (/usr/local/bin/flabel-run)
+  FLABEL_DEPLOY_BUSY_PATTERN   what counts as busy          (tcpreplay|flabel|uv run)
+  FLABEL_DEPLOY_SUDO           privilege wrapper for the install; empty to run unwrapped  (sudo)
+  FLABEL_DEPLOY_GIT / _UV / _PGREP    the external commands
+
+exit codes:
+  0  deployed, or already up to date
+  1  a step failed, or the box was busy. Nothing after the failing step was done.
+  2  usage error
+EOF
+}
+
+case "${1:-}" in
+  --help|-h) usage; exit 0 ;;
+  "") : ;;
+  *) usage >&2; echo >&2; echo "flabel-deploy: unexpected argument: $1" >&2; exit 2 ;;
+esac
+
+[ -d "$REPO" ] || { echo "flabel-deploy: $REPO is not a directory — is the box provisioned?" >&2; exit 1; }
+
+# Resolved to absolute BEFORE the `cd` below. `flabel-run` shipped this exact bug on 2026-08-17: a
+# relative path taken from the environment, then resolved against the repo after the script had
+# already changed directory into it.
+REPO="$(cd "$REPO" && pwd)"
+SOURCE="$REPO/tools/flabel-run"
+case "$INSTALL_TO" in /*) ;; *) INSTALL_TO="$PWD/$INSTALL_TO" ;; esac
+
+# --- step 0: refuse while the box is busy -------------------------------------------------------
+
+#: Everything matching `$BUSY_PATTERN` that is not this deploy itself.
+#:
+#: **Excluding ourselves is not cosmetic — without it the guard fires on every invocation.** The
+#: production pattern contains `flabel` and this script is called `flabel-deploy`, so `pgrep -af`,
+#: which matches against the full command line, finds us. Three kinds of "us", and the third is the
+#: one that is easy to miss:
+#:
+#:   `$$`      this script's own shell.
+#:   `$PPID`   the `sudo flabel-deploy` that invoked it.
+#:   a FORKED SUBSHELL with a DIFFERENT PID and an IDENTICAL COMMAND LINE. Command substitution
+#:             forks, and the child inherits the parent's cmdline verbatim. Measured 2026-08-24:
+#:             `pgrep -af probe-deploy` inside `$( )` reported 344033 *and* 344034, both reading
+#:             `/bin/bash ./probe-deploy`. A pid-only filter leaves 344034 behind, and the deploy
+#:             refuses to run for the rest of time.
+#:
+#: So the last clause drops any line naming this script. The cost is that a genuinely concurrent
+#: second `flabel-deploy` is invisible to this guard — accepted, and stated rather than hidden:
+#: this guard is about a live *labelling run*, and two operators deploying at once is a different
+#: problem that wants a lock, not a pattern.
+busy() {
+  "$PGREP" -af "$BUSY_PATTERN" 2>/dev/null \
+    | awk -v me="$$" -v parent="$PPID" -v self="${0##*/}" '
+        $1 == me || $1 == parent { next }
+        index($0, self)          { next }
+        { print }
+      ' \
+    || true
+}
+
+BUSY="$(busy)"
+if [ -n "$BUSY" ]; then
+  echo "flabel-deploy: refusing to deploy — something is still running:" >&2
+  printf '%s\n' "$BUSY" >&2
+  echo "flabel-deploy: install(1) overwrites in place and bash reads a script as it runs, so" >&2
+  echo "flabel-deploy: deploying now could change a script out from under a live run." >&2
+  echo "flabel-deploy: wait for it to finish, then run this again. Nothing has been changed." >&2
+  exit 1
+fi
+
+cd "$REPO"
+
+# --- steps 1-3: pull, sync, gate ----------------------------------------------------------------
+
+echo "flabel-deploy: pulling $REPO"
+if ! "$GIT" pull --ff-only; then
+  echo "flabel-deploy: git pull --ff-only failed — nothing else has been done." >&2
+  echo "flabel-deploy: --ff-only rather than a merge on purpose: a merge commit made here is a" >&2
+  echo "flabel-deploy: state no branch in the repo has, and the box would run unreviewed code." >&2
+  exit 1
+fi
+
+echo "flabel-deploy: syncing dependencies"
+if ! "$UV" sync --extra db; then
+  echo "flabel-deploy: uv sync --extra db failed — the wrapper has NOT been reinstalled." >&2
+  exit 1
+fi
+
+echo "flabel-deploy: verifying the label store against its declaration"
+if ! "$UV" run flabel-db verify; then
+  echo "flabel-deploy: flabel-db verify reported drift — the deploy is STOPPED." >&2
+  echo "flabel-deploy: the box is still running the wrapper it was running before." >&2
+  echo "flabel-deploy: this is the only place the live dataset is ever checked (CI has no GCP" >&2
+  echo "flabel-deploy: credential), so a failure here is a real finding, not a flaky gate." >&2
+  echo "flabel-deploy: 'uv run flabel-db apply' patches what can be patched." >&2
+  exit 1
+fi
+
+# --- step 4: the conditional reinstall -----------------------------------------------------------
+
+# A checkout that cannot supply a wrapper is a FAILURE, not a step to skip. The provisioning script
+# guards its own install with `if [ -x ... ]` and passes over silently, which is right on a first
+# boot where the clone may not exist yet, and wrong here: this script's whole purpose is that the
+# box ends up running the checked-out wrapper.
+if [ ! -f "$SOURCE" ]; then
+  echo "flabel-deploy: $SOURCE is missing — the checkout cannot supply a wrapper to install." >&2
+  exit 1
+fi
+
+hash_of() { md5sum "$1" | cut -d' ' -f1; }
+
+FRESH="$(hash_of "$SOURCE")"
+# `-f`, and the absent case handled FIRST: `md5sum` on a missing file is an error, not a mismatch,
+# so a naive comparison makes the very first deploy the one that fails.
+if [ -f "$INSTALL_TO" ] && [ "$FRESH" = "$(hash_of "$INSTALL_TO")" ]; then
+  echo "flabel-deploy: $INSTALL_TO is already the checked-out wrapper (md5 $FRESH) — not reinstalling"
+else
+  $SUDO install -m 0755 "$SOURCE" "$INSTALL_TO"
+  echo "flabel-deploy: installed $SOURCE -> $INSTALL_TO (md5 $FRESH)"
+fi
+
+echo "flabel-deploy: done — $(cd "$REPO" && "$GIT" rev-parse --short HEAD 2>/dev/null || echo "HEAD unknown")"
