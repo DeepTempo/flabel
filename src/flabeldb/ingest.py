@@ -101,6 +101,30 @@ def next_attempt(
     )
 
 
+def classify_job(job: object | None) -> str:
+    """What a load job's state means for the walk — `MISSING`, `SUCCEEDED` or `FAILED`.
+
+    **Reading `state` alone is the trap, and §10 M1 measured it.** A load that fails on a bad row
+    finishes with `state: DONE`, `errorResult: invalid` and `outputRows: None` — so "DONE means it
+    worked" calls a failed load a success, skips the retry, and lands a `runs` row for a table that
+    has no rows in it. The commit marker would then be pointing at nothing.
+
+    A job still in flight is neither, and is refused rather than guessed at: calling it `FAILED`
+    walks past a load that is about to land and duplicates its rows, calling it `SUCCEEDED` skips a
+    table that has none yet. §3.3 assumes one runner, so a running job under our own id means a
+    previous invocation has not finished.
+    """
+    if job is None:
+        return MISSING
+    state = getattr(job, "state", None)
+    if state not in (None, "DONE"):
+        raise RuntimeError(
+            f"a load job for this run is still running (state {state!r}). Ingest assumes one "
+            f"runner (§3.3); wait for it to finish rather than starting a second."
+        )
+    return FAILED if getattr(job, "error_result", None) else SUCCEEDED
+
+
 def apply_skip_tiers(
     attested: Sequence[int],
     notes: Sequence[str],
@@ -127,6 +151,100 @@ def apply_skip_tiers(
     return kept, (*notes, *added)
 
 
+# --- where the decisions above meet BigQuery ----------------------------------------------------
+#
+# Everything from here down needs a client, and so is reachable only from `test_flabeldb_live.py`
+# and a hand-run against `flabel_scratch`. That boundary is exactly where LS-3 shipped two broken
+# commands with CI green, so each function below is kept as thin as it can be: the deciding is done
+# above, and these only ask BigQuery and report what it said.
+
+
+def probe_job(bq, job_reference: str, *, location: str | None = None) -> str:
+    """Ask BigQuery about one job id, in the vocabulary `next_attempt` walks over."""
+    from google.api_core.exceptions import NotFound
+
+    from flabeldb import client as client_module
+
+    try:
+        job = bq.get_job(job_reference, location=location or client_module.LOCATION)
+    except NotFound:
+        return MISSING
+    return classify_job(job)
+
+
+def already_committed(bq, dataset: str, run_id: str) -> bool:
+    """§7.4's PRIMARY guard: `SELECT 1 FROM runs WHERE run_id = @id`.
+
+    A query, not a job id. It is immune to job-id retention (§10 M1) and to the burnt-id problem,
+    and it tests the fact that actually matters — that the commit marker is there — rather than a
+    fact about our own bookkeeping.
+    """
+    bigquery = _client_module()._bigquery()
+    sql = f"SELECT 1 FROM `{bq.project}.{dataset}.runs` WHERE run_id = @run_id LIMIT 1"
+    config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("run_id", "STRING", run_id)]
+    )
+    return bool(list(bq.query(sql, job_config=config).result()))
+
+
+def clear_orphans(bq, dataset: str, run_id: str) -> dict[str, int]:
+    """§5.3 step 2: delete this run's rows from every table ingest writes.
+
+    A run that is new and a run that is half-loaded are **indistinguishable** — the commit marker
+    is absent either way — and they need the same treatment, so this runs unconditionally once
+    `already_committed` says no. Bounded, targeted, and by definition invisible rows: §2.2's stated
+    exception to append-only.
+    """
+    bigquery = _client_module()._bigquery()
+    removed: dict[str, int] = {}
+    for table in LOAD_ORDER:
+        sql = f"DELETE FROM `{bq.project}.{dataset}.{table}` WHERE run_id = @run_id"
+        config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("run_id", "STRING", run_id)]
+        )
+        job = bq.query(sql, job_config=config)
+        job.result()
+        removed[table] = job.num_dml_affected_rows or 0
+    return removed
+
+
+def load_rows(bq, dataset: str, table: str, rows: Sequence[dict], job_reference: str) -> None:
+    """One batch load job under an exact job id.
+
+    **Batch loads, never the streaming API** (§7.4): atomic per job, free, and no streaming buffer
+    to block a later correction. `WRITE_APPEND` with the declared schema, so a row that does not
+    match fails the job rather than inventing a column.
+    """
+    client_module = _client_module()
+    bigquery = client_module._bigquery()
+    from flabeldb import schema
+
+    config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        schema=client_module.to_bigquery(schema.TABLES[table].fields),
+    )
+    job = bq.load_table_from_json(
+        list(rows),
+        f"{bq.project}.{dataset}.{table}",
+        job_config=config,
+        job_id=job_reference,
+        location=client_module.LOCATION,
+    )
+    job.result()
+
+
+def _client_module():
+    """Imported through a function so this module still imports without the `db` extra.
+
+    The same lesson as `cli._not_found_types`: a top-level client import made three tests exit
+    EXIT_INTERNAL on a checkout without the extra, and the `bare-runner` job caught it.
+    """
+    from flabeldb import client
+
+    return client
+
+
 __all__ = [
     "FAILED",
     "GS_URI",
@@ -134,8 +252,13 @@ __all__ = [
     "MAX_ATTEMPTS",
     "MISSING",
     "SUCCEEDED",
+    "already_committed",
     "apply_skip_tiers",
+    "classify_job",
+    "clear_orphans",
     "job_id",
+    "load_rows",
     "next_attempt",
+    "probe_job",
     "split_gs_uri",
 ]

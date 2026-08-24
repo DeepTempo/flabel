@@ -161,3 +161,40 @@ def test_the_other_ci_jobs_still_install_the_extra():
             f"the `{name}` job no longer installs the db extra, so the store's pure tests skip "
             f"in CI — which is how LS-3 shipped two broken commands green"
         )
+
+
+# --- the store's modules must IMPORT with nothing installed --------------------------------------
+
+
+@pytest.mark.parametrize("module", ["schema", "identity", "attest", "parse", "ingest", "cli"])
+def test_every_store_module_imports_with_google_unavailable(module):
+    """`flabel` declares `dependencies = []` and the store is a separate distribution for that
+    reason — but a module that imports `google` at the TOP is broken on a bare checkout however
+    the packaging is declared.
+
+    This has bitten twice on this branch, both times caught by the `bare-runner` job rather than
+    locally, because the extra is installed here: `cli._verify` gained
+    `from google.api_core.exceptions import NotFound` at function top, and three tests that
+    monkeypatch the client exited EXIT_INTERNAL. Checked in-process now, so it fails on a laptop
+    too.
+
+    `google` is masked in `sys.modules` with `None`, which makes `import google...` raise
+    `ImportError` exactly as an absent package does, and the module is re-imported from source.
+    """
+    import importlib
+    import sys
+
+    masked = [name for name in sys.modules if name == "google" or name.startswith("google.")]
+    saved = {name: sys.modules.pop(name) for name in masked}
+    ours = [name for name in list(sys.modules) if name.startswith("flabeldb")]
+    stored = {name: sys.modules.pop(name) for name in ours}
+    sys.modules["google"] = None  # any `import google.x` now raises ImportError
+    try:
+        importlib.import_module(f"flabeldb.{module}")
+    finally:
+        del sys.modules["google"]
+        for name in list(sys.modules):
+            if name.startswith("flabeldb"):
+                del sys.modules[name]
+        sys.modules.update(saved)
+        sys.modules.update(stored)

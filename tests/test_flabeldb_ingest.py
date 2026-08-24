@@ -210,3 +210,39 @@ def test_anything_that_is_not_a_gs_object_is_refused_before_any_network_call(uri
     """§6.1 gave `--source-uri` the same treatment: validated, not merely recorded."""
     with pytest.raises(ValueError, match="gs://"):
         ingest.split_gs_uri(uri)
+
+
+# --- what BigQuery's job state actually means (§10 M1) ------------------------------------------
+
+
+class Job:
+    """The two attributes `classify_job` reads, in the shapes the client returns them."""
+
+    def __init__(self, state="DONE", error_result=None):
+        self.state = state
+        self.error_result = error_result
+
+
+def test_a_finished_job_with_no_error_succeeded():
+    assert ingest.classify_job(Job(state="DONE")) == ingest.SUCCEEDED
+
+
+def test_a_finished_job_WITH_an_error_result_failed_even_though_its_state_is_DONE():
+    """**§10 M1, measured, and the trap.** A bad-row load left `state: DONE`, `errorResult:
+    invalid`, `outputRows: None` — so reading `state` alone calls a failed load a success, skips
+    the retry, and lands a `runs` row for a table that has no rows."""
+    job = Job(state="DONE", error_result={"reason": "invalid", "message": "bad row"})
+    assert ingest.classify_job(job) == ingest.FAILED
+
+
+def test_an_absent_job_is_missing():
+    assert ingest.classify_job(None) == ingest.MISSING
+
+
+@pytest.mark.parametrize("state", ["RUNNING", "PENDING"])
+def test_a_job_still_IN_FLIGHT_is_neither_and_raises(state):
+    """Calling it FAILED would walk past a load that is about to land and duplicate its rows;
+    calling it SUCCEEDED would skip a table that has none yet. §3.3 assumes one runner, so this
+    means a previous invocation is still going — which is an operator's problem, named."""
+    with pytest.raises(RuntimeError, match="still running"):
+        ingest.classify_job(Job(state=state))
