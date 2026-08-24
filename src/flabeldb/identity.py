@@ -12,8 +12,10 @@ from content, which is why exclusions are data rather than deletions.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from hashlib import sha256
 from ipaddress import ip_address
+from types import MappingProxyType
 
 #: Sixteen hex characters, matching the `snapshot_id` convention so the existing
 #: `fullmatch(r"[0-9a-f]{16}")` guard applies unchanged.
@@ -31,12 +33,40 @@ DIGEST_CHARS = 16
 #: Refusing is not a loss of labels: such detections are already `unsupported_transport` unmatched
 #: detections and never became labels in the first place. `flabel-ingest` counts the refusals and
 #: records them on the run, so the refusal is visible rather than silent.
-WRITABLE_PROTOS = frozenset({"tcp", "udp", "icmp"})
+#: IANA protocol number for each writable proto, and the reason the refusal above is SAFE.
+#:
+#: `labels.json` does not carry `ip_proto` — that is #96 — so ingest has to derive it from the
+#: proto name. For these three the mapping is unambiguous, which is exactly why refusing everything
+#: else loses nothing: `unknown_transport` is the one case where the name does NOT determine the
+#: number (50 for ESP, 132 for SCTP, and Zeek writes both with identical 5-tuples), and deriving it
+#: there would be a guess that silently merges two real flows.
+#:
+#: `WRITABLE_PROTOS` is derived from these keys rather than written twice, so the set of protos we
+#: accept and the set we can number cannot drift apart.
+IP_PROTO_BY_NAME: Mapping[str, int] = MappingProxyType({"icmp": 1, "tcp": 6, "udp": 17})
+
+WRITABLE_PROTOS = frozenset(IP_PROTO_BY_NAME)
 
 
 def is_writable(proto: str) -> bool:
     """Whether a `flow_labels` row may be written for a flow of this proto (§3.2, #96)."""
     return proto.lower() in WRITABLE_PROTOS
+
+
+def ip_proto_of(proto: str) -> int:
+    """The IANA number for a writable proto. Raises for anything else, deliberately.
+
+    A default here would be the whole defect: `flow_key` puts `ip_proto` in its material precisely
+    to separate two conversations Zeek writes with identical 5-tuples, so a guessed number would
+    reinstate the collision it exists to prevent. Callers check `is_writable` first.
+    """
+    try:
+        return IP_PROTO_BY_NAME[proto.lower()]
+    except KeyError:
+        raise ValueError(
+            f"{proto!r} has no derivable ip_proto: labels.json does not carry one (#96), and only "
+            f"{sorted(WRITABLE_PROTOS)} are determined by name. Such a flow is not writable."
+        ) from None
 
 
 def _endpoint(packed_and_port: tuple[bytes, int]) -> str:

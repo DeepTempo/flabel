@@ -253,3 +253,36 @@ def test_the_run_id_does_not_read_the_wall_clock():
     )
     first = identity.run_id(**args)
     assert identity.run_id(**args) == first
+
+
+# --- deriving ip_proto, which labels.json does not carry ----------------------------------------
+
+
+@pytest.mark.parametrize("proto, number", [("icmp", 1), ("tcp", 6), ("udp", 17)])
+def test_the_writable_protos_have_their_iana_number(proto, number):
+    """`labels.json` carries no `ip_proto` (#96), so ingest derives it from the name."""
+    assert identity.ip_proto_of(proto) == number
+    assert identity.ip_proto_of(proto.upper()) == number
+
+
+def test_the_writable_set_and_the_numbers_are_one_fact():
+    """Written twice they would drift, and the drift would be silent: a proto in the writable set
+    with no number crashes ingest, and a number with no writable entry is dead code."""
+    assert frozenset(identity.IP_PROTO_BY_NAME) == identity.WRITABLE_PROTOS
+
+
+@pytest.mark.parametrize("proto", ["unknown_transport", "esp", "sctp", "gre"])
+def test_an_unwritable_proto_has_no_derivable_number_and_is_not_guessed(proto):
+    """THE REASON the refusal is safe rather than merely cautious. `unknown_transport` is exactly
+    the case where the name does not determine the number — 50 for ESP, 132 for SCTP, and Zeek
+    writes both with identical 5-tuples — so a default here would reinstate the very collision
+    `ip_proto` is in the key to prevent."""
+    with pytest.raises(ValueError, match="no derivable ip_proto"):
+        identity.ip_proto_of(proto)
+
+
+def test_every_writable_proto_can_actually_be_keyed():
+    """The two halves meeting: anything `is_writable` admits must survive `flow_key`."""
+    for proto in sorted(identity.WRITABLE_PROTOS):
+        assert identity.is_writable(proto)
+        assert len(key(proto=proto, ip_proto=identity.ip_proto_of(proto))) == 16
