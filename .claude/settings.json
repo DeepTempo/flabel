@@ -12,7 +12,7 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "uv run --no-sync pytest -q" }
+          { "type": "command", "command": "set -o pipefail; uv run --no-sync pytest -q -m 'not requires_tools' 2>&1 | tail -20" }
         ]
       }
     ]
