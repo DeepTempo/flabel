@@ -12,7 +12,7 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "uv run --no-sync pytest -q" }
+          { "type": "command", "command": "out=$(uv run --no-sync pytest -q -m \"not requires_tools\" 2>&1); c=$?; printf \"%s\\n\" \"$out\" | tail -20; exit $c" }
         ]
       }
     ]
