@@ -8,17 +8,22 @@ Spec: `docs/spec-label-store.md`. Design reasoning: `inline-labeling/label-store
 were then executed against the live service. The step list is resequenced rather than renumbered —
 issues #145–#153 keep their step ids, so nothing has to be re-filed.
 
-## Progress — Phase 3a is 3 of 7
+## Progress — Phase 3a is 4 of 7
 
 | Step | Issue | State |
 | :-- | :-- | :-- |
 | LS-1 additive fields | [#145](https://github.com/DeepTempo/flabel/issues/145) | ✅ merged (PR #155) |
 | LS-3 `flabeldb` + schema | [#147](https://github.com/DeepTempo/flabel/issues/147) | ✅ merged (PR #157) |
 | LS-6 dataset + IAM | [#149](https://github.com/DeepTempo/flabel/issues/149) | ✅ merged (PR #160) |
-| **LS-4 `flabel-ingest`** | [#148](https://github.com/DeepTempo/flabel/issues/148) | **next** |
+| LS-4 `flabel-ingest` | [#148](https://github.com/DeepTempo/flabel/issues/148) | ✅ merged (PRs #166, #167, #168) |
 | LS-2 `flabel-deploy` ⟂ | [#146](https://github.com/DeepTempo/flabel/issues/146) | not started |
-| LS-5 wire `flabel-run` | [#150](https://github.com/DeepTempo/flabel/issues/150) | not started |
+| **LS-5 wire `flabel-run`** | [#150](https://github.com/DeepTempo/flabel/issues/150) | **next** |
 | LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | not started |
+
+LS-4 landed two corrections to documents outside its own scope, both found by running it rather
+than reading it: spec §5.3 step 3 contradicted its own step 2 (a table cleared by step 2 and then
+skipped by step 3 as "already done" ended with zero rows under a live commit marker), and §7.4's
+guard 4 — the duplicate-`run_id` assertion — had never been implemented at all.
 
 The `flabel` dataset was provisioned 2026-08-24 — five tables and `authoritative_runs`, all empty —
 closing [#163](https://github.com/DeepTempo/flabel/issues/163), which no step owned. It is what LS-2's
