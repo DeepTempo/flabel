@@ -419,9 +419,28 @@ The retry path, verified working:
 2. Otherwise the run is new *or* half-loaded, and those are indistinguishable and need the same
    treatment: `DELETE FROM <each table> WHERE run_id = @id`, clearing any orphans. Bounded, targeted,
    and by definition invisible rows — §2.2's stated exception.
-3. Load each table with `jobId = ingest-<run_id>-<table>-<attempt>`, where `attempt` is found by
-   walking upward from 1: a **missing** job id (`Not found`) means unused; a job that exists and
-   *succeeded* means this table is done; one that exists and *failed* means increment and retry.
+3. Load **every** table with `jobId = ingest-<run_id>-<table>-<attempt>`, where `attempt` is the
+   first id that is **unused** — walking upward from 1 until `Not found`. A job that already
+   exists is used, whether it succeeded or failed.
+
+**Revision 3 corrects step 3, and step 2 is why** (measured 2026-08-24 against `flabel_scratch`).
+Revision 2 read: *"a job that exists and succeeded means this table is done; one that exists and
+failed means increment and retry."* The first half is incompatible with step 2. Step 2 has just
+deleted that table's rows — unconditionally, because a new run and a half-loaded run are
+indistinguishable — so after it runs, "done" is false.
+
+Driven against the live service, that combination produced a run whose `flow_labels` table ended
+with **zero rows**: cleared by step 2, skipped by step 3 as already done, and then the `runs` commit
+marker landed on top of the emptiness. Which is precisely the failure the ordering exists to
+prevent, reached from the other direction — a visible run pointing at rows that are not there.
+
+The root cause is §10 M1 generalised. **A job id is permanent, so "this id succeeded once" says
+nothing about whether its rows are there now.** Once step 2 has cleared them, the only question the
+walk can answer is which id is free — which is what step 3 now asks.
+
+A consequence worth stating for anyone writing tests here: because job ids never expire, a test that
+asserts on attempt *numbers* cannot reuse a `run_id` between sessions. The second run finds the
+first run's attempts already used and the walk correctly answers something different.
 
 ### 5.5 Rebuild
 
