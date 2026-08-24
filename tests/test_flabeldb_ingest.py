@@ -535,6 +535,7 @@ def test_backfill_ingests_each_uri_in_turn():
 def test_a_run_already_present_is_counted_separately_from_one_ingested():
     """The two are different facts about a backfill, and collapsing them would make a second full
     pass look like it did the same work as the first."""
+
     def fake(uri):
         return {"run_id": "x", "status": "already-present" if "1" in uri else "ingested"}
 
@@ -548,6 +549,7 @@ def test_one_failing_tarball_does_not_stop_the_rest():
     """**The property that makes a backfill worth running unattended.** Stopping on the first bad
     archive would mean one corrupt object holds up every run published after it — and #164 says a
     replaced tarball is possible, so a bad one is not hypothetical."""
+
     def fake(uri):
         if "2" in uri:
             raise ValueError("not one of ours")
@@ -562,6 +564,7 @@ def test_one_failing_tarball_does_not_stop_the_rest():
 
 def test_a_backfill_that_failed_on_everything_still_reports_rather_than_raising():
     """The caller needs the list. Raising the first error would discard the other ninety-nine."""
+
     def fake(_uri):
         raise ValueError("boom")
 
@@ -573,6 +576,7 @@ def test_a_backfill_that_failed_on_everything_still_reports_rather_than_raising(
 def test_a_second_full_backfill_ingests_nothing():
     """LS-8's stated acceptance test, in miniature — the property, here, rather than the
     whole-archive run. The already-committed guard (§7.4) is what supplies it."""
+
     def fake(_uri):
         return {"run_id": "x", "status": "already-present"}
 
