@@ -8,6 +8,22 @@ Spec: `docs/spec-label-store.md`. Design reasoning: `inline-labeling/label-store
 were then executed against the live service. The step list is resequenced rather than renumbered —
 issues #145–#153 keep their step ids, so nothing has to be re-filed.
 
+## Progress — Phase 3a is 3 of 7
+
+| Step | Issue | State |
+| :-- | :-- | :-- |
+| LS-1 additive fields | [#145](https://github.com/DeepTempo/flabel/issues/145) | ✅ merged (PR #155) |
+| LS-3 `flabeldb` + schema | [#147](https://github.com/DeepTempo/flabel/issues/147) | ✅ merged (PR #157) |
+| LS-6 dataset + IAM | [#149](https://github.com/DeepTempo/flabel/issues/149) | ✅ merged (PR #160) |
+| **LS-4 `flabel-ingest`** | [#148](https://github.com/DeepTempo/flabel/issues/148) | **next** |
+| LS-2 `flabel-deploy` ⟂ | [#146](https://github.com/DeepTempo/flabel/issues/146) | not started |
+| LS-5 wire `flabel-run` | [#150](https://github.com/DeepTempo/flabel/issues/150) | not started |
+| LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | not started |
+
+The `flabel` dataset was provisioned 2026-08-24 — five tables and `authoritative_runs`, all empty —
+closing [#163](https://github.com/DeepTempo/flabel/issues/163), which no step owned. It is what LS-2's
+pre-deploy `verify` gate needs in order to pass, and what LS-4 will write the first rows into.
+
 ## Shape of the work
 
 **Phase 3a — LS-1 … LS-7.** Land the store, and the origin URI the requirement actually asks for.
@@ -30,9 +46,11 @@ necessary but not sufficient:
 - **LS-1 ⟂ LS-2** was file-disjoint, but `flabel-deploy` runs `uv sync --extra db` and that extra does
   not exist until LS-3. Landing LS-2 first ships a deploy script that fails on an unknown extra. LS-2
   now follows LS-3.
-- **LS-4 ⟂ LS-6** was file-disjoint, but LS-4's three most important tests are `requires_bigquery` and
-  need the dataset and grants **LS-6 provisions**. Run in parallel, LS-4 completes with its real tests
-  skipped. LS-6 now precedes LS-4.
+- **LS-4 ⟂ LS-6** was file-disjoint, but LS-4's three most important tests are `requires_bigquery`.
+  LS-6 now precedes LS-4. **The reason given here was wrong and is corrected in LS-6's own section:**
+  those tests need `flabel_scratch`, which already existed, and `test_flabeldb_live.py` *refuses* to
+  run against `flabel` at all. What LS-6 gives LS-4 is **verified grants** — the confidence that a load
+  job from the box will not 403 — not the dataset. The ordering stands; the justification did not.
 
 Only LS-2 is now genuinely parallel, against LS-6 and LS-4.
 
@@ -196,24 +214,45 @@ architecture guard to `"google.cloud"` and confirm it stops firing.
 
 ---
 
-## Step LS-6 — Dataset, IAM, and verification (#149)
+## Step LS-6 — Dataset, IAM, and verification (#149) ✅ merged 2026-08-24 (PR #160)
 
-Resequenced to **precede** LS-4, because LS-4's real tests need what this provisions.
+**Amended after the fact from `docs/label-store-provision.md` §4**, which recorded three ways this
+section had gone stale and correctly declined to edit a file outside its own list. The original
+wording is kept struck through where it was *wrong*, not merely superseded, because what it got wrong
+is the point: this step turned out to be **verification, not provisioning**.
+
+~~Resequenced to **precede** LS-4, because LS-4's real tests need what this provisions.~~
+**False.** `tests/test_flabeldb_live.py` *refuses* to run against `flabel` — it deletes and recreates
+tables — and defaults to `flabel_scratch`, which already existed. The resequencing was still right,
+but the reason was wrong: what LS-6 gives LS-4 is **grant verification**, not the dataset.
 
 **Files touched** — `docs/label-store-provision.md`
 
 **What changes**
-- The `flabel` dataset in **`us-central1`** — pinned, because the results bucket is a `US-CENTRAL1`
-  regional bucket and a load job needs a compatible location. `flabel_scratch` already exists.
+- ~~The `flabel` dataset in **`us-central1`**~~ — **it already existed**, created 2026-08-20 18:33 UTC
+  as a side effect of LS-3's live round trip, in `us-central1`, and undocumented until now. That
+  undocumented state is what LS-6 actually closed. The location requirement itself stands: the results
+  bucket is `US-CENTRAL1` regional and a load job needs a compatible location.
 - **BigQuery IAM, which revision 1 omitted entirely** — the same omission as the 2026-08-19 GCS
   blocker, one service over: `bigquery.jobUser` on the project and `bigquery.dataEditor` on the dataset
-  for the instance SA, `dataOwner` for whoever runs `apply`.
-- **No GCS grant is needed.** Revision 1 called `objectViewer` a blocker; measured, the SA already
-  holds it alongside `objectCreator`.
+  for the instance SA. ~~`dataOwner` for whoever runs `apply`.~~ **Measured false** — `apply` run as the
+  SA, which holds only `dataEditor`, exited `0` and 16 live tests passed. Spec §7.3's `dataOwner` row is
+  over-broad and should be narrowed or justified.
+- ~~**No GCS grant is needed.** Revision 1 called `objectViewer` a blocker~~ — true, but **established
+  in spec §7.2, not found here.** LS-6 does not get credit for it.
 
 **The test that proves it** — from the box, both directions: a read of a published tarball succeeds
 (**already verified** — metadata-server token, HTTP 200), a load job succeeds, and an overwrite and a
 delete are still refused. Recorded with the command and its output.
+
+**What it actually established**, beyond the above: the archive **is** protected from the ingestion
+identity in both directions (`403` on delete and on overwrite), which retracted #158. The probe that
+said otherwise used `--if-generation-match=0`, whose precondition fails on any existing object, so it
+returned `412` regardless of permission — the guard that made it safe made it blind. A discriminating
+probe needs a *matching* precondition and an operator-side positive control. And the answer had been
+in `docs/status.yaml` since 2026-08-19 from a better probe than either revision built.
+
+**Left open** — #159, #161, #162, #163 (closed 2026-08-24, below), #164.
 
 **Depends on** LS-3. `⟂ LS-2`.
 
