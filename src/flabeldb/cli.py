@@ -184,6 +184,34 @@ def _apply(bq, dataset: str) -> int:
     return EXIT_OK
 
 
+def duplicate_run_ids(rows) -> tuple[str, ...]:
+    """§7.4 guard 4, as sentences. Pure, so the reporting is testable without a dataset.
+
+    Guards 1-3 — the `SELECT 1` before any load, batch loads only, attempt-numbered job ids — are
+    the mechanism that stops a run being committed twice. This is the assertion that the mechanism
+    is still connected, and it has to be a query over the DATA because none of the three can report
+    that it has stopped working: an idempotency guard that fails is, by definition, not running.
+
+    A duplicated `run_id` means the commit marker landed twice, so every read joining through it
+    doubles — silently, and in a way that looks like more evidence rather than less.
+    """
+    return tuple(
+        f"runs: run_id {run_id!r} appears {count} times — the commit marker landed more than "
+        f"once, so every read joining through it doubles (§7.4)"
+        for run_id, count in rows
+    )
+
+
+def _duplicate_run_id_rows(bq, dataset: str):
+    """The offenders, or an empty list. Separated from the sentence-building so the query lives
+    with the client and the reporting stays pure."""
+    sql = (
+        f"SELECT run_id, COUNT(*) AS n FROM `{bq.project}.{dataset}.runs` "
+        f"GROUP BY run_id HAVING n > 1 ORDER BY run_id"
+    )
+    return [(row.run_id, row.n) for row in bq.query(sql).result()]
+
+
 def _verify(bq, dataset: str) -> int:
     """Compare the live dataset against the declaration, and exit 1 on ANY difference.
 
@@ -220,6 +248,10 @@ def _verify(bq, dataset: str) -> int:
             f"recreated, not patched"
         )
     found += list(schema.differences(client_module.live_schema(bq, dataset)))
+    if not found:
+        # §7.4 guard 4, and only once the SHAPE is right: `runs` has to exist and match before a
+        # query over it means anything, and a missing table is already reported above.
+        found += list(duplicate_run_ids(_duplicate_run_id_rows(bq, dataset)))
     found = tuple(found)
     if not found:
         print(f"flabel-db: {dataset} matches the declaration ({len(schema.TABLES)} tables)")
