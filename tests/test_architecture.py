@@ -249,7 +249,7 @@ def test_store_modules_are_all_accounted_for():
     kind, the exact state the boundary above is meant to prevent. Found by review of LS-1's plan.
     """
     pure = set(STORE_PURE)
-    impure = {"client.py", "cli.py"}
+    impure = {"client.py", "cli.py", "ingest.py"}
     present = {
         str(path.relative_to(FLABELDB))
         for path in FLABELDB.rglob("*.py")
