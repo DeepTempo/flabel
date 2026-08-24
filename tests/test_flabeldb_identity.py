@@ -13,6 +13,8 @@ in the file. A uid is a per-run observation, never identity.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from flabeldb import identity
@@ -286,3 +288,85 @@ def test_every_writable_proto_can_actually_be_keyed():
     for proto in sorted(identity.WRITABLE_PROTOS):
         assert identity.is_writable(proto)
         assert len(key(proto=proto, ip_proto=identity.ip_proto_of(proto))) == 16
+
+
+# --- the measurement §3.2 rests on, made here rather than cited ---------------------------------
+
+
+@pytest.mark.requires_tools
+def test_one_flow_read_twice_with_different_zeek_uids_has_one_flow_key(tmp_path):
+    """**THE claim `flow_key` exists for, against real Zeek rather than a fixture dict.**
+
+    Spec §3.2 cites a measurement on Zeek 8.0.4: under `-D` uids are a fixed sequence in
+    connection-creation order, so a flow carried `CRdT6w4PA64qWKmBk3` when second in a file and
+    `CJKFoj4bpHEhTeaRoj` when first, with the same `ts_first` both times.
+
+    The captures behind that measurement are not in this repo, and the published archive on
+    `fl-replay` cannot substitute: 23 of its captures were labelled twice and every pair produced
+    an identical `flow_key` set, but in all 21 comparable pairs the uids were also identical — so
+    the archive shows stability across a re-run and never exercises the instability itself.
+
+    So the measurement is made here. `benign.pcap` holds two flows; `editcap` selects the second
+    one's packets into a file of their own, which makes it flow #1 without touching its timestamp.
+    Reproduced on Zeek 8.2.1, so the behaviour is not specific to the version §3.2 measured.
+    """
+    import subprocess
+
+    capture = pathlib.Path("tests/fixtures/benign.pcap").resolve()
+    second_only = tmp_path / "second-flow-only.pcap"
+    subprocess.run(["editcap", "-r", str(capture), str(second_only), "8-14"], check=True)
+
+    def conns(path: pathlib.Path) -> list[dict[str, str]]:
+        out = tmp_path / f"zeek-{path.stem}"
+        out.mkdir()
+        subprocess.run(["zeek", "-D", "-r", str(path)], cwd=out, check=True)
+        rows = [
+            line.split("\t")
+            for line in (out / "conn.log").read_text().splitlines()
+            if not line.startswith("#")
+        ]
+        return [
+            {
+                "uid": r[1],
+                "src_ip": r[2],
+                "src_port": int(r[3]),
+                "dst_ip": r[4],
+                "dst_port": int(r[5]),
+                "proto": r[6],
+                "ts": r[0],
+            }
+            for r in rows
+        ]
+
+    both = conns(capture)
+    alone = conns(second_only)
+    assert len(both) == 2 and len(alone) == 1, (both, alone)
+
+    second = next(c for c in both if (c["src_ip"], c["src_port"]) == ("10.0.0.6", 49153))
+    same = alone[0]
+
+    # The premise: one flow, two uids, and the FIRST uid of each file is the same string.
+    assert second["ts"] == same["ts"], "editcap shifted the timestamp; the comparison is void"
+    assert second["uid"] != same["uid"], (
+        "the uids did not differ, so this run proves nothing about positional uids — "
+        f"{second['uid']} vs {same['uid']}"
+    )
+    assert same["uid"] == both[0]["uid"], (
+        "the isolated flow did not inherit flow #1's uid, so uids are not positional here and "
+        "the measurement §3.2 rests on no longer reproduces"
+    )
+
+    # The conclusion: identity is unmoved by it.
+    def key_of(conn: dict) -> str:
+        return identity.flow_key(
+            "a" * 64,
+            proto=conn["proto"],
+            ip_proto=identity.ip_proto_of(conn["proto"]),
+            src_ip=conn["src_ip"],
+            src_port=conn["src_port"],
+            dst_ip=conn["dst_ip"],
+            dst_port=conn["dst_port"],
+            ts_first_iso=conn["ts"],
+        )
+
+    assert key_of(second) == key_of(same), "one flow, two rows — keying followed the uid"

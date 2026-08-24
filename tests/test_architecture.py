@@ -248,7 +248,7 @@ def test_store_modules_are_all_accounted_for():
     see this package at all — which would let it grow modules with no architectural check of any
     kind, the exact state the boundary above is meant to prevent. Found by review of LS-1's plan.
     """
-    pure = {"schema.py", "identity.py", "attest.py", "parse.py", "__init__.py"}
+    pure = set(STORE_PURE)
     impure = {"client.py", "cli.py"}
     present = {
         str(path.relative_to(FLABELDB))
@@ -274,7 +274,12 @@ def test_store_modules_are_all_accounted_for():
 FORBIDDEN_IN_STORE_PURE = FORBIDDEN_IN_PURE | {"google"}
 
 
-@pytest.mark.parametrize("module", sorted({"schema.py", "identity.py", "attest.py", "parse.py", "__init__.py"}))
+#: The store's pure modules, named once so the accounted-for guard and the purity guard cannot
+#: disagree about which files they cover.
+STORE_PURE = ("__init__.py", "attest.py", "identity.py", "parse.py", "schema.py")
+
+
+@pytest.mark.parametrize("module", STORE_PURE)
 def test_the_stores_pure_modules_are_actually_pure(module):
     """The classification above was DECORATIVE: it named `schema.py` pure and checked nothing.
 
