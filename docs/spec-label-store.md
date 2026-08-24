@@ -740,8 +740,17 @@ carries no exit code**.
 Deployment is three steps — `git pull`, `uv sync --extra db`, reinstall the wrapper — and the two-step
 version already left the box two merges behind with #137 undeployed. `tools/flabel-deploy` does all
 three, `md5sum`-checks the wrapper so it reinstalls only on a real change, runs `flabel-db verify`, and
-refuses while `pgrep -af "tcpreplay|flabel|uv run"` matches: `install` overwrites in place and bash
-reads a script as it executes.
+refuses while `pgrep -af "tcpreplay|flabel|uv run"` matches, because a deploy `git pull`s source a
+running labelling run imports lazily and `uv sync --extra db` **prunes the very virtualenv that run
+is executing out of** — a sync without the extra reports "Would uninstall 25 packages".
+
+The reason first given here was that "`install` overwrites in place and bash reads a script as it
+executes". **Measured 2026-08-24: that is false.** GNU `install` unlinks the destination and creates
+a new inode — the inode number changes and a hardlink to the old one keeps the old contents — which
+is exactly why it can replace a running binary where `cp` gets `ETXTBSY`. A running bash holds its
+descriptor on the old, unlinked inode and reads it to completion. The guard is right; the reason was
+folklore, and it had been repeated into a script header and three test docstrings before anyone
+measured it.
 
 One distribution. `[project.optional-dependencies] db`, and `packages = ["src/flabel", "src/flabeldb"]`
 — a sibling directory is not packaged until that list changes. `flabel`'s `dependencies = []` stays
