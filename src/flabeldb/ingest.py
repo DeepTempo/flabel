@@ -119,6 +119,43 @@ def next_attempt(
     )
 
 
+def first_unused_attempt(
+    probe: Callable[[str], str],
+    run_id: str,
+    table: str,
+    *,
+    max_attempts: int = MAX_ATTEMPTS,
+) -> int:
+    """The first attempt number whose job id is UNUSED — succeeded ones included.
+
+    **This is what `load_run` uses, and §5.3's step 3 as written is incompatible with its step 2.**
+    Measured 2026-08-24 against `flabel_scratch`, and the failure is worth stating exactly:
+
+    Step 2 deletes this run's rows from every table, unconditionally, because a new run and a
+    half-loaded run are indistinguishable. Step 3 then says a job that "exists and *succeeded*
+    means this table is done". After step 2 it does not: its rows have just been deleted. Driving
+    the recovery path against the real service produced a run whose `flow_labels` table ended up
+    with **zero** rows — cleared by step 2, then skipped by step 3, and the `runs` commit marker
+    landed on top of the emptiness.
+
+    A job id is permanent (§10 M1), so "this id succeeded once" says nothing about whether the rows
+    are there NOW. Once the rows have been cleared, the only question the walk can answer is which
+    id is free.
+
+    `next_attempt` keeps §5.3's literal semantics and is still the right function for a path that
+    does not clear first. Nothing calls it that way today; it is kept because the distinction is
+    the finding, and collapsing the two would hide it.
+    """
+    for attempt in range(1, max_attempts + 1):
+        if probe(job_id(run_id, table, attempt)) == MISSING:
+            return attempt
+    raise RuntimeError(
+        f"{run_id}/{table}: all {max_attempts} attempt ids are used. A job id is permanent, "
+        f"so this run has been loaded {max_attempts} times; that is not a retry loop, it is a run "
+        f"being re-ingested repeatedly. Check why the `runs` commit marker is not sticking."
+    )
+
+
 def classify_job(job: object | None) -> str:
     """What a load job's state means for the walk — `MISSING`, `SUCCEEDED` or `FAILED`.
 
@@ -376,6 +413,21 @@ def ingest_one(
 
         parsed = parse.of_directory(directory, ingested_at=ingested_at, archive_uri=uri)
 
+    return load_run(bq, dataset, parsed, skip_tier=skip_tier)
+
+
+def load_run(
+    bq, dataset: str, parsed, *, skip_tier: Iterable[int] = (), stop_after: str | None = None
+) -> dict:
+    """§5.3's three steps, over an already-parsed run.
+
+    Split from `ingest_one` so the recovery path can be driven without a network fetch — the
+    tarball is `ingest_one`'s concern and the ORDERING is this function's, and it is the ordering
+    that the `requires_bigquery` tests need to interrupt.
+
+    `stop_after` exists for exactly that: it stops the loop after the named table, which is how a
+    test produces the half-loaded state a crash would. It is not reachable from the CLI.
+    """
     run_id = parsed.run["run_id"]
     attested, notes = apply_skip_tiers(
         parsed.run["tiers_attested"], parsed.run["attestation_notes"], skip=skip_tier
@@ -383,21 +435,25 @@ def ingest_one(
     parsed.run["tiers_attested"] = list(attested)
     parsed.run["attestation_notes"] = list(notes)
 
+    # STEP 1 — the primary guard (§7.4). A query, not a job id.
     if already_committed(bq, dataset, run_id):
         return {"run_id": run_id, "status": "already-present", "refused": parsed.refused}
 
+    # STEP 2 — new and half-loaded are indistinguishable, so both get the same treatment.
     cleared = clear_orphans(bq, dataset, run_id)
+
+    # STEP 3 — attempt-numbered loads, `runs` last.
     loaded: dict[str, int] = {}
     for table in LOAD_ORDER:
         rows = rows_for(parsed, table)
-        attempt = next_attempt(lambda job: probe_job(bq, job), run_id, table)
-        if attempt is None:
-            # A previous attempt already landed this table; re-loading would double its rows.
-            loaded[table] = 0
-            continue
+        # `first_unused_attempt`, NOT `next_attempt`: step 2 above just deleted this run's rows,
+        # so a job that succeeded on a previous invocation does not mean the table is loaded.
+        attempt = first_unused_attempt(lambda job: probe_job(bq, job), run_id, table)
         if rows:
             load_rows(bq, dataset, table, rows, job_id(run_id, table, attempt))
         loaded[table] = len(rows)
+        if stop_after is not None and table == stop_after:
+            return {"run_id": run_id, "status": "interrupted", "loaded": loaded, "cleared": cleared}
 
     return {
         "run_id": run_id,
@@ -580,9 +636,11 @@ __all__ = [
     "already_committed",
     "apply_skip_tiers",
     "classify_job",
+    "first_unused_attempt",
     "clear_orphans",
     "job_id",
     "load_rows",
+    "load_run",
     "next_attempt",
     "probe_job",
     "split_gs_uri",

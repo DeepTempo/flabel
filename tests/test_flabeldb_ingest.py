@@ -445,3 +445,47 @@ def test_the_run_column_map_covers_exactly_the_tables_that_are_loaded():
 def test_captures_is_the_one_that_differs_and_that_is_why_the_map_exists():
     assert ingest.RUN_COLUMN["captures"] == "observed_by_run_id"
     assert ingest.RUN_COLUMN["runs"] == "run_id"
+
+
+# --- the walk that `load_run` actually uses ------------------------------------------------------
+#
+# **Found by driving the recovery path against the real service.** §5.3's step 3 says a job that
+# "exists and succeeded means this table is done" — and its step 2 has just DELETED that table's
+# rows, unconditionally, because a new run and a half-loaded run are indistinguishable. After the
+# delete, "done" is false. Measured: `flow_labels` ended a recovery with ZERO rows — cleared by
+# step 2, skipped by step 3 — and the `runs` commit marker landed on top of the emptiness.
+
+
+def test_after_a_clear_a_SUCCEEDED_id_is_used_not_done():
+    """The distinction the live failure turned up. `next_attempt` answers §5.3 literally;
+    `first_unused_attempt` answers the question that matters once the rows have been cleared."""
+    states = {ingest.job_id(RUN_ID, "flow_labels", 1): ingest.SUCCEEDED}
+
+    assert ingest.next_attempt(probe_from(states), RUN_ID, "flow_labels") is None
+    assert ingest.first_unused_attempt(probe_from(states), RUN_ID, "flow_labels") == 2
+
+
+def test_the_unused_walk_steps_past_both_kinds_of_used_id():
+    states = {
+        ingest.job_id(RUN_ID, "runs", 1): ingest.SUCCEEDED,
+        ingest.job_id(RUN_ID, "runs", 2): ingest.FAILED,
+        ingest.job_id(RUN_ID, "runs", 3): ingest.SUCCEEDED,
+    }
+    assert ingest.first_unused_attempt(probe_from(states), RUN_ID, "runs") == 4
+
+
+def test_a_fresh_run_still_uses_attempt_one():
+    assert ingest.first_unused_attempt(probe_from({}), RUN_ID, "runs") == 1
+
+
+def test_the_unused_walk_is_bounded_too():
+    calls = 0
+
+    def all_used(_job: str) -> str:
+        nonlocal calls
+        calls += 1
+        assert calls <= ingest.MAX_ATTEMPTS + 5, "the walk is unbounded"
+        return ingest.SUCCEEDED
+
+    with pytest.raises(RuntimeError, match="attempt ids are used"):
+        ingest.first_unused_attempt(all_used, RUN_ID, "runs")
