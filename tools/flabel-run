@@ -26,10 +26,16 @@ REPO="${FLABEL_RUN_REPO:-/opt/flabel/repo}"
 # FLABEL_RUN_INGEST in every test. It would have exited 5 on every successful run, forever, with
 # the store staying empty and the printed recovery command failing identically.
 #
-# **`--no-sync` and not a plain `uv run`**: a plain `uv run` re-resolves the environment to the
-# project's DEFAULT dependencies, and `db` is an OPTIONAL extra — so it would uninstall
-# google-cloud-bigquery out from under the command it is about to run. Installing the extra is
-# `tools/flabel-deploy`'s job (`uv sync --extra db`); this is not the place to re-resolve it.
+# **`--no-sync` because the environment is the deploy's business, not this script's.** It follows
+# `docs/label-store-provision.md`, which reaches every console script that way.
+#
+# The first version of this comment claimed a plain `uv run` would UNINSTALL google-cloud-bigquery,
+# because `db` is an optional extra. **Measured 2026-08-24: that is false, and the distinction is
+# worth keeping.** `uv sync` is EXACT — `uv sync --dry-run` without the extra reports "Would
+# uninstall 25 packages", google-cloud-bigquery among them. `uv run` is INEXACT; `--exact` is opt-in,
+# so it adds what is missing and prunes nothing. `uv run flabel` and `uv run flabel-db` both left the
+# extra intact. So `--no-sync` buys a skipped re-resolve on every indexed run, not rescue from a
+# destroyed venv — and the labelling call below is correct to be a plain `uv run`.
 #
 # Left UNQUOTED at the call site, following $SUDO and $GCLOUD: this is a COMMAND LINE, not a path,
 # so it must word-split. That is also what makes the override usable — an operator reaching for
@@ -235,15 +241,6 @@ TARGET="$1"; shift
 # Only a gs:// argument becomes a `--source-uri`. flabel validates the flag as a gs:// object and
 # exits 2 otherwise, and `provenance` derives `uri_status` as `"gs" if source_uri else "local"` —
 # so passing a local path here would both fail the validation and assert an origin that is false.
-#
-# **`FLABEL_`-prefixed on purpose** (#171). The config sourcing below saves and restores only names
-# matching `^FLABEL_`, so a plain `SOURCE_URI` is one `SOURCE_URI=` line in `flabel.env` away from
-# being silently replaced — and it would land in `run.input.uri`, the provenance field this whole
-# step exists to populate. CLAUDE.md's top guardrail is that no verdict carries an origin that
-# cannot be traced.
-FLABEL_RUN_SOURCE_URI=""
-case "$TARGET" in gs://*) FLABEL_RUN_SOURCE_URI="$TARGET" ;; esac
-
 [ -f "$CONF" ] || { echo "flabel-run: $CONF is missing; the device settings live there" >&2; exit 1; }
 
 # The config file supplies DEFAULTS; anything already in the environment wins.
@@ -252,10 +249,30 @@ case "$TARGET" in gs://*) FLABEL_RUN_SOURCE_URI="$TARGET" ;; esac
 # so `FLABEL_SETTLE_SECONDS=15 flabel-run x.pcap` still settled for the file's 60 and gave no
 # hint it had ignored you. Saving and restoring is uglier than sourcing and is the behaviour a
 # caller expects from an environment variable.
-_saved_env="$(export -p | grep -E '^(export |declare -x )FLABEL_' || true)"
+# `GCP_PROJECT` joins the `FLABEL_` names, and it is not decorative: the usage block promises
+# "anything you set here WINS over flabel.env", and without it that promise was false for the one
+# variable that decides WHICH GCP PROJECT receives label data. `GCP_PROJECT=scratch flabel-run x`
+# would have been silently overridden by the config's production id.
+_saved_env="$(export -p | grep -E '^(export |declare -x )(FLABEL_|GCP_PROJECT)' || true)"
 # shellcheck disable=SC1090
 set -a; . "$CONF"; set +a
 eval "$_saved_env"
+
+# **The origin, derived AFTER the config file has been read and the caller's environment restored
+# over it.** Renaming this `FLABEL_`-prefixed was the first attempt and it does not work: the
+# save on the line above is `export -p`, which lists only EXPORTED variables, and a plain
+# assignment is not one — so the name never entered the snapshot and never came back out of it.
+# Deriving it here instead puts it beyond the reach of `. "$CONF"` entirely, whatever it is called.
+#
+# It still precedes every reassignment of `$TARGET` — the `gs://` staging block below and the
+# `readlink -f` after it — which is the property that matters: this is the ORIGINAL argument, and
+# losing it is how the bucket URI used to be discarded (spec §6.1).
+#
+# It matters because it lands in `run.input.uri`. CLAUDE.md's top guardrail is that no verdict
+# carries an origin that cannot be traced, and a config file quietly forging one is the quietest
+# possible way to break it.
+FLABEL_RUN_SOURCE_URI=""
+case "$TARGET" in gs://*) FLABEL_RUN_SOURCE_URI="$TARGET" ;; esac
 
 # Now that the config has been read and the caller's environment restored over it, the publishing
 # destination is knowable. A trailing slash is stripped because `gs://bucket/results/` is the
@@ -450,8 +467,8 @@ publish() {
 #: are intact both on the box and in the bucket, so reusing 1 would tell a batch caller to discard
 #: a capture that succeeded. Re-indexing is free (`flabel-ingest` short-circuits on the commit
 #: marker), so the recovery is to re-run the ingest, not the capture.
-#: Exit 5 only when the run itself succeeded. A dead run is not published, so it cannot reach here
-#: — but if it ever did, its own code is the more important fact and keeps precedence.
+# Exit 5 only when the run itself succeeded. A dead run is not published, so it cannot reach here —
+# but if it ever did, its own code is the more important fact and keeps precedence.
 not_indexed() {
   echo "flabel-run: PUBLISHED BUT NOT INDEXED — $1" >&2
   echo "flabel-run: the run succeeded and its labels are intact, on the box and in the bucket." >&2
@@ -474,6 +491,8 @@ index_run() {
     echo "flabel-run: GCP_PROJECT is not set, and flabel-ingest cannot reach the store without it." >&2
     echo "flabel-run: the repo is public, so the id is never committed. Add it to $CONF:" >&2
     echo "flabel-run:   export GCP_PROJECT=<the project id>      # see .env.example" >&2
+    echo "flabel-run: then re-index with:" >&2
+    echo "flabel-run:   cd $REPO && $INGEST $uri" >&2
     return 0
   fi
 
@@ -497,6 +516,16 @@ index_run() {
   # and collapsing all three into 5 told the operator to re-run for two of them, where re-running
   # changes nothing. Exit 5 stays one code — a batch caller needs one answer — but the log now
   # carries which.
+  # **Above 128 means a SIGNAL, not an exit status.** `wait` returns 128+N when it is interrupted,
+  # and `flabel-ingest` only ever returns 0, 1, 2 or 3 — so reporting "exited 143" sends the
+  # operator to file a bug against a tool that did nothing wrong.
+  if [ "$code" -gt 128 ]; then
+    echo "flabel-run: the indexing was TERMINATED by signal $((code - 128)), not failed." >&2
+    echo "flabel-run: the store may hold a partial load; re-indexing clears and reloads it." >&2
+    echo "flabel-run: re-index with:" >&2
+    echo "flabel-run:   cd $REPO && $INGEST $uri" >&2
+    return 0
+  fi
   echo "flabel-run: flabel-ingest exited $code." >&2
   case "$code" in
     1) echo "flabel-run: 1 = not ingested. Re-indexing is free and is the right first move." >&2 ;;

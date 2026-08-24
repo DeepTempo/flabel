@@ -15,7 +15,9 @@ assertion — *what would have been run* — available without running it.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -105,7 +107,14 @@ exit "${{FAKE_EXIT:-0}}"
     gcloud.write_text(
         f"""#!/bin/bash
 printf "%s\\n" "$*" >> {gcloud_log}
-case "$*" in *"cp "*) printf 'PUBLISH %s\\n' "$*" >> {order_log} ;; esac
+# A PUBLISH is a `cp` whose DESTINATION is the bucket. `stage_capture` also runs `storage cp`,
+# downwards, and matching on "cp " alone counted that as a publish — correct only for as long as
+# every test using `ordering()` happens to pass a local capture.
+case "$*" in
+  *"cp "*) case "${{@: -1}}" in
+    gs://*) printf 'PUBLISH %s\\n' "$*" >> {order_log} ;;
+  esac ;;
+esac
 # A staging fetch has to leave a file behind or the wrapper's existence check stops the run before
 # anything interesting happens. Only for a LOCAL destination: an upload's destination is a gs:// URI
 # and must not be created on disk.
@@ -122,10 +131,13 @@ exit "${{FAKE_GCLOUD_EXIT:-0}}"
     # A `flabel-ingest` stub: logs the URI it was handed and honours FAKE_INGEST_EXIT, so
     # "published but not indexed" (exit 5) is reachable without BigQuery.
     ingest_log = tmp_path / "ingest-log"
+    # What the ingest actually SAW for the project, so "the environment wins" is observable.
+    ingest_env = tmp_path / "ingest-project"
     ingest = tmp_path / "fake-ingest"
     ingest.write_text(
         f"""#!/bin/bash
 printf 'INDEX %s\\n' "$*" >> {order_log}
+printf '%s\\n' "${{GCP_PROJECT:-}}" > {ingest_env}
 for a in "$@"; do case "$a" in gs://*) printf '%s\\n' "$a" >> {ingest_log};; esac; done
 if [ -n "${{FAKE_INGEST_SLEEP:-}}" ]; then
   trap 'printf terminated > {ingest_marker}; exit 143' TERM
@@ -145,6 +157,7 @@ exit "${{FAKE_INGEST_EXIT:-0}}"
         "GCP_PROJECT": "test-project",
         "_ingest_log": str(ingest_log),
         "_order_log": str(order_log),
+        "_ingest_env": str(ingest_env),
         "_ingest_marker": str(ingest_marker),
         "FLABEL_RUN_CONF": str(conf),
         "FLABEL_RUN_CAPTURES": str(tmp_path / "captures"),
@@ -199,6 +212,29 @@ def ingests(lab: dict[str, str]) -> list[str]:
     """Every URI `flabel-ingest` was asked to index, or `[]` if it was never called."""
     log = Path(lab["_ingest_log"])
     return log.read_text().splitlines() if log.exists() else []
+
+
+def wait_for_marker(marker: Path, value: str, *, tries: int = 300) -> str:
+    """Poll a marker file until it holds `value`, and return what it holds.
+
+    **On CONTENT, never on existence.** `printf x > f` truncates before it writes, so a poll that
+    breaks on `f.exists()` can win the race at the zero-length instant and then assert `"" == "x"`.
+    That is a flake in the test, not a defect in the wrapper, and it is exactly the shape that made
+    a sibling test red in CI and green here.
+    """
+    import time
+
+    for _ in range(tries):
+        try:
+            if marker.read_text() == value:
+                return value
+        except OSError:
+            pass
+        time.sleep(0.05)
+    try:
+        return marker.read_text()
+    except OSError:
+        return "<no marker>"
 
 
 def ordering(lab: dict[str, str]) -> list[str]:
@@ -1173,7 +1209,11 @@ def test_a_gs_capture_passes_the_ORIGINAL_uri_and_not_the_staged_path(lab, tmp_p
     # the staged path SHOULD be in the command line, as the capture argument. The two facts
     # together are the actual contract, so both are asserted: flabel is handed the staged copy to
     # read, and told the gs:// origin it came from.
-    staged = f"{lab['FLABEL_RUN_CAPTURES']}/capture.pcap"
+    # `os.path.realpath`, because the wrapper runs the capture through `readlink -f`. On macOS —
+    # which this repo supports, and which `publish()`'s COPYFILE_DISABLE comment exists for —
+    # tmp paths live under `/var/folders/…`, a symlink to `/private/var/folders/…`, so a literal
+    # comparison fails on a developer's laptop while saying something untrue about the wrapper.
+    staged = os.path.realpath(f"{lab['FLABEL_RUN_CAPTURES']}/capture.pcap")
     assert value != staged
     assert staged in args, f"the staged copy is not what flabel was asked to read: {args}"
     assert args.index(staged) < args.index("--source-uri"), (
@@ -1352,7 +1392,11 @@ def test_the_default_ingest_command_is_reached_through_uv_run_and_not_from_PATH(
     # an environment the production one never has — and when the default was sabotaged back to the
     # bare name it ran the real ingest, which reached storage.googleapis.com for a 403. No test in
     # this repo may contact the network (CLAUDE.md), including a failing one.
-    clean = [d for d in os.environ["PATH"].split(os.pathsep) if ".venv" not in d]
+    clean = [
+        d
+        for d in os.environ["PATH"].split(os.pathsep)
+        if ".venv" not in d and d != os.path.dirname(sys.executable)
+    ]
     result = invoke(
         lab,
         str(path),
@@ -1362,6 +1406,13 @@ def test_the_default_ingest_command_is_reached_through_uv_run_and_not_from_PATH(
             "FAKE_MAKE_RUN": "1",
             "FAKE_WRITE_LABELS": "1",
         },
+    )
+
+    # Explicit, not incidental: if a bare `flabel-ingest` were still reachable, a regression here
+    # would run the REAL ingest and reach storage.googleapis.com. No test may contact the network,
+    # including a failing one, and relying on the PATH edit to guarantee that is relying on luck.
+    assert shutil.which("flabel-ingest", path=os.pathsep.join(clean)) is None, (
+        "flabel-ingest is still on PATH, so a regression here would run the real ingest"
     )
 
     assert result.returncode == 0, result.stderr
@@ -1450,7 +1501,6 @@ def test_a_terminating_signal_reaches_the_indexing_child(lab, tmp_path):
     "Still green" was true, and was not the same as "covered".
     """
     import signal
-    import time
 
     path = capture(tmp_path)
     marker = Path(lab["_ingest_marker"])
@@ -1465,22 +1515,29 @@ def test_a_terminating_signal_reaches_the_indexing_child(lab, tmp_path):
         stderr=subprocess.PIPE,
         text=True,
     )
-    for _ in range(200):
-        if marker.exists():
-            break
-        time.sleep(0.05)
-    assert marker.exists() and marker.read_text() == "started", "the indexing child never started"
+    assert wait_for_marker(marker, "started") == "started", "the indexing child never started"
 
-    process.send_signal(signal.SIGTERM)
-    process.wait(timeout=30)
+    try:
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=30)
+    finally:
+        if process.poll() is None:  # a hang must not leave a wrapper and a sleeper behind
+            process.kill()
+            process.wait(timeout=10)
 
-    for _ in range(200):
-        if marker.read_text() != "started":
-            break
-        time.sleep(0.05)
-    assert marker.read_text() == "terminated", (
+    assert wait_for_marker(marker, "terminated") == "terminated", (
         "the indexing child was orphaned: the wrapper died and left it writing to the store"
     )
+
+    # **And it must be reported as a signal, not as an exit status.** `wait` returns 128+N when it
+    # is interrupted, and `flabel-ingest` only ever returns 0, 1, 2 or 3 — so "flabel-ingest exited
+    # 143" sends the operator to file a bug against a tool that did nothing wrong. Found by
+    # sabotaging the `-gt 128` branch and watching this test stay green.
+    stderr = process.stderr.read() if process.stderr else ""
+    assert "exited 143" not in stderr, (
+        f"a signal was reported as an exit status flabel-ingest cannot return: {stderr}"
+    )
+    assert "TERMINATED by signal 15" in stderr, stderr
 
 
 def test_the_publish_happens_before_the_index(lab, tmp_path):
@@ -1539,23 +1596,61 @@ def test_a_run_that_labelled_something_and_one_that_labelled_nothing_are_both_in
 
 
 def test_a_config_file_cannot_replace_the_recorded_origin(lab, tmp_path):
-    """`SOURCE_URI` was un-namespaced, and the config sourcing saves and restores only names
-    matching `^FLABEL_`.
+    """A line in `flabel.env` — a file the operator edits — must not be able to forge a capture's
+    recorded origin. It lands in `run.input.uri`, and CLAUDE.md's top guardrail is that no verdict
+    carries an origin that cannot be traced.
 
-    So a single `SOURCE_URI=` line in `/var/lib/flabel/flabel.env` — a file the operator edits —
-    silently replaced the origin on every run, and it lands in `run.input.uri`: the provenance
-    field the whole step exists to populate. CLAUDE.md's top guardrail is that no verdict carries
-    an origin that cannot be traced, and this is the quietest possible way to break it. Renaming it
-    `FLABEL_RUN_SOURCE_URI` puts it under the restore that already exists.
+    **Renaming it `FLABEL_`-prefixed was the first attempt and it does not work.** The save is
+    `export -p`, which lists only EXPORTED variables; a plain assignment is not one, so the name
+    never entered the snapshot and never came back out of it. The rename moved the hazard to the
+    new name rather than closing it.
 
-    Found by a fresh review of the merged diff (#171), not by the tests.
+    What closes it is deriving the origin *after* the sourcing and the restore, which puts it
+    beyond `. "$CONF"` whatever it is called — and still before every reassignment of `$TARGET`,
+    which is the property the origin depends on.
     """
     conf = Path(lab["FLABEL_RUN_CONF"])
-    conf.write_text(conf.read_text() + "SOURCE_URI=gs://somewhere-else/wrong.pcap\n")
+    # **The name the wrapper actually reads.** The first version of this test wrote the OLD name,
+    # `SOURCE_URI=`, which the wrapper had just stopped using — so it passed no matter what the
+    # code did, including with the fix reverted. A test that cannot fail is not coverage, and
+    # writing one an hour after recording that exact rule is why the review is a gate.
+    conf.write_text(conf.read_text() + "FLABEL_RUN_SOURCE_URI=gs://somewhere-else/wrong.pcap\n")
 
     args = flabel_args_after_gs_run(lab, tmp_path, "gs://bucket/dir/capture.pcap")
 
     value = args[args.index("--source-uri") + 1]
     assert value == "gs://bucket/dir/capture.pcap", (
         "a line in flabel.env replaced the capture's recorded origin"
+    )
+
+
+def test_the_environment_beats_the_config_file_for_the_project_that_receives_labels(lab, tmp_path):
+    """The usage block's heading is "anything you set here WINS over flabel.env", and the
+    save/restore that makes it true filtered on `^FLABEL_` only — so it was false for
+    `GCP_PROJECT`, the single variable deciding WHICH GCP PROJECT receives label data.
+
+    A one-off run into a scratch project would have gone silently into production instead, which is
+    the same bug the wrapper's own comment says the save/restore exists to prevent
+    (`FLABEL_SETTLE_SECONDS=15` still settling for the file's 60, and giving no hint it had ignored
+    you), reintroduced for the one variable where it is expensive.
+    """
+    conf = Path(lab["FLABEL_RUN_CONF"])
+    conf.write_text(conf.read_text() + "export GCP_PROJECT=the-production-project\n")
+    path = capture(tmp_path)
+
+    result = invoke(
+        lab,
+        str(path),
+        extra={
+            "GCP_PROJECT": "my-scratch-project",
+            "FAKE_MAKE_RUN": "1",
+            "FAKE_WRITE_LABELS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert ingests(lab), "the run was never indexed, so this proves nothing about the project"
+    assert Path(lab["_ingest_env"]).read_text().strip() == "my-scratch-project", (
+        "the config file overrode the project given on the command line, so a scratch run would "
+        "have written into production"
     )
