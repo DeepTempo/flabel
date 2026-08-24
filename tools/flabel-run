@@ -15,6 +15,10 @@ CONF="${FLABEL_RUN_CONF:-/var/lib/flabel/flabel.env}"
 CAPTURES="${FLABEL_RUN_CAPTURES:-/var/lib/flabel/captures}"
 RUNS="${FLABEL_RUN_RUNS:-/var/lib/flabel/runs}"
 REPO="${FLABEL_RUN_REPO:-/opt/flabel/repo}"
+# Overridable like every other external command here, so the tests need neither /opt nor a real
+# dataset. `flabel-ingest` is a console script of the `flabeldb` package, installed by the same
+# `uv sync --extra db` that LS-2's deploy runs.
+INGEST="${FLABEL_RUN_INGEST:-flabel-ingest}"
 
 # The privilege wrapper, overridable for the same reason: a replay needs root for raw sockets,
 # and a test must be able to observe the command WITHOUT running it as root or at all.
@@ -185,6 +189,17 @@ esac
 
 TARGET="$1"; shift
 
+# **The origin, captured before anything can overwrite it.** A gs:// capture is staged below and
+# `TARGET` is then reassigned to the local path, which is exactly how the bucket URI used to be
+# discarded with the shell variable — `run.input.path` recorded the staged path and no amount of
+# reading the run directory afterwards recovered where the capture came from (spec §6.1).
+#
+# Only a gs:// argument becomes a `--source-uri`. flabel validates the flag as a gs:// object and
+# exits 2 otherwise, and `provenance` derives `uri_status` as `"gs" if source_uri else "local"` —
+# so passing a local path here would both fail the validation and assert an origin that is false.
+SOURCE_URI=""
+case "$TARGET" in gs://*) SOURCE_URI="$TARGET" ;; esac
+
 [ -f "$CONF" ] || { echo "flabel-run: $CONF is missing; the device settings live there" >&2; exit 1; }
 
 # The config file supplies DEFAULTS; anything already in the environment wins.
@@ -292,7 +307,7 @@ $SUDO -E env \
   FLABEL_REPLAY_MULTIPLIER="${FLABEL_REPLAY_MULTIPLIER:-1000}" \
   FLABEL_REPLAY_TOPSPEED="${FLABEL_REPLAY_TOPSPEED:-}" \
   FLABEL_SETTLE_SECONDS="${FLABEL_SETTLE_SECONDS:-60}" \
-  uv run flabel "$TARGET" --output-dir "$RUNS" "$@" &
+  uv run flabel "$TARGET" --output-dir "$RUNS" ${SOURCE_URI:+--source-uri "$SOURCE_URI"} "$@" &
 CHILD=$!
 trap 'kill -TERM "$CHILD" 2>/dev/null' TERM INT HUP
 wait "$CHILD"
@@ -331,6 +346,9 @@ publish() {
     echo "flabel-run: not publishing $name — it wrote no labels.json, so there is no result" >&2
     return 0
   fi
+  # From here the function either publishes or fails. PUBLISHED is set only on the success path,
+  # below, because `return 0` above means DECLINED and an `if` cannot tell the two apart — which
+  # would let the indexing step ask the bucket for an object nobody wrote.
 
   # Built in a temporary directory, not inside $RUNS. A tarball written beside the run directories
   # is picked up as one by anything that lists them — including this script's own BEFORE/AFTER
@@ -372,7 +390,36 @@ publish() {
     return 1
   fi
   rm -rf "$workdir"
+  PUBLISHED="$name"
   echo "flabel-run: published $RESULTS_URI/$name.tar.gz"
+  return 0
+}
+
+#: Index a published run, and record the one outcome that is neither success nor failure.
+#:
+#: **Ordering is always archive-then-index** (§7.5). The tarball is the system of record and the
+#: store is a view over it, so a store write that preceded the publish could index a run that never
+#: reached the bucket — and `flabel-ingest` reads the published tarball rather than the local run
+#: directory precisely so that every ingested run is provably rebuildable (§7.2).
+#:
+#: **Exit 5: published, not indexed.** On exit 4's reasoning from `docs/spec.md` §12 — the labels
+#: are intact both on the box and in the bucket, so reusing 1 would tell a batch caller to discard
+#: a capture that succeeded. Re-indexing is free (`flabel-ingest` short-circuits on the commit
+#: marker), so the recovery is to re-run the ingest, not the capture.
+index_run() {
+  local name="$1" uri
+  uri="$RESULTS_URI/$name.tar.gz"
+  echo "flabel-run: indexing $uri"
+  if "$INGEST" "$uri"; then
+    return 0
+  fi
+  echo "flabel-run: PUBLISHED BUT NOT INDEXED — $uri" >&2
+  echo "flabel-run: the run succeeded and its labels are intact, on the box and in the bucket." >&2
+  echo "flabel-run: only the store is behind. Re-index with:" >&2
+  echo "flabel-run:   $INGEST $uri" >&2
+  # Exit 5 only when the run itself succeeded. A dead run is not published, so it cannot reach
+  # here — but if it ever did, its own code is the more important fact and keeps precedence.
+  [ "$STATUS" = "0" ] && STATUS=5
   return 0
 }
 
@@ -404,7 +451,15 @@ if [ -n "$RESULTS_URI" ]; then
   done < <(comm -13 <(printf '%s\n' "$BEFORE" | sort) <(printf '%s\n' "$AFTER" | sort))
 
   if [ "$COUNT" = "1" ]; then
-    publish "$OUTPUT_DIR/$NEW" || unpublished_if_run_succeeded
+    PUBLISHED=""
+    if publish "$OUTPUT_DIR/$NEW"; then
+      # Only a run that was actually published is indexed. `publish` returns 0 when it DECLINES —
+      # a run with no labels.json is not a result — and indexing then would fetch a tarball that
+      # was never written.
+      [ -n "$PUBLISHED" ] && index_run "$PUBLISHED"
+    else
+      unpublished_if_run_succeeded
+    fi
   elif [ "$COUNT" = "0" ]; then
     # Normal for a rejected capture, and for a failure before the directory could be created.
     # Not an error, and not silent: "nothing was published" is worth one line.

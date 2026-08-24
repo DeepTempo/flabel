@@ -106,7 +106,21 @@ exit "${{FAKE_GCLOUD_EXIT:-0}}"
     )
     gcloud.chmod(0o755)
 
+    # A `flabel-ingest` stub: logs the URI it was handed and honours FAKE_INGEST_EXIT, so
+    # "published but not indexed" (exit 5) is reachable without BigQuery.
+    ingest_log = tmp_path / "ingest-log"
+    ingest = tmp_path / "fake-ingest"
+    ingest.write_text(
+        f"""#!/bin/bash
+for a in "$@"; do case "$a" in gs://*) printf '%s\\n' "$a" >> {ingest_log};; esac; done
+exit "${{FAKE_INGEST_EXIT:-0}}"
+"""
+    )
+    ingest.chmod(0o755)
+
     return {
+        "FLABEL_RUN_INGEST": str(ingest),
+        "_ingest_log": str(ingest_log),
         "FLABEL_RUN_CONF": str(conf),
         "FLABEL_RUN_CAPTURES": str(tmp_path / "captures"),
         "FLABEL_RUN_RUNS": str(tmp_path / "runs"),
@@ -153,6 +167,12 @@ def recorded(lab: dict[str, str]) -> str:
 def uploads(lab: dict[str, str]) -> list[str]:
     """Every `gcloud` invocation the wrapper made, one per line, or `[]` if it made none."""
     log = Path(lab["_gcloud_log"])
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def ingests(lab: dict[str, str]) -> list[str]:
+    """Every URI `flabel-ingest` was asked to index, or `[]` if it was never called."""
+    log = Path(lab["_ingest_log"])
     return log.read_text().splitlines() if log.exists() else []
 
 
@@ -1082,3 +1102,170 @@ def test_a_failed_stage_stops_immediately_and_says_only_the_real_reason(lab, tmp
     assert "no such capture" not in result.stderr, (
         "a denied fetch must not also report a missing file — that is the wrong diagnosis"
     )
+
+
+# --- LS-5: the origin URI, and indexing after the publish ---------------------------------------
+#
+# Two changes, and the first is the one the requirement actually rests on. `tools/flabel-run` stages
+# a `gs://` object and then assigns `TARGET="$LOCAL"`, so `run.input.path` recorded the staged local
+# path and the bucket URI was **discarded with the shell variable** — spec §6.1 is explicit that
+# without `--source-uri` the requirement cannot be met at all, because no amount of reading a run
+# directory afterwards recovers where the capture came from.
+
+
+def flabel_args(lab: dict[str, str]) -> list[str]:
+    """The arguments the wrapper handed to `flabel`, one per line as the sudo stub records them.
+
+    Returned as a LIST and asserted on element-wise, never by substring over the joined command.
+    #134's review found a check that passed because the pytest temp path happened to contain the
+    string it was looking for — on macOS, runs live under `/var/folders/`, so "is the staged path
+    absent?" was satisfied by an accident of the fixture rather than by the wrapper.
+    """
+    return recorded(lab).splitlines()
+
+
+def test_a_gs_capture_passes_the_ORIGINAL_uri_and_not_the_staged_path(lab, tmp_path):
+    args = flabel_args_after_gs_run(lab, tmp_path, "gs://bucket/dir/capture.pcap")
+
+    assert "--source-uri" in args
+    value = args[args.index("--source-uri") + 1]
+    assert value == "gs://bucket/dir/capture.pcap"
+    # And the staged path is not what was passed — checked as an ELEMENT, not a substring.
+    staged = f"{lab['FLABEL_RUN_CAPTURES']}/capture.pcap"
+    assert value != staged
+    assert staged not in [a for a in args if a.startswith("--source-uri")]
+
+
+def flabel_args_after_gs_run(lab, tmp_path, uri: str) -> list[str]:
+    result = invoke(lab, uri, extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1"})
+    assert result.returncode == 0, result.stderr
+    return flabel_args(lab)
+
+
+def test_a_local_capture_passes_NO_source_uri_so_uri_status_reads_local(lab, tmp_path):
+    """§6.1: flabel writes `gs` or `local`, and `provenance` derives it as `"gs" if source_uri else
+    "local"`. Passing the local path here would record it as a `gs` origin, which is false — and
+    `--source-uri` validates as a gs:// object anyway, so it would exit 2 before the run."""
+    path = capture(tmp_path)
+    result = invoke(lab, str(path), extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1"})
+
+    assert result.returncode == 0, result.stderr
+    assert "--source-uri" not in flabel_args(lab)
+
+
+def test_the_source_uri_survives_extra_arguments(lab, tmp_path):
+    """The wrapper appends `"$@"` after its own flags, so an operator flag must not displace it."""
+    result = invoke(
+        lab, "gs://bucket/c.pcap", "--both", extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1"}
+    )
+
+    assert result.returncode == 0, result.stderr
+    args = flabel_args(lab)
+    assert args[args.index("--source-uri") + 1] == "gs://bucket/c.pcap"
+    assert "--both" in args
+
+
+# --- indexing, and exit 5 ------------------------------------------------------------------------
+
+
+def test_a_published_run_is_then_indexed(lab, tmp_path):
+    """§7.5: ordering is always archive-then-index. The tarball is the system of record and the
+    store is a view over it, so a store write that preceded the publish could index a run that
+    never reached the bucket."""
+    path = capture(tmp_path)
+    result = invoke(lab, str(path), extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1"})
+
+    assert result.returncode == 0, result.stderr
+    assert ingests(lab), "nothing was indexed after a successful publish"
+    assert ingests(lab)[0].startswith("gs://test-bucket/results/"), ingests(lab)
+
+
+def test_an_unpublished_run_is_never_indexed(lab, tmp_path):
+    """Publishing off means there is no tarball, and `flabel-ingest` reads the tarball (§7.2).
+    Indexing anyway would ask the bucket for an object nobody wrote."""
+    path = capture(tmp_path)
+    result = invoke(
+        lab,
+        str(path),
+        extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1", "FLABEL_RESULTS_URI": ""},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert ingests(lab) == []
+
+
+def test_a_failed_run_is_neither_published_nor_indexed_and_still_exits_1(lab, tmp_path):
+    path = capture(tmp_path)
+    result = invoke(lab, str(path), extra={"FAKE_EXIT": "1"})
+
+    assert result.returncode == 1
+    assert uploads(lab) == []
+    assert ingests(lab) == []
+
+
+def test_an_ingest_failure_exits_5_with_the_labels_intact_and_the_tarball_published(lab, tmp_path):
+    """**Exit 5: published, not indexed** (§7.5), on exit 4's reasoning from spec §12.
+
+    Reusing 1 would tell a batch caller to discard a capture that SUCCEEDED — the labels are on the
+    box and in the bucket, and only the index is behind. That is a different instruction from "this
+    capture produced nothing".
+    """
+    path = capture(tmp_path)
+    result = invoke(
+        lab,
+        str(path),
+        extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1", "FAKE_INGEST_EXIT": "1"},
+    )
+
+    assert result.returncode == 5, result.stderr
+    assert uploads(lab), "the tarball was not published"
+    assert "5" in result.stderr or "index" in result.stderr.lower()
+
+
+def test_exit_5_is_distinct_from_every_other_code_the_wrapper_uses(lab, tmp_path):
+    """1 is a dead run, 2 is usage, 5 is published-not-indexed. A caller that cannot tell them
+    apart cannot decide whether to re-run the capture or only re-index it."""
+    path = capture(tmp_path)
+    usage = invoke(lab)
+    assert usage.returncode == 2
+    dead = invoke(lab, str(path), extra={"FAKE_EXIT": "1"})
+    assert dead.returncode == 1
+    unindexed = invoke(
+        lab,
+        str(path),
+        extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1", "FAKE_INGEST_EXIT": "1"},
+    )
+    assert unindexed.returncode == 5
+
+
+def test_a_run_that_labelled_nothing_is_still_published_and_still_indexed(lab, tmp_path):
+    """`docs/spec.md` §13: an all-IPsec capture exits 0 with `labels[]` empty, and `_write_output`
+    writes `labels.json` unconditionally on the success path. So a clean capture already publishes,
+    and indexing it is how a previously authoritative tier gets cleared.
+
+    Revision 1 wanted to change the publish condition to exit 0 for exactly this; the premise was
+    false, and the behaviour it was reaching for is what this pins.
+    """
+    path = capture(tmp_path)
+    result = invoke(lab, str(path), extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1"})
+
+    assert result.returncode == 0, result.stderr
+    assert uploads(lab), "an empty-labels run was not published"
+    assert ingests(lab), "an empty-labels run was not indexed, so a stale tier stays authoritative"
+
+
+def test_a_run_with_no_labels_is_declined_by_publish_and_therefore_not_indexed(lab, tmp_path):
+    """**Found while wiring the indexing step.** `publish` returns 0 in two different situations:
+    it published, and it DECLINED because the run wrote no `labels.json` — a failed run's directory
+    exists but is not a result. An `if publish; then index` cannot tell those apart, so the first
+    version indexed a run whose tarball was never written, and `flabel-ingest` would have asked the
+    bucket for an object that does not exist.
+
+    The wrapper records what it actually published instead of reading the exit code.
+    """
+    path = capture(tmp_path)
+    result = invoke(lab, str(path), extra={"FAKE_MAKE_RUN": "1"})  # no FAKE_WRITE_LABELS
+
+    assert uploads(lab) == [], "a run with no labels.json was published"
+    assert ingests(lab) == [], "a run that was never published was indexed"
+    assert result.returncode == 0

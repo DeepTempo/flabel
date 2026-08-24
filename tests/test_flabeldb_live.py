@@ -665,3 +665,144 @@ def test_a_load_that_succeeded_is_not_repeated_on_a_re_run(bq):
     # count is what one clean ingest produces — not zero (cleared then skipped) and not two.
     ingest.load_run(bq, DATASET, a_parsed_run("dedupe1"))
     assert counts_for(bq, run_id)["flow_labels"] == 1, "recovery did not restore exactly one row"
+
+
+# --- a clean capture is a result, against the real view ------------------------------------------
+#
+# `docs/spec.md` §13: an all-IPsec capture "exits 0 with `labels[]` empty", and `_write_output`
+# writes `labels.json` unconditionally on the success path — so a run that labelled nothing is
+# published and is indexed. `test_flabel_run.py` pins both of those. What the indexing is FOR
+# cannot be tested there: it needs the view, and the view needs BigQuery. This is the other half,
+# and it is the behaviour revision 1's deleted publish-on-exit-0 bullet was reaching for.
+
+
+def a_run_over(capture: str, *, started_at: str, finished_at: str, labelled: bool):
+    """A run over `capture` attesting tier 2, with or without a label.
+
+    `started_at` is the only thing separating the two runs' identities: §3.3 derives `run_id` from
+    `(capture, mode, started_at, flabel_version)`, and the other three are held equal deliberately
+    — two runs over ONE capture is the situation under test.
+    """
+    from flabeldb import parse
+
+    label = {
+        "best_tier": 2,
+        "flow": {
+            "proto": "tcp",
+            "src_ip": "10.0.0.1",
+            "src_port": 1234,
+            "dst_ip": "10.0.0.2",
+            "dst_port": 80,
+            "ts_first": "2026-08-24T00:00:01.000000Z",
+            "ts_last": "2026-08-24T00:00:02.000000Z",
+            "uid": "CabcDEF",
+        },
+        "labels": [{"name": "verdict", "value": "malicious", "tier": 2, "sids": [1]}],
+        "sources": [{"tier": 2, "source": "et/open", "sid": 1, "rev": 1}],
+    }
+    document = {
+        "run": {
+            "mode": "offline",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "flabel_version": "0.0.0",
+            "tiers_attempted": [2],
+            "tool_failures": [],
+            # Attested: `rules_loaded == total_admitted` and neither is zero (§2.4). Load-bearing
+            # for the empty run — a run that attests nothing supersedes nothing, so without this
+            # the test would go green while proving the opposite of what it claims.
+            "counts": {"rules_loaded": 10, "rules_failed": 0, "rules_skipped": 0},
+            "ruleset": {"snapshot_id": "b8b1e00ed2285240", "total_admitted": 10},
+            "input": {"sha256": capture, "path": "/x/y.pcap", "bytes": 1, "snaplens": [96]},
+        },
+        "labels": [label] if labelled else [],
+        "unmatched_detections": [],
+    }
+    return parse.rows(document, ingested_at="2026-08-24T12:00:00.000000Z")
+
+
+def authoritative_for(bq, capture: str) -> set[tuple[int, str]]:
+    """`(tier, run_id)` the view currently supplies for one capture."""
+    rows = bq.query(
+        f"SELECT tier, run_id FROM `{bq.project}.{DATASET}.authoritative_runs` "
+        f"WHERE capture_sha256 = '{capture}'"
+    ).result()
+    return {(row.tier, row.run_id) for row in rows}
+
+
+def authoritative_labels(bq, capture: str) -> int:
+    """Flow labels reachable THROUGH the view — `blfile`'s read (§5.2), reduced to a count.
+
+    `a.tier = 2` because both runs here attest tier 2 and nothing else, so the filter changes no
+    result; it keeps the count a count of LABELS rather than of (label, tier) pairs, which is what
+    it would silently become the day a run in this fixture attests two tiers.
+    """
+    rows = bq.query(
+        f"SELECT COUNT(*) AS c FROM `{bq.project}.{DATASET}.flow_labels` AS f "
+        f"JOIN `{bq.project}.{DATASET}.authoritative_runs` AS a "
+        f"ON a.run_id = f.run_id AND a.capture_sha256 = f.capture_sha256 "
+        f"WHERE f.capture_sha256 = '{capture}' AND a.tier = 2"
+    ).result()
+    return list(rows)[0].c
+
+
+def test_a_run_that_labelled_nothing_takes_the_tier_and_leaves_nothing_authoritative(bq):
+    """**An empty `labels[]` is a result, not an absence.**
+
+    A capture that was examined and found clean is knowledge, and it has to clear the stale tier
+    rather than let yesterday's labels stand as current. So: ingest a run that labels a flow and
+    confirm the view supplies it, then ingest a LATER run over the same capture that labelled
+    nothing, and confirm the tier is now supplied by the later run and reaches no labels at all.
+
+    The superseded rows are **not deleted**. §4.5's distinction — a record, not a delete — applies
+    to supersession as much as to retraction: the old labels stay in `flow_labels` and stop being
+    current, which is what makes a reproduction of an earlier run possible at all.
+    """
+    import hashlib
+
+    from flabeldb import cli, ingest
+
+    for name in ingest.LOAD_ORDER:
+        rebuild(bq, name)
+    rebuild(bq, "run_exclusions")
+    for _name, sql in cli.view_sql(DATASET):
+        bq.query(sql).result()
+
+    capture = hashlib.sha256(f"{SESSION}-clean-sweep".encode()).hexdigest()
+    laden = a_run_over(
+        capture,
+        started_at="2026-08-24T00:00:00.000001Z",
+        finished_at="2026-08-24T00:01:00.000000Z",
+        labelled=True,
+    )
+    clean = a_run_over(
+        capture,
+        started_at="2026-08-24T02:00:00.000002Z",
+        finished_at="2026-08-24T02:01:00.000000Z",
+        labelled=False,
+    )
+
+    assert laden.run["run_id"] != clean.run["run_id"], "the two runs share an id"
+    assert clean.flow_labels == [], "the clean run's fixture carries labels"
+    assert clean.run["tiers_attested"] == [2], (
+        "the empty run attested nothing, so it could supersede nothing and every assertion below "
+        f"would hold for the wrong reason: {clean.run['attestation_notes']}"
+    )
+
+    assert ingest.load_run(bq, DATASET, laden)["status"] == "ingested"
+    assert authoritative_for(bq, capture) == {(2, laden.run["run_id"])}
+    assert authoritative_labels(bq, capture) == 1, (
+        "the laden run supplied no authoritative label, so there is nothing here to clear"
+    )
+
+    assert ingest.load_run(bq, DATASET, clean)["status"] == "ingested"
+    assert authoritative_for(bq, capture) == {(2, clean.run["run_id"])}, (
+        "a run that labelled nothing did not take the tier, so a capture since found clean still "
+        "reads as malicious"
+    )
+    assert authoritative_labels(bq, capture) == 0, (
+        "the superseded labels are still reachable through the view"
+    )
+    assert counts_for(bq, laden.run["run_id"])["flow_labels"] == 1, (
+        "supersession deleted the older run's rows — they are a record and must survive it"
+    )
