@@ -11,8 +11,9 @@
 #
 # Four things happen, in this order, and the order is the contract:
 #
-#   0. Refuse if a labelling run is still going.  `install` overwrites IN PLACE and bash reads a
-#      script as it executes, so deploying under a live run can change a script mid-flight.
+#   0. Refuse if a labelling run is still going. `git pull` rewrites source a running labelling run
+#      imports lazily, and `uv sync --extra db` PRUNES the very virtualenv that run is executing
+#      out of — measured: a sync without the extra reports "Would uninstall 25 packages".
 #   1. `git pull --ff-only`
 #   2. `uv sync --extra db`
 #   3. `flabel-db verify` — the PRE-DEPLOY GATE. It lives here rather than in CI because CI has no
@@ -27,6 +28,12 @@ set -euo pipefail
 # Overridable so the tests need neither /opt nor root, and so a second lab does not need a forked
 # copy. Defaults are what `docs/phase-2-replay-box-provision.sh` lays down.
 REPO="${FLABEL_DEPLOY_REPO:-/opt/flabel/repo}"
+# The box's config, read for `GCP_PROJECT` alone. `flabel-db verify` resolves its project from that
+# variable and has NO metadata-server fallback (`flabeldb/client.py`), and
+# `docs/label-store-provision.md` §7 records that it is not in the box's environment — `sudo`
+# strips it besides. Without this the pre-deploy gate, the entire reason `verify` lives in a deploy
+# script rather than in CI, failed 100% of the time and blamed the dataset for it.
+CONF="${FLABEL_DEPLOY_CONF:-/var/lib/flabel/flabel.env}"
 INSTALL_TO="${FLABEL_DEPLOY_INSTALL_TO:-/usr/local/bin/flabel-run}"
 
 # The external commands, overridable for the same reason. `uv` covers both the sync and the verify:
@@ -35,6 +42,9 @@ INSTALL_TO="${FLABEL_DEPLOY_INSTALL_TO:-/usr/local/bin/flabel-run}"
 GIT="${FLABEL_DEPLOY_GIT:-git}"
 UV="${FLABEL_DEPLOY_UV:-uv}"
 PGREP="${FLABEL_DEPLOY_PGREP:-pgrep}"
+# Overridable for the same reason as `$PGREP`: the guard needs `ps` to tell its own processes from
+# everyone else's, and "what happens when it is missing" has to be reachable from a test.
+PS="${FLABEL_DEPLOY_PS:-ps}"
 
 # **No colon**, following `flabel-run`'s `PUBLISH_SUDO` convention exactly: unset means `sudo`, and
 # an EMPTY value means run unwrapped. `${VAR:-sudo}` cannot express that — it treats empty as unset
@@ -61,27 +71,40 @@ usage() {
 flabel-deploy — bring the replay box up to the checked-out commit.
 
 usage:
-  flabel-deploy
+  sudo /opt/flabel/repo/tools/flabel-deploy
   flabel-deploy --help
+
+Run it from the deployment checkout, under sudo: /opt/flabel/repo is root-owned, so an
+unprivileged git pull hits git's "dubious ownership" refusal and uv sync cannot write .venv.
+It is deliberately NOT installed onto PATH — the copy you run should be the copy you just
+pulled.
 
 It takes no arguments. What it does, in order, stopping at the first failure:
 
-  0. refuses while a labelling run is still going (install overwrites in place)
+  0. refuses while a labelling run is still going (a deploy prunes the venv it runs from)
   1. git pull --ff-only          in $FLABEL_DEPLOY_REPO
   2. uv sync --extra db
   3. uv run flabel-db verify     the pre-deploy gate: the live dataset against the declaration
   4. reinstalls tools/flabel-run, but only if it differs from what is installed
 
 environment:
+  GCP_PROJECT                  the project holding the label store. flabel-db verify cannot
+                               run without it. The repo is public, so it is never committed —
+                               put it in flabel.env. What you set here wins over that file.
   FLABEL_DEPLOY_REPO           the deployment checkout      (/opt/flabel/repo)
+  FLABEL_DEPLOY_CONF           the box config, read for GCP_PROJECT
+                                                            (/var/lib/flabel/flabel.env)
   FLABEL_DEPLOY_INSTALL_TO     where the wrapper goes       (/usr/local/bin/flabel-run)
   FLABEL_DEPLOY_BUSY_PATTERN   what counts as busy          (tcpreplay|flabel|uv run)
   FLABEL_DEPLOY_SUDO           privilege wrapper for the install; empty to run unwrapped  (sudo)
-  FLABEL_DEPLOY_GIT / _UV / _PGREP    the external commands
+  FLABEL_DEPLOY_GIT / _UV / _PGREP / _PS   the external commands
 
 exit codes:
   0  deployed, or already up to date
-  1  a step failed, or the box was busy. Nothing after the failing step was done.
+  1  a step failed, or the box was busy. Nothing after the failing step was done. Steps
+     BEFORE it were: a failure at the gate or the install leaves the checkout pulled and the
+     venv synced, with the previous wrapper still in place. That is a deliberate stopping
+     point, not a rollback — re-running once the cause is fixed completes the deploy.
   2  usage error
 EOF
 }
@@ -118,18 +141,48 @@ case "$INSTALL_TO" in /*) ;; *) INSTALL_TO="$PWD/$INSTALL_TO" ;; esac
 #:             `/bin/bash ./probe-deploy`. A pid-only filter leaves 344034 behind, and the deploy
 #:             refuses to run for the rest of time.
 #:
-#: So the last clause drops any line naming this script. The cost is that a genuinely concurrent
-#: second `flabel-deploy` is invisible to this guard — accepted, and stated rather than hidden:
-#: this guard is about a live *labelling run*, and two operators deploying at once is a different
-#: problem that wants a lock, not a pattern.
+#: **The first version excluded by NAME — any line containing `${0##*/}` — and that version could
+#: fail OPEN, which is the one direction a safety guard must never fail.** Measured: `bash <
+#: flabel-deploy`, or `cat flabel-deploy | bash`, gives `$0 == "bash"`. The filter then dropped
+#: every line containing "bash", including `/bin/bash /usr/local/bin/flabel-run capture.pcap` — the
+#: live labelling run it exists to see. GNU awk compounds it: `index($0, "")` returns 1, so an
+#: empty basename dropped every line and the guard went silently inert.
+#:
+#: So membership is by PROCESS GROUP instead, which is what "our own processes" actually means. A
+#: fork keeps its parent's pgid, so the subshell above is covered by construction rather than by a
+#: string match; a labelling run started from another session has its own. `$$` and `$PPID` stay as
+#: belt and braces, because `sudo` may place us in a new group.
+#:
+#: **It fails the right way.** If `ps` cannot answer for `$$` it can answer for nothing, so every
+#: match is reported and the deploy refuses. A guard that cannot identify its own processes must
+#: not answer "idle".
+#:
+#: The accepted cost is unchanged and still stated rather than hidden: a genuinely concurrent second
+#: `flabel-deploy` from another session is invisible here. That wants a lock, not a pattern.
 busy() {
-  "$PGREP" -af "$BUSY_PATTERN" 2>/dev/null \
-    | awk -v me="$$" -v parent="$PPID" -v self="${0##*/}" '
-        $1 == me || $1 == parent { next }
-        index($0, self)          { next }
-        { print }
-      ' \
-    || true
+  local mypgid pid rest theirs
+  # `ps -o pgid= -p <pid>`, asked per candidate. NOT `ps -g <pgid>`: measured 2026-08-24, procps
+  # reads `-g` as a SESSION selector, and `ps -o pid= -g "$(ps -o pgid= -p $$)"` returned nothing
+  # at all — which would have excluded nothing and made every deploy refuse.
+  mypgid="$("$PS" -o pgid= -p $$ 2>/dev/null | tr -d ' \t')"
+  while read -r pid rest; do
+    [ -n "$pid" ] || continue
+    case " $$ $PPID " in *" $pid "*) continue ;; esac
+    if [ -z "$mypgid" ]; then
+      # `ps` could not identify even US, so it can identify nothing. Report every match and let the
+      # caller refuse: a guard unable to tell its own processes apart must never answer "idle".
+      printf '%s %s\n' "$pid" "$rest"
+      continue
+    fi
+    theirs="$("$PS" -o pgid= -p "$pid" 2>/dev/null | tr -d ' \t')"
+    # **No answer means the process is GONE, and gone is not busy.** Almost always it is our own
+    # forked subshell, which exits the instant `pgrep` does — so treating "unidentifiable" as
+    # "still running" made the guard refuse on its own corpse. The question this guard asks is
+    # whether something is running NOW, and a pid that has already exited answers it: no.
+    [ -z "$theirs" ] && continue
+    [ "$theirs" = "$mypgid" ] && continue
+    printf '%s %s\n' "$pid" "$rest"
+  done < <("$PGREP" -af "$BUSY_PATTERN" 2>/dev/null || true)
 }
 
 # **A guard that cannot run must stop the deploy, not wave it through.** `busy` ends in `|| true`
@@ -137,20 +190,62 @@ busy() {
 # above it, swallows "command not found" just as quietly. `procps` is not in every minimal image
 # (Ubuntu's own is installed with --no-install-recommends), so this is not hypothetical: the guard
 # would report an idle box on a busy one, and `install` would overwrite a wrapper mid-run.
-if ! command -v "$PGREP" >/dev/null 2>&1; then
-  echo "flabel-deploy: cannot find \`$PGREP\`, so whether the box is busy is UNKNOWABLE." >&2
-  echo "flabel-deploy: refusing rather than assuming idle — install(1) overwrites in place and" >&2
-  echo "flabel-deploy: bash reads a script as it runs. Install procps, or set FLABEL_DEPLOY_PGREP." >&2
-  exit 1
-fi
+# `ps` as well as `pgrep`: the guard needs both, and the argument for checking one is the argument
+# for checking the other. Without `ps` the process-group exclusion cannot be computed — that case
+# fails closed by construction, but a clear refusal beats a confusing one.
+for tool in "$PGREP" "$PS"; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "flabel-deploy: cannot find \`$tool\`, so whether the box is busy is UNKNOWABLE." >&2
+    echo "flabel-deploy: refusing rather than assuming idle. A deploy under a live run can pull" >&2
+    echo "flabel-deploy: new source and prune the venv out from under it. Install procps, or set" >&2
+    echo "flabel-deploy: FLABEL_DEPLOY_PGREP." >&2
+    exit 1
+  fi
+done
 
 BUSY="$(busy)"
 if [ -n "$BUSY" ]; then
   echo "flabel-deploy: refusing to deploy — something is still running:" >&2
-  printf '%s\n' "$BUSY" >&2
-  echo "flabel-deploy: install(1) overwrites in place and bash reads a script as it runs, so" >&2
-  echo "flabel-deploy: deploying now could change a script out from under a live run." >&2
+  # PID and the first command word only. `pgrep -af` prints the whole command line, and a labelling
+  # run's carries FLABEL_INLINE_HOST (the firewall management address) and the capture filename,
+  # which embeds a customer IP. A refusal is exactly the text an operator pastes into a GitHub
+  # issue on a PUBLIC repo — see the standing #162. Enough to identify it, not enough to leak.
+  printf '%s\n' "$BUSY" | while read -r pid cmd _; do
+    printf 'flabel-deploy:   pid %s  %s …\n' "$pid" "$cmd" >&2
+  done
+  echo "flabel-deploy: a deploy pulls new source and PRUNES the virtualenv that run executes out" >&2
+  echo "flabel-deploy: of, so it can break a run that is already past the replay." >&2
   echo "flabel-deploy: wait for it to finish, then run this again. Nothing has been changed." >&2
+  exit 1
+fi
+
+# --- the project, resolved before ANYTHING is changed -------------------------------------------
+#
+# **The pre-deploy gate could not run on the box at all, and blamed the dataset when it failed.**
+# `flabel-db verify` resolves its project from `$GCP_PROJECT` and has no metadata-server fallback,
+# `docs/label-store-provision.md` §7 records that the box does not have it in the environment, and
+# `sudo` strips it besides. So `verify` exited 2 — "no project" — and this script reported
+# "reported drift ... a real finding, not a flaky gate" and sent the operator to run `apply`
+# against a live production dataset over a problem that did not exist.
+#
+# Environment first, config file second: same precedence `flabel-run` gives every other setting.
+# The value is never committed — the repo is public — so `flabel.env` is where it belongs.
+if [ -z "${GCP_PROJECT:-}" ] && [ -f "$CONF" ]; then
+  # Sourced in a SUBSHELL: this script wants one value out of that file, not whatever else it sets.
+  GCP_PROJECT="$(. "$CONF" >/dev/null 2>&1 || true; printf '%s' "${GCP_PROJECT:-}")"
+fi
+export GCP_PROJECT="${GCP_PROJECT:-}"
+
+# Checked here, before the pull, so a missing project costs nothing. Refusing after the pull and
+# the sync leaves the box holding new source, a new venv and the OLD wrapper — the half-deployed
+# state this script's header promises it never creates.
+if [ -z "$GCP_PROJECT" ]; then
+  echo "flabel-deploy: GCP_PROJECT is not set, and $CONF does not supply it." >&2
+  echo "flabel-deploy: flabel-db verify cannot reach the store without it, and a gate that could" >&2
+  echo "flabel-deploy: not run must never be read as a gate that passed." >&2
+  echo "flabel-deploy: the repo is public, so the id is never committed. Add it to $CONF:" >&2
+  echo "flabel-deploy:   export GCP_PROJECT=<the project id>       # see .env.example" >&2
+  echo "flabel-deploy: nothing has been changed." >&2
   exit 1
 fi
 
@@ -172,15 +267,28 @@ if ! "$UV" sync --extra db; then
   exit 1
 fi
 
-echo "flabel-deploy: verifying the label store against its declaration"
-if ! "$UV" run flabel-db verify; then
-  echo "flabel-deploy: flabel-db verify reported drift — the deploy is STOPPED." >&2
-  echo "flabel-deploy: the box is still running the wrapper it was running before." >&2
-  echo "flabel-deploy: this is the only place the live dataset is ever checked (CI has no GCP" >&2
-  echo "flabel-deploy: credential), so a failure here is a real finding, not a flaky gate." >&2
-  echo "flabel-deploy: 'uv run flabel-db apply' patches what can be patched." >&2
-  exit 1
-fi
+echo "flabel-deploy: verifying the label store against its declaration (project $GCP_PROJECT)"
+VERIFY=0
+"$UV" run flabel-db verify || VERIFY=$?
+# **`flabel-db`'s exit codes are distinct on purpose, so reading them as one is throwing away the
+# distinction it maintains.** 1 is drift, 2 is the operator's environment, 3 is a defect in
+# `flabel-db` itself — and only the first is a statement about the dataset. Collapsing them is how
+# a missing environment variable got reported as a drifted schema.
+case "$VERIFY" in
+  0) ;;
+  1) echo "flabel-deploy: flabel-db verify reported DRIFT — the deploy is STOPPED." >&2
+     echo "flabel-deploy: this is the only place the live dataset is ever checked (CI has no GCP" >&2
+     echo "flabel-deploy: credential), so this is a real finding, not a flaky gate." >&2
+     echo "flabel-deploy:   uv run flabel-db apply     patches what can be patched." >&2
+     exit 1 ;;
+  2) echo "flabel-deploy: flabel-db verify COULD NOT RUN — this is the environment, NOT drift." >&2
+     echo "flabel-deploy: the dataset has not been examined and nothing is known about it." >&2
+     echo "flabel-deploy: check the project ($GCP_PROJECT), the db extra, and the credential." >&2
+     exit 1 ;;
+  *) echo "flabel-deploy: flabel-db verify failed with $VERIFY — a DEFECT in flabel-db, not" >&2
+     echo "flabel-deploy: drift. The dataset has not been examined. Report it." >&2
+     exit 1 ;;
+esac
 
 # --- step 4: the conditional reinstall -----------------------------------------------------------
 
@@ -193,7 +301,27 @@ if [ ! -f "$SOURCE" ]; then
   exit 1
 fi
 
-hash_of() { md5sum "$1" | cut -d' ' -f1; }
+# **Checked AGAIN, immediately before the install.** Step 0 ran before a network `git pull`, a
+# `uv sync` that can take minutes on a cold cache, and a BigQuery round trip. A labelling run
+# started anywhere in that window was entirely unprotected by a guard that ran once at the top.
+if [ -n "$(busy)" ]; then
+  echo "flabel-deploy: a run started while this deploy was working — NOT installing the wrapper." >&2
+  echo "flabel-deploy: the pull and the sync have already happened, so the box is part-way: new" >&2
+  echo "flabel-deploy: source and a new venv, with the previous wrapper still installed. Re-run" >&2
+  echo "flabel-deploy: this once the box is idle to finish." >&2
+  exit 1
+fi
+
+# `md5sum` is GNU; `md5 -q` is the BSD and macOS spelling. This repo is developed on both — see
+# `flabel-run`'s COPYFILE_DISABLE note — and without the fallback every test in this file dies
+# under `pipefail` at exit 127 on a laptop, with nothing said about why.
+hash_of() {
+  if command -v md5sum >/dev/null 2>&1; then
+    md5sum "$1" | cut -d' ' -f1
+  else
+    md5 -q "$1"
+  fi
+}
 
 FRESH="$(hash_of "$SOURCE")"
 # `-f`, and the absent case handled FIRST: `md5sum` on a missing file is an error, not a mismatch,
@@ -201,7 +329,15 @@ FRESH="$(hash_of "$SOURCE")"
 if [ -f "$INSTALL_TO" ] && [ "$FRESH" = "$(hash_of "$INSTALL_TO")" ]; then
   echo "flabel-deploy: $INSTALL_TO is already the checked-out wrapper (md5 $FRESH) — not reinstalling"
 else
-  $SUDO install -m 0755 "$SOURCE" "$INSTALL_TO"
+  # Every other step explains its own failure; this one died on `install`'s raw stderr with no
+  # `flabel-deploy:` line and whatever exit code `sudo` or `install` chose.
+  if ! $SUDO install -m 0755 "$SOURCE" "$INSTALL_TO"; then
+    echo "flabel-deploy: could not install $SOURCE -> $INSTALL_TO." >&2
+    echo "flabel-deploy: the pull, the sync and the gate all succeeded, so the box has new source" >&2
+    echo "flabel-deploy: and a new venv with the PREVIOUS wrapper in place. Check you can write" >&2
+    echo "flabel-deploy: $INSTALL_TO — this is the one step that needs privilege." >&2
+    exit 1
+  fi
   echo "flabel-deploy: installed $SOURCE -> $INSTALL_TO (md5 $FRESH)"
 fi
 

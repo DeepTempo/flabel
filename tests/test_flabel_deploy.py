@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,11 @@ def box(tmp_path: Path) -> dict[str, str]:
 
     installed = tmp_path / "bin" / "flabel-run"
     installed.parent.mkdir()
+
+    # The box's config. Empty by default; individual tests write into it. The real one lives at
+    # /var/lib/flabel/flabel.env and is where GCP_PROJECT belongs, the repo being public.
+    conf = tmp_path / "flabel.env"
+    conf.write_text("")
 
     log = tmp_path / "commands"
 
@@ -63,14 +69,25 @@ def box(tmp_path: Path) -> dict[str, str]:
     )
     # `pgrep -af` prints "<pid> <command line>". The stub reproduces that shape, and exits 1 with
     # no output when nothing matches, exactly as pgrep does.
+    calls = tmp_path / "pgrep-calls"
     pgrep = stub(
         "pgrep",
+        # A call counter, so a test can make only the SECOND check match — which is what a run
+        # STARTING DURING the deploy looks like from here.
+        f'n=$(cat {calls} 2>/dev/null || echo 0); n=$((n + 1)); printf "%s" "$n" > {calls}\n'
+        'want="${FAKE_PGREP_MATCH_ON_CALL:-}"\n'
+        'if [ -n "$want" ] && [ "$n" != "$want" ]; then exit 1; fi\n'
         'if [ -n "${FAKE_PGREP_MATCH:-}" ]; then printf "%s\\n" "$FAKE_PGREP_MATCH"; exit 0; fi\n'
         "exit 1",
     )
 
     return {
         "FLABEL_DEPLOY_REPO": str(repo),
+        "FLABEL_DEPLOY_CONF": str(conf),
+        # `flabel-db verify` cannot reach the store without it, so every test that expects a deploy
+        # to complete needs one. The tests that care about its ABSENCE unset it explicitly.
+        "GCP_PROJECT": "test-project",
+        "_conf": str(conf),
         "FLABEL_DEPLOY_INSTALL_TO": str(installed),
         "FLABEL_DEPLOY_GIT": str(git),
         "FLABEL_DEPLOY_UV": str(uv),
@@ -87,7 +104,10 @@ def box(tmp_path: Path) -> dict[str, str]:
 
 
 def invoke(
-    box: dict[str, str], *args: str, extra: dict[str, str] | None = None
+    box: dict[str, str],
+    *args: str,
+    extra: dict[str, str] | None = None,
+    wrapper: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, **{k: v for k, v in box.items() if not k.startswith("_")}}
     env.update(extra or {})
@@ -98,7 +118,13 @@ def invoke(
         if value == "__unset__":
             del env[name]
     return subprocess.run(
-        [str(WRAPPER), *args], capture_output=True, text=True, env=env, cwd=box["_tmp"], check=False
+        [str(wrapper or WRAPPER), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=box["_tmp"],
+        check=False,
+        timeout=120,
     )
 
 
@@ -126,14 +152,18 @@ def test_the_deploy_issues_pull_sync_verify_and_install_in_that_order(box):
     result = invoke(box)
 
     assert result.returncode == 0, result.stderr
-    assert commands(box) == ["pgrep", "git", "uv", "uv", "git"], issued(box)
+    assert commands(box) == ["pgrep", "git", "uv", "uv", "pgrep", "git"], issued(box)
     assert issued(box)[1] == "git pull --ff-only"
     assert issued(box)[2] == "uv sync --extra db"
     assert issued(box)[3] == "uv run flabel-db verify"
     # The trailing `git` is the deployed-commit line. It runs AFTER the install, so it cannot be
     # mistaken for a step, and it is what turns "the deploy ran" into "the box is on this commit"
     # — the fact whose absence let the box sit two merges behind.
-    assert issued(box)[4].startswith("git rev-parse")
+    # The SECOND pgrep is the busy guard re-checked immediately before the install. Step 0 ran
+    # before a network pull, a `uv sync` that can take minutes, and a BigQuery round trip — a run
+    # started anywhere in that window was unprotected by a guard that only ran at the top.
+    assert issued(box)[4].startswith("pgrep")
+    assert issued(box)[5].startswith("git rev-parse")
     assert Path(box["_installed"]).read_text() == Path(box["_source"]).read_text()
 
 
@@ -149,10 +179,15 @@ def test_the_pull_is_ff_only_so_a_diverged_checkout_stops_rather_than_merging(bo
 
 
 def test_a_wrapper_that_is_already_installed_is_not_reinstalled_and_the_output_says_so(box):
-    """`install` overwrites IN PLACE, and bash reads a script as it executes (§7.5). Reinstalling
-    a byte-identical file is therefore not a harmless no-op — it is a needless chance to corrupt a
-    running wrapper — and "nothing to do" has to be visible or the operator cannot tell a skipped
-    deploy from a silent one."""
+    """Reinstalling a byte-identical file is pointless work on the one path that needs privilege,
+    and "nothing to do" has to be visible or the operator cannot tell a skipped deploy from a
+    silent one.
+
+    The original docstring said this avoided corrupting a running wrapper, because "`install`
+    overwrites IN PLACE and bash reads a script as it executes". Measured 2026-08-24: false —
+    `install` unlinks and creates a new inode, so a running bash keeps reading the old one. The
+    reason is gone; the behaviour is still worth pinning.
+    """
     installed = Path(box["_installed"])
     installed.write_text(Path(box["_source"]).read_text())
     installed.chmod(0o755)
@@ -234,14 +269,30 @@ def test_a_checkout_with_no_wrapper_is_an_error_rather_than_a_silent_skip(box):
 
 
 def test_a_busy_box_aborts_before_the_pull_and_before_the_install(box):
-    """§7.5: `install` overwrites in place and bash reads a script as it executes, so deploying
-    under a live run can change a script mid-flight.
+    """§7.5: a deploy `git pull`s source a running labelling run imports lazily, and
+    `uv sync --extra db` prunes the very virtualenv that run is executing out of.
 
     **Asserted on the commands issued, not on the exit code.** A script that ran the pull, ran the
     sync and then exited 1 would satisfy an exit-code assertion completely while having done the
     exact thing the guard forbids.
     """
-    result = invoke(box, extra={"FAKE_PGREP_MATCH": "4242 tcpreplay -i ens5 --topspeed x.pcap"})
+    # **A REAL pid, in its own session.** The guard drops a pid `ps` cannot find, because a process
+    # that has already exited is not one that is still running — so a synthetic `4242` is dropped
+    # as gone and the test would pass for entirely the wrong reason. `start_new_session` puts it in
+    # its own process group, as a labelling run started from another terminal would be.
+    sleeper = subprocess.Popen(
+        [shutil.which("sleep") or "/bin/sleep", "30"], start_new_session=True
+    )
+    try:
+        result = invoke(
+            box,
+            extra={
+                "FAKE_PGREP_MATCH": f"{sleeper.pid} tcpreplay -i ens5 --topspeed x.pcap",
+            },
+        )
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=10)
 
     # FIRST, because it is the claim. Asserting the exit code first means a script that pulled,
     # synced and then exited 1 reports as `assert 0 == 1` — technically red, and silent about the
@@ -249,7 +300,14 @@ def test_a_busy_box_aborts_before_the_pull_and_before_the_install(box):
     assert commands(box) == ["pgrep"], f"the guard did not abort before the pull: {issued(box)}"
     assert result.returncode == 1
     assert not Path(box["_installed"]).exists()
-    assert "4242 tcpreplay" in result.stderr, "the refusal did not name what was still running"
+    assert str(sleeper.pid) in result.stderr, "the refusal did not name what was still running"
+    assert "tcpreplay" in result.stderr, "the refusal did not say what kind of thing it was"
+    # And NOT the rest of the command line. `pgrep -af` prints it in full, and a real labelling
+    # run's carries FLABEL_INLINE_HOST — the firewall management address — and a capture filename
+    # embedding a customer IP. A refusal is the text an operator pastes into a public issue.
+    assert "--topspeed" not in result.stderr and "x.pcap" not in result.stderr, (
+        f"the refusal leaked the full command line: {result.stderr}"
+    )
 
 
 def test_the_busy_guard_runs_before_anything_else_at_all(box):
@@ -259,7 +317,7 @@ def test_the_busy_guard_runs_before_anything_else_at_all(box):
     assert commands(box)[0] == "pgrep", issued(box)
 
 
-def test_the_real_pgrep_does_not_match_the_deploy_script_itself(box):
+def test_the_real_pgrep_does_not_match_the_deploy_script_itself(box, tmp_path):
     """**The trap this guard walks straight into, and the real `pgrep` is the only way to see it.**
 
     The production pattern is `tcpreplay|flabel|uv run`, and this script is called `flabel-deploy`.
@@ -274,9 +332,20 @@ def test_the_real_pgrep_does_not_match_the_deploy_script_itself(box):
     if shutil.which("pgrep") is None:
         pytest.skip("no pgrep here — the guard's own refusal is covered by its own test")
 
+    # **Run through a uniquely-named COPY, and match on that name.** The property under test is
+    # that the script's own name is in the pattern, and any name does that. Using the literal
+    # "flabel-deploy" made the test measure the machine instead: it asserts the deploy does NOT
+    # refuse, so any unrelated process carrying that string fails it — an editor, a pager, or, as
+    # observed, the very shell running the test suite, whose command line mentioned the file being
+    # edited. That was a real one-in-many flake, and it was the guard being right.
+    unique = tmp_path / f"flabel-deploy-{uuid.uuid4().hex[:8]}"
+    shutil.copy(WRAPPER, unique)
+    unique.chmod(0o755)
+
     result = invoke(
         box,
-        extra={"FLABEL_DEPLOY_PGREP": "__unset__", "FLABEL_DEPLOY_BUSY_PATTERN": "flabel-deploy"},
+        extra={"FLABEL_DEPLOY_PGREP": "__unset__", "FLABEL_DEPLOY_BUSY_PATTERN": unique.name},
+        wrapper=unique,
     )
 
     assert result.returncode == 0, f"the deploy refused because of its own process: {result.stderr}"
@@ -297,7 +366,12 @@ def test_the_real_pgrep_still_sees_a_process_that_is_genuinely_running(box, tmp_
 
     marker = tmp_path / "flabel-busy-marker"
     marker.symlink_to(shutil.which("sleep") or "/bin/sleep")
-    child = subprocess.Popen([str(marker), "30"])
+    # **A new session, so the marker is in its OWN process group.** The guard excludes our own
+    # group, and pytest's `Popen` would otherwise put this in the same group as the deploy it is
+    # about to run — so the guard would correctly ignore it and the test would fail for a reason
+    # that has nothing to do with the guard. A real labelling run started from another terminal is
+    # in its own group, which is exactly what this reproduces.
+    child = subprocess.Popen([str(marker), "30"], start_new_session=True)
     try:
         # **Wait until pgrep can actually see it.** `Popen` returns as soon as the fork succeeds,
         # before the child has exec'd, so the deploy could run its guard against a process that
@@ -453,3 +527,204 @@ def test_a_pgrep_that_is_not_there_stops_the_deploy_rather_than_reading_as_idle(
     assert result.returncode == 1
     assert not Path(box["_installed"]).exists()
     assert "UNKNOWABLE" in result.stderr, result.stderr
+
+
+# --- the project the gate needs (#170 review) ---------------------------------------------------
+
+
+def test_a_missing_project_stops_before_the_pull_rather_than_after_the_sync(box):
+    """**The pre-deploy gate could not run on the box at all.**
+
+    `flabel-db verify` resolves its project from `$GCP_PROJECT` and has no metadata-server
+    fallback; `docs/label-store-provision.md` §7 records that the box does not have it in the
+    environment, and `sudo` strips it besides. So the gate that is the entire reason `verify` lives
+    in a deploy script rather than in CI would have failed on every single run.
+
+    Checked before the pull, so a missing project costs nothing. Refusing after the pull and the
+    sync would leave new source, a new venv and the OLD wrapper — precisely the half-deployed state
+    this script's header promises it never creates.
+    """
+    result = invoke(box, extra={"GCP_PROJECT": "__unset__"})
+
+    # `pgrep` only — the busy guard is step 0 and it reads, it does not change. What must NOT
+    # appear is `git` or `uv`: the pull and the sync are the things that leave the box half-done.
+    assert commands(box) == ["pgrep"], f"the deploy changed things before noticing: {issued(box)}"
+    assert result.returncode == 1
+    assert not Path(box["_installed"]).exists()
+    assert "GCP_PROJECT" in result.stderr, result.stderr
+
+
+def test_the_project_can_come_from_the_config_file(box):
+    """Where it belongs: the repo is public, so the id is never committed, and `flabel.env` is the
+    per-box config `flabel-run` already reads."""
+    Path(box["_conf"]).write_text("export GCP_PROJECT=from-the-config\n")
+
+    result = invoke(box, extra={"GCP_PROJECT": "__unset__"})
+
+    assert result.returncode == 0, result.stderr
+    assert commands(box) == ["pgrep", "git", "uv", "uv", "pgrep", "git"], issued(box)
+
+
+def test_the_environment_beats_the_config_file_for_the_project(box):
+    """Same precedence `flabel-run` gives every other setting: what you type wins over the file."""
+    Path(box["_conf"]).write_text("export GCP_PROJECT=from-the-config\n")
+
+    result = invoke(box, extra={"GCP_PROJECT": "from-the-environment"})
+
+    assert result.returncode == 0, result.stderr
+    assert "from-the-environment" in result.stdout, result.stdout
+
+
+def test_a_verify_that_could_not_run_is_not_reported_as_drift(box):
+    """**`flabel-db`'s exit codes are distinct on purpose.** 1 is drift, 2 is the operator's
+    environment, 3 is a defect in `flabel-db` itself — and only the first says anything about the
+    dataset.
+
+    Collapsing them is how a missing environment variable got reported as a drifted schema, with
+    the script insisting it was "a real finding, not a flaky gate" and sending the operator to run
+    `apply` against live production over a problem that did not exist.
+    """
+    result = invoke(box, extra={"FAKE_VERIFY_EXIT": "2"})
+
+    assert result.returncode == 1
+    assert not Path(box["_installed"]).exists()
+    assert "NOT drift" in result.stderr, result.stderr
+    assert "DRIFT —" not in result.stderr, (
+        f"an environment failure was called drift: {result.stderr}"
+    )
+
+
+def test_real_drift_is_still_reported_as_drift(box):
+    """The other half, so the discrimination above cannot be satisfied by never saying drift."""
+    result = invoke(box, extra={"FAKE_VERIFY_EXIT": "1"})
+
+    assert result.returncode == 1
+    assert "DRIFT" in result.stderr, result.stderr
+    assert "flabel-db apply" in result.stderr, "the operator was not told how to fix real drift"
+
+
+def test_a_defect_in_flabel_db_is_not_reported_as_drift_either(box):
+    """Exit 3 is `flabel-db` saying it broke. `docs/spec-label-store.md` gave it its own code
+    precisely so it could not be read as a statement about the dataset."""
+    result = invoke(box, extra={"FAKE_VERIFY_EXIT": "3"})
+
+    assert result.returncode == 1
+    assert "DEFECT" in result.stderr, result.stderr
+    assert "not" in result.stderr and "drift" in result.stderr
+
+
+def test_a_run_that_starts_DURING_the_deploy_still_stops_the_install(box):
+    """**The guard ran once, minutes before the thing it guards.**
+
+    Step 0 happens before a network `git pull`, a `uv sync` that can take minutes on a cold cache,
+    and a BigQuery round trip. A labelling run started anywhere in that window was completely
+    unprotected — and `uv sync` prunes the very virtualenv such a run is executing out of, which is
+    a worse outcome than the wrapper swap the guard was originally written for.
+
+    So the guard is re-checked immediately before the install. The pull and the sync have already
+    happened by then, which is why the refusal says the box is part-way rather than untouched.
+    """
+    sleeper = subprocess.Popen(
+        [shutil.which("sleep") or "/bin/sleep", "30"], start_new_session=True
+    )
+    try:
+        result = invoke(
+            box,
+            extra={
+                "FAKE_PGREP_MATCH": f"{sleeper.pid} tcpreplay -i ens5 x.pcap",
+                "FAKE_PGREP_MATCH_ON_CALL": "2",
+            },
+        )
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=10)
+
+    assert not Path(box["_installed"]).exists(), "the wrapper was swapped under a live run"
+    assert result.returncode == 1
+    assert "started while this deploy was working" in result.stderr, result.stderr
+    # The pull and the sync DID happen — saying otherwise would be the lie the header warns about.
+    assert commands(box) == ["pgrep", "git", "uv", "uv", "pgrep"], issued(box)
+
+
+def test_a_ps_that_is_not_there_stops_the_deploy_too(box):
+    """The guard needs `ps` as much as it needs `pgrep` — without it there is no way to tell our
+    own processes from everyone else's, and the same `|| true` swallows its absence.
+
+    Found by sabotage: removing `ps` from the availability loop left every test green, because the
+    only test for that loop used a missing `pgrep` and never reached the `ps` half.
+    """
+    result = invoke(box, extra={"FLABEL_DEPLOY_PS": "/nonexistent/ps"})
+
+    assert commands(box) == [], issued(box)
+    assert result.returncode == 1
+    assert not Path(box["_installed"]).exists()
+    assert "UNKNOWABLE" in result.stderr, result.stderr
+
+
+def test_the_guard_still_sees_a_live_run_when_the_script_is_fed_on_stdin(box, tmp_path):
+    """**The fail-open case, and the reason the name-based self-exclusion had to go.**
+
+    `bash < flabel-deploy`, or `cat flabel-deploy | bash`, is a plausible one-off remote deploy —
+    and it makes `$0` the string `bash`. The first version of the guard dropped any line containing
+    `${0##*/}`, so it then dropped every line containing "bash", including
+    `/bin/bash /usr/local/bin/flabel-run capture.pcap` — the live labelling run it exists to see.
+
+    Measured: `bash < script` and `cat script | bash` both report `$0 == bash`.
+
+    That is the one direction a safety guard must never fail, and no test caught it: the existing
+    real-`pgrep` tests use a marker whose name contains no "bash", so the name filter left it
+    alone. This drives the script through stdin and gives the busy process a `bash` command line,
+    which is what a labelling run actually has.
+    """
+    if shutil.which("pgrep") is None or shutil.which("ps") is None:
+        pytest.skip("no pgrep/ps here — the refusal when they are missing has its own test")
+
+    # A busy process whose command line contains BOTH the pattern and "bash", exactly as a real
+    # `/bin/bash /usr/local/bin/flabel-run …` does. Its own session, like a run from another shell.
+    marker = tmp_path / f"flabel-busy-{uuid.uuid4().hex[:8]}"
+    marker.write_text("#!/bin/bash\nsleep 30\n")
+    marker.chmod(0o755)
+    child = subprocess.Popen(["/bin/bash", str(marker)], start_new_session=True)
+    try:
+        env = {**os.environ, **{k: v for k, v in box.items() if not k.startswith("_")}}
+        env.update({"FLABEL_DEPLOY_PGREP": "pgrep", "FLABEL_DEPLOY_BUSY_PATTERN": marker.name})
+        with open(WRAPPER) as script:  # fed on STDIN, so $0 becomes "bash"
+            result = subprocess.run(
+                ["bash"],
+                stdin=script,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=box["_tmp"],
+                check=False,
+                timeout=120,
+            )
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+
+    assert result.returncode == 1, (
+        f"the guard failed OPEN and deployed under a live run: {result.stdout}{result.stderr}"
+    )
+    assert not Path(box["_installed"]).exists(), "the wrapper was swapped under a live run"
+
+
+def test_an_install_that_fails_says_so_rather_than_dying_on_raw_stderr(box):
+    """Every other step explains its own failure. This one used to die on `install`'s stderr with
+    no `flabel-deploy:` line and whatever exit code `sudo` or `install` chose — and it is the one
+    step that needs privilege, so it is the one most likely to fail on a real box.
+
+    Found by sabotage: the swallow-the-failure sabotage stayed green because nothing made `install`
+    fail in the first place.
+    """
+    failing_sudo = Path(box["_tmp"]) / "failing-sudo"
+    failing_sudo.write_text('#!/bin/bash\necho "sudo: authentication failure" >&2\nexit 1\n')
+    failing_sudo.chmod(0o755)
+
+    result = invoke(box, extra={"FLABEL_DEPLOY_SUDO": str(failing_sudo)})
+
+    assert result.returncode == 1
+    assert not Path(box["_installed"]).exists()
+    assert "could not install" in result.stderr, result.stderr
+    # And it must not claim the box is untouched: the pull and the sync already happened.
+    assert "PREVIOUS wrapper" in result.stderr, result.stderr
