@@ -132,6 +132,18 @@ busy() {
     || true
 }
 
+# **A guard that cannot run must stop the deploy, not wave it through.** `busy` ends in `|| true`
+# so a no-match exit 1 from pgrep is not fatal — and that same `|| true`, with the `2>/dev/null`
+# above it, swallows "command not found" just as quietly. `procps` is not in every minimal image
+# (Ubuntu's own is installed with --no-install-recommends), so this is not hypothetical: the guard
+# would report an idle box on a busy one, and `install` would overwrite a wrapper mid-run.
+if ! command -v "$PGREP" >/dev/null 2>&1; then
+  echo "flabel-deploy: cannot find \`$PGREP\`, so whether the box is busy is UNKNOWABLE." >&2
+  echo "flabel-deploy: refusing rather than assuming idle — install(1) overwrites in place and" >&2
+  echo "flabel-deploy: bash reads a script as it runs. Install procps, or set FLABEL_DEPLOY_PGREP." >&2
+  exit 1
+fi
+
 BUSY="$(busy)"
 if [ -n "$BUSY" ]; then
   echo "flabel-deploy: refusing to deploy — something is still running:" >&2

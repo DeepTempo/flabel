@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -270,6 +271,9 @@ def test_the_real_pgrep_does_not_match_the_deploy_script_itself(box):
     Driven by narrowing the pattern to `flabel-deploy` rather than by widening the environment, so
     the test does not depend on what else happens to be running on the machine.
     """
+    if shutil.which("pgrep") is None:
+        pytest.skip("no pgrep here — the guard's own refusal is covered by its own test")
+
     result = invoke(
         box,
         extra={"FLABEL_DEPLOY_PGREP": "__unset__", "FLABEL_DEPLOY_BUSY_PATTERN": "flabel-deploy"},
@@ -288,10 +292,30 @@ def test_the_real_pgrep_still_sees_a_process_that_is_genuinely_running(box, tmp_
     naming this script, so such a marker would be filtered as our own process and this test would
     go green for precisely the wrong reason.
     """
+    if shutil.which("pgrep") is None:
+        pytest.skip("no pgrep here — the guard's own refusal is covered by its own test")
+
     marker = tmp_path / "flabel-busy-marker"
     marker.symlink_to(shutil.which("sleep") or "/bin/sleep")
     child = subprocess.Popen([str(marker), "30"])
     try:
+        # **Wait until pgrep can actually see it.** `Popen` returns as soon as the fork succeeds,
+        # before the child has exec'd, so the deploy could run its guard against a process that
+        # does not yet have its command line — the test then measures the race rather than the
+        # guard. This box was fast enough and CI was not: it went green here and red there, which
+        # is the only reason the race was visible at all.
+        for _ in range(200):
+            if (
+                subprocess.run(
+                    ["pgrep", "-f", "flabel-busy-marker"], capture_output=True
+                ).returncode
+                == 0
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the marker process never became visible to pgrep")
+
         result = invoke(
             box,
             extra={
@@ -409,3 +433,23 @@ def test_the_production_defaults_are_the_boxes_real_paths(box):
     assert 'REPO="${FLABEL_DEPLOY_REPO:-/opt/flabel/repo}"' in text
     assert 'INSTALL_TO="${FLABEL_DEPLOY_INSTALL_TO:-/usr/local/bin/flabel-run}"' in text
     assert 'BUSY_PATTERN="${FLABEL_DEPLOY_BUSY_PATTERN:-tcpreplay|flabel|uv run}"' in text
+
+
+def test_a_pgrep_that_is_not_there_stops_the_deploy_rather_than_reading_as_idle(box):
+    """**A guard that cannot run must stop the deploy.**
+
+    `busy()` ends in `|| true` so that pgrep's no-match exit 1 is not fatal — and that same
+    `|| true`, with the `2>/dev/null` beside it, swallows "command not found" just as quietly. The
+    result is a guard that reports an idle box on a busy one, and an `install` that overwrites a
+    wrapper mid-run.
+
+    Not hypothetical: `procps` is absent from plenty of minimal images, and this repo's own CI
+    container is built with `--no-install-recommends`. This test is also why the two real-`pgrep`
+    tests may skip without leaving the behaviour uncovered.
+    """
+    result = invoke(box, extra={"FLABEL_DEPLOY_PGREP": "/nonexistent/pgrep"})
+
+    assert commands(box) == [], issued(box)
+    assert result.returncode == 1
+    assert not Path(box["_installed"]).exists()
+    assert "UNKNOWABLE" in result.stderr, result.stderr
