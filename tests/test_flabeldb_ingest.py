@@ -489,3 +489,93 @@ def test_the_unused_walk_is_bounded_too():
 
     with pytest.raises(RuntimeError, match="attempt ids are used"):
         ingest.first_unused_attempt(all_used, RUN_ID, "runs")
+
+
+# --- --backfill: the flag, not the operation -----------------------------------------------------
+#
+# LS-4 supplies the mechanism; **LS-8 is the whole-archive run** plus `tools/reconcile_store.py`,
+# and it depends on LS-5 and LS-7. So this loops and reports, and reconciles nothing.
+
+
+def test_only_tarballs_are_selected_and_the_order_is_deterministic():
+    """A prefix holds whatever anyone put there. Ordering matters because a partial backfill that
+    is resumed should cover the same ground in the same sequence."""
+    names = [
+        "results/b.tar.gz",
+        "results/notes.txt",
+        "results/a.tar.gz",
+        "results/",
+        "results/c.tgz",
+    ]
+    found = ingest.select_tarballs("gs://bucket", names)
+
+    assert found == ["gs://bucket/results/a.tar.gz", "gs://bucket/results/b.tar.gz"]
+
+
+def test_a_prefix_with_no_tarballs_is_an_empty_list_and_not_an_error():
+    """An archive nobody has published to yet is a real state, not a failure."""
+    assert ingest.select_tarballs("gs://bucket", ["results/", "results/README"]) == []
+
+
+def test_backfill_ingests_each_uri_in_turn():
+    seen = []
+
+    def fake(uri):
+        seen.append(uri)
+        return {"run_id": uri[-8:], "status": "ingested"}
+
+    summary = ingest.backfill_over(["gs://b/1.tar.gz", "gs://b/2.tar.gz"], fake)
+
+    assert seen == ["gs://b/1.tar.gz", "gs://b/2.tar.gz"]
+    assert summary["ingested"] == 2
+    assert summary["already_present"] == 0
+    assert summary["failed"] == []
+
+
+def test_a_run_already_present_is_counted_separately_from_one_ingested():
+    """The two are different facts about a backfill, and collapsing them would make a second full
+    pass look like it did the same work as the first."""
+    def fake(uri):
+        return {"run_id": "x", "status": "already-present" if "1" in uri else "ingested"}
+
+    summary = ingest.backfill_over(["gs://b/1.tar.gz", "gs://b/2.tar.gz"], fake)
+
+    assert summary["ingested"] == 1
+    assert summary["already_present"] == 1
+
+
+def test_one_failing_tarball_does_not_stop_the_rest():
+    """**The property that makes a backfill worth running unattended.** Stopping on the first bad
+    archive would mean one corrupt object holds up every run published after it — and #164 says a
+    replaced tarball is possible, so a bad one is not hypothetical."""
+    def fake(uri):
+        if "2" in uri:
+            raise ValueError("not one of ours")
+        return {"run_id": "x", "status": "ingested"}
+
+    summary = ingest.backfill_over(["gs://b/1.tar.gz", "gs://b/2.tar.gz", "gs://b/3.tar.gz"], fake)
+
+    assert summary["ingested"] == 2
+    assert [uri for uri, _ in summary["failed"]] == ["gs://b/2.tar.gz"]
+    assert "not one of ours" in summary["failed"][0][1]
+
+
+def test_a_backfill_that_failed_on_everything_still_reports_rather_than_raising():
+    """The caller needs the list. Raising the first error would discard the other ninety-nine."""
+    def fake(_uri):
+        raise ValueError("boom")
+
+    summary = ingest.backfill_over(["gs://b/1.tar.gz", "gs://b/2.tar.gz"], fake)
+    assert summary["ingested"] == 0
+    assert len(summary["failed"]) == 2
+
+
+def test_a_second_full_backfill_ingests_nothing():
+    """LS-8's stated acceptance test, in miniature — the property, here, rather than the
+    whole-archive run. The already-committed guard (§7.4) is what supplies it."""
+    def fake(_uri):
+        return {"run_id": "x", "status": "already-present"}
+
+    summary = ingest.backfill_over(["gs://b/1.tar.gz"] * 5, fake)
+    assert summary["ingested"] == 0
+    assert summary["already_present"] == 5

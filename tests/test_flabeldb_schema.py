@@ -138,13 +138,25 @@ def fake_bq(location: str = "us-central1"):
     It asks because the dataset's LOCATION is immutable and part of the store's identity: the
     results bucket is US-CENTRAL1 regional, and BigQuery job ids are namespaced
     `project:location.jobid`.
+
+    It also answers `query` with no rows, because `_verify` runs §7.4's duplicate-`run_id`
+    assertion once the shape is clean. A fake that did not would make every clean-verify test fail
+    on the guard rather than on what it is testing — and adding it here rather than silencing the
+    guard is the point: verify really does query now.
     """
+
+    class Empty:
+        def result(self):
+            return iter(())
 
     class Bq:
         project = "p"
 
         def get_dataset(self, _reference):
             return type("Dataset", (), {"location": location})()
+
+        def query(self, _sql, **_kwargs):
+            return Empty()
 
     return Bq()
 
@@ -1208,3 +1220,85 @@ def test_each_of_the_three_ways_to_ask_is_still_accepted(argv):
 
     args = cli.build_parser().parse_args(argv)
     assert args.action == "show"
+
+
+# --- §7.4 guard 4: the assertion that the other three are still connected ------------------------
+
+
+def test_duplicate_run_ids_are_reported_as_drift():
+    """§7.4: guards 1-3 are the mechanism; this proves the mechanism is still WORKING.
+
+    A duplicate `run_id` in `runs` means the commit marker landed twice for one run, so every
+    read that joins through it doubles. None of guards 1-3 can notice that about themselves —
+    an idempotency guard cannot report that it stopped working — which is why the check is a
+    query over the data rather than another branch in the loader.
+    """
+    from flabeldb import cli
+
+    found = cli.duplicate_run_ids([("abc123", 2), ("def456", 3)])
+
+    assert found
+    assert any("abc123" in message and "2" in message for message in found)
+
+
+def test_no_duplicates_is_silent():
+    from flabeldb import cli
+
+    assert cli.duplicate_run_ids([]) == ()
+
+
+def test_the_duplicate_check_names_every_offender_not_just_the_first():
+    """One duplicated run is a bug; five is a different bug, and the count is the difference."""
+    from flabeldb import cli
+
+    found = cli.duplicate_run_ids([("a", 2), ("b", 2), ("c", 9)])
+    assert len(found) == 3
+
+
+def test_verify_actually_RUNS_the_duplicate_check(monkeypatch, capsys):
+    """**Found by sabotage.** Deleting the call from `_verify` left all 127 tests green: the guard
+    was tested and unwired, which is the exact failure mode §7.4 wrote guard 4 to prevent one layer
+    down. A guard nothing calls is a guard that has stopped working, silently.
+    """
+    from flabeldb import cli, client
+
+    class Row:
+        run_id, n = "dupe0000", 2
+
+    class Bq:
+        project = "p"
+
+        def get_dataset(self, _reference):
+            return type("Dataset", (), {"location": "us-central1"})()
+
+        def query(self, _sql, **_kwargs):
+            return type("Job", (), {"result": lambda self: iter([Row()])})()
+
+    monkeypatch.setattr(client, "client", lambda **_: Bq())
+    monkeypatch.setattr(
+        client, "live_schema", lambda *_a, **_k: {n: schema.TABLES[n] for n in schema.TABLES}
+    )
+
+    assert cli.main(["verify"]) == cli.EXIT_DRIFT
+    assert "dupe0000" in capsys.readouterr().err
+
+
+def test_the_duplicate_check_is_skipped_while_the_shape_is_still_wrong(monkeypatch, capsys):
+    """A query over `runs` means nothing when `runs` is missing — and reporting a query failure
+    on top of "table is missing" would bury the fact that matters under a consequence of it."""
+    from flabeldb import cli, client
+
+    class Bq:
+        project = "p"
+
+        def get_dataset(self, _reference):
+            return type("Dataset", (), {"location": "us-central1"})()
+
+        def query(self, _sql, **_kwargs):
+            raise AssertionError("the duplicate check queried a dataset whose shape is wrong")
+
+    monkeypatch.setattr(client, "client", lambda **_: Bq())
+    monkeypatch.setattr(client, "live_schema", lambda *_a, **_k: {})
+
+    assert cli.main(["verify"]) == cli.EXIT_DRIFT
+    assert "missing" in capsys.readouterr().err

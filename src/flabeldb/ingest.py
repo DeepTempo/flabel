@@ -206,6 +206,46 @@ def apply_skip_tiers(
     return kept, (*notes, *added)
 
 
+def select_tarballs(bucket_uri: str, names: Iterable[str]) -> list[str]:
+    """The published tarballs among `names`, as full `gs://` URIs, sorted.
+
+    A prefix holds whatever anyone put there — `tools/flabel-run` writes `<name>.tar.gz` and nothing
+    stops a note or a directory placeholder living beside them. Sorted because a backfill that is
+    interrupted and resumed should cover the same ground in the same sequence.
+    """
+    root = bucket_uri.rstrip("/")
+    return sorted(f"{root}/{name}" for name in names if name.endswith(".tar.gz"))
+
+
+def backfill_over(uris: Sequence[str], ingest: Callable[[str], dict]) -> dict:
+    """Ingest each URI in turn, and **keep going when one fails**.
+
+    That is the property which makes a backfill worth running unattended. Stopping at the first bad
+    archive would let one corrupt object hold up every run published after it, and #164 says a
+    replaced tarball is possible rather than hypothetical. Raising would be worse still: it
+    discards the other ninety-nine results along with the reason for the one.
+
+    `ingested` and `already_present` are counted apart, because they are different facts — a second
+    full pass over the archive should be visibly free rather than looking like it repeated the
+    work.
+
+    Takes the ingest as a CALLABLE for the same reason `next_attempt` takes a probe: the loop and
+    its failure handling are the part worth testing, and neither needs a client.
+    """
+    summary: dict = {"ingested": 0, "already_present": 0, "failed": [], "total": len(uris)}
+    for uri in uris:
+        try:
+            result = ingest(uri)
+        except Exception as error:  # noqa: BLE001 - recorded per URI, never allowed to end the run
+            summary["failed"].append((uri, f"{type(error).__name__}: {error}"))
+            continue
+        if result.get("status") == "already-present":
+            summary["already_present"] += 1
+        else:
+            summary["ingested"] += 1
+    return summary
+
+
 # --- where the decisions above meet BigQuery ----------------------------------------------------
 #
 # Everything from here down needs a client, and so is reachable only from `test_flabeldb_live.py`
@@ -536,12 +576,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     dataset = args.dataset or client_module.DEFAULT_DATASET
     if args.backfill:
-        print(
-            "flabel-ingest: --backfill is not implemented yet (LS-4 is mid-step); ingest one "
-            "tarball at a time for now.",
-            file=sys.stderr,
-        )
-        return EXIT_USAGE
+        return _backfill(bq, dataset, args)
 
     try:
         result = ingest_one(
@@ -595,6 +630,59 @@ def main(argv: Sequence[str] | None = None) -> int:
     return EXIT_OK
 
 
+def _backfill(bq, dataset: str, args) -> int:
+    """`--backfill <gs://…>`: ingest everything under the prefix that is not already present.
+
+    **This is the flag, not the operation.** LS-8 is the whole-archive run plus
+    `tools/reconcile_store.py`, and it depends on LS-5 and LS-7; nothing here reconciles a run's
+    rows against its own `run.counts`.
+
+    Worth knowing before pointing it at the whole archive: LS-8 measured the ceiling at roughly
+    **375 runs a day**, four load jobs each against a 1,500-per-table-per-day quota. Today's
+    archive is 25 tarballs, so this is a note for later rather than a limit now — and there is no
+    throttle here, deliberately, because a throttle nobody has needed yet is a guess.
+    """
+    import sys
+
+    try:
+        uris = list_tarballs(args.uri, local_adc=args.local_adc)
+    except Exception as error:  # noqa: BLE001 - classified below, never re-raised bare
+        if _is_credential_failure(error):
+            print(f"flabel-ingest: {error}\n\nNothing was read.", file=sys.stderr)
+            return EXIT_USAGE
+        traceback.print_exc()
+        return EXIT_INTERNAL
+
+    if not uris:
+        print(f"flabel-ingest: no .tar.gz under {args.uri}; nothing to do")
+        return EXIT_OK
+
+    print(f"flabel-ingest: {len(uris)} tarball(s) under {args.uri}")
+    summary = backfill_over(
+        uris,
+        lambda uri: ingest_one(
+            bq,
+            dataset,
+            uri=uri,
+            ingested_at=_now_iso(),
+            skip_tier=args.skip_tier,
+            local_adc=args.local_adc,
+        ),
+    )
+    print(
+        f"flabel-ingest: {summary['ingested']} ingested, "
+        f"{summary['already_present']} already present, {len(summary['failed'])} failed"
+    )
+    if summary["failed"]:
+        print("\nflabel-ingest: these were NOT ingested:", file=sys.stderr)
+        for uri, reason in summary["failed"]:
+            print(f"  {uri}\n    {reason}", file=sys.stderr)
+        # Exit 1 = "not ingested", which is true of some of them. The counts above say how many,
+        # so a caller can tell a total failure from one bad tarball among ninety-nine.
+        return EXIT_FAILED
+    return EXIT_OK
+
+
 def _now_iso() -> str:
     """`ingested_at`. The one clock reading in the whole step, and it is here rather than in
     `parse` because §5.5 lists `ingested_at` among the things a rebuild does not reproduce."""
@@ -613,6 +701,20 @@ def _is_credential_failure(error: BaseException) -> bool:
     except ImportError:  # pragma: no cover - no extra means no google exception could be raised
         return False
     return isinstance(error, (GoogleAuthError, Forbidden, Unauthorized, RetryError))
+
+
+def list_tarballs(prefix_uri: str, *, local_adc: bool = False) -> list[str]:
+    """Every published tarball under a `gs://bucket/prefix`, as full URIs.
+
+    `objectViewer` on the bucket is what this needs, and LS-6 measured that the instance SA already
+    holds it alongside `objectCreator` — unconditionally, with no project-level storage role.
+    """
+    from google.cloud import storage
+
+    bucket_name, prefix = split_gs_uri(prefix_uri)
+    gcs = storage.Client(credentials=_client_module().credentials(local_adc=local_adc))
+    names = [blob.name for blob in gcs.list_blobs(bucket_name, prefix=prefix)]
+    return select_tarballs(f"gs://{bucket_name}", names)
 
 
 def _client_module():
