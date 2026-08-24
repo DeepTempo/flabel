@@ -29,6 +29,27 @@ def run(days_ago: float, conclusion: str = "success") -> dict:
     }
 
 
+def fresh_run(conclusion: str = "success") -> dict:
+    """A run that is fresh against the REAL clock, for the two `main` tests only.
+
+    `main` takes no `now`: its own docstring says it is "argv parsing and file reading. The
+    decision is `verify`" — and `verify` *is* clock-injectable, which is why every freshness test
+    below is deterministic. Building a `main` fixture from `NOW` quietly coupled two parsing tests
+    to the wall clock instead.
+
+    It was a time bomb with a known fuse. `NOW` is 2026-08-15 and the threshold is 7 days, so these
+    two passed until 2026-08-22 and failed every run after. Measured 2026-08-24: they turned `main`
+    itself red on the merge of PR #160 — a docs-only change that had been green on its branch three
+    days earlier — while the feeds workflow was perfectly healthy, having run successfully at
+    04:31 that morning. A liveness gate that cries wolf about itself is one people learn to ignore,
+    which is the opposite of what this file is for.
+    """
+    return {
+        "conclusion": conclusion,
+        "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
+
+
 # --- the passing case, and it must be narrow ---------------------------------------------------
 
 
@@ -197,14 +218,14 @@ def test_unusable_timestamps_are_none_rather_than_an_exception(raw):
 
 def test_main_reads_the_jq_projection(tmp_path, capsys):
     path = tmp_path / "runs.json"
-    path.write_text(json.dumps([run(0)]))
+    path.write_text(json.dumps([fresh_run()]))
     assert main(["prog", str(path)]) == 0
 
 
 def test_main_also_reads_a_raw_api_response(tmp_path):
     """`gh api` without `--jq` returns an object. Doing something sensible with it is free."""
     path = tmp_path / "runs.json"
-    path.write_text(json.dumps({"workflow_runs": [run(0)]}))
+    path.write_text(json.dumps({"workflow_runs": [fresh_run()]}))
     assert main(["prog", str(path)]) == 0
 
 
