@@ -724,7 +724,32 @@ To be verified from the box in both directions rather than inferred from role na
 ### 7.5 Trigger, deployment, packaging
 
 `tools/flabel-run` calls `flabel-ingest` after a successful publish; ordering is always
-archive-then-index. **Exit 5: published, not indexed** — on exit 4's reasoning from `docs/spec.md`
+archive-then-index.
+
+**It is invoked as `uv run --no-sync flabel-ingest`, never as a bare command name** (#171). The
+console scripts of the `db` extra live in the repo's uv-managed virtualenv, which is on nobody's
+`PATH` — the same reason the labelling call is `uv run flabel` and `tools/flabel-deploy` runs
+`uv run flabel-db verify`. `--no-sync` follows `docs/label-store-provision.md`, which reaches every
+console script that way, and buys a skipped re-resolve on each indexed run.
+
+**It does not rescue the environment, and the first version of this paragraph said it did.** That
+claim — that a plain `uv run` would uninstall `google-cloud-bigquery`, `db` being optional — was
+asserted in a review, repeated here, and is false. Measured 2026-08-24: `uv sync` is EXACT, and
+`uv sync --dry-run` without the extra reports *"Would uninstall 25 packages"* including
+`google-cloud-bigquery`; `uv run` is INEXACT, with `--exact` opt-in, so it adds what is missing and
+prunes nothing. Both `uv run flabel` and `uv run flabel-db` left the extra intact. Recorded because
+two independent reviews raised it as a CRITICAL and only measurement settled it.
+
+The wrapper also requires `GCP_PROJECT` — checked before the call, so a missing one names the
+variable rather than surfacing as an opaque exit 5 — and echoes `flabel-ingest`'s own exit code,
+because the recovery differs by code and "re-run the ingest" is wrong advice for 2 and 3. A status
+above 128 is reported as the signal it is, since `wait` returns 128+N and `flabel-ingest` returns
+only 0–3.
+
+**Nothing in this repo creates `/var/lib/flabel/flabel.env` or puts `GCP_PROJECT` in it.** The
+wrapper reads it from there (the config is sourced, and the environment wins over it), and the
+message names the variable when it is missing — but no step owns making it exist. Same shape as
+#163, which no step owned either. **Exit 5: published, not indexed** — on exit 4's reasoning from `docs/spec.md`
 §12, that the labels are intact both on the box and in the bucket, so reusing 1 would tell a batch
 caller to discard a capture that succeeded.
 
