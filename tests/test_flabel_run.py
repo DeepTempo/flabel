@@ -69,7 +69,14 @@ if [ -n "${{FAKE_MAKE_RUN:-}}" ]; then
   printf '%s' '{{"run":{{"mode":"replay"}}}}' > "$d/run.json"
   printf '%s' 'zeek log' > "$d/zeek/conn.log"
   if [ -n "${{FAKE_WRITE_LABELS:-}}" ]; then
-    printf '%s' '{{"labels":[]}}' > "$d/labels.json"
+    # FAKE_WRITE_LABELS=1 writes an EMPTY labels[]; any other value writes one label. Without the
+    # second shape "a run that labelled nothing" was not a distinguishing condition anywhere in
+    # this harness, and its test was a duplicate of the ordinary published-and-indexed one.
+    if [ "$FAKE_WRITE_LABELS" = "1" ]; then
+      printf '%s' '{{"labels":[]}}' > "$d/labels.json"
+    else
+      printf '%s' '{{"labels":[{{"best_tier":2}}]}}' > "$d/labels.json"
+    fi
   fi
 fi
 if [ -n "${{FAKE_STRAY_FILE:-}}" ] && [ -n "${{base:-}}" ]; then
@@ -89,10 +96,16 @@ exit "${{FAKE_EXIT:-0}}"
     # the production bucket, so leaving it unset would make the suite's behaviour depend on whether
     # a test happened to create a run directory. Nothing here may contact GCS by accident.
     gcloud_log = tmp_path / "gcloud-calls"
+    # ONE log both stubs append to, so "archive then index" (§7.5) is observable. The two separate
+    # logs could not distinguish that ordering from its reverse — the step's headline invariant was
+    # pinned only indirectly, by the declined-publish test, whose name is about something else.
+    order_log = tmp_path / "order-log"
+    ingest_marker = tmp_path / "ingest-child-state"
     gcloud = tmp_path / "fake-gcloud"
     gcloud.write_text(
         f"""#!/bin/bash
 printf "%s\\n" "$*" >> {gcloud_log}
+case "$*" in *"cp "*) printf 'PUBLISH %s\\n' "$*" >> {order_log} ;; esac
 # A staging fetch has to leave a file behind or the wrapper's existence check stops the run before
 # anything interesting happens. Only for a LOCAL destination: an upload's destination is a gs:// URI
 # and must not be created on disk.
@@ -112,7 +125,14 @@ exit "${{FAKE_GCLOUD_EXIT:-0}}"
     ingest = tmp_path / "fake-ingest"
     ingest.write_text(
         f"""#!/bin/bash
+printf 'INDEX %s\\n' "$*" >> {order_log}
 for a in "$@"; do case "$a" in gs://*) printf '%s\\n' "$a" >> {ingest_log};; esac; done
+if [ -n "${{FAKE_INGEST_SLEEP:-}}" ]; then
+  trap 'printf terminated > {ingest_marker}; exit 143' TERM
+  printf started > {ingest_marker}
+  for _ in $(seq 1 200); do sleep 0.1; done
+  printf finished > {ingest_marker}
+fi
 exit "${{FAKE_INGEST_EXIT:-0}}"
 """
     )
@@ -120,7 +140,12 @@ exit "${{FAKE_INGEST_EXIT:-0}}"
 
     return {
         "FLABEL_RUN_INGEST": str(ingest),
+        # Required by `flabel-ingest` and therefore by the indexing step (#171). The real box gets
+        # it from flabel.env; the repo is public so the id is never committed.
+        "GCP_PROJECT": "test-project",
         "_ingest_log": str(ingest_log),
+        "_order_log": str(order_log),
+        "_ingest_marker": str(ingest_marker),
         "FLABEL_RUN_CONF": str(conf),
         "FLABEL_RUN_CAPTURES": str(tmp_path / "captures"),
         "FLABEL_RUN_RUNS": str(tmp_path / "runs"),
@@ -174,6 +199,14 @@ def ingests(lab: dict[str, str]) -> list[str]:
     """Every URI `flabel-ingest` was asked to index, or `[]` if it was never called."""
     log = Path(lab["_ingest_log"])
     return log.read_text().splitlines() if log.exists() else []
+
+
+def ordering(lab: dict[str, str]) -> list[str]:
+    """`PUBLISH` and `INDEX` in the order they actually happened — §7.5's invariant, observable."""
+    log = Path(lab["_order_log"])
+    if not log.exists():
+        return []
+    return [line.split(" ", 1)[0] for line in log.read_text().splitlines()]
 
 
 def recording_sudo(tmp_path: Path) -> tuple[Path, Path]:
@@ -1131,9 +1164,21 @@ def test_a_gs_capture_passes_the_ORIGINAL_uri_and_not_the_staged_path(lab, tmp_p
     value = args[args.index("--source-uri") + 1]
     assert value == "gs://bucket/dir/capture.pcap"
     # And the staged path is not what was passed — checked as an ELEMENT, not a substring.
+    #
+    # A second line here used to filter `args` to elements *starting with* `--source-uri` and
+    # assert `staged` was not among them. That can never be true — `staged` is an absolute
+    # filesystem path — so it asserted nothing whatsoever.
+    #
+    # Strengthening it to `staged not in args` is also wrong, and the way it fails is the point:
+    # the staged path SHOULD be in the command line, as the capture argument. The two facts
+    # together are the actual contract, so both are asserted: flabel is handed the staged copy to
+    # read, and told the gs:// origin it came from.
     staged = f"{lab['FLABEL_RUN_CAPTURES']}/capture.pcap"
     assert value != staged
-    assert staged not in [a for a in args if a.startswith("--source-uri")]
+    assert staged in args, f"the staged copy is not what flabel was asked to read: {args}"
+    assert args.index(staged) < args.index("--source-uri"), (
+        "the capture argument and the origin flag are the wrong way round"
+    )
 
 
 def flabel_args_after_gs_run(lab, tmp_path, uri: str) -> list[str]:
@@ -1219,7 +1264,10 @@ def test_an_ingest_failure_exits_5_with_the_labels_intact_and_the_tarball_publis
 
     assert result.returncode == 5, result.stderr
     assert uploads(lab), "the tarball was not published"
-    assert "5" in result.stderr or "index" in result.stderr.lower()
+    # NOT `"5" in result.stderr`: stderr carries a pytest tmp path, which routinely contains a 5,
+    # so that assertion passed on what the environment happened to put in the string — the exact
+    # accident this file's docstring warns about, and #134's review found the same shape.
+    assert "PUBLISHED BUT NOT INDEXED" in result.stderr, result.stderr
 
 
 def test_exit_5_is_distinct_from_every_other_code_the_wrapper_uses(lab, tmp_path):
@@ -1269,3 +1317,245 @@ def test_a_run_with_no_labels_is_declined_by_publish_and_therefore_not_indexed(l
     assert uploads(lab) == [], "a run with no labels.json was published"
     assert ingests(lab) == [], "a run that was never published was indexed"
     assert result.returncode == 0
+
+
+# --- #171: the indexing seam, exercised as it is actually invoked -------------------------------
+
+
+def test_the_default_ingest_command_is_reached_through_uv_run_and_not_from_PATH(lab, tmp_path):
+    """**The bug #169 shipped, and the test whose absence let it through.**
+
+    `flabel-ingest` is a console script of the optional `db` extra. It lives in the repo's
+    uv-managed virtualenv, which is on nobody's `PATH` — measured on this box, `command -v
+    flabel-ingest` finds nothing, and neither does `command -v flabel`, which is why the labelling
+    call is `uv run flabel`. The wrapper defaulted `$INGEST` to the bare name `flabel-ingest`, so
+    every successful run on the box would have exited 5 with `command not found` and left the store
+    empty, forever.
+
+    It was invisible because the `lab` fixture sets `FLABEL_RUN_INGEST` to an absolute stub path in
+    **every** test: the one value that is wrong in production was the one value never exercised.
+    So this test unsets it and puts a recording `uv` first on `PATH`, which is the only arrangement
+    that can see the default at all. `test_gcloud_runs_privileged_by_default` already used the
+    `__unset__` sentinel for exactly this purpose on another default.
+    """
+    path = capture(tmp_path)
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    uv_log = tmp_path / "uv-calls"
+    fake_uv = fakebin / "uv"
+    fake_uv.write_text(f'#!/bin/bash\nprintf "%s\\n" "$*" >> {uv_log}\nexit 0\n')
+    fake_uv.chmod(0o755)
+
+    # **`.venv/bin` is stripped, and that is what makes this test faithful.** `uv run pytest` puts
+    # the project venv on PATH, so a bare `flabel-ingest` resolves *here* and does not on the box,
+    # where the operator invokes the wrapper from a plain shell. Left in, this test would exercise
+    # an environment the production one never has — and when the default was sabotaged back to the
+    # bare name it ran the real ingest, which reached storage.googleapis.com for a 403. No test in
+    # this repo may contact the network (CLAUDE.md), including a failing one.
+    clean = [d for d in os.environ["PATH"].split(os.pathsep) if ".venv" not in d]
+    result = invoke(
+        lab,
+        str(path),
+        extra={
+            "FLABEL_RUN_INGEST": "__unset__",
+            "PATH": os.pathsep.join([str(fakebin), *clean]),
+            "FAKE_MAKE_RUN": "1",
+            "FAKE_WRITE_LABELS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = uv_log.read_text().splitlines() if uv_log.exists() else []
+    assert calls, "the default never reached `uv` at all — it was looked up on PATH"
+    # `--no-sync` is not decoration: a plain `uv run` re-resolves to the project's DEFAULT
+    # dependencies, and `db` is an optional extra, so it would uninstall google-cloud-bigquery out
+    # from under the command it is about to run.
+    assert calls[0].startswith("run --no-sync flabel-ingest gs://"), calls
+
+
+def test_the_ingest_override_may_carry_arguments_like_every_other_external_command(lab, tmp_path):
+    """`$INGEST` is a COMMAND LINE, not a path, and is left unquoted at the call site exactly as
+    `$SUDO`, `$GCLOUD` and `$PUBLISH_SUDO` are.
+
+    The wrapper's own comment promises it is "overridable like every other external command here".
+    Quoted, the natural override — `uv run --no-sync flabel-ingest --dataset flabel_scratch` — is
+    looked up as one file with that entire absurd name.
+    """
+    path = capture(tmp_path)
+    result = invoke(
+        lab,
+        str(path),
+        extra={
+            "FLABEL_RUN_INGEST": f"{lab['FLABEL_RUN_INGEST']} --dataset flabel_scratch",
+            "FAKE_MAKE_RUN": "1",
+            "FAKE_WRITE_LABELS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert ingests(lab), "an override carrying arguments was not run"
+
+
+def test_a_missing_gcp_project_names_the_variable_instead_of_a_bare_exit_5(lab, tmp_path):
+    """The second, independent cause of exit-5-forever: `flabeldb.client` reads `$GCP_PROJECT` and
+    raises without it, and `docs/label-store-provision.md` records that the box does not export it.
+
+    Collapsed into a bare exit 5, a nightly batch over 40 captures produces 40 identical failures
+    and never names the one missing variable. The run still succeeded and is still published, so
+    the code stays 5 — what changes is that the log says why.
+    """
+    path = capture(tmp_path)
+    result = invoke(
+        lab,
+        str(path),
+        extra={"GCP_PROJECT": "__unset__", "FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1"},
+    )
+
+    assert result.returncode == 5
+    assert uploads(lab), "the run was not published, so this is not the published-not-indexed path"
+    assert ingests(lab) == [], "the ingest was run without the project it requires"
+    assert "GCP_PROJECT" in result.stderr, result.stderr
+
+
+def test_the_ingests_own_exit_code_is_reported_because_the_recovery_differs_by_code(lab, tmp_path):
+    """`flabel-ingest` distinguishes 1 (not ingested), 2 (the operator's environment) and 3 (a
+    defect in ingest itself). Exit 5 stays ONE code — a batch caller needs one answer — but
+    collapsing all three without echoing which told the operator "re-run the ingest" for two codes
+    where re-running changes nothing at all.
+    """
+    path = capture(tmp_path)
+    result = invoke(
+        lab,
+        str(path),
+        extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1", "FAKE_INGEST_EXIT": "2"},
+    )
+
+    assert result.returncode == 5
+    assert "exited 2" in result.stderr, result.stderr
+    assert "change NOTHING" in result.stderr, (
+        "exit 2 was reported without saying that re-indexing will not help"
+    )
+
+
+def test_a_terminating_signal_reaches_the_indexing_child(lab, tmp_path):
+    """**The trap is removed the moment the labelling child is reaped**, and everything the
+    indexing step added runs after that. A foreground ingest — a GCS fetch plus several BigQuery
+    load jobs — was therefore a child no signal could reach.
+
+    `timeout 3600 flabel-run big.pcap` signals the wrapper PID alone, so the orphaned ingest went
+    on to write the store's commit marker minutes after the operator believed the run had stopped.
+
+    The pre-existing `test_a_terminating_signal_is_forwarded_to_the_run` does not cover this: the
+    child it watches is the labelling run, and the indexing child does not exist in its timeline.
+    "Still green" was true, and was not the same as "covered".
+    """
+    import signal
+    import time
+
+    path = capture(tmp_path)
+    marker = Path(lab["_ingest_marker"])
+    env = {**os.environ, **{k: v for k, v in lab.items() if not k.startswith("_")}}
+    env.update({"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1", "FAKE_INGEST_SLEEP": "1"})
+
+    process = subprocess.Popen(
+        [str(WRAPPER), str(path)],
+        env=env,
+        cwd=str(tmp_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    for _ in range(200):
+        if marker.exists():
+            break
+        time.sleep(0.05)
+    assert marker.exists() and marker.read_text() == "started", "the indexing child never started"
+
+    process.send_signal(signal.SIGTERM)
+    process.wait(timeout=30)
+
+    for _ in range(200):
+        if marker.read_text() != "started":
+            break
+        time.sleep(0.05)
+    assert marker.read_text() == "terminated", (
+        "the indexing child was orphaned: the wrapper died and left it writing to the store"
+    )
+
+
+def test_the_publish_happens_before_the_index(lab, tmp_path):
+    """§7.5's headline invariant — archive then index — asserted on ONE ordered log.
+
+    It was previously pinned only indirectly. The publish and index stubs wrote to two separate
+    files with no shared sequence, so nothing could distinguish this ordering from its reverse; the
+    only thing standing in the way was a test about a declined publish, whose name is about
+    something else entirely.
+    """
+    path = capture(tmp_path)
+    result = invoke(lab, str(path), extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1"})
+
+    assert result.returncode == 0, result.stderr
+    assert ordering(lab) == ["PUBLISH", "INDEX"], ordering(lab)
+
+
+def test_a_run_that_failed_but_still_published_keeps_its_own_exit_code(lab, tmp_path):
+    """The `[ "$STATUS" = "0" ]` guard inside the not-indexed path, which had no test.
+
+    Not reachable in production today — `_write_output` returns success unconditionally and every
+    failure path writes `run.json` and no `labels.json` — so this is a defensive guard rather than
+    a live bug. It is worth pinning anyway: exit 1 says "the labelling run failed, discard this
+    capture" and exit 5 says "it succeeded, just re-index". Letting 5 overwrite 1 would tell a
+    batch caller the opposite of the truth about a run that died.
+    """
+    path = capture(tmp_path)
+    result = invoke(
+        lab,
+        str(path),
+        extra={
+            "FAKE_EXIT": "1",
+            "FAKE_MAKE_RUN": "1",
+            "FAKE_WRITE_LABELS": "1",
+            "FAKE_INGEST_EXIT": "1",
+        },
+    )
+
+    assert result.returncode == 1, "exit 5 overwrote the failed run's own code"
+
+
+def test_a_run_that_labelled_something_and_one_that_labelled_nothing_are_both_indexed(
+    lab, tmp_path
+):
+    """The empty-`labels[]` case, now that the harness can tell the two apart.
+
+    `FAKE_WRITE_LABELS=1` writes `{"labels":[]}` and any other value writes one label. Before that
+    distinction existed, "a run that labelled nothing is still published and still indexed" passed
+    exactly the same input as the ordinary published-and-indexed test — a duplicate that read as
+    extra coverage.
+    """
+    empty = capture(tmp_path)
+    result = invoke(lab, str(empty), extra={"FAKE_MAKE_RUN": "1", "FAKE_WRITE_LABELS": "1"})
+    assert result.returncode == 0, result.stderr
+    assert ingests(lab) and ordering(lab) == ["PUBLISH", "INDEX"]
+
+
+def test_a_config_file_cannot_replace_the_recorded_origin(lab, tmp_path):
+    """`SOURCE_URI` was un-namespaced, and the config sourcing saves and restores only names
+    matching `^FLABEL_`.
+
+    So a single `SOURCE_URI=` line in `/var/lib/flabel/flabel.env` — a file the operator edits —
+    silently replaced the origin on every run, and it lands in `run.input.uri`: the provenance
+    field the whole step exists to populate. CLAUDE.md's top guardrail is that no verdict carries
+    an origin that cannot be traced, and this is the quietest possible way to break it. Renaming it
+    `FLABEL_RUN_SOURCE_URI` puts it under the restore that already exists.
+
+    Found by a fresh review of the merged diff (#171), not by the tests.
+    """
+    conf = Path(lab["FLABEL_RUN_CONF"])
+    conf.write_text(conf.read_text() + "SOURCE_URI=gs://somewhere-else/wrong.pcap\n")
+
+    args = flabel_args_after_gs_run(lab, tmp_path, "gs://bucket/dir/capture.pcap")
+
+    value = args[args.index("--source-uri") + 1]
+    assert value == "gs://bucket/dir/capture.pcap", (
+        "a line in flabel.env replaced the capture's recorded origin"
+    )

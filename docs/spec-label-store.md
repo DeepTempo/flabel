@@ -724,7 +724,17 @@ To be verified from the box in both directions rather than inferred from role na
 ### 7.5 Trigger, deployment, packaging
 
 `tools/flabel-run` calls `flabel-ingest` after a successful publish; ordering is always
-archive-then-index. **Exit 5: published, not indexed** — on exit 4's reasoning from `docs/spec.md`
+archive-then-index.
+
+**It is invoked as `uv run --no-sync flabel-ingest`, never as a bare command name** (#171). The
+console scripts of the `db` extra live in the repo's uv-managed virtualenv, which is on nobody's
+`PATH` — the same reason the labelling call is `uv run flabel` and `tools/flabel-deploy` runs
+`uv run flabel-db verify`. `--no-sync` because a plain `uv run` re-resolves to the project's
+*default* dependencies, and `db` is optional, so it would uninstall `google-cloud-bigquery` out
+from under the command it is about to run; installing the extra is the deploy's job. The wrapper
+also requires `GCP_PROJECT` — checked before the call, so a missing one names the variable rather
+than surfacing as an opaque exit 5 — and echoes `flabel-ingest`'s own exit code, because the
+recovery differs by code and "re-run the ingest" is wrong advice for 2 and 3. **Exit 5: published, not indexed** — on exit 4's reasoning from `docs/spec.md`
 §12, that the labels are intact both on the box and in the bucket, so reusing 1 would tell a batch
 caller to discard a capture that succeeded.
 

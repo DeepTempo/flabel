@@ -15,10 +15,28 @@ CONF="${FLABEL_RUN_CONF:-/var/lib/flabel/flabel.env}"
 CAPTURES="${FLABEL_RUN_CAPTURES:-/var/lib/flabel/captures}"
 RUNS="${FLABEL_RUN_RUNS:-/var/lib/flabel/runs}"
 REPO="${FLABEL_RUN_REPO:-/opt/flabel/repo}"
-# Overridable like every other external command here, so the tests need neither /opt nor a real
-# dataset. `flabel-ingest` is a console script of the `flabeldb` package, installed by the same
-# `uv sync --extra db` that LS-2's deploy runs.
-INGEST="${FLABEL_RUN_INGEST:-flabel-ingest}"
+# **`uv run --no-sync`, not a bare command name** (#171). `flabel-ingest` is a console script of
+# the optional `db` extra and lives in the repo's uv-managed virtualenv, which is on nobody's PATH.
+# Measured on fl-replay 2026-08-24: `command -v flabel-ingest` finds nothing — and neither does
+# `command -v flabel`, which is exactly why the labelling call below is `uv run flabel`. Every
+# other console script in the repo is reached the same way: `tools/flabel-deploy` runs
+# `uv run flabel-db verify`, `docs/label-store-provision.md` runs `uv run --no-sync flabel-db …`.
+#
+# The bare name shipped in #169 and was invisible because the `lab` fixture overrides
+# FLABEL_RUN_INGEST in every test. It would have exited 5 on every successful run, forever, with
+# the store staying empty and the printed recovery command failing identically.
+#
+# **`--no-sync` and not a plain `uv run`**: a plain `uv run` re-resolves the environment to the
+# project's DEFAULT dependencies, and `db` is an OPTIONAL extra — so it would uninstall
+# google-cloud-bigquery out from under the command it is about to run. Installing the extra is
+# `tools/flabel-deploy`'s job (`uv sync --extra db`); this is not the place to re-resolve it.
+#
+# Left UNQUOTED at the call site, following $SUDO and $GCLOUD: this is a COMMAND LINE, not a path,
+# so it must word-split. That is also what makes the override usable — an operator reaching for
+# FLABEL_RUN_INGEST="uv run --no-sync flabel-ingest --dataset flabel_scratch" would otherwise get
+# "no such file" for a file of that entire literal name, while the comment promised it was
+# overridable like every other external command here.
+INGEST="${FLABEL_RUN_INGEST:-uv run --no-sync flabel-ingest}"
 
 # The privilege wrapper, overridable for the same reason: a replay needs root for raw sockets,
 # and a test must be able to observe the command WITHOUT running it as root or at all.
@@ -107,6 +125,12 @@ environment (anything you set here WINS over /var/lib/flabel/flabel.env):
   FLABEL_RESULTS_URI         where a successful run is published as a tarball. Defaults to
                              gs://pm-proto-496816-flabel-pcaps/results. Set it EMPTY to run
                              without publishing at all.
+  GCP_PROJECT                the project holding the label store. Required for the indexing
+                             step below and for nothing else; the repo is public, so the id
+                             is never committed — put it in flabel.env. See .env.example.
+  FLABEL_RUN_INGEST          how flabel-ingest is invoked (default `uv run --no-sync
+                             flabel-ingest`). A COMMAND LINE, not a path, so extra arguments
+                             work: e.g. "uv run --no-sync flabel-ingest --dataset flabel_scratch".
 
 output:
   One directory per run under /var/lib/flabel/runs/LABELED_{capture}_{timestamp}/ holding
@@ -120,6 +144,20 @@ output:
   LABELED_{capture}_{timestamp}.tar.gz, unpacking to one directory of that name. A run
   with no labels.json is never published, so everything in that bucket has labels in it.
   If the upload fails the command exits non-zero and says so — the local run is untouched.
+
+  A run that was PUBLISHED is then indexed into the label store with flabel-ingest. Always in
+  that order — archive then index: the tarball is the system of record and the store is a view
+  over it, so ingest reads the published tarball rather than the local directory. Re-indexing
+  the same run is free; it short-circuits on the store's commit marker.
+
+exit codes:
+  0  labelled, published and indexed (or published with publishing switched off)
+  1  the labelling run failed. No labels.json.
+  2  usage error
+  4  the run succeeded and was NOT published. labels.json is intact on the box.
+  5  the run succeeded and WAS published, and the store was not updated. The labels are
+     intact both here and in the bucket, so the recovery is to re-run the ingest, not the
+     capture. The failing command and flabel-ingest's own exit code are printed.
 
 examples:
   flabel-run ./capture.pcap
@@ -197,8 +235,14 @@ TARGET="$1"; shift
 # Only a gs:// argument becomes a `--source-uri`. flabel validates the flag as a gs:// object and
 # exits 2 otherwise, and `provenance` derives `uri_status` as `"gs" if source_uri else "local"` —
 # so passing a local path here would both fail the validation and assert an origin that is false.
-SOURCE_URI=""
-case "$TARGET" in gs://*) SOURCE_URI="$TARGET" ;; esac
+#
+# **`FLABEL_`-prefixed on purpose** (#171). The config sourcing below saves and restores only names
+# matching `^FLABEL_`, so a plain `SOURCE_URI` is one `SOURCE_URI=` line in `flabel.env` away from
+# being silently replaced — and it would land in `run.input.uri`, the provenance field this whole
+# step exists to populate. CLAUDE.md's top guardrail is that no verdict carries an origin that
+# cannot be traced.
+FLABEL_RUN_SOURCE_URI=""
+case "$TARGET" in gs://*) FLABEL_RUN_SOURCE_URI="$TARGET" ;; esac
 
 [ -f "$CONF" ] || { echo "flabel-run: $CONF is missing; the device settings live there" >&2; exit 1; }
 
@@ -307,7 +351,7 @@ $SUDO -E env \
   FLABEL_REPLAY_MULTIPLIER="${FLABEL_REPLAY_MULTIPLIER:-1000}" \
   FLABEL_REPLAY_TOPSPEED="${FLABEL_REPLAY_TOPSPEED:-}" \
   FLABEL_SETTLE_SECONDS="${FLABEL_SETTLE_SECONDS:-60}" \
-  uv run flabel "$TARGET" --output-dir "$RUNS" ${SOURCE_URI:+--source-uri "$SOURCE_URI"} "$@" &
+  uv run flabel "$TARGET" --output-dir "$RUNS" ${FLABEL_RUN_SOURCE_URI:+--source-uri "$FLABEL_RUN_SOURCE_URI"} "$@" &
 CHILD=$!
 trap 'kill -TERM "$CHILD" 2>/dev/null' TERM INT HUP
 wait "$CHILD"
@@ -406,20 +450,63 @@ publish() {
 #: are intact both on the box and in the bucket, so reusing 1 would tell a batch caller to discard
 #: a capture that succeeded. Re-indexing is free (`flabel-ingest` short-circuits on the commit
 #: marker), so the recovery is to re-run the ingest, not the capture.
+#: Exit 5 only when the run itself succeeded. A dead run is not published, so it cannot reach here
+#: — but if it ever did, its own code is the more important fact and keeps precedence.
+not_indexed() {
+  echo "flabel-run: PUBLISHED BUT NOT INDEXED — $1" >&2
+  echo "flabel-run: the run succeeded and its labels are intact, on the box and in the bucket." >&2
+  echo "flabel-run: only the store is behind." >&2
+  [ "$STATUS" = "0" ] && STATUS=5
+  return 0
+}
+
 index_run() {
-  local name="$1" uri
+  local name="$1" uri code=0
   uri="$RESULTS_URI/$name.tar.gz"
-  echo "flabel-run: indexing $uri"
-  if "$INGEST" "$uri"; then
+
+  # Checked HERE rather than left to fail inside the ingest (#171). `flabeldb.client` reads
+  # $GCP_PROJECT and raises without it, which reaches us as a bare exit 2 — and the box does not
+  # export it (docs/label-store-provision.md §"GCP_PROJECT is not in the environment"). Naming the
+  # missing variable is the difference between one fix and forty identical re-index attempts.
+  # It is read from the environment or from $CONF, never hardcoded: the repo is public.
+  if [ -z "${GCP_PROJECT:-}" ]; then
+    not_indexed "$uri"
+    echo "flabel-run: GCP_PROJECT is not set, and flabel-ingest cannot reach the store without it." >&2
+    echo "flabel-run: the repo is public, so the id is never committed. Add it to $CONF:" >&2
+    echo "flabel-run:   export GCP_PROJECT=<the project id>      # see .env.example" >&2
     return 0
   fi
-  echo "flabel-run: PUBLISHED BUT NOT INDEXED — $uri" >&2
-  echo "flabel-run: the run succeeded and its labels are intact, on the box and in the bucket." >&2
-  echo "flabel-run: only the store is behind. Re-index with:" >&2
-  echo "flabel-run:   $INGEST $uri" >&2
-  # Exit 5 only when the run itself succeeded. A dead run is not published, so it cannot reach
-  # here — but if it ever did, its own code is the more important fact and keeps precedence.
-  [ "$STATUS" = "0" ] && STATUS=5
+
+  echo "flabel-run: indexing $uri"
+  # **Backgrounded and trapped** (#171). The trap on the labelling child is removed the moment it
+  # is reaped, and everything the indexing step added runs after that — so a foreground ingest,
+  # which fetches from GCS and runs several BigQuery load jobs, was a child no signal could reach.
+  # `timeout 3600 flabel-run big.pcap` signals the wrapper PID alone, and the orphaned ingest went
+  # on to write the commit marker minutes after the operator believed the run had stopped.
+  $INGEST "$uri" &
+  INGEST_CHILD=$!
+  trap 'kill -TERM "$INGEST_CHILD" 2>/dev/null' TERM INT HUP
+  wait "$INGEST_CHILD" || code=$?
+  trap - TERM INT HUP
+
+  [ "$code" = "0" ] && return 0
+
+  not_indexed "$uri"
+  # **The ingest's own code, echoed** (#171). `flabel-ingest` distinguishes 1 (not ingested —
+  # a real, reported outcome), 2 (the operator's environment) and 3 (a defect in ingest itself),
+  # and collapsing all three into 5 told the operator to re-run for two of them, where re-running
+  # changes nothing. Exit 5 stays one code — a batch caller needs one answer — but the log now
+  # carries which.
+  echo "flabel-run: flabel-ingest exited $code." >&2
+  case "$code" in
+    1) echo "flabel-run: 1 = not ingested. Re-indexing is free and is the right first move." >&2 ;;
+    2) echo "flabel-run: 2 = the environment, not the run. Re-indexing will change NOTHING until" >&2
+       echo "flabel-run:     it is fixed — check GCP_PROJECT, the db extra, and the credential." >&2 ;;
+    3) echo "flabel-run: 3 = a DEFECT in flabel-ingest. Re-running reproduces it; report it." >&2 ;;
+    127) echo "flabel-run: 127 = the command was not found. \$INGEST is [$INGEST] — this is #171." >&2 ;;
+  esac
+  echo "flabel-run: re-index with:" >&2
+  echo "flabel-run:   cd $REPO && $INGEST $uri" >&2
   return 0
 }
 
