@@ -806,3 +806,91 @@ def test_a_run_that_labelled_nothing_takes_the_tier_and_leaves_nothing_authorita
     assert counts_for(bq, laden.run["run_id"])["flow_labels"] == 1, (
         "supersession deleted the older run's rows — they are a record and must survive it"
     )
+
+
+# --- LS-8: the one query `tools/reconcile_store.py` adds ------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def counted_rows(bq):
+    """Two runs' rows in a real dataset, then `row_counts` over them.
+
+    Rebuilt rather than appended to, because the assertion is about counts and a leftover row from
+    another test would make it wrong for a reason that has nothing to do with the query.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import reconcile_store
+
+    for name in ("runs", "captures", "flow_labels", "unmatched"):
+        rebuild(bq, name)
+
+    first, second = "aaaa0000aaaa0000", "bbbb1111bbbb1111"
+    capture = "c" * 64
+    statements = [
+        f"INSERT INTO `{bq.project}.{DATASET}.runs` (run_id, capture_sha256, mode) "
+        f"VALUES ('{first}', '{capture}', 'offline'), ('{second}', '{capture}', 'replay')",
+        # `captures` names the run in a DIFFERENT column (§4.2) — the whole point of this test.
+        f"INSERT INTO `{bq.project}.{DATASET}.captures` "
+        f"(capture_sha256, observed_by_run_id) VALUES ('{capture}', '{first}')",
+        f"INSERT INTO `{bq.project}.{DATASET}.flow_labels` "
+        f"(run_id, capture_sha256, flow_key) VALUES "
+        f"('{first}', '{capture}', 'f1'), ('{first}', '{capture}', 'f2'), "
+        f"('{second}', '{capture}', 'f3')",
+        f"INSERT INTO `{bq.project}.{DATASET}.unmatched` "
+        f"(run_id, capture_sha256) VALUES ('{first}', '{capture}')",
+    ]
+    for sql in statements:
+        bq.query(sql).result()
+    return first, second, reconcile_store.row_counts(bq, DATASET, reconcile_store.run_id_columns())
+
+
+def test_row_counts_counts_every_table_for_every_run(counted_rows):
+    """One statement, so every table is counted at the same point in time — four queries would be
+    four, and a backfill running beside this would be counted mid-flight in one and after it in
+    another."""
+    first, second, counts = counted_rows
+    assert counts[first] == {"runs": 1, "captures": 1, "flow_labels": 2, "unmatched": 1}
+
+
+def test_row_counts_reads_captures_through_observed_by_run_id(counted_rows):
+    """§4.2 names the run differently in `captures`, and getting it wrong would return zero
+    sightings for every run and report the whole archive as broken. This is that column, against
+    the real table rather than against the declaration."""
+    first, _second, counts = counted_rows
+    assert counts[first]["captures"] == 1
+
+
+def test_a_run_with_no_rows_in_a_table_is_absent_rather_than_zero(counted_rows):
+    """`GROUP BY` yields no row for an empty group, so the reconciliation reads a missing key as
+    zero. That is `compare_run`'s `actual.get(table, 0)`, and this is the shape it relies on."""
+    _first, second, counts = counted_rows
+    assert "captures" not in counts[second]
+    assert "unmatched" not in counts[second]
+    assert counts[second]["flow_labels"] == 1
+
+
+def test_the_reconciliation_reports_a_row_count_shortfall_against_a_real_dataset(counted_rows):
+    """The end the whole tool exists for, over rows that really are in BigQuery: a tarball that
+    parses to more rows than the store holds."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import reconcile_store
+
+    first, _second, counts = counted_rows
+    expectation = reconcile_store.RunExpectation(
+        run_id=first,
+        archive_uri="gs://example/results/LABELED_x.tar.gz",
+        rows={"runs": 1, "captures": 1, "flow_labels": 431, "unmatched": 1},
+        counts={"labels": 431, "unmatched": 1},
+        refused=0,
+    )
+    result = reconcile_store.reconcile([expectation], counts, [first])
+    assert not result.agrees
+    (found,) = [item for item in result.disagreements if item.kind == "row-count"]
+    assert found.table == "flow_labels"
+    assert (found.expected, found.actual) == (431, 2)

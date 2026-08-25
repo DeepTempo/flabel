@@ -592,7 +592,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"flabel-ingest: {error}", file=sys.stderr)
         return EXIT_FAILED
     except Exception as error:  # noqa: BLE001 - classified, never re-raised bare
-        if client_module and _is_credential_failure(error):
+        if client_module and is_credential_failure(error):
             print(
                 f"flabel-ingest: {type(error).__name__}: {error}\n\nThis is NOT a report about "
                 f"the run: nothing was loaded, because the identity could not be used.",
@@ -647,7 +647,7 @@ def _backfill(bq, dataset: str, args) -> int:
     try:
         uris = list_tarballs(args.uri, local_adc=args.local_adc)
     except Exception as error:  # noqa: BLE001 - classified below, never re-raised bare
-        if _is_credential_failure(error):
+        if is_credential_failure(error):
             print(f"flabel-ingest: {error}\n\nNothing was read.", file=sys.stderr)
             return EXIT_USAGE
         traceback.print_exc()
@@ -691,8 +691,13 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
-def _is_credential_failure(error: BaseException) -> bool:
-    """Whether `error` means the identity failed rather than the run being bad. Mirrors
+def is_credential_failure(error: BaseException) -> bool:
+    """Whether `error` means the identity failed rather than the run being bad.
+
+    **Public, because `tools/reconcile_store.py` needs the same classification** and reaching for a
+    private name across a module boundary is a dependency nothing would notice breaking: a rename
+    here would leave the suite green and raise `AttributeError` from inside that tool's own
+    exception handler, which is the one place an error must not be possible. Mirrors
     `cli._credential_failure_types`: lazily imported and matched by TYPE, because the name-matching
     version missed 15 of 18 `google.auth` classes (#157)."""
     try:

@@ -399,3 +399,146 @@ gcloud storage buckets describe "$B" \
 gcloud storage ls --soft-deleted "$B/results/**"
 gcloud auth revoke                                          # status.yaml 2026-08-19
 ```
+
+---
+
+## 8. Backfilling the archive, and reconciling against it (LS-8, #152)
+
+Added by LS-8. `flabel-ingest --backfill` loads the archive; `tools/reconcile_store.py` then asks
+whether the store still agrees with what it was derived from. **The two are separate commands on
+purpose** — a tool that loaded the rows and then verified them would be checking its own work in
+the same process, off the same parse, which is the shape §5's sabotage round already had to correct
+once.
+
+### The order, and the flag that is not optional yet
+
+    # 1. ingest. --skip-tier 2 until #142 is fixed: every --offline and --both run in the archive
+    #    came from the box whose Suricata loads none of the snapshot, so tier 2 must load without
+    #    superseding (§2.4 is the mechanism; the flag is how it is applied to a backfill).
+    uv run --no-sync flabel-ingest --backfill "$FLABEL_RESULTS_URI" --skip-tier 2
+
+    # 2. reconcile. Read-only, so it cannot damage `flabel` — but see the caveat below
+    #    about its ANSWER while something else is writing.
+    uv run --no-sync python tools/reconcile_store.py
+
+`FLABEL_RESULTS_URI` is **required, not defaulted**. `tools/flabel-run:281` carries the real bucket
+as a literal and that is one of #162's named sites; a second copy would make `CLAUDE.md`'s guardrail
+less true rather than more.
+
+### What reconciliation compares, and why it is two legs and not one
+
+| Leg | Compares | Catches |
+| :-- | :-- | :-- |
+| 1 | BigQuery row counts against a fresh parse of the tarball | a half-loaded run, a `runs` marker over an empty table (§5.3's measured failure), a run whose tarball is gone |
+| 2 | that parse against the tarball's own `run.counts` | a tarball inconsistent with itself, before the store is considered at all |
+
+**Be precise about leg 2, because the obvious claim for it is wrong.** It is not two independent
+measurements of the capture: `src/flabel/cli.py` builds `counts.labels` and `labels[]` from the same
+`correlation.labels` list in one process, so at labelling time they cannot disagree. Leg 2 is a check
+on the archived document and on the code that reads it, and it catches two things leg 1 structurally
+cannot — a document that changed after it was published, and a `flabeldb.parse` that silently drops
+a label while reading. That second one is the reason both legs exist: leg 1 compares the store
+against that same parse, so a reader losing rows satisfies it perfectly, and `counts.labels` is then
+the only number left in the file that still says what the run found. Neither leg cross-validates the
+labelling itself — nothing here can tell you the labels are *right*.
+
+### Measured on `fl-replay`, 2026-08-25
+
+Against `flabel_scratch`, not `flabel` — the production dataset was still empty when this was
+written, and populating it is a separate decision.
+
+**1. Backfill the whole archive.**
+
+```
+flabel-ingest: 25 tarball(s) under $FLABEL_RESULTS_URI
+flabel-ingest: 25 ingested, 0 already present, 0 failed
+```
+
+| table | rows |
+| :-- | --: |
+| `runs` | 25 |
+| `captures` | 25 |
+| `flow_labels` | 1,870 |
+| `unmatched` | 35 |
+| **total** | **1,955** |
+
+`flow_labels` equals the sum of `run.counts.labels` across the archive exactly, and **refusals were
+0** on all 25 runs (see below for why that is not an accident). At most 100 load jobs — 25 runs × 4
+tables — against a 1,500-per-table-per-day quota; the real number is lower, because `load_run`
+creates no job for a table with no rows and `counts.labels` runs from 0 to 375.
+
+**2. Reconcile.**
+
+```
+reconcile_store: 25 run(s) in $FLABEL_RESULTS_URI, checked against flabel_scratch
+reconcile_store: the store agrees with the archive on every run
+exit 0
+```
+
+Both legs ran on all 25 runs. This is the first time the agreeing path has been produced by real
+data rather than by a fixture.
+
+**3. A second full backfill adds zero rows** — the plan's second named test:
+
+```
+flabel-ingest: 0 ingested, 25 already present, 0 failed
+```
+
+1,955 rows before, 1,955 after. §7.4's primary guard is a query against the `runs` commit marker,
+so re-indexing is free rather than merely harmless.
+
+**4. A deliberately corrupted count fails it** — the plan's first named test, on a real archived
+run rather than a fixture. Run `1e1a1cf2cae41888`, whose 338 labels the store holds correctly:
+
+```
+clean                                       -> []
+counts.labels 338 -> 339 (corrupted)        -> [self-report] flow_labels expected 339, parses to 338
+```
+
+**What an earlier version of this section got wrong, because it is instructive.** The first
+reconcile was run against a `flabel_scratch` that had never been backfilled, so all 25 runs came
+back `[not-ingested]` — and `compare_run` returned early on a missing `runs` marker, which put leg
+2 behind "the store has this run". Leg 2 therefore executed **zero** times out of 25, and the
+report's `0 [self-report]` meant *never checked* while reading as *all 25 are consistent*. Found by
+review, not by the tests: the fixtures' counts were built to agree, so leg 2 was silent whether or
+not it ran. Leg 1 still short-circuits on the marker; leg 2 no longer does, because it needs no
+store at all. #171's shape exactly — the one path never exercised was the one that mattered.
+
+### Why `refused` is 0, and the pin that keeps it honest
+
+`parse.rows` refuses a flow whose transport carries no derivable `ip_proto` (§3.2, #96), and
+**nothing in BigQuery records that number** — it exists only in the archive, which is the second
+reason this tool re-parses instead of reasoning from the store. It is 0 because the protos a label
+can carry (`models.CORRELATABLE_PROTOCOLS`) are exactly the protos the store can write
+(`identity.WRITABLE_PROTOS`) — two sets declared in two places, which **nothing pinned together**
+before LS-8. If they diverge, `refused` goes non-zero for ordinary traffic and leg 2 reports a
+shortfall it cannot explain, so `test_reconcile_store.py` now asserts they agree.
+
+Four `run.counts` fields came back null on some runs — `rules_loaded`, `rules_failed`,
+`rules_skipped` and `identify_alerts_suppressed`, all Suricata's, null on a `replay` run where that
+pass never ran (§10). Leg 2 skips a null rather than comparing against it: §10 is emphatic that a
+null count means *not measured*. `labels` and `unmatched` were never null across the archive.
+
+### Two limits worth knowing before trusting a green result
+
+**Both legs are cardinality-only.** Nothing compares `flow_key`, `best_tier`, `labels` or `sources`,
+so a load that silently *corrupted* rows passes while their count matches. A digest over
+`flow_key` — `TO_HEX(MD5(STRING_AGG(flow_key, '' ORDER BY flow_key)))` beside the existing
+`COUNT(*)`, against the same digest over the parse — would convert this into a content check for
+about ten lines. Deliberately **not** done in LS-8, whose plan scopes it to row counts; recorded
+here so the option is not re-derived.
+
+**The two sides are read minutes apart.** `archive_expectations` lists and parses the archive
+before `row_counts` queries the dataset, so a run published and indexed inside that window has rows
+in the store and was not in the listing, and is reported as an orphan. Reconcile is data-safe
+against `flabel` while something else writes — it issues only `SELECT`s, and the single `UNION ALL`
+gives one consistent snapshot across the four tables — but its *answer* is only as good as the
+quiet period around it. Re-run before believing an orphan.
+
+### What this does and does not say about #164
+
+`run_id` is derived from the run block (§3.3), so **replacing a tarball with one whose block differs
+shows up as a pair** — an orphaned run in the store beside a tarball that has never been ingested —
+and the orphan's own message says to look for the other. That narrows #164; it does not close it. A
+replacement that keeps the run block and the counts identical while changing a label is invisible
+here, because nothing in the store records a digest of the object the rows came from.
