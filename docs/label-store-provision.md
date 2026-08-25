@@ -504,6 +504,66 @@ review, not by the tests: the fixtures' counts were built to agree, so leg 2 was
 not it ran. Leg 1 still short-circuits on the marker; leg 2 no longer does, because it needs no
 store at all. #171's shape exactly — the one path never exercised was the one that mattered.
 
+### The production dataset, 2026-08-25 — the first rows `flabel` has ever held
+
+Run after #175 was green and reviewed (Craig, 2026-08-25). Pre-flight: `flabel-db verify` clean,
+all five tables at 0 rows.
+
+```
+flabel-ingest --backfill $FLABEL_RESULTS_URI --dataset flabel --skip-tier 2
+  -> 25 ingested, 0 already present, 0 failed          exit 0
+
+reconcile_store.py --dataset flabel
+  -> 25 run(s); the store agrees with the archive on every run     exit 0
+```
+
+`runs` 25 · `captures` 25 · `flow_labels` 1,870 · `unmatched` 35 · **1,955 rows**, identical to the
+`flabel_scratch` rehearsal and to the projection from the parse.
+
+**What the store can actually serve is much less than what it holds, and that is §5.1 working.**
+
+| | |
+| :-- | --: |
+| `flow_labels` rows loaded | 1,870 |
+| belonging to an **authoritative** run | **408** |
+| superseded or unattested — loaded, not selected | 1,462 |
+| captures with an authoritative tier | 17 |
+| of those, captures carrying labels | 15 |
+
+`blfile --dataset flabel --allow-missing-origin` emitted exactly **408 flows across 15 captures**,
+which is the merge agreeing with an independent SQL count over `authoritative_runs` — two different
+implementations of "which rows count", one in Python and one in the view, reaching the same number.
+
+**The archive is 24 `replay` runs and one `--offline` run**, and the attestation is the interesting
+part:
+
+* the 24 replay runs attest tier 1, and 8 of them are superseded — real supersession, in production,
+  on captures that were labelled more than once;
+* the single `--offline` run attests **nothing**, and its own note says why:
+  `tier 2 not attested: 84958 of 84960 admitted rules loaded`. **`--skip-tier 2` was not what
+  suppressed it** — §2.4's rule-count check did, on its own. That is #142 observed on production
+  data rather than inferred, and it means the store holds no tier-2 knowledge at all today.
+
+So **LS-7's cross-tier composition path still has only fixtures behind it** (#144, #9's accepted
+consequences): with no attested tier 2 anywhere, no flow in `flabel` composes from two tiers.
+
+**And the headline requirement is unmet for every row.** `blfile --dataset flabel` with no flags
+emits **0 flows** and refuses 408 for want of a recorded origin — every archived run predates
+`--source-uri`, so all 25 `captures` rows carry `uri_status: not-recorded`. That is §6.4 working as
+designed: the shortfall is counted and said out loud rather than being a short label list nobody
+questions. A capture labelled *after* LS-5 will carry its `gs://` origin and need no flag.
+
+One real `coverage` block, for a flow in `capture_2026-07-31_pub-…`:
+
+```json
+{"input_status": "complete", "unmatched": 0, "unmatched_ratio": 0.0,
+ "loss_conditions_fired": ["ja4_unavailable"]}
+```
+
+`ja4_unavailable` is correct and not a defect: the `ja4` Zeek package is in the CI container and not
+on `fl-replay`, so rows written here carry null `ja4`/`ja4s` meaning *not computed* rather than *no
+TLS* — which is exactly the distinction §11's row for it exists to keep.
+
 ### Why `refused` is 0, and the pin that keeps it honest
 
 `parse.rows` refuses a flow whose transport carries no derivable `ip_proto` (§3.2, #96), and
