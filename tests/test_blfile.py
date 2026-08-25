@@ -1347,9 +1347,24 @@ def test_rebuild_refuses_a_flag_it_would_silently_ignore(flag, value, tmp_path, 
 
 def test_the_refusal_list_covers_every_flag_that_shapes_the_selection():
     """A flag added to the parser and not to `REBUILD_REFUSES` would be quietly ignored under
-    `--rebuild`, which is the exact failure the refusal exists to prevent."""
-    shaping = {"label", "capture", "limit", "allow_missing_origin", "as_of"}
-    assert set(blfile.REBUILD_REFUSES) == shaping
+    `--rebuild`, which is the exact failure the refusal exists to prevent.
+
+    **Derived from the parser, not from a second copy of the list.** An earlier version compared
+    `REBUILD_REFUSES` to a hand-written set of the same five names — so whoever added a flag would
+    update both literals in one edit and the test could never fire. It claimed to catch exactly the
+    thing it could not see.
+    """
+    # Everything that does not shape a selection: where to read, where to write, and how to auth.
+    allowed = {"help", "project", "dataset", "local_adc", "output", "rebuild"}
+    dests = {
+        action.dest for action in blfile.build_parser()._actions if action.dest != "==SUPPRESS=="
+    }
+    shaping = dests - allowed
+    assert shaping == set(blfile.REBUILD_REFUSES), (
+        f"these parser flags shape the selection and --rebuild does not refuse them: "
+        f"{sorted(shaping - set(blfile.REBUILD_REFUSES))}; and these are refused but are not "
+        f"parser flags: {sorted(set(blfile.REBUILD_REFUSES) - shaping)}"
+    )
 
 
 def test_rebuild_reports_the_conflict_before_validating_the_labels(tmp_path, capsys):
@@ -1522,20 +1537,6 @@ def test_a_rebuild_refuses_a_run_that_has_since_been_retracted(monkeypatch):
     assert TIER2_RUN in message
     assert "customer data removal" in message, "§4.5 stores the reason so it stays auditable"
     assert "WITHOUT" in message, "the remedy is a fresh build, which honours the exclusion"
-
-
-def test_the_retraction_check_runs_before_anything_is_composed(monkeypatch):
-    """Nothing retracted may be read into a record, so the check precedes the row fetch — which is
-    what the `never` stubs above assert. Pinned here as its own property because an ordering that
-    happens to be right is one refactor from being wrong."""
-    import inspect
-
-    body = inspect.getsource(blfile.collect_rebuild)
-    executable = "\n".join(
-        line for line in body.splitlines() if not line.strip().startswith("#")
-    ).split('"""')[-1]
-    assert executable.index("query.exclusions") < executable.index("query.runs")
-    assert executable.index("query.exclusions") < executable.index("query.flow_labels")
 
 
 def test_a_retracted_pin_exits_1_because_it_is_about_the_data(monkeypatch, tmp_path, capsys):
@@ -1764,11 +1765,17 @@ def test_a_valid_json_file_of_the_wrong_shape_is_a_usage_error(contents, tmp_pat
     assert "cannot be rebuilt" in capsys.readouterr().err
 
 
-def test_a_non_finite_number_in_a_rebuild_file_is_not_reported_as_a_store_refusal(
+def test_a_non_finite_number_in_a_rebuild_file_is_the_operators_problem(
     monkeypatch, tmp_path, capsys
 ):
-    """`json.loads` accepts the `NaN` literal and `serialise` refuses it (`allow_nan=False`), so
-    `comparable` raised from inside `_report_reproduction` — which sat outside every handler."""
+    """`json.loads` accepts the `NaN` literal and `serialise` refuses it (`allow_nan=False`, §10).
+
+    It reached the interpreter as exit 1 first, then — once the report path was wrapped — as exit 3
+    announcing "a DEFECT in blfile". **Both were wrong: it is a fact about a file the operator
+    passed in**, so it is exit 2, and an earlier version of this test pinned the wrong answer.
+    `read_prior` now canonicalises the document once, which catches this and anything else that
+    cannot be serialised, in one place rather than from two layers down.
+    """
     document = json.loads(collection.serialise(built().document))
     target = tmp_path / "c.json"
     target.write_text(
@@ -1777,8 +1784,10 @@ def test_a_non_finite_number_in_a_rebuild_file_is_not_reported_as_a_store_refusa
     )
     monkeypatch.setattr(blfile.client_module, "client", lambda **kwargs: object())
     monkeypatch.setattr(blfile, "collect_rebuild", lambda *a, **k: built())
-    assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_INTERNAL
-    assert "DEFECT in blfile" in capsys.readouterr().err
+    assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_USAGE
+    message = capsys.readouterr().err
+    assert "cannot be canonicalised" in message
+    assert "DEFECT in blfile" not in message
 
 
 def test_rebuild_refuses_limit_zero_rather_than_calling_it_absent(tmp_path, capsys):
@@ -1791,7 +1800,27 @@ def test_rebuild_refuses_limit_zero_rather_than_calling_it_absent(tmp_path, caps
     assert "silently ignored" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("cutoff", ["yesterday", "2026-13-99", "", "now()"])
+@pytest.mark.parametrize(
+    "cutoff",
+    [
+        "yesterday",
+        "2026-13-99",
+        "",
+        "now()",
+        # **The boundary cases, and the reason the first gate was wrong.** `fromisoformat` takes all
+        # three since 3.11 and BigQuery rejects all three, so a check built on it alone let
+        # `--as-of 20260825` — an ordinary way to type a date — through to a `BadRequest`
+        # "a DEFECT in blfile". Every case the first parametrisation chose was one Python also
+        # rejected, so it could not see this, and the sabotage that restored the old gate stayed
+        # green against it.
+        "20260825",
+        "2026-W35-1",
+        "2026-08-25T00:00:00,5",
+        # And two the digit classes match but the calendar does not.
+        "2026-02-30",
+        "2026-08-25T25:00:00",
+    ],
+)
 def test_a_malformed_as_of_is_a_usage_error_not_a_defect(cutoff, capsys):
     """It used to reach BigQuery, be rejected, and surface as a traceback plus "This is a DEFECT in
     blfile" at exit 3 — for a typo. The value is also written verbatim into the published
@@ -1801,7 +1830,19 @@ def test_a_malformed_as_of_is_a_usage_error_not_a_defect(cutoff, capsys):
 
 
 @pytest.mark.parametrize(
-    "cutoff", ["2026-08-25T00:00:00Z", "2026-08-25T00:00:00+00:00", "2026-08-25"]
+    "cutoff",
+    [
+        "2026-08-25T00:00:00Z",
+        "2026-08-25T00:00:00+00:00",
+        "2026-08-25T00:00:00+0000",
+        "2026-08-25 00:00:00",
+        "2026-08-25",
+        # BigQuery's literal format is `YYYY-[M]M-[D]D[( |T)[H]H:[M]M:[S]S[.F]]` — single digits
+        # allowed. A `fromisoformat` backstop refused these, making the gate STRICTER than the thing
+        # it guards. Wrong in the safer direction, still wrong.
+        "2026-8-5",
+        "2026-8-5T1:02:03.123456+00:00",
+    ],
 )
 def test_a_well_formed_cutoff_is_accepted(cutoff):
     assert blfile._is_instant(cutoff)
@@ -1921,3 +1962,125 @@ def test_the_build_guard_survives_as_a_backstop_for_the_other_path():
             built_at=BUILT_AT,
             version=VERSION,
         )
+
+
+def test_a_run_id_that_is_not_a_string_is_a_usage_error():
+    """The field `by_run.setdefault` hashes and `sorted(set(pinned))` orders — and the one the last
+    round's validation fix did not check. A list `run_id` raised `TypeError: unhashable type` and a
+    mixed int/str pair raised on the sort; both escaped `read_prior` and reached the interpreter as
+    exit 1, the code reserved for a refusal about the store."""
+    document = prior_document()
+    document["runs"][0]["run_id"] = ["x"]
+    with pytest.raises(collection.NotACollection, match="not a string"):
+        collection.read_prior(document)
+
+
+def test_run_ids_of_mixed_type_do_not_reach_the_sort():
+    document = prior_document()
+    document["runs"].append({**document["runs"][0], "run_id": 7, "capture_sha256": "b" * 64})
+    with pytest.raises(collection.NotACollection, match="not a string"):
+        collection.read_prior(document)
+
+
+def test_a_document_that_pins_no_runs_is_refused_rather_than_reproduced():
+    """**The most likely document an operator has on disk today.** Every archived run predates
+    `--source-uri`, so bare `blfile` emits 0 flows and therefore pins nothing.
+
+    Every query short-circuits on an empty id list, so a `runs: []` document read nothing — not the
+    exclusions, not the runs, not a row — and printed "REPRODUCED … 0 flow(s)" at exit 0. It did so
+    even against a dataset that does not exist. `read_prior`'s own docstring gives that exact
+    failure as the reason it refuses a `labels.json`, and the same end was reachable through this
+    door.
+    """
+    document = prior_document()
+    document["runs"] = []
+    document["labels"] = []
+    with pytest.raises(collection.NotACollection, match="pins no runs"):
+        collection.read_prior(document)
+
+
+def test_a_zero_flow_rebuild_cannot_report_success_against_a_dataset_that_is_not_there(
+    monkeypatch, tmp_path, capsys
+):
+    """The end-to-end shape of the finding above: nothing queried, so nothing could fail."""
+    document = json.loads(collection.serialise(built().document))
+    document["runs"] = []
+    document["labels"] = []
+    target = tmp_path / "c.json"
+    target.write_text(json.dumps(document), encoding="utf-8")
+
+    def never(**kwargs):
+        raise AssertionError("a client was built for a document that pins nothing")
+
+    monkeypatch.setattr(blfile.client_module, "client", never)
+    assert blfile.main(["--rebuild", str(target), "--dataset", "no_such_dataset"]) == (
+        blfile.EXIT_USAGE
+    )
+    assert "pins no runs" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("origin", None), ("origin", 5), ("flow", None), ("flow", "x")],
+)
+def test_a_record_whose_origin_or_flow_is_not_an_object_is_a_usage_error(field, value):
+    """`record.get("origin", {})` returns `None` for a key that is PRESENT and null, so the default
+    does not save the `.get` after it — `differences` raised `AttributeError`, reported as a defect
+    in `blfile`. It is a fact about the operator's file."""
+    document = prior_document()
+    document["labels"][0][field] = value
+    with pytest.raises(collection.NotACollection, match=field):
+        collection.read_prior(document)
+
+
+@pytest.mark.parametrize("limit", ["5", True, 1.5, []])
+def test_a_selection_limit_that_is_not_a_whole_number_is_a_usage_error(limit):
+    """`chosen[: "5"]` raises `TypeError: slice indices must be integers`, and `True` silently means
+    a limit of one — `bool` is an `int` in Python, the exclusion `provenance.build_source_entry`
+    already makes for `Detection.tier`."""
+    document = prior_document()
+    document["selection"]["limit"] = limit
+    with pytest.raises(collection.NotACollection, match="whole number"):
+        collection.read_prior(document)
+
+
+def test_a_run_block_that_shadows_a_pin_key_is_refused():
+    """The run block is spread **last**, so a block that ever gained a `run_id` of its own would win
+    and `--rebuild` would pin whatever the block said, silently.
+
+    `docs/spec.md` §10's key set has none of the three today, and the test that looked like it
+    guarded this inspected a hand-written fixture rather than the real thing — so the guard lives in
+    `build`, where it cannot be out of date.
+    """
+    from flabeldb import collection as module
+
+    assert module.PIN_KEYS == ("run_id", "capture_sha256", "supplies")
+    for key in module.PIN_KEYS:
+        block = {**json.loads(run_row(TIER2_RUN)["run_block"]), key: "hijacked"}
+        with pytest.raises(ValueError, match="pinned set"):
+            built(run_rows=[{"run_id": TIER2_RUN, "run_block": json.dumps(block)}])
+
+
+def test_the_same_run_listed_twice_is_reported():
+    """`runs` is excluded from the top-level key loop, so its LENGTH is never compared — the same
+    symmetry gap the labels index already had a check for."""
+    document = prior_document()
+    doubled = json.loads(json.dumps(document))
+    doubled["runs"] = doubled["runs"] + doubled["runs"]
+    found = collection.differences(collection.comparable(document), collection.comparable(doubled))
+    assert any("lists the same run twice" in line for line in found)
+
+
+def test_a_view_file_with_no_header_placeholder_is_refused(monkeypatch, tmp_path):
+    """Before LS-9 each view file carried its own literal CREATE. Now the CREATE only appears where
+    the placeholder is — so a new view file without one would be run by `flabel-db apply` as a plain
+    SELECT: it prints "view <name>", exits 0, and creates nothing. `apply` is the gate."""
+    from flabeldb import schema
+
+    scratch = tmp_path / "views"
+    scratch.mkdir()
+    (scratch / "headerless.sql").write_text("SELECT 1 AS x\n", encoding="utf-8")
+    monkeypatch.setattr(schema, "VIEWS", scratch)
+    assert schema.view_names() == ("headerless",)
+    with pytest.raises(ValueError, match="no header placeholder"):
+        schema.render_view("headerless", "flabel")

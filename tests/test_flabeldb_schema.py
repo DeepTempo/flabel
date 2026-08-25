@@ -1319,7 +1319,6 @@ def test_the_view_file_is_rendered_for_the_ddl_and_for_the_as_of_select():
 
     assert ddl.count("CREATE OR REPLACE VIEW") == 1
     assert adhoc.count("CREATE OR REPLACE VIEW") == 0
-    assert "{" not in ddl.replace("{", "", 0) or "{header}" not in ddl
     for rendered in (ddl, adhoc):
         assert "{header}" not in rendered and "{as_of}" not in rendered
         assert "{dataset}" not in rendered

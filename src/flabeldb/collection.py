@@ -247,12 +247,7 @@ def build(
         # With the authority recorded, a rebuild is a function of the document plus the rows —
         # which is what §6.5 promises — rather than of today's `tiers_attested`.
         "runs": [
-            {
-                "run_id": run_id,
-                "capture_sha256": supplied[run_id][0],
-                "supplies": supplied[run_id][1],
-                **blocks[run_id],
-            }
+            _run_entry(run_id, supplied[run_id], blocks[run_id])
             for run_id in runs_present
             if run_id in blocks
         ],
@@ -327,11 +322,33 @@ def read_prior(document: Mapping[str, Any]) -> Prior:
     selection = document.get("selection") or {}
     if not isinstance(selection, Mapping):
         raise NotACollection(f"`selection` is a {type(selection).__name__}, not an object")
+    limit = selection.get("limit")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)):
+        # `bool` first: `True` is an `int` in Python and `chosen[:True]` silently means one flow.
+        raise NotACollection(f"`selection.limit` is {limit!r}, not a whole number or null")
     records = document.get("labels")
     if records is not None and (
         not isinstance(records, list) or any(not isinstance(item, Mapping) for item in records)
     ):
         raise NotACollection("`labels` is not a list of objects")
+    for index, record in enumerate(records or ()):
+        # `record.get("origin", {})` returns `None` for a key that is PRESENT and null, so the
+        # default does not save the `.get` that follows it. `differences` then raised
+        # `AttributeError` — and a document mixing records with and without an origin raised
+        # `TypeError` on `sorted()` over keys of mixed type. Both were reported as "a DEFECT in
+        # blfile" at exit 3, for a file the operator passed in.
+        for field in ("origin", "flow"):
+            if not isinstance(record.get(field), Mapping):
+                raise NotACollection(
+                    f"`labels[{index}].{field}` is {record.get(field)!r}, not an object"
+                )
+    try:
+        # Catches a `NaN`/`Infinity` literal — `json.loads` accepts them and `serialise` refuses
+        # them (`allow_nan=False`, spec §10) — plus anything else that cannot be canonicalised. One
+        # check here rather than a crash from inside `comparable` two layers down.
+        serialise(document)
+    except ValueError as error:
+        raise NotACollection(f"this document cannot be canonicalised: {error}") from error
     if not isinstance(document.get("builder") or {}, Mapping):
         raise NotACollection("`builder` is not an object")
     runs = document.get("runs")
@@ -339,6 +356,19 @@ def read_prior(document: Mapping[str, Any]) -> Prior:
         raise NotACollection("no `runs` block, so there is no pinned run set to rebuild from")
     if not isinstance(runs, list) or any(not isinstance(entry, Mapping) for entry in runs):
         raise NotACollection("`runs` is not a list of objects, so no pinned set can be read")
+    if not runs:
+        # **`runs: []` used to reproduce unconditionally**, and it is the most likely document an
+        # operator has on disk today: every archived run predates `--source-uri`, so bare `blfile`
+        # emits 0 flows and therefore pins nothing. Every query short-circuits on an empty id list,
+        # so nothing was read — not the exclusions, not the runs, not a row — and the tool printed
+        # "REPRODUCED … 0 flow(s)" and exited 0. It did so even against a dataset that does not
+        # exist. This docstring's own reasoning for refusing a `labels.json` is that it would
+        # "rebuild from an empty pinned set, and report a perfect reproduction of nothing"; the same
+        # thing reached the same end through this door.
+        raise NotACollection(
+            "this document pins no runs, so there is nothing to reproduce. A collection with no "
+            "flows records no run set — rebuild it with the selection that produced it instead"
+        )
     pinned = [entry.get("run_id") for entry in runs]
     incomplete = [
         index
@@ -362,6 +392,13 @@ def read_prior(document: Mapping[str, Any]) -> Prior:
                 f"run {entry['run_id']}'s `supplies` is {entry['supplies']!r}, not a list of tier "
                 f"numbers"
             )
+        if not isinstance(entry["run_id"], str):
+            # The other two fields were checked and this one was not — and it is the one
+            # `by_run.setdefault` hashes and `sorted(set(pinned))` orders. A list run_id raised
+            # `TypeError: unhashable type`, and mixing an int with a str raised on the sort; both
+            # escaped this function and reached the interpreter as exit 1, the code reserved for a
+            # refusal about the store. One field to the left of where the last fix looked.
+            raise NotACollection(f"a `runs` entry's `run_id` is {entry['run_id']!r}, not a string")
         if not isinstance(entry["capture_sha256"], str):
             raise NotACollection(
                 f"run {entry['run_id']}'s `capture_sha256` is not a string: "
@@ -475,6 +512,15 @@ def differences(prior: Mapping[str, Any], rebuilt: Mapping[str, Any]) -> list[st
 
     old_runs = {entry.get("run_id"): entry for entry in prior.get("runs") or ()}
     new_runs = {entry.get("run_id"): entry for entry in rebuilt.get("runs") or ()}
+    # The same symmetry the labels index has below: `runs` is excluded from the top-level key loop,
+    # so its LENGTH is never compared, and a document listing one run twice would compare equal to a
+    # rebuild listing it once.
+    for label, entries, index in (
+        ("document", prior.get("runs"), old_runs),
+        ("rebuild", rebuilt.get("runs"), new_runs),
+    ):
+        if len(entries or ()) != len(index):
+            found.append(f"the {label} lists the same run twice")
     for run_id in sorted(set(old_runs) - set(new_runs), key=str):
         found.append(f"run {run_id} was in the document and is not in the rebuild")
     for run_id in sorted(set(new_runs) - set(old_runs), key=str):
@@ -535,6 +581,30 @@ def differences(prior: Mapping[str, Any], rebuilt: Mapping[str, Any]) -> list[st
                 )
             )
     return found
+
+
+#: The three keys LS-9 puts beside a verbatim run block. §6.4's example shows `run_id`; the
+#: other two are what make the pinned set usable (see `build`).
+PIN_KEYS = ("run_id", "capture_sha256", "supplies")
+
+
+def _run_entry(run_id: str, supplied: tuple[str, list[int]], block: Mapping[str, Any]) -> dict:
+    """One `runs[]` entry: the pin, then the run block verbatim.
+
+    **A collision is refused rather than resolved.** The block is spread last, so a run block that
+    ever gained a `run_id` key of its own would win and `--rebuild` would start pinning whatever the
+    block said, silently. `docs/spec.md` §10's key set has none of these three today and the earlier
+    test for it inspected a hand-written fixture rather than the real thing — so the guard is here,
+    where it cannot be out of date.
+    """
+    collisions = [key for key in PIN_KEYS if key in block]
+    if collisions:
+        raise ValueError(
+            f"run {run_id}'s block carries {collisions}, which §6.4's entry uses for the pinned "
+            f"set. Spreading the block last would let it decide what this document pins; rename "
+            f"the pin keys or nest them before this can ship"
+        )
+    return {"run_id": run_id, "capture_sha256": supplied[0], "supplies": supplied[1], **block}
 
 
 def serialise(document: Mapping[str, Any]) -> str:
