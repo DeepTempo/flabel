@@ -290,9 +290,16 @@ adjacent-behaviour check.
 
 ## 7. Reproducing this
 
-A reconstruction, not a transcript — see the preamble. `.env` does not exist on the box, so
-`GCP_PROJECT` is not in the environment, and `gcloud` needs `--project` because exporting a shell
-variable does not set gcloud's config. Global `flabel-db` flags precede the subcommand.
+A reconstruction, not a transcript — see the preamble. `gcloud` needs `--project` because
+exporting a shell variable does not set gcloud's config. Global `flabel-db` flags precede the
+subcommand.
+
+**Superseded 2026-08-24**: this section used to open "`.env` does not exist on the box, so
+`GCP_PROJECT` is not in the environment", and that was true when written. It is no longer — the
+first `flabel-deploy` run found that its own pre-deploy gate could not resolve a project, and
+`export GCP_PROJECT=` was added to `/var/lib/flabel/flabel.env` (the box config, not `.env`, which
+still does not exist there). `flabel-db verify` now passes on the box without a `--project` flag.
+The interactive commands below still pass one, because a shell here does not source that file.
 
 **Never probe a real published object.** Beyond destruction, `--if-generation-match=0` blocks a write
 only if the named object *exists* — so a mistyped or stale name makes the precondition **succeed** and

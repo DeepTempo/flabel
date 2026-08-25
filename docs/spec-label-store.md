@@ -746,10 +746,11 @@ because the recovery differs by code and "re-run the ingest" is wrong advice for
 above 128 is reported as the signal it is, since `wait` returns 128+N and `flabel-ingest` returns
 only 0–3.
 
-**Nothing in this repo creates `/var/lib/flabel/flabel.env` or puts `GCP_PROJECT` in it.** The
-wrapper reads it from there (the config is sourced, and the environment wins over it), and the
-message names the variable when it is missing — but no step owns making it exist. Same shape as
-#163, which no step owned either. **Exit 5: published, not indexed** — on exit 4's reasoning from `docs/spec.md`
+**`GCP_PROJECT` lives in `/var/lib/flabel/flabel.env`**, added there 2026-08-24 from the metadata
+server's project id — never committed, the repo being public. Both wrappers read it from the config
+and let the environment win over it. It had no owner until then, which is the same shape as #163:
+`flabel-deploy` and `flabel-ingest` both named the variable when it was missing, and nothing made
+it exist. The first deploy on `fl-replay` is what surfaced it. **Exit 5: published, not indexed** — on exit 4's reasoning from `docs/spec.md`
 §12, that the labels are intact both on the box and in the bucket, so reusing 1 would tell a batch
 caller to discard a capture that succeeded.
 
