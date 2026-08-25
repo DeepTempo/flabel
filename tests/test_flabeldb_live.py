@@ -894,3 +894,109 @@ def test_the_reconciliation_reports_a_row_count_shortfall_against_a_real_dataset
     (found,) = [item for item in result.disagreements if item.kind == "row-count"]
     assert found.table == "flow_labels"
     assert (found.expected, found.actual) == (431, 2)
+
+
+# --- LS-9: the cutoff, against real timestamps ----------------------------------------------------
+
+
+@pytest.fixture
+def crossed_clocks(bq):
+    """Two runs over one capture whose clocks are **crossed** — the state §6.5 is entirely about.
+
+    A backfill ingests old tarballs late, so one of these finished early and was ingested last,
+    which is exactly the pair a `finished_at` filter gets backwards.
+
+    **Function-scoped, and it rebuilds every time.** As a module fixture it was emptied by the last
+    test in this file, which calls `rebuild(bq, "runs")` itself — so it worked only because pytest
+    happened to run that test last. Reorder the file and
+    `test_a_cutoff_before_everything_yields_nothing` would pass against an empty table, which is
+    the count-of-zero-that-proves-nothing pattern LS-8's review already found once. The row count is
+    asserted after the insert for the same reason.
+    """
+    from flabeldb import query
+
+    rebuild(bq, "runs")
+    rebuild(bq, "run_exclusions")
+    capture = "d" * 64
+    rows = [
+        # (run_id, finished_at, ingested_at)
+        ("ea111111111111ea", "2026-08-17T00:00:00", "2026-08-17T01:00:00"),  # early, early
+        ("la222222222222la", "2026-08-18T00:00:00", "2026-09-01T00:00:00"),  # early-ish, LATE
+    ]
+    values = ", ".join(
+        f"('{run_id}', '{capture}', 'offline', [2], TIMESTAMP '{finished}', TIMESTAMP '{ingested}')"
+        for run_id, finished, ingested in rows
+    )
+    bq.query(
+        f"INSERT INTO `{bq.project}.{DATASET}.runs` "
+        f"(run_id, capture_sha256, mode, tiers_attested, finished_at, ingested_at) VALUES {values}"
+    ).result()
+    held = list(bq.query(f"SELECT COUNT(*) AS n FROM `{bq.project}.{DATASET}.runs`").result())[0][
+        "n"
+    ]
+    assert held == len(rows), f"the fixture inserted {len(rows)} rows and the table holds {held}"
+    return capture, query
+
+
+def test_without_a_cutoff_the_later_finisher_is_authoritative(crossed_clocks, bq):
+    """The baseline: §4.6 picks on `finished_at`, so the run that finished later wins."""
+    capture, query = crossed_clocks
+    rows = query.authoritative(bq, DATASET, [capture])
+    assert [row["run_id"] for row in rows] == ["la222222222222la"]
+
+
+def test_a_run_finished_before_the_cutoff_but_ingested_after_it_is_excluded(crossed_clocks, bq):
+    """**The assertion that pins the whole of §6.5, and the one a plausible implementation gets
+    backwards.**
+
+    `la222222222222la` finished 2026-08-18 — comfortably before a cutoff of 2026-08-25 — but was
+    not ingested until 2026-09-01. A document rebuilt "as of the 25th" must NOT gain it, because it
+    was not in the store that day. A `finished_at` filter would include it, and the collection would
+    silently differ from the one that document recorded.
+    """
+    capture, query = crossed_clocks
+    rows = query.authoritative(bq, DATASET, [capture], as_of="2026-08-25T00:00:00Z")
+
+    ids = [row["run_id"] for row in rows]
+    assert "la222222222222la" not in ids, (
+        "the run was ingested after the cutoff and must not supply the tier; this is what "
+        "filtering on finished_at instead of ingested_at gets wrong"
+    )
+    assert ids == ["ea111111111111ea"], "authority falls back to the run that WAS in the store"
+
+
+def test_a_cutoff_before_everything_yields_nothing(crossed_clocks, bq):
+    capture, query = crossed_clocks
+    assert query.authoritative(bq, DATASET, [capture], as_of="2026-01-01T00:00:00Z") == []
+
+
+def test_a_cutoff_after_everything_agrees_with_the_view(crossed_clocks, bq):
+    """One rule, two renderings. With the cutoff past every `ingested_at`, the re-rendered SELECT
+    must return exactly what the view returns — which is the check that the two cannot diverge."""
+    capture, query = crossed_clocks
+    via_view = query.authoritative(bq, DATASET, [capture])
+    via_render = query.authoritative(bq, DATASET, [capture], as_of="2099-01-01T00:00:00Z")
+    assert via_render == via_view
+
+
+def test_the_cutoff_still_lets_finished_at_decide_between_survivors(bq):
+    """Both clocks, doing different jobs: `ingested_at` selects the candidates, `finished_at` picks
+    the winner among them. With both runs ingested before the cutoff, the later finisher wins."""
+    from flabeldb import query
+
+    rebuild(bq, "runs")
+    rebuild(bq, "run_exclusions")
+    capture = "e" * 64
+    values = ", ".join(
+        f"('{run_id}', '{capture}', 'offline', [2], TIMESTAMP '{finished}', TIMESTAMP '{ingested}')"
+        for run_id, finished, ingested in [
+            ("aa333333333333aa", "2026-08-10T00:00:00", "2026-08-11T00:00:00"),
+            ("bb444444444444bb", "2026-08-12T00:00:00", "2026-08-11T00:00:00"),
+        ]
+    )
+    bq.query(
+        f"INSERT INTO `{bq.project}.{DATASET}.runs` "
+        f"(run_id, capture_sha256, mode, tiers_attested, finished_at, ingested_at) VALUES {values}"
+    ).result()
+    rows = query.authoritative(bq, DATASET, [capture], as_of="2026-08-25T00:00:00Z")
+    assert [row["run_id"] for row in rows] == ["bb444444444444bb"]

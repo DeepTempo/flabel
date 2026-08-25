@@ -21,6 +21,7 @@ from flabel import labels as labels_module
 from flabel.models import LABEL_KINDS
 from flabeldb import blfile, collection, merge
 from test_flabeldb_merge import (
+    BOTH_RUN,
     CAPTURE,
     FLOW_KEY,
     OTHER_CAPTURE,
@@ -236,6 +237,10 @@ def test_two_label_values_emit_only_flows_carrying_both():
         "captures": 1,
         "flows": 1,
         "flows_without_origin": 0,
+        # Inputs, so §6.5's `--rebuild` reads the selection instead of inferring it.
+        "limit": None,
+        "allow_missing_origin": False,
+        "as_of": None,
     }
     assert [record["flow"]["flow_key"] for record in document["labels"]] == ["a" * 64]
 
@@ -308,7 +313,7 @@ def test_capture_resolves_a_name_the_authoritative_run_never_saw(monkeypatch):
         seen["wanted"] = list(wanted)
         return [CAPTURE]  # the table knows this name; the authoritative sighting does not
 
-    def authoritative(bq, dataset, captures=()):
+    def authoritative(bq, dataset, captures=(), *, as_of=None):
         seen["captures"] = list(captures)
         return [{"capture_sha256": CAPTURE, "tier": 2, "run_id": TIER2_RUN}]
 
@@ -624,8 +629,20 @@ def test_run_blocks_are_embedded_verbatim_and_ordered_by_run_id():
         run_rows=[run_row(TIER2_RUN, block), run_row(TIER1_RUN)],
     ).document
 
-    assert document["runs"][0] == json.loads(run_row(TIER1_RUN)["run_block"])
-    assert document["runs"][1] == block
+    # §6.4's literal is `{ "run_id": "…", "…": "the run block, verbatim" }` — the id BESIDE the
+    # block, which LS-7 omitted and §6.5's `--rebuild` needs as its pinned set.
+    assert document["runs"][0] == {
+        "run_id": TIER1_RUN,
+        "capture_sha256": CAPTURE,
+        "supplies": [1],
+        **json.loads(run_row(TIER1_RUN)["run_block"]),
+    }
+    assert document["runs"][1] == {
+        "run_id": TIER2_RUN,
+        "capture_sha256": CAPTURE,
+        "supplies": [2],
+        **block,
+    }
     assert TIER1_RUN < TIER2_RUN, "the fixture must actually exercise the ordering"
 
 
@@ -1050,7 +1067,9 @@ def test_a_capture_name_resolving_to_several_digests_is_said_out_loud(monkeypatc
     monkeypatch.setattr(
         blfile.query, "capture_shas", lambda bq, dataset, wanted: [CAPTURE, OTHER_CAPTURE]
     )
-    monkeypatch.setattr(blfile.query, "authoritative", lambda bq, dataset, captures=(): [])
+    monkeypatch.setattr(
+        blfile.query, "authoritative", lambda bq, dataset, captures=(), *, as_of=None: []
+    )
     monkeypatch.setattr(blfile.query, "flow_labels", lambda bq, dataset, run_ids: [])
     monkeypatch.setattr(blfile.query, "sightings", lambda bq, dataset, run_ids: [])
     monkeypatch.setattr(blfile.query, "runs", lambda bq, dataset, run_ids: [])
@@ -1085,3 +1104,753 @@ def _unmatched_detection(*, reason: str):
         ),
         reason=reason,
     )
+
+
+# --- LS-9: reproduction (§6.5) --------------------------------------------------------------------
+
+
+def prior_document(**kwargs) -> dict:
+    """A prior collection, **round-tripped through JSON** the way `--rebuild` reads one.
+
+    The round trip is the point. `dataclasses.asdict` leaves `sids` as a tuple and `json.loads`
+    yields a list, so a fixture built in memory and compared to another built in memory agrees on
+    something a real rebuild never sees. Measured against production before this was fixed: every
+    one of 20 records was reported as differing, on nothing but `(40151,) != [40151]`.
+    """
+    return json.loads(collection.serialise(built(**kwargs).document))
+
+
+def test_the_document_records_the_run_ids_it_was_built_from():
+    """§6.4's literal is `{ "run_id": "…", "…": "the run block, verbatim" }`, and LS-7 emitted only
+    the block — so the document did not name its own runs and §6.5 had no pinned set to read.
+
+    `origin.run_ids` is not a substitute: it names only the runs that contributed an EMITTED flow,
+    so a run whose flows were all refused for missing origin, or truncated away by `--limit`, is
+    absent from it.
+    """
+    document = prior_document()
+    assert [entry["run_id"] for entry in document["runs"]] == [TIER2_RUN]
+    block = json.loads(run_row(TIER2_RUN)["run_block"])
+    assert document["runs"][0] == {
+        "run_id": TIER2_RUN,
+        "capture_sha256": CAPTURE,
+        # **The tiers this run SUPPLIES here**, which is not the same as what it attested.
+        "supplies": [2],
+        **block,
+    }
+    for key in ("run_id", "capture_sha256", "supplies"):
+        assert key not in block, f"the run block has no {key} of its own, so nothing is shadowed"
+
+
+def test_the_selection_records_its_inputs_so_rebuild_reads_rather_than_infers():
+    document = prior_document(limit=1, allow_missing_origin=True, as_of="2026-08-25T00:00:00Z")
+    assert document["selection"]["limit"] == 1
+    assert document["selection"]["allow_missing_origin"] is True
+    assert document["selection"]["as_of"] == "2026-08-25T00:00:00Z"
+
+
+def test_read_prior_takes_the_selection_and_the_pinned_run_set():
+    prior = collection.read_prior(prior_document(limit=5, allow_missing_origin=True))
+    assert prior.pinned_runs == (TIER2_RUN,)
+    assert prior.selection.labels == ("verdict",)
+    assert prior.selection.limit == 5
+    assert prior.selection.allow_missing_origin is True
+
+
+def test_read_prior_carries_the_cutoff_so_the_rebuilt_document_still_records_it():
+    """**A document built with `--as-of` could not be reproduced at all**, and the failure message
+    blamed the store.
+
+    `read_prior` dropped the cutoff while `comparable` kept `selection.as_of` in the comparison, so
+    the rebuild wrote `as_of: null` against a document that said otherwise: one difference, and
+    `blfile` exited 1 announcing that "the rows those runs hold have changed". Nothing had changed.
+
+    Carrying it forward is inert for querying — the authority is read from the document, so no
+    cutoff is re-applied — and §6.5 refuses `--rebuild --as-of` on the COMMAND LINE, which is not
+    the same as forgetting what the document said.
+
+    **The document must actually carry a cutoff for this to mean anything.** An earlier version of
+    this test used one whose `as_of` was already null, so carrying and dropping were
+    indistinguishable and the sabotage stayed green.
+    """
+    document = prior_document(as_of="2026-08-25T00:00:00Z")
+    assert document["selection"]["as_of"] == "2026-08-25T00:00:00Z"
+    assert collection.read_prior(document).selection.as_of == "2026-08-25T00:00:00Z"
+
+
+def test_read_prior_refuses_a_labels_json():
+    """§9 forbids a collection stamped with `labels.json`'s version, and the other direction matters
+    as much: handed a labels.json, `--rebuild` would read no selection, rebuild from an empty pinned
+    set, and report a perfect reproduction of nothing."""
+    with pytest.raises(collection.NotACollection, match="document_type"):
+        collection.read_prior({"schema_version": "2.0", "run": {}, "labels": []})
+
+
+def test_read_prior_refuses_a_document_version_it_cannot_reproduce():
+    document = prior_document()
+    document["schema_version"] = "0.9"
+    with pytest.raises(collection.NotACollection, match="schema_version"):
+        collection.read_prior(document)
+
+
+def test_read_prior_refuses_a_document_written_before_run_ids_were_recorded():
+    """Documents LS-7 wrote have `runs[]` entries with no `run_id`. Refusing names the reason rather
+    than rebuilding from an empty pin and calling it a reproduction."""
+    document = prior_document()
+    document["runs"] = [
+        {key: value for key, value in document["runs"][0].items() if key != "run_id"}
+    ]
+    with pytest.raises(collection.NotACollection, match="do not carry"):
+        collection.read_prior(document)
+
+
+def test_reproduction_is_over_records_with_built_at_excluded():
+    """§6.5, and the same correction `docs/spec.md` §10 already made for a run's output: byte
+    identity is unachievable, so the comparison is over records."""
+    first = prior_document()
+    second = json.loads(collection.serialise(built().document))
+    second["built_at"] = "2099-01-01T00:00:00.000000Z"
+    assert first["built_at"] != second["built_at"]
+    assert collection.differences(collection.comparable(first), collection.comparable(second)) == []
+
+
+def test_a_tuple_and_a_list_of_the_same_sids_are_not_a_difference():
+    """**The bug that made `--rebuild` incapable of ever reproducing anything.**
+
+    One side of the comparison comes from `json.loads` of a file, the other is built in memory where
+    `dataclasses.asdict` leaves `sids` a tuple — and `(40151,)` does not equal `[40151]`. Against
+    the production store every record was reported as differing on nothing else. A document is JSON,
+    so the value compared is the JSON value.
+    """
+    in_memory = built().document
+    from_file = json.loads(collection.serialise(in_memory))
+    assert isinstance(in_memory["labels"][0]["labels"][0]["sids"], tuple)
+    assert isinstance(from_file["labels"][0]["labels"][0]["sids"], list)
+    assert (
+        collection.differences(collection.comparable(from_file), collection.comparable(in_memory))
+        == []
+    )
+
+
+def test_the_outcome_counts_are_not_part_of_the_reproduction():
+    """Measured against production: a `--limit 20` document pins only the runs whose flows survived
+    truncation, while its `flows_without_origin` counted the whole pre-limit selection — 408 against
+    20. Rebuilding from the pin asks a narrower question and honestly reports the smaller number.
+
+    Dropping the counts costs no detection: a changed flow count IS an added or removed record.
+    """
+    assert set(collection.SELECTION_OUTCOMES) == {"captures", "flows", "flows_without_origin"}
+    document = prior_document()
+    narrowed = json.loads(json.dumps(document))
+    narrowed["selection"]["flows_without_origin"] = 408
+    assert (
+        collection.differences(collection.comparable(document), collection.comparable(narrowed))
+        == []
+    )
+
+
+def test_a_changed_selection_input_is_a_difference():
+    """The inputs stay in the comparison — a rebuild reads them from the document, so a mismatch
+    would be a defect in this tool rather than a change in the store."""
+    document = prior_document()
+    other = json.loads(json.dumps(document))
+    other["selection"]["labels"] = ["threat-name"]
+    found = collection.differences(collection.comparable(document), collection.comparable(other))
+    assert any("selection" in line for line in found)
+
+
+def test_a_lost_flow_and_a_gained_flow_are_both_named():
+    document = prior_document()
+    changed = json.loads(json.dumps(document))
+    changed["labels"] = []
+    found = collection.differences(collection.comparable(document), collection.comparable(changed))
+    assert any("was in the document and is not in the rebuild" in line for line in found)
+    assert any(FLOW_KEY in line for line in found)
+
+
+def test_differences_are_keyed_on_the_flow_and_not_on_position():
+    """A rebuild that gained one flow would otherwise report every later record as changed, burying
+    the one real finding under a list of shifted rows."""
+    document = prior_document(
+        rows=[
+            row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)], flow_key="a" * 64),
+            row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2002)], flow_key="b" * 64),
+        ]
+    )
+    without_first = json.loads(json.dumps(document))
+    without_first["labels"] = without_first["labels"][1:]
+    found = collection.differences(
+        collection.comparable(document), collection.comparable(without_first)
+    )
+    assert len(found) == 1, found
+    assert "a" * 64 in found[0]
+
+
+def test_a_changed_run_set_is_named_in_both_directions():
+    document = prior_document()
+    changed = json.loads(json.dumps(document))
+    changed["runs"] = []
+    found = collection.differences(collection.comparable(document), collection.comparable(changed))
+    assert any(f"run {TIER2_RUN} was in the document" in line for line in found)
+
+
+def test_a_builder_mismatch_is_reported_naming_both_values():
+    """§6.5 asks for it to be "reported naming both" — reported, not fatal. It is a fact about the
+    two builds rather than a difference in the records."""
+    moved = collection.builder_differences(
+        {"version": "0.1.0", "label_kinds": "aaaa"}, {"version": "0.2.0", "label_kinds": "bbbb"}
+    )
+    assert len(moved) == 2
+    assert any("'0.1.0'" in line and "'0.2.0'" in line for line in moved)
+    assert any("'aaaa'" in line and "'bbbb'" in line for line in moved)
+
+
+def test_the_builder_is_not_part_of_the_records_comparison():
+    """Otherwise a version bump would read as a failed reproduction."""
+    document = prior_document()
+    other = json.loads(json.dumps(document))
+    other["builder"]["version"] = "9.9.9"
+    assert (
+        collection.differences(collection.comparable(document), collection.comparable(other)) == []
+    )
+    assert "builder" not in collection.comparable(document)
+
+
+# --- LS-9 at the CLI ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--label", "verdict"),
+        ("--as-of", "2026-08-25T00:00:00Z"),
+        ("--capture", CAPTURE),
+        ("--limit", "5"),
+        ("--allow-missing-origin", None),
+    ],
+)
+def test_rebuild_refuses_a_flag_it_would_silently_ignore(flag, value, tmp_path, capsys):
+    """§6.5 names `--label` and `--as-of`, on §12's precedent for `--sources`: a flag that looks
+    like it changed the selection and did not is worse than one that errors.
+
+    The other three are refused on the identical reasoning — a rebuild takes its selection from the
+    document, so every one of these would be ignored.
+    """
+    target = tmp_path / "c.json"
+    target.write_text(collection.serialise(built().document), encoding="utf-8")
+    argv = ["--rebuild", str(target), flag] + ([value] if value else [])
+    assert blfile.main(argv) == blfile.EXIT_USAGE
+    message = capsys.readouterr().err
+    assert flag in message
+    assert "silently ignored" in message
+
+
+def test_the_refusal_list_covers_every_flag_that_shapes_the_selection():
+    """A flag added to the parser and not to `REBUILD_REFUSES` would be quietly ignored under
+    `--rebuild`, which is the exact failure the refusal exists to prevent."""
+    shaping = {"label", "capture", "limit", "allow_missing_origin", "as_of"}
+    assert set(blfile.REBUILD_REFUSES) == shaping
+
+
+def test_rebuild_reports_the_conflict_before_validating_the_labels(tmp_path, capsys):
+    """`--rebuild x --label nonsense` must report the conflict, not the unknown kind: the label was
+    never going to be used."""
+    target = tmp_path / "c.json"
+    target.write_text(collection.serialise(built().document), encoding="utf-8")
+    assert blfile.main(["--rebuild", str(target), "--label", "not-a-kind"]) == blfile.EXIT_USAGE
+    message = capsys.readouterr().err
+    assert "silently ignored" in message
+    assert "LABEL_KINDS" not in message
+
+
+def test_a_rebuild_file_that_is_missing_or_not_json_is_a_usage_error(tmp_path, capsys):
+    assert blfile.main(["--rebuild", str(tmp_path / "absent.json")]) == blfile.EXIT_USAGE
+    assert "cannot read" in capsys.readouterr().err
+
+    broken = tmp_path / "broken.json"
+    broken.write_text('{"document_type":', encoding="utf-8")
+    assert blfile.main(["--rebuild", str(broken)]) == blfile.EXIT_USAGE
+    assert "is not JSON" in capsys.readouterr().err
+
+
+def test_a_pinned_run_absent_from_the_store_is_a_hard_failure_naming_it(monkeypatch, capsys):
+    """§6.5's hard failure. §1 makes the store a derived index over the archive, so a run it no
+    longer holds cannot be re-derived — a rebuild that quietly omitted it would answer a different
+    question and look like a reproduction."""
+    prior = collection.read_prior(prior_document())
+    monkeypatch.setattr(blfile.query, "exclusions", lambda bq, dataset, run_ids: [])
+    monkeypatch.setattr(blfile.query, "runs", lambda bq, dataset, run_ids: [])
+    with pytest.raises(blfile.PinnedRunMissing, match=TIER2_RUN):
+        blfile.collect_rebuild(object(), "flabel", prior, built_at=BUILT_AT)
+
+
+def test_that_hard_failure_exits_1_because_it_is_about_the_store(monkeypatch, tmp_path, capsys):
+    target = tmp_path / "c.json"
+    target.write_text(collection.serialise(built().document), encoding="utf-8")
+    monkeypatch.setattr(blfile.client_module, "client", lambda **kwargs: object())
+    monkeypatch.setattr(
+        blfile,
+        "collect_rebuild",
+        _raising(blfile.PinnedRunMissing(f"{TIER2_RUN} is not in flabel")),
+    )
+    assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_REFUSED
+    assert TIER2_RUN in capsys.readouterr().err
+
+
+def test_rebuild_issues_no_query_that_re_decides_authority():
+    """The authority is read from the document, so no statement asks the store for it.
+
+    `query.pinned_authority` existed for exactly one commit and was the CRITICAL defect: it
+    recovered a run's tiers from `tiers_attested`, which is what a run claimed and not what it
+    supplies. There is now nothing to ask.
+    """
+    assert not hasattr(blfile.query, "pinned_authority")
+
+
+def test_as_of_reaches_the_query_and_bare_blfile_reads_the_view(monkeypatch):
+    """Two paths, one rule: without a cutoff the view is read, with one the same file is re-rendered
+    as a parameterised SELECT."""
+    seen = {}
+
+    def authoritative(bq, dataset, captures=(), *, as_of=None):
+        seen["as_of"] = as_of
+        return []
+
+    monkeypatch.setattr(blfile.query, "authoritative", authoritative)
+    monkeypatch.setattr(blfile.query, "flow_labels", lambda *a, **k: [])
+    monkeypatch.setattr(blfile.query, "sightings", lambda *a, **k: [])
+    monkeypatch.setattr(blfile.query, "runs", lambda *a, **k: [])
+
+    blfile.collect(object(), "flabel", collection.Selection(labels=("verdict",)), built_at=BUILT_AT)
+    assert seen["as_of"] is None
+    blfile.collect(
+        object(),
+        "flabel",
+        collection.Selection(labels=("verdict",), as_of="2026-08-25T00:00:00Z"),
+        built_at=BUILT_AT,
+    )
+    assert seen["as_of"] == "2026-08-25T00:00:00Z"
+
+
+def test_a_reproduction_failure_exits_1_and_names_the_differences(monkeypatch, tmp_path, capsys):
+    """A rebuild that did not reproduce is a statement about the DATA — the store no longer yields
+    what that document recorded — so it shares 1 with the conflicts. Exit 0 would make `--rebuild` a
+    command that cannot fail."""
+    document = built().document
+    target = tmp_path / "c.json"
+    target.write_text(collection.serialise(document), encoding="utf-8")
+
+    # The store now yields one fewer flow than the document recorded.
+    fewer = built(
+        rows=[row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)], flow_key="z" * 64)]
+    )
+    monkeypatch.setattr(blfile.client_module, "client", lambda **kwargs: object())
+    monkeypatch.setattr(blfile, "collect_rebuild", lambda *a, **k: fewer)
+
+    assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_REFUSED
+    message = capsys.readouterr().err
+    assert "DID NOT reproduce" in message
+    assert FLOW_KEY in message
+
+
+def test_a_successful_reproduction_says_so_and_exits_0(monkeypatch, tmp_path, capsys):
+    result = built()
+    target = tmp_path / "c.json"
+    target.write_text(collection.serialise(result.document), encoding="utf-8")
+    monkeypatch.setattr(blfile.client_module, "client", lambda **kwargs: object())
+    monkeypatch.setattr(blfile, "collect_rebuild", lambda *a, **k: built())
+
+    assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_OK
+    message = capsys.readouterr().err
+    assert "REPRODUCED" in message
+    assert "built_at excluded" in message
+
+
+def test_a_builder_mismatch_is_reported_but_does_not_fail_the_reproduction(
+    monkeypatch, tmp_path, capsys
+):
+    """§6.5 says "reported naming both". It is printed FIRST, because a changed `label_kinds`
+    changes what `--label verdict` means and a reader needs that before anything below it."""
+    document = json.loads(collection.serialise(built().document))
+    document["builder"]["label_kinds"] = "0000000000000000"
+    target = tmp_path / "c.json"
+    target.write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr(blfile.client_module, "client", lambda **kwargs: object())
+    monkeypatch.setattr(blfile, "collect_rebuild", lambda *a, **k: built())
+
+    assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_OK
+    message = capsys.readouterr().err
+    assert "builder.label_kinds" in message
+    assert "0000000000000000" in message
+    assert "REPRODUCED" in message
+    assert message.index("builder.label_kinds") < message.index("REPRODUCED")
+
+
+def test_a_rebuild_refuses_a_run_that_has_since_been_retracted(monkeypatch):
+    """**Reproduction is an audit capability; retraction is a correction. Retraction wins.**
+
+    §4.5 is explicit that `run_exclusions` "covers the cases nobody wants to think about: a capture
+    that must come out for legal or customer-data reasons, and a run later found to be mislabelled."
+    `authoritative_runs` anti-joins the table, so the ordinary read path never sees an excluded
+    run — but `--rebuild` pins a set recorded *before* the exclusion existed, so it is the one that
+    can resurrect one. A rebuild that silently reproduced it would re-publish exactly what somebody
+    removed, and a retraction that can be reproduced past is not a retraction.
+    """
+    prior = collection.read_prior(prior_document())
+    monkeypatch.setattr(
+        blfile.query,
+        "exclusions",
+        lambda bq, dataset, run_ids: [
+            {
+                "run_id": TIER2_RUN,
+                "reason": "customer data removal",
+                "excluded_by": "craig@deeptempo.ai",
+                "excluded_at": "2026-08-26T00:00:00Z",
+            }
+        ],
+    )
+
+    def never(*args, **kwargs):
+        raise AssertionError("a retracted run's rows were read")
+
+    monkeypatch.setattr(blfile.query, "runs", never)
+    monkeypatch.setattr(blfile.query, "flow_labels", never)
+
+    with pytest.raises(blfile.PinnedRunExcluded) as raised:
+        blfile.collect_rebuild(object(), "flabel", prior, built_at=BUILT_AT)
+    message = str(raised.value)
+    assert TIER2_RUN in message
+    assert "customer data removal" in message, "§4.5 stores the reason so it stays auditable"
+    assert "WITHOUT" in message, "the remedy is a fresh build, which honours the exclusion"
+
+
+def test_the_retraction_check_runs_before_anything_is_composed(monkeypatch):
+    """Nothing retracted may be read into a record, so the check precedes the row fetch — which is
+    what the `never` stubs above assert. Pinned here as its own property because an ordering that
+    happens to be right is one refactor from being wrong."""
+    import inspect
+
+    body = inspect.getsource(blfile.collect_rebuild)
+    executable = "\n".join(
+        line for line in body.splitlines() if not line.strip().startswith("#")
+    ).split('"""')[-1]
+    assert executable.index("query.exclusions") < executable.index("query.runs")
+    assert executable.index("query.exclusions") < executable.index("query.flow_labels")
+
+
+def test_a_retracted_pin_exits_1_because_it_is_about_the_data(monkeypatch, tmp_path, capsys):
+    target = tmp_path / "c.json"
+    target.write_text(collection.serialise(built().document), encoding="utf-8")
+    monkeypatch.setattr(blfile.client_module, "client", lambda **kwargs: object())
+    monkeypatch.setattr(
+        blfile,
+        "collect_rebuild",
+        _raising(blfile.PinnedRunExcluded(f"{TIER2_RUN} — reason 'legal removal'")),
+    )
+    assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_REFUSED
+    assert "legal removal" in capsys.readouterr().err
+
+
+# --- the end-to-end rebuild, which nothing exercised ---------------------------------------------
+
+
+def fake_store(rows, sightings_rows, run_rows):
+    """A `query` stand-in that answers from fixtures, so the WHOLE rebuild path runs.
+
+    **This is the test the plan names and the review found missing.** Every earlier CLI-level
+    reproduction test monkeypatched `collect_rebuild` away, and the two that called it returned
+    before composing anything — so `collect_rebuild` was never run to completion anywhere in the
+    suite. That is #171's shape: the one path production takes was the one path no test exercised,
+    and it is why the pinned-tier defect and the dropped-cutoff defect were both invisible.
+    """
+
+    def patch(monkeypatch):
+        monkeypatch.setattr(blfile.query, "exclusions", lambda bq, dataset, run_ids: [])
+        monkeypatch.setattr(
+            blfile.query,
+            "runs",
+            lambda bq, dataset, run_ids: [r for r in run_rows if r["run_id"] in set(run_ids)],
+        )
+        monkeypatch.setattr(
+            blfile.query,
+            "flow_labels",
+            lambda bq, dataset, run_ids: [r for r in rows if r["run_id"] in set(run_ids)],
+        )
+        monkeypatch.setattr(
+            blfile.query,
+            "sightings",
+            lambda bq, dataset, run_ids: [
+                s for s in sightings_rows if s["observed_by_run_id"] in set(run_ids)
+            ],
+        )
+
+    return patch
+
+
+def test_a_rebuild_reproduces_the_document_it_was_given(monkeypatch):
+    """PLAN's first named test, driven through `read_prior` and `collect_rebuild` for real."""
+    rows = [row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)])]
+    sightings_rows = [sighting(run_id=TIER2_RUN)]
+    run_rows = [run_row(TIER2_RUN)]
+    document = json.loads(
+        collection.serialise(built(rows=rows, sightings=sightings_rows, run_rows=run_rows).document)
+    )
+    fake_store(rows, sightings_rows, run_rows)(monkeypatch)
+
+    prior = collection.read_prior(document)
+    rebuilt = blfile.collect_rebuild(object(), "flabel", prior, built_at="2099-01-01T00:00:00.0Z")
+
+    assert (
+        collection.differences(
+            collection.comparable(document), collection.comparable(rebuilt.document)
+        )
+        == []
+    )
+    assert rebuilt.document["built_at"] != document["built_at"]
+
+
+def test_a_rebuild_reproduces_a_partially_superseded_capture(monkeypatch):
+    """**The variant that catches the CRITICAL defect.**
+
+    A `--both` run supplies tier 1 while a newer `--offline` run supplies tier 2, so the `--both`
+    run ATTESTS a tier it does not supply. Recovering the pin from `tiers_attested` made this exact
+    document un-rebuildable — two runs for one (capture, tier) — and no test could see it because
+    none of them composed anything.
+    """
+    both = row(
+        run_id=BOTH_RUN,
+        sources=[source(tier=1, sid=700, name="panw"), source(tier=2, sid=2001)],
+    )
+    newer = row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2002)], flow_key="c" * 64)
+    auth = merge.authority(
+        [
+            {"capture_sha256": CAPTURE, "tier": 1, "run_id": BOTH_RUN},
+            {"capture_sha256": CAPTURE, "tier": 2, "run_id": TIER2_RUN},
+        ]
+    )
+    rows = [both, newer]
+    sightings_rows = [sighting(run_id=BOTH_RUN), sighting(run_id=TIER2_RUN)]
+    run_rows = [run_row(BOTH_RUN), run_row(TIER2_RUN)]
+    document = json.loads(
+        collection.serialise(
+            built(rows=rows, auth=auth, sightings=sightings_rows, run_rows=run_rows).document
+        )
+    )
+    fake_store(rows, sightings_rows, run_rows)(monkeypatch)
+
+    prior = collection.read_prior(document)
+    rebuilt = blfile.collect_rebuild(object(), "flabel", prior, built_at="2099-01-01T00:00:00.0Z")
+    assert (
+        collection.differences(
+            collection.comparable(document), collection.comparable(rebuilt.document)
+        )
+        == []
+    )
+
+
+def test_a_rebuild_reproduces_a_document_that_had_a_cutoff(monkeypatch):
+    """The variant that catches the dropped-cutoff defect: an `--as-of` document must reproduce."""
+    rows = [row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)])]
+    sightings_rows = [sighting(run_id=TIER2_RUN)]
+    run_rows = [run_row(TIER2_RUN)]
+    document = json.loads(
+        collection.serialise(
+            built(
+                rows=rows,
+                sightings=sightings_rows,
+                run_rows=run_rows,
+                as_of="2026-08-25T00:00:00Z",
+            ).document
+        )
+    )
+    fake_store(rows, sightings_rows, run_rows)(monkeypatch)
+
+    prior = collection.read_prior(document)
+    rebuilt = blfile.collect_rebuild(object(), "flabel", prior, built_at="2099-01-01T00:00:00.0Z")
+    assert rebuilt.document["selection"]["as_of"] == "2026-08-25T00:00:00Z"
+    assert (
+        collection.differences(
+            collection.comparable(document), collection.comparable(rebuilt.document)
+        )
+        == []
+    )
+
+
+def test_a_rebuild_reproduces_a_limited_document(monkeypatch):
+    """`--limit` truncates a prefix of a total order, and the pin covers every tier-supplier of
+    every capture in that prefix — so re-applying the same limit yields the identical prefix."""
+    rows = [
+        row(
+            run_id=TIER2_RUN,
+            sources=[source(tier=2, sid=2000 + index)],
+            flow_key=f"{index:064d}",
+            flow=flow_struct(ts_first=f"2026-07-08T12:00:0{index}.000000Z"),
+        )
+        for index in range(4)
+    ]
+    sightings_rows = [sighting(run_id=TIER2_RUN)]
+    run_rows = [run_row(TIER2_RUN)]
+    document = json.loads(
+        collection.serialise(
+            built(rows=rows, sightings=sightings_rows, run_rows=run_rows, limit=2).document
+        )
+    )
+    assert document["selection"]["flows"] == 2
+    fake_store(rows, sightings_rows, run_rows)(monkeypatch)
+
+    prior = collection.read_prior(document)
+    rebuilt = blfile.collect_rebuild(object(), "flabel", prior, built_at="2099-01-01T00:00:00.0Z")
+    assert (
+        collection.differences(
+            collection.comparable(document), collection.comparable(rebuilt.document)
+        )
+        == []
+    )
+
+
+def test_a_rebuild_notices_when_the_rows_really_did_change(monkeypatch):
+    """The other half: the reproduction must FAIL when the store no longer holds what the document
+    recorded. Otherwise every test above is satisfied by a comparison that cannot fail."""
+    rows = [
+        row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)], flow_key="a" * 64),
+        row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2002)], flow_key="b" * 64),
+    ]
+    sightings_rows = [sighting(run_id=TIER2_RUN)]
+    run_rows = [run_row(TIER2_RUN)]
+    document = json.loads(
+        collection.serialise(built(rows=rows, sightings=sightings_rows, run_rows=run_rows).document)
+    )
+    # The store has lost one flow since.
+    fake_store(rows[:1], sightings_rows, run_rows)(monkeypatch)
+
+    prior = collection.read_prior(document)
+    rebuilt = blfile.collect_rebuild(object(), "flabel", prior, built_at="2099-01-01T00:00:00.0Z")
+    found = collection.differences(
+        collection.comparable(document), collection.comparable(rebuilt.document)
+    )
+    assert len(found) == 1
+    assert "b" * 64 in found[0]
+
+
+# --- the rest of the 2026-08-25 review -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "[]",
+        "5",
+        '"x"',
+        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": 42}',
+        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": [1]}',
+        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": [],'
+        ' "selection": ["x"]}',
+        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": [],'
+        ' "builder": ["x"]}',
+        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": [],'
+        ' "labels": [1, 2]}',
+    ],
+)
+def test_a_valid_json_file_of_the_wrong_shape_is_a_usage_error(contents, tmp_path, capsys):
+    """**Each of these used to reach the interpreter as exit 1** — the code this tool publishes as a
+    refusal about the store — because `read_prior` only checked `document_type`, `schema_version`
+    and `runs[].run_id`, and everything else indexed blindly.
+
+    It is an operator's file, so it is exit 2: a fact about the argument, not about the dataset.
+    """
+    target = tmp_path / "c.json"
+    target.write_text(contents, encoding="utf-8")
+    assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_USAGE
+    assert "cannot be rebuilt" in capsys.readouterr().err
+
+
+def test_a_non_finite_number_in_a_rebuild_file_is_not_reported_as_a_store_refusal(
+    monkeypatch, tmp_path, capsys
+):
+    """`json.loads` accepts the `NaN` literal and `serialise` refuses it (`allow_nan=False`), so
+    `comparable` raised from inside `_report_reproduction` — which sat outside every handler."""
+    document = json.loads(collection.serialise(built().document))
+    target = tmp_path / "c.json"
+    target.write_text(
+        json.dumps(document).replace('"unmatched_ratio": 0.0', '"unmatched_ratio": NaN'),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(blfile.client_module, "client", lambda **kwargs: object())
+    monkeypatch.setattr(blfile, "collect_rebuild", lambda *a, **k: built())
+    assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_INTERNAL
+    assert "DEFECT in blfile" in capsys.readouterr().err
+
+
+def test_rebuild_refuses_limit_zero_rather_than_calling_it_absent(tmp_path, capsys):
+    """`0 == False` in Python, so `not in (None, False, ())` treated `--limit 0` as not supplied and
+    the operator got "selects nothing" instead of "--rebuild ignores --limit". Right code, wrong
+    explanation."""
+    target = tmp_path / "c.json"
+    target.write_text(collection.serialise(built().document), encoding="utf-8")
+    assert blfile.main(["--rebuild", str(target), "--limit", "0"]) == blfile.EXIT_USAGE
+    assert "silently ignored" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("cutoff", ["yesterday", "2026-13-99", "", "now()"])
+def test_a_malformed_as_of_is_a_usage_error_not_a_defect(cutoff, capsys):
+    """It used to reach BigQuery, be rejected, and surface as a traceback plus "This is a DEFECT in
+    blfile" at exit 3 — for a typo. The value is also written verbatim into the published
+    `selection.as_of`, so a malformed cutoff would become part of the provenance."""
+    assert blfile.main(["--as-of", cutoff]) == blfile.EXIT_USAGE
+    assert "not an ISO-8601 instant" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "cutoff", ["2026-08-25T00:00:00Z", "2026-08-25T00:00:00+00:00", "2026-08-25"]
+)
+def test_a_well_formed_cutoff_is_accepted(cutoff):
+    assert blfile._is_instant(cutoff)
+
+
+def test_a_rewritten_run_block_is_not_a_reproduction():
+    """§6.4 embeds the blocks as provenance — ruleset snapshot, tool versions, mode, `input`.
+    Comparing only the id set meant a run row rewritten by a re-ingest reported REPRODUCED, which is
+    exactly the scenario `--rebuild` audits."""
+    document = prior_document()
+    changed = json.loads(json.dumps(document))
+    changed["runs"][0]["mode"] = "both"
+    found = collection.differences(collection.comparable(document), collection.comparable(changed))
+    assert len(found) == 1
+    assert "block differs" in found[0] and "mode" in found[0]
+
+
+def test_the_same_records_in_a_different_order_are_not_a_reproduction():
+    """§6.4's canonical ordering is part of the document, so a re-ordering is a difference."""
+    document = prior_document(
+        rows=[
+            row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)], flow_key="a" * 64),
+            row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2002)], flow_key="b" * 64),
+        ]
+    )
+    reversed_records = json.loads(json.dumps(document))
+    reversed_records["labels"] = list(reversed(reversed_records["labels"]))
+    found = collection.differences(
+        collection.comparable(document), collection.comparable(reversed_records)
+    )
+    assert len(found) == 1
+    assert "order differs" in found[0]
+
+
+def test_a_repeated_flow_key_is_reported_rather_than_collapsed():
+    """`differences` indexes records by (capture, flow_key), and the cardinality check that used to
+    catch a duplicate — `selection.flows` — is now excluded from the comparison. §3.2 makes the pair
+    a flow's identity, so this asserts the assumption instead of trusting it."""
+    document = prior_document()
+    doubled = json.loads(json.dumps(document))
+    doubled["labels"] = doubled["labels"] + doubled["labels"]
+    found = collection.differences(collection.comparable(document), collection.comparable(doubled))
+    assert any("two records for one (capture, flow_key)" in line for line in found)
+
+
+def test_a_view_cannot_be_rendered_with_a_query_parameter_in_it():
+    """`render_view(as_of=True, ddl=True)` is reachable and yields `CREATE OR REPLACE VIEW …
+    @as_of`, which BigQuery cannot create: a view takes no parameters."""
+    from flabeldb import schema
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        schema.render_view("authoritative_runs", "flabel", as_of=True, ddl=True)

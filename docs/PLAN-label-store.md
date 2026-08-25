@@ -8,7 +8,7 @@ Spec: `docs/spec-label-store.md`. Design reasoning: `inline-labeling/label-store
 were then executed against the live service. The step list is resequenced rather than renumbered —
 issues #145–#153 keep their step ids, so nothing has to be re-filed.
 
-## Progress — Phase 3a COMPLETE, LS-8 merged; LS-9 is the last step
+## Progress — Phase 3a and LS-8 merged; LS-9 open
 
 | Step | Issue | State |
 | :-- | :-- | :-- |
@@ -20,7 +20,7 @@ issues #145–#153 keep their step ids, so nothing has to be re-filed.
 | LS-5 wire `flabel-run` | [#150](https://github.com/DeepTempo/flabel/issues/150) | ✅ merged (PR #169) |
 | LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | ✅ merged (PR #174) — the last of Phase 3a |
 | LS-8 backfill and reconcile | [#152](https://github.com/DeepTempo/flabel/issues/152) | ✅ merged (PR #175) — Phase 3b |
-| LS-9 `blfile` reproduction | [#153](https://github.com/DeepTempo/flabel/issues/153) | **next — the last of Phase 3b** |
+| LS-9 `blfile` reproduction | [#153](https://github.com/DeepTempo/flabel/issues/153) | 🔜 open — the last of Phase 3b. `collection_id` deferred |
 
 LS-4 landed two corrections to documents outside its own scope, both found by running it rather
 than reading it: spec §5.3 step 3 contradicted its own step 2 (a table cleared by step 2 and then
@@ -46,6 +46,29 @@ escapes in the tests (a `flow_key` tie-break `merge.compose`'s own pre-sort made
 captures, and a UTF-8 assertion that round-tripped through `json.loads`), and one was a stale `.pyc`
 in the sabotage harness itself, which is worth knowing: a patch and a restore inside one second can
 leave the previous bytecode in place and read as a guard that holds.
+
+LS-9's `--as-of` needed the supersession rule with one extra predicate, and §9 forbids a second
+implementation of it — so `views/authoritative_runs.sql` gained two placeholders and is rendered
+twice from the one file: as the `CREATE VIEW` for `flabel-db apply`, and as a bare parameterised
+SELECT for `blfile --as-of`. The executed DDL is unchanged, so no `apply` against a live dataset was
+implied. Verified against production: with the cutoff past every `ingested_at` the re-rendered SELECT
+returns exactly the view's 17 rows.
+
+Its review found a CRITICAL that only real composition could expose. §6.5 says `--rebuild` takes
+"the pinned `run_id` set", and ids alone are not enough: the rebuild also needs each run's *tiers*,
+and the only thing to recover those from — `tiers_attested` — is what a run **claimed**, not what it
+supplies. A `--both` run attesting `[1, 2]` while supplying only tier 1 made the rebuild see two runs
+for one (capture, tier) and exit 1 naming a view it had never queried, about a consistent store —
+**every capture re-run at one tier was un-rebuildable**. The document now records the authority
+itself. Four more: an `--as-of` document could never reproduce (the cutoff was dropped on read but
+compared on output, so the tool announced that the rows had changed when nothing had); a
+valid-JSON-but-wrong-shaped file reached the interpreter as exit 1; run blocks and record order were
+never compared; and `--limit 0` slipped the `--rebuild` refusal because `0 == False`.
+
+**And nothing exercised `collect_rebuild` to completion** — every CLI test stubbed it out and the two
+that called it returned early — which is why both defects were invisible. That is #171's shape for
+the third time in this phase. `collection_id` is deferred (Craig): §6.3 promised it and nothing ever
+defined it, so §6.4 now records the three jobs it could serve rather than guessing one.
 
 LS-8's reconciliation is two legs, and the review found that one of them could not fire. `compare_run`
 returned early on a missing `runs` marker, which put the archive-against-its-own-`run.counts` leg

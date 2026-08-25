@@ -22,6 +22,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from flabeldb import client as client_module
+from flabeldb import schema
 from flabeldb.cli import IDENTIFIER
 
 #: Every read joins through `runs` (§5.3), and `authoritative_runs` already anti-joins
@@ -78,14 +79,57 @@ def capture_shas(bq, dataset: str, wanted: Sequence[str]) -> list[str]:
     return sorted(row["capture_sha256"] for row in _rows(bq, sql, [_strings("wanted", wanted)]))
 
 
-def authoritative(bq, dataset: str, captures: Sequence[str] = ()) -> list[dict[str, Any]]:
-    """§4.6's view: for each (capture, tier), the run that currently supplies it."""
-    sql = f"SELECT capture_sha256, tier, run_id FROM {table(bq, dataset, VIEW)}"
+def authoritative(
+    bq, dataset: str, captures: Sequence[str] = (), *, as_of: str | None = None
+) -> list[dict[str, Any]]:
+    """For each (capture, tier), the run that currently supplies it — or that supplied it at
+    `as_of`.
+
+    Without `as_of` this reads §4.6's view, which is what the BigQuery console sees and what LS-7
+    has always used. With it, the view cannot help: a view takes no parameters, and §6.5's cutoff
+    filters on `ingested_at`. So the **same statement** is re-rendered from the **same file** as a
+    bare parameterised SELECT (`schema.render_view`), which is how `--as-of` gets the supersession
+    rule without §9's forbidden second copy of it.
+
+    `as_of` is bound as a `TIMESTAMP` parameter, never interpolated — it is a value, unlike the
+    dataset.
+    """
+    bigquery = client_module._bigquery()
     parameters: list[Any] = []
+    if as_of is None:
+        sql = f"SELECT capture_sha256, tier, run_id FROM {table(bq, dataset, VIEW)}"
+    else:
+        # The rendered body already projects (capture_sha256, tier, run_id) and ends at
+        # `WHERE recency = 1`, so it is a complete SELECT and needs no wrapping.
+        if not IDENTIFIER.fullmatch(dataset):
+            raise ValueError(f"dataset {dataset!r} is not a BigQuery identifier")
+        sql = schema.render_view(VIEW, dataset, as_of=True, ddl=False).rstrip().rstrip(";")
+        sql = f"SELECT capture_sha256, tier, run_id FROM ({sql})"
+        parameters.append(bigquery.ScalarQueryParameter("as_of", "TIMESTAMP", as_of))
     if captures:
+        # Always `WHERE`, never `AND`: both branches leave an outer SELECT with no predicate on it.
+        # A first version chose between them by looking for " WHERE " in `sql`, which the rendered
+        # body contains internally — so the as-of path produced `SELECT ... FROM (...) AND ...`.
         sql += " WHERE capture_sha256 IN UNNEST(@captures)"
         parameters.append(_strings("captures", captures))
     return _rows(bq, sql + " ORDER BY capture_sha256, tier", parameters)
+
+
+def exclusions(bq, dataset: str, run_ids: Sequence[str]) -> list[dict[str, Any]]:
+    """§4.5's retractions for the given runs, with their reasons.
+
+    `authoritative_runs` anti-joins this table, so the ordinary read path never sees an excluded
+    run and never has to ask. `--rebuild` does: it pins a run set recorded before the exclusion
+    existed, so it is the one path that can resurrect a retracted run, and it has to look.
+    """
+    if not run_ids:
+        return []
+    sql = (
+        f"SELECT run_id, reason, excluded_at, excluded_by "
+        f"FROM {table(bq, dataset, 'run_exclusions')} WHERE run_id IN UNNEST(@runs) "
+        f"ORDER BY run_id"
+    )
+    return _rows(bq, sql, [_strings("runs", run_ids)])
 
 
 def flow_labels(bq, dataset: str, run_ids: Sequence[str]) -> list[dict[str, Any]]:

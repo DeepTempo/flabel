@@ -57,6 +57,10 @@ TOOL = "blfile"
 #: `--source-uri`, which is every run in the archive (§4.2, §6.1).
 NOT_RECORDED = "not-recorded"
 
+#: The `selection` fields that describe the RESULT rather than the request. Excluded from a
+#: reproduction comparison — see `comparable`, which records the measurement that showed why.
+SELECTION_OUTCOMES = frozenset({"captures", "flows", "flows_without_origin"})
+
 #: `docs/spec.md` §10's timestamp format, written out because `tests/test_architecture.py` shares
 #: only `flabel.models` with this package. `test_blfile.py` pins it to `labels.iso_from_epoch`.
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
@@ -72,6 +76,9 @@ class Selection:
     captures: tuple[str, ...] = ()
     limit: int | None = None
     allow_missing_origin: bool = False
+    #: §6.5's audit cutoff, an ISO-8601 instant or `None`. Filters candidate runs on `ingested_at`,
+    #: never on `finished_at` — see `schema.AS_OF_PREDICATE` for why both clocks are needed.
+    as_of: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -173,6 +180,19 @@ def build(
         chosen = chosen[: selection.limit]
 
     captures_present = {record.capture_sha256 for record in chosen}
+    # run_id -> (capture, the tiers it SUPPLIES here). A run covers exactly one capture (§3.3), so
+    # the pair is well defined; `supplies` is a subset of that run's `tiers_attested` whenever a
+    # newer run has taken one of its tiers.
+    supplied: dict[str, tuple[str, list[int]]] = {}
+    for capture in captures_present:
+        for tier, run_id in sorted(auth.by_capture.get(capture, {}).items()):
+            capture_seen, tiers = supplied.setdefault(run_id, (capture, []))
+            tiers.append(tier)
+            if capture_seen != capture:  # pragma: no cover - §3.3 makes this unreachable
+                raise ValueError(
+                    f"run {run_id} supplies two captures ({capture_seen}, {capture}); §3.3 derives "
+                    f"a run id from one capture, so this cannot happen and must not be guessed at"
+                )
     runs_present = sorted(
         {
             run_id
@@ -199,8 +219,37 @@ def build(
             "captures": len(captures_present),
             "flows": len(chosen),
             "flows_without_origin": len(without_origin),
+            # **Inputs, not outcomes**, and they are here so §6.5's `--rebuild` can READ the
+            # selection instead of inferring it. Both are derivable from the records — the limit
+            # from the record count, the flag from whether any emitted origin is `not-recorded` —
+            # and an inference that happens to work is a worse contract than a field.
+            "limit": selection.limit,
+            "allow_missing_origin": selection.allow_missing_origin,
+            "as_of": selection.as_of,
         },
-        "runs": [blocks[run_id] for run_id in runs_present if run_id in blocks],
+        # **`run_id`, `capture_sha256` and `supplies` beside the verbatim block.** §6.4's example
+        # literal shows the id and LS-7 omitted it; the other two are what make §6.5's pinned set
+        # *usable*, and getting that wrong was a defect rather than a shortfall.
+        #
+        # "The pinned `run_id` set" is under-specified in §6.5, and the first implementation read
+        # it as ids alone and recovered each run's tiers from `runs.tiers_attested`. Those are
+        # different things — §5.2 rule 2 turns on exactly the difference — so a `--both` run
+        # ATTESTING [1, 2] while SUPPLYING only tier 1 made the rebuild see two runs for one
+        # (capture, tier) and fail, naming a view it had never queried, on a consistent store.
+        # Measured: any capture re-run at one tier produced an un-rebuildable document.
+        #
+        # With the authority recorded, a rebuild is a function of the document plus the rows —
+        # which is what §6.5 promises — rather than of today's `tiers_attested`.
+        "runs": [
+            {
+                "run_id": run_id,
+                "capture_sha256": supplied[run_id][0],
+                "supplies": supplied[run_id][1],
+                **blocks[run_id],
+            }
+            for run_id in runs_present
+            if run_id in blocks
+        ],
         "labels": [
             _record(record, origins.get(record.capture_sha256), coverage.get(record.capture_sha256))
             for record in chosen
@@ -212,6 +261,250 @@ def build(
         refused=merged.refused,
         refusal_notes=merged.refusal_notes,
     )
+
+
+# --- reproduction (§6.5) --------------------------------------------------------------------------
+
+
+class NotACollection(Exception):
+    """The file handed to `--rebuild` is not a `labels-collection` this build can reproduce from."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Prior:
+    """A previous collection, as the inputs needed to rebuild it plus what it claimed.
+
+    §6.5: `--rebuild` "takes the selection **and the pinned `run_id` set** from a prior document,
+    making the output a function of that document plus the store." Everything here is read from the
+    file; nothing is inferred, which is why LS-9 added `selection.limit`,
+    `selection.allow_missing_origin` and `runs[].run_id` to §6.4's block.
+    """
+
+    selection: Selection
+    #: The runs the prior document was built from. **Pinned**: §5.1's "which run supplies this tier
+    #: now" is not re-asked, or `--rebuild` would be a function of today's store.
+    pinned_runs: tuple[str, ...]
+    #: Which run supplied which (capture, tier), **read from the document**. Not re-derived from
+    #: `runs.tiers_attested`: a run can attest a tier a newer run has since taken, and treating
+    #: attested as supplied made every partially-superseded capture un-rebuildable.
+    authority: merge.Authority
+    builder: Mapping[str, Any]
+    document: Mapping[str, Any]
+
+
+def read_prior(document: Mapping[str, Any]) -> Prior:
+    """A prior `labels-collection` as a `Prior`, or a readable refusal.
+
+    **The document type is checked, not assumed.** §9 says a collection must never be stamped with
+    `labels.json`'s `schema_version`, and the other direction matters just as much here: handed a
+    `labels.json`, `--rebuild` would read `selection` as absent, rebuild from an empty pinned set,
+    and report a perfect reproduction of nothing.
+    """
+    if not isinstance(document, Mapping):
+        raise NotACollection(
+            f"the file holds a {type(document).__name__}, not an object. Every check below reads "
+            f"keys, and letting it through reached the interpreter as exit 1 — the code this tool "
+            f"publishes as a refusal about the store"
+        )
+    kind = document.get("document_type")
+    if kind != DOCUMENT_TYPE:
+        raise NotACollection(
+            f"document_type is {kind!r}, not {DOCUMENT_TYPE!r}. `--rebuild` needs a collection; a "
+            f"labels.json describes one run over one capture and has no selection to reproduce"
+        )
+    version = document.get("schema_version")
+    if version != SCHEMA_VERSION:
+        raise NotACollection(
+            f"schema_version is {version!r} and this build writes {SCHEMA_VERSION!r}. Reproducing "
+            f"across a document version is not what §6.5 promises"
+        )
+    selection = document.get("selection") or {}
+    if not isinstance(selection, Mapping):
+        raise NotACollection(f"`selection` is a {type(selection).__name__}, not an object")
+    records = document.get("labels")
+    if records is not None and (
+        not isinstance(records, list) or any(not isinstance(item, Mapping) for item in records)
+    ):
+        raise NotACollection("`labels` is not a list of objects")
+    if not isinstance(document.get("builder") or {}, Mapping):
+        raise NotACollection("`builder` is not an object")
+    runs = document.get("runs")
+    if runs is None:
+        raise NotACollection("no `runs` block, so there is no pinned run set to rebuild from")
+    if not isinstance(runs, list) or any(not isinstance(entry, Mapping) for entry in runs):
+        raise NotACollection("`runs` is not a list of objects, so no pinned set can be read")
+    pinned = [entry.get("run_id") for entry in runs]
+    incomplete = [
+        index
+        for index, entry in enumerate(runs)
+        if not entry.get("run_id") or not entry.get("capture_sha256") or not entry.get("supplies")
+    ]
+    if incomplete:
+        raise NotACollection(
+            f"{len(incomplete)} of {len(runs)} `runs` entries do not carry `run_id`, "
+            f"`capture_sha256` and `supplies`. Documents written before LS-9 omitted them, and "
+            f"without `supplies` the pinned set cannot be read: `tiers_attested` is what a run "
+            f"CLAIMED, not what it supplies here, and treating them as the same makes every "
+            f"partially superseded capture un-rebuildable"
+        )
+    rows = [
+        {"capture_sha256": entry["capture_sha256"], "tier": tier, "run_id": entry["run_id"]}
+        for entry in runs
+        for tier in entry["supplies"]
+    ]
+    try:
+        authority = merge.authority(rows)
+    except merge.StoreInconsistent as error:
+        raise NotACollection(
+            f"the document's own pinned set names two runs for one (capture, tier): {error}. That "
+            f"is a defect in the document rather than in the store"
+        ) from error
+    return Prior(
+        selection=Selection(
+            labels=tuple(selection.get("labels") or ()),
+            limit=selection.get("limit"),
+            allow_missing_origin=bool(selection.get("allow_missing_origin")),
+            # **Carried forward, and it has to be.** `collect_rebuild` never passes this to a
+            # query — the pinned authority is read from the document, so no cutoff is re-applied —
+            # but the rebuilt document must record the same cutoff the original did. Dropping it
+            # made the rebuild write `as_of: null` against a document that said otherwise, so
+            # `differences` reported one difference and `blfile` exited 1 announcing that "the rows
+            # those runs hold have changed". Nothing had changed. §6.5 refuses `--rebuild --as-of`
+            # from the COMMAND LINE; that is not the same as forgetting what the document said.
+            as_of=selection.get("as_of"),
+        ),
+        pinned_runs=tuple(sorted(set(pinned))),
+        authority=authority,
+        builder=dict(document.get("builder") or {}),
+        document=document,
+    )
+
+
+def comparable(document: Mapping[str, Any]) -> dict[str, Any]:
+    """The part of a document a reproduction is judged on — **everything but `built_at` and
+    `builder`**, canonicalised.
+
+    §6.5: "Reproduction is over records, excluding `built_at` — not byte-for-byte", the same
+    correction `docs/spec.md` §10 already made for a run's output. `builder` is excluded here and
+    compared separately, because a changed `LABEL_KINDS` or store schema is a fact about the build
+    rather than a difference in the records, and §6.5 asks for it to be "reported naming both".
+
+    **The round trip through `serialise` is what makes "over records" true rather than aspirational,
+    and without it `--rebuild` could never reproduce anything.** One side of the comparison comes
+    from `json.loads` of a file and the other is freshly built in memory, where
+    `dataclasses.asdict` leaves `sids` and a `multi` value as **tuples** — and `(40151,)` does not
+    equal `[40151]`. Measured against the production store: every single record was reported as
+    differing, on nothing but that. A document is JSON, so the value being compared is the JSON
+    value, not the Python scaffolding that happened to produce it.
+    """
+    kept = {key: value for key, value in document.items() if key not in ("built_at", "builder")}
+    selection = kept.get("selection")
+    if isinstance(selection, Mapping):
+        # §6.5's promise is over **records**. `selection`'s INPUTS are kept — they are what was
+        # asked for, and a rebuild reads them from this very document, so a mismatch would be a
+        # defect. Its derived COUNTS are dropped, and `flows_without_origin` is why.
+        #
+        # Measured against production: a `--limit 20` document pins only the 3 runs whose flows
+        # survived truncation, while its `flows_without_origin` counted the 408 in the whole
+        # pre-limit selection. Rebuilding from those 3 runs asks a genuinely narrower question and
+        # honestly reports 20 — so the count differs while every record matches.
+        #
+        # Dropping them costs no detection: a changed flow count shows up as an added or removed
+        # record, and an origin appearing shows up as `origin.uri` on the record itself. A count
+        # that can only disagree when nothing about the records has is not evidence.
+        kept["selection"] = {
+            key: value for key, value in selection.items() if key not in SELECTION_OUTCOMES
+        }
+    return json.loads(serialise(kept))
+
+
+def builder_differences(prior: Mapping[str, Any], current: Mapping[str, Any]) -> list[str]:
+    """Every `builder` field that moved, naming both values (§6.5)."""
+    return [
+        f"builder.{key}: the document says {prior.get(key)!r}, this build is {current.get(key)!r}"
+        for key in sorted(set(prior) | set(current))
+        if prior.get(key) != current.get(key)
+    ]
+
+
+def differences(prior: Mapping[str, Any], rebuilt: Mapping[str, Any]) -> list[str]:
+    """How a rebuild differs from the document it reproduces, in terms an operator can act on.
+
+    Structural first — a differing flow count explains every per-record difference below it — and
+    then per flow, keyed on `flow_key` rather than on position, because a rebuild that gained one
+    flow would otherwise report every later record as changed.
+    """
+    found: list[str] = []
+    # **Every top-level key, not a list of three.** An allowlist meant a field the document gains
+    # later is never compared, so a rebuild that differed in it would report success — and it made
+    # `comparable`'s exclusion of `built_at` unobservable, which a sabotage caught: keeping
+    # `built_at` in `comparable` changed nothing, because nothing looked at it.
+    for key in sorted((set(prior) | set(rebuilt)) - {"runs", "labels"}):
+        if prior.get(key) != rebuilt.get(key):
+            found.append(f"{key}: {prior.get(key)!r} became {rebuilt.get(key)!r}")
+
+    old_runs = {entry.get("run_id"): entry for entry in prior.get("runs") or ()}
+    new_runs = {entry.get("run_id"): entry for entry in rebuilt.get("runs") or ()}
+    for run_id in sorted(set(old_runs) - set(new_runs), key=str):
+        found.append(f"run {run_id} was in the document and is not in the rebuild")
+    for run_id in sorted(set(new_runs) - set(old_runs), key=str):
+        found.append(f"run {run_id} is in the rebuild and was not in the document")
+    # **The blocks themselves, not only the id set.** §6.4 embeds them as provenance — ruleset
+    # snapshot, tool versions, mode, `input` — and comparing ids alone meant a run row rewritten by
+    # a re-ingest reported REPRODUCED. That is precisely the scenario `--rebuild` audits.
+    for run_id in sorted(set(old_runs) & set(new_runs), key=str):
+        if old_runs[run_id] != new_runs[run_id]:
+            fields = sorted(
+                key
+                for key in set(old_runs[run_id]) | set(new_runs[run_id])
+                if old_runs[run_id].get(key) != new_runs[run_id].get(key)
+            )
+            found.append(f"run {run_id}'s block differs: {', '.join(fields)}")
+
+    keyed = lambda records: {  # noqa: E731 - a one-line index, named for what it is
+        (
+            record.get("origin", {}).get("capture_sha256"),
+            record.get("flow", {}).get("flow_key"),
+        ): record
+        for record in records or ()
+    }
+    old, new = keyed(prior.get("labels")), keyed(rebuilt.get("labels"))
+    # `keyed` is a dict, so a repeated (capture, flow_key) would collapse and the cardinality check
+    # that used to catch it — `selection.flows` — is now excluded. §3.2 makes the pair unique per
+    # collection, so this asserts the assumption rather than trusting it.
+    for label, records, index in (("document", prior, old), ("rebuild", rebuilt, new)):
+        if len(records.get("labels") or ()) != len(index):
+            found.append(
+                f"the {label} carries two records for one (capture, flow_key); §3.2 makes that "
+                f"pair a flow's identity, so this is a defect in whatever wrote it"
+            )
+    for key in sorted(set(old) - set(new)):
+        found.append(
+            f"flow {key[1]} of capture {key[0]} was in the document and is not in the rebuild"
+        )
+    for key in sorted(set(new) - set(old)):
+        found.append(
+            f"flow {key[1]} of capture {key[0]} is in the rebuild and was not in the document"
+        )
+    # Order is part of the contract (§6.4's canonical ordering), so a rebuild that emitted the same
+    # records in a different sequence is not a reproduction. Compared only when the sets match, so
+    # an added flow reports as one addition rather than as a re-ordering too.
+    if set(old) == set(new) and list(old) != list(new):
+        found.append(
+            "the records are the same but their order differs; §6.4's canonical ordering is part "
+            "of the document"
+        )
+    for key in sorted(set(old) & set(new)):
+        if old[key] != new[key]:
+            found.append(
+                f"flow {key[1]} of capture {key[0]} differs: "
+                + ", ".join(
+                    f"{field} {old[key].get(field)!r} -> {new[key].get(field)!r}"
+                    for field in sorted(set(old[key]) | set(new[key]))
+                    if old[key].get(field) != new[key].get(field)
+                )
+            )
+    return found
 
 
 def serialise(document: Mapping[str, Any]) -> str:

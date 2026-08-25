@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import pathlib
 import sys
@@ -76,7 +77,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit flows whose capture has no recorded origin (§6.4). They are counted either way",
     )
+    parser.add_argument(
+        "--as-of",
+        default=None,
+        metavar="TIMESTAMP",
+        help="only runs ingested at or before this instant (§6.5). Filters ingested_at, never "
+        "finished_at",
+    )
+    parser.add_argument(
+        "--rebuild",
+        default=None,
+        metavar="COLLECTION",
+        help="reproduce a prior collection from its own selection and pinned run set (§6.5)",
+    )
     return parser
+
+
+#: Flags `--rebuild` refuses, and why refusing is not pedantry. §6.5 names `--label` and `--as-of`
+#: on §12's precedent for `--sources`: "a flag that looks like it changed the selection and did not
+#: is worse than one that errors." The other three are refused on the identical reasoning — a
+#: rebuild takes its selection from the document, so every one of these would be silently ignored.
+REBUILD_REFUSES = ("label", "as_of", "capture", "limit", "allow_missing_origin")
 
 
 def unknown_labels(wanted: Sequence[str]) -> list[str]:
@@ -128,7 +149,7 @@ def collect(
         # by the caller, because an unrestricted query here would silently build the whole corpus.
         rows: list = []
     else:
-        rows = query.authoritative(bq, dataset, captures)
+        rows = query.authoritative(bq, dataset, captures, as_of=selection.as_of)
     auth = merge.authority(rows)
     run_ids = query.run_ids_of(rows)
     merged = merge.compose(query.flow_labels(bq, dataset, run_ids), auth)
@@ -141,6 +162,113 @@ def collect(
         built_at=built_at,
         version=version,
     )
+
+
+class PinnedRunMissing(Exception):
+    """A run the prior document pinned is not in the store (§6.5's hard failure)."""
+
+
+class PinnedRunExcluded(Exception):
+    """A run the prior document pinned has since been **retracted** (§4.5).
+
+    Reproduction is an audit capability; retraction is a correction. When they collide, retraction
+    wins, because a retraction that can be reproduced past is not a retraction — and §4.5 is
+    explicit that this table "covers the cases nobody wants to think about: a capture that must come
+    out for legal or customer-data reasons, and a run later found to be mislabelled." Rebuilding
+    such a document would re-publish exactly what somebody removed.
+
+    The remedy is a fresh `blfile` without `--rebuild`, which reads `authoritative_runs` and so
+    honours the exclusion — giving the corrected collection rather than the retracted one.
+    """
+
+
+def collect_rebuild(
+    bq,
+    dataset: str,
+    prior: collection.Prior,
+    *,
+    built_at: str,
+    version: str = __version__,
+) -> collection.Built:
+    """§6.5's `--rebuild`: the prior document's own selection, over its own pinned run set.
+
+    **Authority is not re-decided, and it is not re-derived either.** `prior.authority` is read
+    straight out of the document's `runs[]` entries, because the document already answered §5.1's
+    "which run supplies this tier". Re-asking the store would make `--rebuild` a function of today's
+    rows rather than of that document plus them, which is the one thing the flag promises it is not.
+
+    The first version asked the store and got it wrong in a way worth remembering: it recovered each
+    pinned run's tiers from `runs.tiers_attested`, which is what a run CLAIMED rather than what it
+    supplies. §5.2 rule 2 turns on that difference, so a `--both` run attesting [1, 2] while
+    supplying only tier 1 made the rebuild see two runs for one (capture, tier) and fail — naming a
+    view it had never queried, about a consistent store. Every capture re-run at one tier was
+    un-rebuildable.
+
+    A pinned run the store does not hold is a **hard failure naming it** (§6.5), not a smaller
+    collection. The store is a derived index (§1); a run it has lost cannot be re-derived, so a
+    rebuild that quietly omitted it would answer a different question and look like a reproduction.
+    """
+    retracted = query.exclusions(bq, dataset, prior.pinned_runs)
+    if retracted:
+        # **Checked before anything is composed**, so nothing retracted is ever read into a record.
+        raise PinnedRunExcluded(
+            f"the document pins {len(retracted)} run(s) that have since been retracted (§4.5): "
+            + "; ".join(_retraction(row) for row in retracted)
+            + ". A retraction that can be reproduced past is not a retraction, and §4.5 covers "
+            "legal and customer-data removals as well as mislabelled runs. Run `blfile` WITHOUT "
+            "--rebuild to get the corrected collection: it reads authoritative_runs, which "
+            "anti-joins this table"
+        )
+    run_ids = list(prior.pinned_runs)
+    run_rows = query.runs(bq, dataset, run_ids)
+    found = {row["run_id"] for row in run_rows}
+    missing = [run_id for run_id in run_ids if run_id not in found]
+    if missing:
+        raise PinnedRunMissing(
+            f"the document pins {len(run_ids)} run(s) and {len(missing)} are not in "
+            f"{dataset}: {', '.join(missing)}. §1 makes the store a derived index over the "
+            f"archive, so a run it no longer holds cannot be re-derived — re-ingest the tarball "
+            f"(`flabel-ingest`) or reconcile the store first (tools/reconcile_store.py)"
+        )
+    # **The authority comes from the document, not from a query.** That is what makes a rebuild a
+    # function of "that document plus the store" (§6.5) rather than of today's `tiers_attested`.
+    merged = merge.compose(query.flow_labels(bq, dataset, run_ids), prior.authority)
+    return collection.build(
+        merged=merged,
+        auth=prior.authority,
+        sightings=query.sightings(bq, dataset, run_ids),
+        run_rows=run_rows,
+        selection=prior.selection,
+        built_at=built_at,
+        version=version,
+    )
+
+
+def _is_instant(value: str) -> bool:
+    """Whether `value` parses as an ISO-8601 instant, `Z` included.
+
+    `datetime.fromisoformat` accepts `Z` from 3.11 and this project requires 3.12, so no separate
+    handling is needed. A date with no time is accepted — BigQuery reads it as midnight — because
+    `--as-of 2026-08-25` is a reasonable thing to type.
+    """
+    try:
+        datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _retraction(row: object) -> str:
+    """One `run_exclusions` row as a sentence. §4.5 stores the reason so it stays auditable."""
+    reason = row.get("reason")
+    who = row.get("excluded_by")
+    when = row.get("excluded_at")
+    parts = [f"{row.get('run_id')}", f"reason {reason!r}"]
+    if who:
+        parts.append(f"by {who}")
+    if when:
+        parts.append(f"at {when}")
+    return " ".join(parts)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -159,6 +287,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return EXIT_USAGE
 
+    prior: collection.Prior | None = None
+    if args.rebuild is not None:
+        # §6.5, on §12's precedent for `--sources`: a flag that looks like it changed the selection
+        # and did not is worse than one that errors. Checked BEFORE `--label` is validated, so
+        # `--rebuild x --label nonsense` reports the conflict rather than the unknown kind.
+        # `is not None` and an explicit falsity check per kind. `not in (None, False, ())` was the
+        # first form and `0 == False` in Python, so `--rebuild x --limit 0` slipped the refusal and
+        # got the generic "selects nothing" message instead — right code, wrong explanation.
+        supplied = [
+            name
+            for name in REBUILD_REFUSES
+            if (getattr(args, name) is not None and getattr(args, name) is not False)
+        ]
+        if supplied:
+            flags = ", ".join(f"--{name.replace('_', '-')}" for name in supplied)
+            print(
+                f"blfile: --rebuild takes its selection from the document, so {flags} would be "
+                f"silently ignored. §6.5 refuses them rather than appear to honour them.",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        try:
+            document = json.loads(pathlib.Path(args.rebuild).read_text(encoding="utf-8"))
+            prior = collection.read_prior(document)
+        except OSError as error:
+            print(f"blfile: cannot read {args.rebuild!r} — {error}", file=sys.stderr)
+            return EXIT_USAGE
+        except json.JSONDecodeError as error:
+            print(f"blfile: {args.rebuild!r} is not JSON — {error}", file=sys.stderr)
+            return EXIT_USAGE
+        except collection.NotACollection as error:
+            print(f"blfile: {args.rebuild!r} cannot be rebuilt — {error}", file=sys.stderr)
+            return EXIT_USAGE
+
     wanted = tuple(args.label or (DEFAULT_LABEL,))
     unknown = unknown_labels(wanted)
     if unknown:
@@ -172,12 +334,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.limit is not None and args.limit < 1:
         print(f"blfile: --limit {args.limit} selects nothing; pass 1 or more", file=sys.stderr)
         return EXIT_USAGE
+    if args.as_of is not None and not _is_instant(args.as_of):
+        # Checked here rather than left to BigQuery. `--as-of yesterday` bound a `TIMESTAMP`
+        # parameter the service rejected, and the failure surfaced as a traceback plus "This is a
+        # DEFECT in blfile" at exit 3 — for a typo. The value is also written verbatim into the
+        # published `selection.as_of`, so a malformed cutoff would become part of the provenance.
+        print(
+            f"blfile: --as-of {args.as_of!r} is not an ISO-8601 instant. Pass something like "
+            f"2026-08-25T00:00:00Z; §6.5 compares it against `ingested_at`.",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
 
-    selection = collection.Selection(
-        labels=wanted,
-        captures=tuple(args.capture or ()),
-        limit=args.limit,
-        allow_missing_origin=args.allow_missing_origin,
+    selection = (
+        prior.selection
+        if prior is not None
+        else collection.Selection(
+            labels=wanted,
+            captures=tuple(args.capture or ()),
+            limit=args.limit,
+            allow_missing_origin=args.allow_missing_origin,
+            as_of=args.as_of,
+        )
     )
 
     try:
@@ -187,7 +365,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_USAGE
 
     try:
-        built = collect(bq, args.dataset, selection, built_at=now_iso())
+        if prior is not None:
+            built = collect_rebuild(bq, args.dataset, prior, built_at=now_iso())
+        else:
+            built = collect(bq, args.dataset, selection, built_at=now_iso())
+    except (PinnedRunMissing, PinnedRunExcluded) as error:
+        # §6.5's hard failure. A statement about the store, so it shares 1 with the conflicts below.
+        print(f"blfile: cannot reproduce {args.rebuild!r} — {error}", file=sys.stderr)
+        return EXIT_REFUSED
     except merge.MergeConflict as error:
         # §9: never silently pick a winner when two tiers disagree on a single-arity label's value.
         print(
@@ -227,8 +412,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_INTERNAL
 
-    _report(built, selection, args.dataset)
     try:
+        _report(built, selection, args.dataset)
+        reproduced = True
+        if prior is not None:
+            # **Inside the handler.** `comparable` runs `serialise`, which raises on a non-finite
+            # number, and `differences` indexes into records — so a valid-JSON-but-wrong-shaped
+            # `--rebuild` file reached the interpreter as exit 1, the code reserved for a refusal
+            # about the store. `read_prior` now type-checks the document; this covers the rest.
+            reproduced = _report_reproduction(prior, built, args.rebuild)
         text = collection.serialise(built.document)
         if args.output:
             write_document(pathlib.Path(args.output), text)
@@ -247,7 +439,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         # corrupt dataset for a typo'd path.
         print(f"blfile: cannot write {args.output!r} — {error}", file=sys.stderr)
         return EXIT_USAGE
-    return EXIT_OK
+    except Exception as error:  # noqa: BLE001 - anything left is a defect, and must not be exit 1
+        traceback.print_exc()
+        print(
+            f"\nblfile: internal error while reporting — {type(error).__name__}: {error}\n"
+            f"\nThis is a DEFECT in blfile. Exit {EXIT_INTERNAL} is not {EXIT_REFUSED}: nothing "
+            f"above says the store disagrees.",
+            file=sys.stderr,
+        )
+        return EXIT_INTERNAL
+    # A rebuild that did not reproduce is a statement about the DATA — the store no longer yields
+    # what that document recorded — so it shares 1 with the conflicts above rather than being a
+    # defect or a usage error. Exit 0 would make `--rebuild` a command that cannot fail.
+    return EXIT_OK if reproduced else EXIT_REFUSED
 
 
 def write_document(target: pathlib.Path, text: str) -> None:
@@ -273,6 +477,49 @@ def _silence_broken_pipe() -> None:
     """Keep the interpreter from re-raising on the flush at exit (CPython's documented recipe)."""
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, sys.stdout.fileno())
+
+
+def _report_reproduction(prior: collection.Prior, built: collection.Built, path: str) -> bool:
+    """§6.5's verdict: did this rebuild reproduce that document?
+
+    **Over records, with `built_at` excluded** — not byte-for-byte, which is unachievable and is the
+    same error `docs/spec.md` §10 already corrected for a run's output.
+
+    `builder` is compared separately and **never fails the reproduction**, because §6.5 asks only
+    that a mismatch be "reported naming both". It is a fact about the two builds rather than a
+    difference in the records — but it is printed first, because a changed `LABEL_KINDS` changes
+    what `--label verdict` *means*, and a reader needs that before they read anything below it.
+    """
+    moved = collection.builder_differences(prior.builder, built.document["builder"])
+    if moved:
+        print(
+            f"blfile: this build is not the build that wrote {path!r} — {len(moved)} builder "
+            f"field(s) differ. The records may still match; a changed label_kinds or store_schema "
+            f"means they would be answering a slightly different question.",
+            file=sys.stderr,
+        )
+        for line in moved:
+            print(f"  {line}", file=sys.stderr)
+
+    found = collection.differences(
+        collection.comparable(prior.document), collection.comparable(built.document)
+    )
+    if not found:
+        print(
+            f"blfile: REPRODUCED {path!r} — {built.document['selection']['flows']} flow(s), "
+            f"identical over records with built_at excluded (§6.5)",
+            file=sys.stderr,
+        )
+        return True
+    print(
+        f"blfile: DID NOT reproduce {path!r} — {len(found)} difference(s). The document pins its "
+        f"run set, so this means the rows those runs hold have changed, not that a different "
+        f"selection was made.",
+        file=sys.stderr,
+    )
+    for line in found:
+        print(f"  {line}", file=sys.stderr)
+    return False
 
 
 def now_iso() -> str:
