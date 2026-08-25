@@ -8,7 +8,7 @@ Spec: `docs/spec-label-store.md`. Design reasoning: `inline-labeling/label-store
 were then executed against the live service. The step list is resequenced rather than renumbered —
 issues #145–#153 keep their step ids, so nothing has to be re-filed.
 
-## Progress — Phase 3a is 6 of 7
+## Progress — Phase 3a is COMPLETE
 
 | Step | Issue | State |
 | :-- | :-- | :-- |
@@ -18,12 +18,32 @@ issues #145–#153 keep their step ids, so nothing has to be re-filed.
 | LS-4 `flabel-ingest` | [#148](https://github.com/DeepTempo/flabel/issues/148) | ✅ merged (PRs #166, #167, #168) |
 | LS-2 `flabel-deploy` ⟂ | [#146](https://github.com/DeepTempo/flabel/issues/146) | ✅ merged (PR #170) |
 | LS-5 wire `flabel-run` | [#150](https://github.com/DeepTempo/flabel/issues/150) | ✅ merged (PR #169) |
-| **LS-7 `blfile`** | [#151](https://github.com/DeepTempo/flabel/issues/151) | **next — the last of Phase 3a** |
+| LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | ✅ merged (PR #174) — the last of Phase 3a |
 
 LS-4 landed two corrections to documents outside its own scope, both found by running it rather
 than reading it: spec §5.3 step 3 contradicted its own step 2 (a table cleared by step 2 and then
 skipped by step 3 as "already done" ended with zero rows under a live commit marker), and §7.4's
 guard 4 — the duplicate-`run_id` assertion — had never been implemented at all.
+
+LS-7 moved the merge rule out of SQL and into `src/flabeldb/merge.py`, and the eng-review gate ran
+**before** the PR this time. It returned thirteen findings; the three that mattered were all in the
+same place — the verdict. `models.verdict_entry` hardcodes `value="malicious"`, so rebuilding it
+from the surviving sources is a *write*: a stored verdict of any other value was silently rewritten
+and published as ground truth, and the cross-tier conflict guard could not see it because it only
+compared stored entries with each other. Worse, a `--both` run stores its verdict at
+`min(sources.tier)`, so tier-filtering that entry dropped it entirely — leaving the exact run shape
+rule 2 exists for with no comparison at all. Both were reproduced by hand before being believed.
+Two more were found by running the tool rather than reading it: `--capture <name>` resolved
+correctly in SQL and was then re-filtered by name downstream, returning an empty collection at exit
+0; and a bad `--output` path escaped `main` entirely and reached the interpreter as exit 1 — the
+code `blfile` publishes as "the store holds a disagreement".
+
+Forty-eight sabotages, all red for their stated reason. Six of them were green first: four were
+escapes in the tests (a `flow_key` tie-break `merge.compose`'s own pre-sort made unobservable, a
+`--limit` fixture whose two sort keys ascended together, an ordering test that never used two
+captures, and a UTF-8 assertion that round-tripped through `json.loads`), and one was a stale `.pyc`
+in the sabotage harness itself, which is worth knowing: a patch and a restore inside one second can
+leave the previous bytecode in place and read as a guard that holds.
 
 LS-5 closed the gap between "`--source-uri` exists" (LS-1) and "anything passes it": the wrapper now
 carries the original `gs://` argument and calls `flabel-ingest` after a successful publish. Its one

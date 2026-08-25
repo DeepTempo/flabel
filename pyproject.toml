@@ -26,6 +26,7 @@ db = [
 flabel = "flabel.cli:main"
 flabel-db = "flabeldb.cli:main"
 flabel-ingest = "flabeldb.ingest:main"
+blfile = "flabeldb.blfile:main"
 
 [build-system]
 requires = ["hatchling"]

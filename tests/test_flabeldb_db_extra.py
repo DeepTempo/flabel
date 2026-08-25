@@ -166,7 +166,42 @@ def test_the_other_ci_jobs_still_install_the_extra():
 # --- the store's modules must IMPORT with nothing installed --------------------------------------
 
 
-@pytest.mark.parametrize("module", ["schema", "identity", "attest", "parse", "ingest", "cli"])
+#: Every module in `src/flabeldb`, named once. `test_the_module_list_is_exhaustive` below is what
+#: keeps it honest: LS-7 added four modules and this list did not notice, which is the same silent
+#: loss of a guard that `test_store_modules_are_all_accounted_for` exists to prevent one file over.
+STORE_MODULES = [
+    "attest",
+    "blfile",
+    "cli",
+    "client",
+    "collection",
+    "identity",
+    "ingest",
+    "merge",
+    "parse",
+    "query",
+    "schema",
+]
+
+
+def test_the_module_list_is_exhaustive():
+    """A module absent from the list above is never checked, and nothing says so."""
+    import pathlib
+
+    package = pathlib.Path(__file__).resolve().parents[1] / "src" / "flabeldb"
+    present = {
+        path.stem
+        for path in package.glob("*.py")
+        if path.name != "__init__.py" and "__pycache__" not in path.parts
+    }
+    assert set(STORE_MODULES) == present, (
+        f"listed but absent: {sorted(set(STORE_MODULES) - present)}; present but unlisted: "
+        f"{sorted(present - set(STORE_MODULES))}. An unlisted module imports `google` at the top "
+        f"with the whole suite green until the bare-runner job says otherwise."
+    )
+
+
+@pytest.mark.parametrize("module", STORE_MODULES)
 def test_every_store_module_imports_with_google_unavailable(module):
     """`flabel` declares `dependencies = []` and the store is a separate distribution for that
     reason — but a module that imports `google` at the TOP is broken on a bare checkout however

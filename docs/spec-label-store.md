@@ -395,12 +395,31 @@ Composition, per flow:
 raw per-run rows. Accepted (Craig) — at a few hundred labels per capture, pulling rows and composing
 in Python is not a scale problem, and `blfile` is how anyone will actually read this.
 
-**Two latent losses, recorded now because they are cheap to design for and expensive to retrofit.**
+**Three latent losses, recorded now because they are cheap to design for and expensive to retrofit.**
 Rule 4 discards the higher tier's value when two tiers disagree on a single-arity label — today
 `verdict` is always `"malicious"` so nothing is lost, but the rule as stated would hide a genuine
 disagreement. `blfile` therefore treats a cross-tier value conflict as a **hard failure**, not a
 silent pick. And a label whose `LabelEntry.tier` names one tier lives in that tier's slice only, so
 superseding that tier removes the label even if another tier's sources would support it.
+
+**The third is in the `multi` arity, and lands with the kind this section says is next.** Rule 4
+takes the *value* from the lowest surviving tier's entry while unioning `sids` across all of them,
+so a merged MITRE-technique entry would cite a tier-2 sid beside a value list that tier-2 source
+never asserted — untraceable in exactly the way `LabelEntry`'s own docstring forbids. The
+single-arity conflict guard cannot see it, because differing `multi` values are not a conflict
+under rule 4 as written. Nothing is at risk today: every kind in `LABEL_KINDS` is `single`. Whoever
+adds the first `multi` kind must decide whether its `sids` narrow to the tier the value came from,
+or the value becomes the union — and rule 4 must then say which.
+
+**A cross-run disagreement about `verdict` is the same failure and is guarded the same way, but it
+is not a cross-*tier* check.** `models.verdict_entry` hardcodes `value="malicious"`, so `blfile`
+rebuilding the verdict from the surviving sources is a write rather than a read: a stored verdict
+carrying any other value would be silently rewritten and published as ground truth. `blfile`
+therefore compares the rebuilt verdict against **every contributing run's** stored entry and fails
+on any mismatch. The verdict is deliberately **not** tier-filtered on the way in, because
+`LabelEntry.tier` on a verdict is a derived `min(sources.tier)` rather than a claim of tier
+membership — a `--both` run stores its verdict at tier 1 even when the tier it still supplies is 2,
+and filtering on that number left the run shape rule 2 exists for with no comparison at all.
 
 ### 5.3 Commit ordering, and the recovery that actually works
 
@@ -537,7 +556,17 @@ blfile [--label NAME]...              build a collection. Default: --label verdi
     --capture <sha|name>              restrict to one capture. Repeatable
     --limit <n>
     --output <file>
+    --allow-missing-origin            emit flows with no recorded origin (§6.4)
+    --local-adc                       use ADC instead of the instance identity (§7.1)
 ```
+
+`blfile`'s exit codes mirror `flabel-db`'s, and **1 is narrow on purpose**: 1 is a refusal about the
+*data* — a cross-tier value conflict, or `authoritative_runs` returning two runs for one
+(capture, tier) — 2 is the operator's environment or arguments, and 3 is a defect in `blfile`
+itself. A bare `raise` reaches the interpreter as 1, which would report a store disagreement for a
+bug in the tool, so nothing in `main` re-raises. `--limit` is applied **after** composition, never
+in SQL: a flow's rows come from up to one run per tier, so a `LIMIT` on `flow_labels` would cut a
+flow's tier-2 row off from its tier-1 one and merge half of it.
 
 `--label` values are validated against `LABEL_KINDS`; an unknown name exits 2 naming the permitted
 set. Multiple values are **ANDed**: a flow is emitted only if it carries every requested kind, because
@@ -568,7 +597,7 @@ after someone has looked at real rows. §6.5 keeps their design so it is not re-
                   "uri": "gs://tempo-datasets-002-north-south/lax_capture_2026-07-08.pcap",
                   "uri_status": "gs",
                   "filename": "lax_capture_2026-07-08.pcap",
-                  "link_type": 1, "snaplen": 262144,
+                  "link_type": 1, "snaplens": [262144],
                   "run_ids": { "1": "a1b2c3d4e5f60718", "2": "9f8e7d6c5b4a3928" },
                   "coverage": { "input_status": "complete", "unmatched": 0,
                                 "unmatched_ratio": 0.0, "loss_conditions_fired": [] } },
@@ -603,6 +632,52 @@ Four things revision 1 got wrong here:
 `(origin.capture_sha256, flow.ts_first, flow_key)` — `flow_key` replacing `uid` as the tie-break,
 since §3.2 disqualifies `uid` from carrying ordering meaning. `runs` by `run_id`, labels by `name`.
 `json.dump(sort_keys=True, indent=2, ensure_ascii=False)`, trailing newline.
+
+**Three rules this section left to the implementer, settled in LS-7** (Craig, 2026-08-25). Recorded
+here rather than in `collection.py` alone, because each is a property of the document a consumer
+reads and would otherwise be re-derived differently by `--rebuild`:
+
+- **`snaplens` is plural.** The example literal above said `snaplen` until LS-7; §4.2, §6.1 and the
+  `captures` column are plural, and §4.2 already records this same drift being corrected once at
+  LS-3. A singular value would have to invent a winner where a `mergecap` pcapng's interfaces
+  disagree — measured 96 and 65535 — which is the one fact the field exists to expose.
+- **`origin` resolves to the lowest authoritative tier that actually *recorded* one**, falling back
+  to the lowest tier's sighting when none did, so `filename`, `link_type` and `snaplens` are still
+  published for a flow that is then counted origin-less. §6.5's "lowest surviving tier's run when
+  two tiers **disagree**" governs two *recorded* origins; a `not-recorded` sighting is not a
+  disagreeing value — §4.2 added `uri_status` precisely so a null `uri` is one fact rather than
+  two. This is not hypothetical: every run in the archive predates `--source-uri`, so a strict
+  lowest-tier rule would refuse a flow whose origin the store demonstrably holds from a newer run
+  at the other tier.
+- **`coverage` aggregates over the capture's authoritative runs**, rather than quoting one of them.
+  `unmatched` is the sum, `loss_conditions_fired` the union of the flags that are `true` — never
+  the ones that are `null`, since §10 makes "JA4 was fine" and "nothing ever probed JA4" different
+  facts — `input_status` is `partial` if any contributing run read the capture short, and
+  `unmatched_ratio` is recomputed by `models.CorrelationResult`'s own formula over the summed
+  counts. **Not `unmatched / detections`**: `docs/spec.md` §10 says outright that the published
+  ratio excludes unsupported-transport detections (#84), so the obvious division publishes a
+  different number from the one each run was gated on. Quoting a single tier's block would report
+  `unmatched: 0` over a capture whose other tier left detections unplaced — the misreading this
+  bullet's own justification says `coverage` exists to prevent, one level up. A count no
+  contributing run established is `null`, not `0` — and so is one only *some* contributing runs
+  established, since summing the rest would publish one run's number as though it described the
+  capture. `unmatched_ratio` is `null` whenever any of its three inputs is, including
+  `unmatched_unsupported_transport`: treating a missing exclusion count as zero silently reduces
+  the ratio to the `unmatched / detections` this bullet forbids.
+
+**A row `blfile` cannot construct is a counted refusal, not a crash** — §9 asks LS-7 to decide this
+deliberately and it is decided on §3.2's `ip_proto` precedent: refuse the flow, count it, name it
+on stderr. A historical row whose (kind, tier) pair falls outside today's `LABEL_KINDS` is data an
+older writer produced legally, and raising on it is how a backfill becomes unrunnable. The two
+failures §9 says must never be quiet keep their own exit code: `merge.MergeConflict` is
+deliberately **not** a `ValueError`, so the refusal handler cannot swallow it, and neither is
+`merge.StoreInconsistent` — a bare `except ValueError` at the CLI would put a corrupt `run_block`'s
+`json.JSONDecodeError`, and every ordinary coding slip, under the exit code reserved for the
+dataset contradicting itself.
+
+**`selection.flows_without_origin` counts the selection; `selection.flows` counts what was
+emitted.** `--limit` separates the two, and they are different facts rather than a discrepancy: the
+shortfall in origins is a property of the corpus, not of how much of it was asked for.
 
 ### 6.5 Reproducing a collection — Phase 3b
 
