@@ -1854,3 +1854,70 @@ def test_a_view_cannot_be_rendered_with_a_query_parameter_in_it():
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         schema.render_view("authoritative_runs", "flabel", as_of=True, ddl=True)
+
+
+def test_read_prior_refuses_a_run_listed_under_two_captures():
+    """**I claimed this was unreachable and it was not.**
+
+    §3.3 derives a run id from one capture, so the store cannot produce it — but `--rebuild` builds
+    its `Authority` from a *document*, and a hand-edited one can say anything. It reached
+    `collection.build`'s own guard, which raises a bare `ValueError`, which `main` classifies as
+    "a DEFECT in blfile" at exit 3 — for a bad input file. It is a fact about the file, so exit 2.
+    """
+    document = prior_document()
+    entry = document["runs"][0]
+    document["runs"] = [entry, {**entry, "capture_sha256": "b" * 64}]
+    with pytest.raises(collection.NotACollection, match="listed under two captures"):
+        collection.read_prior(document)
+
+
+@pytest.mark.parametrize("supplies", ["1", 1, [1, "2"], [True], None, {}])
+def test_read_prior_refuses_a_supplies_that_is_not_tier_numbers(supplies):
+    """`supplies` is what the pin is *made of*. A string is iterable and would produce tiers of
+    `"1"`; `True` is an `int` in Python and would serialise as `true`, the exclusion
+    `provenance.build_source_entry` already makes for `Detection.tier`."""
+    document = prior_document()
+    document["runs"][0]["supplies"] = supplies
+    with pytest.raises(collection.NotACollection):
+        collection.read_prior(document)
+
+
+def test_read_prior_refuses_a_capture_that_is_not_a_string():
+    document = prior_document()
+    document["runs"][0]["capture_sha256"] = ["a" * 64]
+    with pytest.raises(collection.NotACollection, match="not a string"):
+        collection.read_prior(document)
+
+
+def test_the_build_guard_survives_as_a_backstop_for_the_other_path():
+    """`collection.build` is reached from a fresh build too, where the authority comes from the
+    view. `read_prior` is the gate for the rebuild path; this stays because the other path exists.
+    """
+    auth = merge.authority(
+        [
+            {"capture_sha256": CAPTURE, "tier": 2, "run_id": TIER2_RUN},
+            {"capture_sha256": OTHER_CAPTURE, "tier": 2, "run_id": TIER2_RUN},
+        ]
+    )
+    rows = [
+        row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)], capture=CAPTURE),
+        row(
+            run_id=TIER2_RUN,
+            sources=[source(tier=2, sid=2002)],
+            capture=OTHER_CAPTURE,
+            flow_key="d" * 64,
+        ),
+    ]
+    with pytest.raises(ValueError, match="supplies two captures"):
+        collection.build(
+            merged=merge.compose(rows, auth),
+            auth=auth,
+            sightings=[
+                sighting(run_id=TIER2_RUN),
+                sighting(run_id=TIER2_RUN, capture=OTHER_CAPTURE),
+            ],
+            run_rows=[run_row(TIER2_RUN)],
+            selection=collection.Selection(labels=("verdict",), allow_missing_origin=True),
+            built_at=BUILT_AT,
+            version=VERSION,
+        )

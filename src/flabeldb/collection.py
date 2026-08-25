@@ -188,10 +188,16 @@ def build(
         for tier, run_id in sorted(auth.by_capture.get(capture, {}).items()):
             capture_seen, tiers = supplied.setdefault(run_id, (capture, []))
             tiers.append(tier)
-            if capture_seen != capture:  # pragma: no cover - §3.3 makes this unreachable
+            if capture_seen != capture:
+                # **Not unreachable, and an earlier version of this said it was.** §3.3 makes it
+                # impossible for a run the STORE produced, but `--rebuild` builds an `Authority`
+                # from a document, and a hand-edited one can name a run under two captures. That
+                # reached here and was reported as "a DEFECT in blfile" at exit 3 for a bad input
+                # file. `read_prior` now refuses it as `NotACollection`, so this is the backstop
+                # rather than the gate — kept because `build` is reachable from both paths.
                 raise ValueError(
                     f"run {run_id} supplies two captures ({capture_seen}, {capture}); §3.3 derives "
-                    f"a run id from one capture, so this cannot happen and must not be guessed at"
+                    f"a run id from one capture, so this must not be guessed at"
                 )
     runs_present = sorted(
         {
@@ -347,6 +353,30 @@ def read_prior(document: Mapping[str, Any]) -> Prior:
             f"CLAIMED, not what it supplies here, and treating them as the same makes every "
             f"partially superseded capture un-rebuildable"
         )
+    by_run: dict[str, str] = {}
+    for entry in runs:
+        if not isinstance(entry["supplies"], list) or not all(
+            isinstance(tier, int) and not isinstance(tier, bool) for tier in entry["supplies"]
+        ):
+            raise NotACollection(
+                f"run {entry['run_id']}'s `supplies` is {entry['supplies']!r}, not a list of tier "
+                f"numbers"
+            )
+        if not isinstance(entry["capture_sha256"], str):
+            raise NotACollection(
+                f"run {entry['run_id']}'s `capture_sha256` is not a string: "
+                f"{entry['capture_sha256']!r}"
+            )
+        seen = by_run.setdefault(entry["run_id"], entry["capture_sha256"])
+        if seen != entry["capture_sha256"]:
+            # §3.3 derives a run id from one capture, so the store cannot produce this — but a
+            # hand-edited document can, and it used to reach `build`'s own guard and be reported as
+            # "a DEFECT in blfile" at exit 3. It is a fact about the file, so it is exit 2.
+            raise NotACollection(
+                f"run {entry['run_id']} is listed under two captures ({seen}, "
+                f"{entry['capture_sha256']}). §3.3 derives a run id from one capture, so this "
+                f"document is inconsistent with itself"
+            )
     rows = [
         {"capture_sha256": entry["capture_sha256"], "tier": tier, "run_id": entry["run_id"]}
         for entry in runs
