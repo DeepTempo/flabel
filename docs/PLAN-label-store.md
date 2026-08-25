@@ -8,7 +8,7 @@ Spec: `docs/spec-label-store.md`. Design reasoning: `inline-labeling/label-store
 were then executed against the live service. The step list is resequenced rather than renumbered —
 issues #145–#153 keep their step ids, so nothing has to be re-filed.
 
-## Progress — Phase 3a is built; 3b is LS-9
+## Progress — Phase 3a is COMPLETE; 3b is LS-8 (open) and LS-9
 
 | Step | Issue | State |
 | :-- | :-- | :-- |
@@ -18,8 +18,8 @@ issues #145–#153 keep their step ids, so nothing has to be re-filed.
 | LS-4 `flabel-ingest` | [#148](https://github.com/DeepTempo/flabel/issues/148) | ✅ merged (PRs #166, #167, #168) |
 | LS-2 `flabel-deploy` ⟂ | [#146](https://github.com/DeepTempo/flabel/issues/146) | ✅ merged (PR #170) |
 | LS-5 wire `flabel-run` | [#150](https://github.com/DeepTempo/flabel/issues/150) | ✅ merged (PR #169) |
-| LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | 🔜 open (PR #174) — the last of Phase 3a |
-| LS-8 backfill and reconcile | [#152](https://github.com/DeepTempo/flabel/issues/152) | 🔜 open, stacked on LS-7 — Phase 3b |
+| LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | ✅ merged (PR #174) — the last of Phase 3a |
+| LS-8 backfill and reconcile | [#152](https://github.com/DeepTempo/flabel/issues/152) | 🔜 open (PR #175) — Phase 3b |
 | LS-9 `blfile` reproduction | [#153](https://github.com/DeepTempo/flabel/issues/153) | **next — the last of Phase 3b** |
 
 LS-4 landed two corrections to documents outside its own scope, both found by running it rather
