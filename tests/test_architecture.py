@@ -249,7 +249,7 @@ def test_store_modules_are_all_accounted_for():
     kind, the exact state the boundary above is meant to prevent. Found by review of LS-1's plan.
     """
     pure = set(STORE_PURE)
-    impure = {"client.py", "cli.py", "ingest.py"}
+    impure = {"blfile.py", "client.py", "cli.py", "ingest.py", "query.py"}
     present = {
         str(path.relative_to(FLABELDB))
         for path in FLABELDB.rglob("*.py")
@@ -276,7 +276,15 @@ FORBIDDEN_IN_STORE_PURE = FORBIDDEN_IN_PURE | {"google"}
 
 #: The store's pure modules, named once so the accounted-for guard and the purity guard cannot
 #: disagree about which files they cover.
-STORE_PURE = ("__init__.py", "attest.py", "identity.py", "parse.py", "schema.py")
+STORE_PURE = (
+    "__init__.py",
+    "attest.py",
+    "collection.py",
+    "identity.py",
+    "merge.py",
+    "parse.py",
+    "schema.py",
+)
 
 
 @pytest.mark.parametrize("module", STORE_PURE)
