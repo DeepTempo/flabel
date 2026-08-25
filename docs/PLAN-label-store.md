@@ -8,7 +8,7 @@ Spec: `docs/spec-label-store.md`. Design reasoning: `inline-labeling/label-store
 were then executed against the live service. The step list is resequenced rather than renumbered —
 issues #145–#153 keep their step ids, so nothing has to be re-filed.
 
-## Progress — Phase 3a is COMPLETE
+## Progress — Phase 3a is built; 3b is LS-9
 
 | Step | Issue | State |
 | :-- | :-- | :-- |
@@ -18,7 +18,9 @@ issues #145–#153 keep their step ids, so nothing has to be re-filed.
 | LS-4 `flabel-ingest` | [#148](https://github.com/DeepTempo/flabel/issues/148) | ✅ merged (PRs #166, #167, #168) |
 | LS-2 `flabel-deploy` ⟂ | [#146](https://github.com/DeepTempo/flabel/issues/146) | ✅ merged (PR #170) |
 | LS-5 wire `flabel-run` | [#150](https://github.com/DeepTempo/flabel/issues/150) | ✅ merged (PR #169) |
-| LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | ✅ merged (PR #174) — the last of Phase 3a |
+| LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | 🔜 open (PR #174) — the last of Phase 3a |
+| LS-8 backfill and reconcile | [#152](https://github.com/DeepTempo/flabel/issues/152) | 🔜 open, stacked on LS-7 — Phase 3b |
+| LS-9 `blfile` reproduction | [#153](https://github.com/DeepTempo/flabel/issues/153) | **next — the last of Phase 3b** |
 
 LS-4 landed two corrections to documents outside its own scope, both found by running it rather
 than reading it: spec §5.3 step 3 contradicted its own step 2 (a table cleared by step 2 and then
@@ -44,6 +46,22 @@ escapes in the tests (a `flow_key` tie-break `merge.compose`'s own pre-sort made
 captures, and a UTF-8 assertion that round-tripped through `json.loads`), and one was a stale `.pyc`
 in the sabotage harness itself, which is worth knowing: a patch and a restore inside one second can
 leave the previous bytecode in place and read as a guard that holds.
+
+LS-8's reconciliation is two legs, and the review found that one of them could not fire. `compare_run`
+returned early on a missing `runs` marker, which put the archive-against-its-own-`run.counts` leg
+behind "the store has this run" — and every tarball was un-ingested the first time the tool ran, so
+that leg executed **zero times out of twenty-five** while the report's `0 [self-report]` read as
+"all twenty-five are consistent". The tests could not see it because their fixture counts were built
+to agree, so the leg was silent either way. Leg 1 still short-circuits on the marker; leg 2 no longer
+does, because it never needed a store.
+
+It also added a second copy of `ingest.RUN_COLUMN` — the map whose own comment records that exact
+drift being *measured* on 2026-08-24, when a run exited 3 having loaded nothing — in a file whose new
+§8 argues against precisely that. All four properties the step names are now measured on the box:
+25 runs and 1,955 rows backfilled, reconcile exit 0 on both legs, a second backfill adding zero rows,
+and a deliberately corrupted count on a real archived run failing with exactly one finding. The
+production `flabel` dataset is deliberately **still empty** — Craig, 2026-08-25: the first rows in it
+should be written by reviewed code.
 
 LS-5 closed the gap between "`--source-uri` exists" (LS-1) and "anything passes it": the wrapper now
 carries the original `gs://` argument and calls `flabel-ingest` after a successful publish. Its one
