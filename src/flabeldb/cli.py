@@ -18,7 +18,6 @@ so the definition of done says pre-deploy rather than claiming a gate that canno
 from __future__ import annotations
 
 import argparse
-import pathlib
 import re
 import sys
 import traceback
@@ -27,7 +26,9 @@ from collections.abc import Sequence
 from flabeldb import client as client_module
 from flabeldb import schema
 
-VIEWS = pathlib.Path(__file__).parent / "views"
+#: Kept as an alias: the views live beside `schema.py`, because a view is part of the
+#: declaration rather than of the CLI that applies it.
+VIEWS = schema.VIEWS
 
 EXIT_OK = 0
 #: The dataset does not match the declaration. `tools/flabel-deploy` stops on this.
@@ -90,11 +91,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def view_sql(dataset: str) -> list[tuple[str, str]]:
-    """Every committed view, with `{dataset}` resolved. Sorted, so `apply` is deterministic."""
-    return [
-        (path.stem, path.read_text(encoding="utf-8").replace("{dataset}", dataset))
-        for path in sorted(VIEWS.glob("*.sql"))
-    ]
+    """Every committed view as executable DDL. Sorted, so `apply` is deterministic.
+
+    Rendered by `schema.render_view` rather than here, because LS-9's `--as-of` renders the same
+    file a second way — as a bare parameterised SELECT — and §9 forbids the supersession rule
+    existing twice. The DDL rendering is byte-identical to what this function produced before that
+    change, so no `apply` against a live dataset is implied by it.
+    """
+    return [(name, schema.render_view(name, dataset)) for name in schema.view_names()]
 
 
 def _apply(bq, dataset: str) -> int:

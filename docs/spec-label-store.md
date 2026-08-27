@@ -557,6 +557,9 @@ blfile [--label NAME]...              build a collection. Default: --label verdi
     --limit <n>
     --output <file>
     --allow-missing-origin            emit flows with no recorded origin (§6.4)
+    --as-of <timestamp>               only runs ingested at or before this instant (§6.5)
+    --rebuild <collection.json>       reproduce a prior collection (§6.5). Refuses the five flags
+                                      that would shape a selection it takes from the document
     --local-adc                       use ADC instead of the instance identity (§7.1)
 ```
 
@@ -703,6 +706,54 @@ resolves from the pinned set only, taking the **lowest surviving tier's** run wh
 a `builder`-digest mismatch is reported naming both; and `--rebuild` refuses `--label` and `--as-of`
 (exit 2), on §12's precedent for `--sources` — a flag that looks like it changed the selection and did
 not is worse than one that errors.
+
+**Built in LS-9, with four corrections §6.5 needed before it could work.** Recorded here because
+each was found by running the thing, and the first was a defect rather than a shortfall.
+
+**"The pinned `run_id` set" was under-specified, and ids alone are not enough.** A rebuild needs to
+know which run supplied which *(capture, tier)*, and the only thing available to recover that from —
+`runs.tiers_attested` — is the wrong answer: that is what a run **claimed**, not what it supplies.
+§5.2 rule 2 turns on exactly that difference, so a `--both` run attesting `[1, 2]` while supplying
+only tier 1 (its tier 2 having been superseded) made the rebuild see two runs for one (capture,
+tier) and fail — naming `authoritative_runs`, a view that code path never queries, about a perfectly
+consistent store. **Every capture re-run at one tier was un-rebuildable.** So each `runs[]` entry
+carries `run_id`, `capture_sha256` and `supplies` (the tiers it supplies *in this collection*)
+beside the verbatim block, and the authority is read from the document. That is what makes a rebuild
+a function of "that document plus the store" rather than of today's attestations.
+
+**The selection records its inputs.** `limit`, `allow_missing_origin` and `as_of` join `labels` in
+§6.4's block. All three are derivable from the records — the limit from the count, the flag from
+whether any emitted origin is `not-recorded` — and an inference that happens to work is a worse
+contract than a field.
+
+**A pinned run that has since been retracted is a hard failure.** `authoritative_runs` anti-joins
+§4.5, so the ordinary read path never sees an excluded run; `--rebuild` pins a set recorded *before*
+the exclusion existed, so it is the one path that can resurrect one. §4.5 is explicit that the table
+covers "a capture that must come out for legal or customer-data reasons, and a run later found to be
+mislabelled" — so reproducing past it would re-publish exactly what somebody removed. Reproduction
+is an audit capability and retraction is a correction; when they collide, **retraction wins**, and
+the remedy is a fresh `blfile` without `--rebuild`, which reads the view and so honours it.
+
+**Reproduction compares records, run blocks and order — not the outcome counts.** `built_at` and
+`builder` are excluded (the latter reported separately, per below), and so are `selection.captures`,
+`flows` and `flows_without_origin`: a `--limit`ed document pins only the runs whose flows survived
+truncation, while its `flows_without_origin` counted the whole pre-limit selection — measured at 408
+against 20 — so the count differs while every record matches. Dropping them costs no detection,
+because a changed flow count *is* an added or removed record. The comparison is over the **JSON
+value**: `dataclasses.asdict` leaves `sids` a tuple and `json.loads` yields a list, and without
+canonicalising, every record of every document differed on `(40151,) != [40151]`.
+
+**`collection_id` is deliberately not invented** (Craig, 2026-08-25). §6.3 promised it and nothing —
+here, in §6.4, or in LS-9's named tests — ever defined it, so building it would mean guessing which
+of three jobs it serves: a one-field reproduction check (a digest of the records), an unambiguous
+"same question, different answer" signal (a digest of the inputs), or a per-build handle. The three
+are not interchangeable, and an inputs-only id has a genuinely dangerous property for ground truth —
+a stable name whose content silently changed. §6.2's precedent applies in almost these words: "a
+kind whose order is *meaningful* would need that declared on `LabelKind`; none is, so the field is
+not invented yet." Decide it when §8's consolidator exists and there is a consumer with a
+requirement; if it is built then, build **both** digests rather than either alone.
+
+---
 
 ### 6.6 The architecture guard, and why the obvious form cannot fire
 

@@ -1302,3 +1302,85 @@ def test_the_duplicate_check_is_skipped_while_the_shape_is_still_wrong(monkeypat
 
     assert cli.main(["verify"]) == cli.EXIT_DRIFT
     assert "missing" in capsys.readouterr().err
+
+
+# --- LS-9: the one file, rendered two ways -------------------------------------------------------
+
+
+def test_the_view_file_is_rendered_for_the_ddl_and_for_the_as_of_select():
+    """§9 forbids implementing the supersession rule twice and §4.6 says there is exactly one view.
+
+    `--as-of` needs the same selection with one more predicate, and a view takes no parameters — so
+    the same file is rendered a second way instead of a second statement existing. One text rendered
+    two ways cannot diverge; a second view could, which is what §4.6 records removing.
+    """
+    ddl = schema.render_view("authoritative_runs", "flabel_scratch")
+    adhoc = schema.render_view("authoritative_runs", "flabel_scratch", as_of=True, ddl=False)
+
+    assert ddl.count("CREATE OR REPLACE VIEW") == 1
+    assert adhoc.count("CREATE OR REPLACE VIEW") == 0
+    for rendered in (ddl, adhoc):
+        assert "{header}" not in rendered and "{as_of}" not in rendered
+        assert "{dataset}" not in rendered
+
+
+def test_the_two_renderings_differ_by_exactly_the_cutoff_and_the_create():
+    """The property that makes "one rule" true rather than asserted: the as-of statement is the
+    view's body with **one** predicate added, and nothing else."""
+    import difflib
+
+    ddl = schema.render_view("authoritative_runs", "flabel_scratch")
+    adhoc = schema.render_view("authoritative_runs", "flabel_scratch", as_of=True, ddl=False)
+    changed = [
+        line
+        for line in difflib.unified_diff(ddl.splitlines(), adhoc.splitlines(), lineterm="", n=0)
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    ]
+    removed = [line for line in changed if line.startswith("-")]
+    added = [line for line in changed if line.startswith("+") and line[1:].strip()]
+    assert len(removed) == 1 and "CREATE OR REPLACE VIEW" in removed[0]
+    assert len(added) == 1
+    assert added[0].lstrip("+").strip() == "AND r.ingested_at <= @as_of"
+
+
+def test_the_cutoff_filters_ingested_at_and_never_finished_at():
+    """**§6.5's whole argument, and the thing a plausible implementation gets backwards.**
+
+    A backfill ingests old tarballs late, so a run finishing 2026-08-17 can carry an `ingested_at`
+    of 2026-09-01. Filtering on `finished_at` would let a document rebuilt "as of the 25th" silently
+    gain a run that was not in the store that day. Both clocks are needed and they do different
+    jobs: `ingested_at` selects the candidate set, `finished_at` decides which candidate wins.
+    """
+    assert "ingested_at" in schema.AS_OF_PREDICATE
+    assert "finished_at" not in schema.AS_OF_PREDICATE
+
+    adhoc = sql_of("authoritative_runs.sql").replace("{as_of}", schema.AS_OF_PREDICATE)
+    # `finished_at` still appears — in the ORDER BY, which is what decides the winner.
+    ordering = re.search(r"ORDER BY(.+?)\)", adhoc, re.IGNORECASE | re.DOTALL)
+    assert "finished_at" in ordering.group(1)
+    # ...and the cutoff is a predicate, not part of that ordering.
+    assert "ingested_at" not in ordering.group(1)
+
+
+def test_the_cutoff_is_a_bound_parameter_and_not_interpolated():
+    """A timestamp IS a value, unlike a dataset name, so nothing interpolates it."""
+    assert "@as_of" in schema.AS_OF_PREDICATE
+    adhoc = schema.render_view("authoritative_runs", "flabel_scratch", as_of=True, ddl=False)
+    assert "@as_of" in adhoc
+
+
+def test_the_ddl_rendering_carries_no_cutoff_at_all():
+    """The view must stay what LS-3 shipped: `apply` against a live dataset is not implied by LS-9,
+    and a view that filtered on a parameter it cannot take would not be creatable."""
+    ddl = schema.render_view("authoritative_runs", "flabel")
+    assert "ingested_at" not in ddl
+    assert "@as_of" not in ddl
+
+
+def test_render_view_refuses_a_name_it_does_not_have():
+    with pytest.raises(ValueError, match="not a committed view"):
+        schema.render_view("current_labels", "flabel")
+
+
+def test_view_names_matches_the_files_on_disk():
+    assert schema.view_names() == tuple(sorted(path.stem for path in VIEWS.glob("*.sql")))

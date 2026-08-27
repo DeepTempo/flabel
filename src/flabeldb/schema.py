@@ -14,6 +14,7 @@ and nothing else needs them, so they live in `views/` as text.
 
 from __future__ import annotations
 
+import pathlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -369,6 +370,83 @@ TABLES: Mapping[str, Table] = MappingProxyType(
         ),
     }
 )
+
+
+#: Where the committed view SQL lives. Beside this module, because a view is part of the
+#: declaration rather than part of the CLI that applies it.
+VIEWS = pathlib.Path(__file__).parent / "views"
+
+#: The one predicate `--as-of` adds, and the reason it is here rather than written into a second
+#: statement. §6.5: the cutoff filters on `ingested_at` and **never** on `finished_at` — a backfill
+#: ingests old tarballs late, so a run finishing 2026-08-17 can carry an `ingested_at` of
+#: 2026-09-01, and a `finished_at` filter would let a document rebuilt "as of the 25th" silently
+#: gain a run that was not in the store that day. Both clocks are needed and they do different
+#: jobs: `ingested_at` selects the candidate set, `finished_at` (already in the ORDER BY) decides
+#: which candidate wins.
+AS_OF_PREDICATE = "\n    AND r.ingested_at <= @as_of"
+
+
+def view_names() -> tuple[str, ...]:
+    """Every committed view, by name. Sorted, so `apply` is deterministic."""
+    return tuple(sorted(path.stem for path in VIEWS.glob("*.sql")))
+
+
+def render_view(name: str, dataset: str, *, as_of: bool = False, ddl: bool = True) -> str:
+    """One committed view's SQL, rendered for the job in hand.
+
+    **Two renderings of one file, which is what stops the supersession rule existing twice.**
+    §9 says the merge rule must never be implemented twice and §4.6 says there is exactly one
+    view; `--as-of` needs the same selection with one extra predicate, and a second statement —
+    view or otherwise — would be a copy that can drift. So:
+
+    * `ddl=True, as_of=False` is what `flabel-db apply` writes. The as-of placeholder renders to
+      nothing, so the **executed statement** is exactly what LS-3 shipped and no `apply` against a
+      live dataset is implied by LS-9. (The returned *string* is not byte-identical — the file
+      gained explanatory comments — but they precede the `CREATE`, and BigQuery does not store
+      them. Nothing in the repo compares view text: `cli._verify` diffs `schema.TABLES` only.)
+    * `ddl=False, as_of=True` is what `blfile --as-of` runs: the same body as a bare SELECT, with
+      `@as_of` bound as a parameter rather than interpolated.
+
+    The dataset is interpolated because it cannot be bound — a dataset name is part of a table
+    path, not a value — and `cli.IDENTIFIER` is what guards it at both call sites.
+    """
+    if name not in view_names():
+        raise ValueError(f"{name!r} is not a committed view; have {list(view_names())}")
+    if as_of and ddl:
+        # Reachable, and it produces `CREATE OR REPLACE VIEW … @as_of`, which BigQuery cannot
+        # create: a view takes no parameters. Refused rather than left as a footgun for the next
+        # caller, since the two flags are independent booleans and nothing else pairs them.
+        raise ValueError(
+            "a view cannot carry a query parameter, so as_of and ddl are mutually exclusive: "
+            "render the DDL for `flabel-db apply`, or the bare SELECT for `blfile --as-of`"
+        )
+    text = (VIEWS / f"{name}.sql").read_text(encoding="utf-8")
+    # **Comments do not count, and both placeholders are required.** This file's own comment records
+    # that naming a placeholder in a comment injects the substitution into it, and line 4 already
+    # names `{dataset}` that way — so a guard that greps the whole text is satisfied by prose. And
+    # checking only the header left the other half open: a file with a header and no as-of site
+    # renders, for `blfile --as-of`, as the view body with **no cutoff predicate**, while
+    # `selection.as_of` still claims one. That is a provenance falsehood, which is a worse outcome
+    # than the "apply succeeds at nothing" case the guard was added for.
+    executable = "\n".join(line.split("--")[0] for line in text.splitlines())
+    absent = [name for name in ("{header}", "{as_of}") if name not in executable]
+    if absent:
+        # Before LS-9 each view file carried its own literal `CREATE OR REPLACE VIEW`; now the
+        # CREATE only appears where the placeholder is. A new view file without one would be run by
+        # `flabel-db apply` as a plain SELECT — printing "view <name>", exiting 0, and creating
+        # nothing. `apply` is the gate, so it must not be able to succeed at nothing.
+        raise ValueError(
+            f"{name}.sql is missing {absent} outside its comments. Without the header, rendering "
+            f"as DDL produces a bare SELECT that `apply` runs and reports as a created view; "
+            f"without the as-of site, `blfile --as-of` silently applies no cutoff while the "
+            f"document it writes claims one"
+        )
+    header = f"CREATE OR REPLACE VIEW `{dataset}.{name}` AS" if ddl else ""
+    return (
+        text.replace("{header}", header)
+        .replace("{as_of}", AS_OF_PREDICATE if as_of else "")
+        .replace("{dataset}", dataset)
+    )
 
 
 @dataclass(frozen=True)
