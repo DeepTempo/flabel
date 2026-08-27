@@ -504,6 +504,110 @@ review, not by the tests: the fixtures' counts were built to agree, so leg 2 was
 not it ran. Leg 1 still short-circuits on the marker; leg 2 no longer does, because it needs no
 store at all. #171's shape exactly — the one path never exercised was the one that mattered.
 
+### The production dataset, 2026-08-25 — the first rows `flabel` has ever held
+
+Run after #175 was green and reviewed (Craig, 2026-08-25). Pre-flight: `flabel-db verify` clean,
+all five tables at 0 rows.
+
+```
+flabel-ingest --backfill $FLABEL_RESULTS_URI --dataset flabel --skip-tier 2
+  -> 25 ingested, 0 already present, 0 failed          exit 0
+
+reconcile_store.py --dataset flabel
+  -> 25 run(s); the store agrees with the archive on every run     exit 0
+```
+
+`runs` 25 · `captures` 25 · `flow_labels` 1,870 · `unmatched` 35 · **1,955 rows**, matching the
+`flabel_scratch` rehearsal.
+
+**Not three independent numbers.** The load submits `ingest.rows_for(parsed, table)` and the
+projection counts `len(ingest.rows_for(parsed, table))` — same function, same parse, same archive —
+and the rehearsal is that same parser over the same 25 objects. Their agreement checks the *load*,
+not the count. The genuinely independent number is reconciliation's leg 2, against `run.counts`,
+and that covers `flow_labels` (1,870) and `unmatched` (35) only: **1,905 of the 1,955 rows have a
+self-report behind them; the other 50 — `runs` and `captures`, one row each — are counted only by
+the parse.**
+
+**What the store can actually serve is much less than what it holds, and that is §5.1 working.**
+
+| | |
+| :-- | --: |
+| `flow_labels` rows loaded | 1,870 |
+| belonging to an **authoritative** run | **408** |
+| superseded or unattested — loaded, not selected | 1,462 |
+| captures with an authoritative tier | 17 — `COUNT(DISTINCT capture_sha256)` over `authoritative_runs` |
+| of those, captures carrying labels | 15 — the same, joined to `flow_labels`; also what `blfile` reports |
+
+`blfile --dataset flabel --allow-missing-origin` emitted exactly **408 flows across 15 captures**,
+matching a SQL row count over `flow_labels` restricted to `authoritative_runs`.
+
+**That is one implementation, not two, and an earlier version of this claimed otherwise.** Both
+sides read the same view: `merge.compose`'s whole test is `row["run_id"] not in auth.by_run`, and
+`auth` comes from `query.authoritative`, which selects from `authoritative_runs`. §5.2 is titled "It
+is implemented once, in Python" and §9 forbids a second copy — so claiming two implementations
+agreed was claiming the architecture had been violated. What the agreement establishes is narrower
+and still worth having: Python's **flow** count equals SQL's **row** count, so no
+`(capture, flow_key)` is double-counted. Even that is guaranteed rather than tested today, because
+with no tier-2 attestation each capture has exactly one authoritative run and multi-row composition
+never happens.
+
+**The archive is 24 `replay` runs and one `--offline` run**, and the attestation is the interesting
+part:
+
+* the 24 replay runs attest tier 1, and **7** of them are superseded — real supersession, in
+  production, on captures labelled more than once. (An earlier version said 8. That is `25 - 17`,
+  which counts every run supplying nothing — and the extra one is the `--offline` run below, which
+  attests nothing and so was never a candidate. Two different §2.4 mechanisms, and this document
+  exists partly to keep "we have no record" and "we have a record we will not treat as current"
+  apart.) **No `finished_at` collision was observed**, so §4.6's `run_id` tie-break still has only
+  fixtures behind it — and `status.yaml` already records that no behavioural test can catch a
+  missing tie-break, which voids production supersession as evidence for it;
+* the single `--offline` run attests **nothing**, and its own note says why:
+  `tier 2 not attested: 84958 of 84960 admitted rules loaded, so 2 never examined the capture and
+  any label they would have produced is absent from a run that otherwise looks complete`.
+  **`--skip-tier 2` was not what suppressed it** — §2.4's rule-count check did, on its own, and the
+  two are distinguishable: `ingest.apply_skip_tiers` adds its own note only for a tier that *was*
+  attested, so the rule-count text being present proves tier 2 never was.
+
+  Two precisions this bullet got wrong at first. The branch that fired is §2.4's **strict equality**
+  (`loaded != total`, two rules short), not #142's specified shape of Suricata 7.0.3 refusing an 8.0
+  ruleset and loading none of it — so pinning the Suricata version may not clear this, and two
+  uncompilable rules would still block attestation. And it is **not newly observed**: the identical
+  measurement is in `docs/RESUME-ls-5.md`, dated 2026-08-24, before `flabel` held a row. Attestation
+  is computed at ingest from the tarball's run block, so it is a property of the archive, and
+  backfilling re-observed it rather than establishing it.
+
+So **LS-7's cross-tier composition path still has only fixtures behind it** (#144, #9's accepted
+consequences): with no *attested* tier 2 anywhere, no tier-2 source survives rule 2 and no flow in
+`flabel` composes from two tiers. The rows are there — `--skip-tier 2` loads and does not supersede
+— so this is "no *selectable* tier-2 knowledge", which is the distinction §2.4 exists to draw, not
+"no tier-2 rows". Also not new: `RESUME-ls-7.md` said it pre-backfill.
+
+**And the headline requirement is unmet for every row.** `blfile --dataset flabel` with no flags
+emits **0 flows** and refuses 408 for want of a recorded origin — every archived run predates
+`--source-uri`, so all 25 `captures` rows carry `uri_status: not-recorded`. That is §6.4 working as
+designed: the shortfall is counted and said out loud rather than being a short label list nobody
+questions. A capture labelled *after* LS-5 will carry its `gs://` origin and need no flag.
+
+One real `coverage` block:
+
+```json
+{"input_status": "complete", "unmatched": 0, "unmatched_ratio": 0.0,
+ "loss_conditions_fired": ["ja4_unavailable"]}
+```
+
+`ja4_unavailable` is correct and not a defect: the `ja4` Zeek package is in the CI container and not
+on `fl-replay`, so rows written here carry null `ja4`/`ja4s` meaning *not computed* rather than *no
+TLS* — which is exactly the distinction §11's row for it exists to keep.
+
+**The block alone does not establish the cause**, and citing it as though it did was the same
+overstatement as the rest of this section. `provenance` computes the flag as
+`ja4_status != "present"`, true for both `not-installed` and `probe-failed` — three values,
+deliberately (`docs/spec.md` §10) — and `coverage` does not carry `ja4_status`. The package really is
+absent (`RESUME-ls-7.md`), but the field that says so is `tools.ja4_status: "not-installed"` in the
+run block, not this flag. And `unmatched_ratio: 0.0` is not discriminating: `_ratio` returns it
+whenever there was nothing correlatable to lose.
+
 ### Why `refused` is 0, and the pin that keeps it honest
 
 `parse.rows` refuses a flow whose transport carries no derivable `ip_proto` (§3.2, #96), and

@@ -8,7 +8,7 @@ Spec: `docs/spec-label-store.md`. Design reasoning: `inline-labeling/label-store
 were then executed against the live service. The step list is resequenced rather than renumbered —
 issues #145–#153 keep their step ids, so nothing has to be re-filed.
 
-## Progress — Phase 3a is COMPLETE; 3b is LS-8 (open) and LS-9
+## Progress — Phase 3a COMPLETE, LS-8 merged; LS-9 is the last step
 
 | Step | Issue | State |
 | :-- | :-- | :-- |
@@ -19,7 +19,7 @@ issues #145–#153 keep their step ids, so nothing has to be re-filed.
 | LS-2 `flabel-deploy` ⟂ | [#146](https://github.com/DeepTempo/flabel/issues/146) | ✅ merged (PR #170) |
 | LS-5 wire `flabel-run` | [#150](https://github.com/DeepTempo/flabel/issues/150) | ✅ merged (PR #169) |
 | LS-7 `blfile` | [#151](https://github.com/DeepTempo/flabel/issues/151) | ✅ merged (PR #174) — the last of Phase 3a |
-| LS-8 backfill and reconcile | [#152](https://github.com/DeepTempo/flabel/issues/152) | 🔜 open (PR #175) — Phase 3b |
+| LS-8 backfill and reconcile | [#152](https://github.com/DeepTempo/flabel/issues/152) | ✅ merged (PR #175) — Phase 3b |
 | LS-9 `blfile` reproduction | [#153](https://github.com/DeepTempo/flabel/issues/153) | **next — the last of Phase 3b** |
 
 LS-4 landed two corrections to documents outside its own scope, both found by running it rather
@@ -60,8 +60,9 @@ drift being *measured* on 2026-08-24, when a run exited 3 having loaded nothing 
 §8 argues against precisely that. All four properties the step names are now measured on the box:
 25 runs and 1,955 rows backfilled, reconcile exit 0 on both legs, a second backfill adding zero rows,
 and a deliberately corrupted count on a real archived run failing with exactly one finding. The
-production `flabel` dataset is deliberately **still empty** — Craig, 2026-08-25: the first rows in it
-should be written by reviewed code.
+production `flabel` dataset was **backfilled 2026-08-25** once LS-8 was reviewed — 25 runs, 1,955
+rows, reconciling clean. It was held empty until then (Craig): the first rows in it should be written
+by reviewed code.
 
 LS-5 closed the gap between "`--source-uri` exists" (LS-1) and "anything passes it": the wrapper now
 carries the original `gs://` argument and calls `flabel-ingest` after a successful publish. Its one
