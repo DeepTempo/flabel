@@ -60,8 +60,9 @@ drift being *measured* on 2026-08-24, when a run exited 3 having loaded nothing 
 §8 argues against precisely that. All four properties the step names are now measured on the box:
 25 runs and 1,955 rows backfilled, reconcile exit 0 on both legs, a second backfill adding zero rows,
 and a deliberately corrupted count on a real archived run failing with exactly one finding. The
-production `flabel` dataset is deliberately **still empty** — Craig, 2026-08-25: the first rows in it
-should be written by reviewed code.
+production `flabel` dataset was **backfilled 2026-08-25** once LS-8 was reviewed — 25 runs, 1,955
+rows, reconciling clean. It was held empty until then (Craig): the first rows in it should be written
+by reviewed code.
 
 LS-5 closed the gap between "`--source-uri` exists" (LS-1) and "anything passes it": the wrapper now
 carries the original `gs://` argument and calls `flabel-ingest` after a successful publish. Its one
