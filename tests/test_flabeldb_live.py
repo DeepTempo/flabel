@@ -75,6 +75,20 @@ def _metadata_project() -> str | None:
         return None
 
 
+def empty(bq, name: str) -> None:
+    """`name`, emptied — **`TRUNCATE`, not delete-and-recreate.**
+
+    `rebuild` is DDL, and BigQuery's metadata is eventually consistent behind it: dropping a table
+    and immediately inserting into the replacement is the shape that produced five fixture errors in
+    one run of this file, once the crossed-clocks fixture went function-scoped and turned a single
+    rebuild into five. Emptying a table that already matches the declaration needs no DDL, so a
+    fixture that only wants an empty table uses this instead.
+
+    `rebuild` stays for the tests whose subject IS the table's shape.
+    """
+    bq.query(f"TRUNCATE TABLE `{bq.project}.{DATASET}.{name}`").result()
+
+
 def rebuild(bq, name: str) -> None:
     """`name`, deleted and recreated from the declaration. The manual rebuild, done by hand."""
     from flabeldb import client
@@ -915,8 +929,8 @@ def crossed_clocks(bq):
     """
     from flabeldb import query
 
-    rebuild(bq, "runs")
-    rebuild(bq, "run_exclusions")
+    empty(bq, "runs")
+    empty(bq, "run_exclusions")
     capture = "d" * 64
     rows = [
         # (run_id, finished_at, ingested_at)
@@ -984,8 +998,8 @@ def test_the_cutoff_still_lets_finished_at_decide_between_survivors(bq):
     the winner among them. With both runs ingested before the cutoff, the later finisher wins."""
     from flabeldb import query
 
-    rebuild(bq, "runs")
-    rebuild(bq, "run_exclusions")
+    empty(bq, "runs")
+    empty(bq, "run_exclusions")
     capture = "e" * 64
     values = ", ".join(
         f"('{run_id}', '{capture}', 'offline', [2], TIMESTAMP '{finished}', TIMESTAMP '{ingested}')"

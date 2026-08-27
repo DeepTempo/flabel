@@ -245,38 +245,35 @@ def collect_rebuild(
     )
 
 
-#: What BigQuery's `TIMESTAMP` literal parser actually accepts: `YYYY-[M]M-[D]D` with an optional
-#: time, fractional seconds and zone. **Deliberately narrower than `datetime.fromisoformat`**, which
-#: since 3.11 also takes the ISO *basic* forms and week dates — `20260825` and `2026-W35-1` both
-#: parse in Python and both are rejected by BigQuery. So a check built on `fromisoformat` alone was
-#: a gate looser than the thing it guards: `--as-of 20260825`, an entirely ordinary way to type a
-#: date, passed it, was bound as a parameter, came back a `BadRequest`, and surfaced as "This is a
-#: DEFECT in blfile" at exit 3 — which is the outcome validating it was supposed to prevent.
+#: What BigQuery's `TIMESTAMP` parameter binding accepts, **measured against the live service**
+#: rather than read off the docs (2026-08-25, `SELECT @t` with a `TIMESTAMP` parameter):
+#:
+#:     ACCEPTS   2026-08-25 · 2026-8-5T1:02:03 · …T00:00:00-08 · 2026-08-25 00:00:00 UTC
+#:     REJECTS   2026-08-25T14:30 · …T00:00:00+99:99 · 20260825 · 2026-W35-1
+#:
+#: Two of those settled corrections this gate needed. **Seconds are required once a time is given**
+#: — `T14:30` is an ordinary way to type a cutoff and BigQuery refuses it, so making `:SS` optional
+#: was `20260825` all over again: accepted here, `BadRequest` there, surfacing as "a DEFECT in
+#: blfile" at exit 3. And **the offset is bounded**, because `+99:99` matched a bare two-digit
+#: pattern and was never range-checked.
+#:
+#: Named zones (`… UTC`) are refused even though the service takes them: validating IANA names needs
+#: a tz database this module has no business depending on, and `Z` or a numeric offset expresses any
+#: cutoff. Refusing is the safe direction — exit 2 with guidance, not exit 3 — and it is stated here
+#: rather than claimed as "what BigQuery accepts", which the previous comment did and was wrong.
 _INSTANT = re.compile(
     r"^(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})"
-    r"(?:[ T](?P<hour>\d{1,2}):(?P<minute>\d{1,2})"
-    r"(?::(?P<second>\d{1,2})(?:\.(?P<micro>\d{1,6}))?)?"
-    r"(?:Z|[+-]\d{2}:?\d{2})?)?$"
+    r"(?:[ T](?P<hour>\d{1,2}):(?P<minute>\d{1,2}):(?P<second>\d{1,2})(?:\.\d{1,6})?"
+    r"(?:Z|(?P<sign>[+-])(?P<offhour>\d{2})(?::?(?P<offminute>\d{2}))?)?)?$"
 )
 
 
 def _is_instant(value: str) -> bool:
     """Whether `value` is a timestamp BigQuery will accept.
 
-    Shape from the pattern, then the calendar checked numerically. **Not via
-    `datetime.fromisoformat`, in either direction**, and both directions were wrong at first:
-
-    * looser than BigQuery — since 3.11 `fromisoformat` also takes the ISO *basic* forms and week
-      dates, so `20260825` and `2026-W35-1` both parse in Python and both are rejected by the
-      service. `--as-of 20260825` therefore passed the gate, was bound as a parameter, came back a
-      `BadRequest`, and surfaced as "This is a DEFECT in blfile" at exit 3 — the outcome validating
-      it was meant to prevent;
-    * stricter than BigQuery — `fromisoformat` demands zero-padded components, while BigQuery's
-      literal format is `YYYY-[M]M-[D]D[( |T)[H]H:[M]M:[S]S[.F]]`, so it refused `2026-8-5T1:02:03`,
-      which the service takes.
-
-    A date with no time is accepted; BigQuery reads it as midnight, and `--as-of 2026-08-25` is a
-    reasonable thing to type.
+    Shape from the pattern, then the calendar and the offset checked numerically. Not via
+    `datetime.fromisoformat` in either direction: it accepts the ISO basic forms and week dates that
+    BigQuery rejects, and demands zero-padding that BigQuery does not.
     """
     if not isinstance(value, str):
         return False
@@ -284,8 +281,13 @@ def _is_instant(value: str) -> bool:
     if not found:
         return False
     parts = found.groupdict()
+    if parts["offhour"] is not None and (
+        int(parts["offhour"]) > 23 or int(parts["offminute"] or 0) > 59
+    ):
+        return False
     try:
-        # The digit classes above match `2026-13-99`; only a real calendar rejects it.
+        # The digit classes above match `2026-13-99` and `T25:00:00`; only a real calendar rejects
+        # them.
         datetime(
             int(parts["year"]),
             int(parts["month"]),

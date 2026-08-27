@@ -293,20 +293,172 @@ class Prior:
     document: Mapping[str, Any]
 
 
+# --- the shape `--rebuild` reads (§6.4), declared once -------------------------------------------
+#
+# **Why a declaration rather than a checklist.** Three consecutive rounds of review found the same
+# defect here: a validation fix that covered every field but one, and the one it missed reached the
+# interpreter as exit 1 or was announced as "a DEFECT in blfile" at exit 3. Round one missed the
+# pinned tiers, round two validated two of three pin fields and missed `run_id`, round three
+# validated `run_id` and `limit` and missed `selection.labels`. Each fix was correct and each left a
+# next field to miss.
+#
+# So the shape is stated once, walked once, and `test_blfile.py` asserts it covers every
+# key a real document carries — the same arrangement `RUN_ID_COLUMN` has against `schema.TABLES`
+# and `LOAD_ORDER` has against the declaration. A field added to `build` without a
+# line here is a failing test rather than a latent crash.
+#
+# What is deliberately NOT specced: the interiors of `flow`, `sources`, `labels[]` entries and
+# `builder`. No rebuild path indexes into them — they are compared by equality, which cannot raise —
+# so the canonicalisation check in `read_prior` is their whole requirement. Anything a code path
+# *reads* is specced; that is the rule, and the coverage test enforces it one level down from here.
+
+
+@dataclasses.dataclass(frozen=True)
+class Shape:
+    """What one field of the document may be."""
+
+    kind: tuple[type, ...]
+    #: May be present and `null`.
+    nullable: bool = False
+    #: `bool` is a subclass of `int`, and `True` as a limit silently means one flow.
+    reject_bool: bool = False
+    #: For a list: what each element must be.
+    items: Shape | None = None
+    #: For a mapping: the fields that are read. Extra keys are ignored at runtime and refused by the
+    #: coverage test, which is the split that matters — runtime must not crash, the test must not
+    #: let a field go unspecced.
+    fields: Mapping[str, Shape] | None = None
+    #: For an int: the smallest legal value.
+    minimum: int | None = None
+    #: A list that must not be empty.
+    non_empty: bool = False
+    #: This mapping **embeds something written elsewhere**, so it carries keys this declaration has
+    #: no business naming: a `runs[]` entry wraps §6.4's verbatim run block, `origin` wraps §4.2's
+    #: sighting plus the coverage block, `flow` wraps §4.3's struct. Only the keys a rebuild path
+    #: *indexes* are specced; the rest are compared by equality, which cannot raise, and are covered
+    #: by `read_prior`'s canonicalisation check.
+    #:
+    #: **Everything else is closed**, and that is where the coverage test has teeth: a new key
+    #: in the document proper, in `selection`, or in a `labels[]` record must be declared or the
+    #: test fails. An `embeds` map is where "declare every key" would be a lie.
+    embeds: bool = False
+
+
+_STRING = Shape(kind=(str,))
+_INT = Shape(kind=(int,), reject_bool=True)
+_BOOL = Shape(kind=(bool,))
+
+#: §6.4's document, as the fields any rebuild path reads.
+DOCUMENT_SHAPE = Shape(
+    kind=(Mapping,),
+    fields={
+        "document_type": _STRING,
+        "schema_version": _STRING,
+        "built_at": _STRING,
+        "builder": Shape(kind=(Mapping,)),
+        "selection": Shape(
+            kind=(Mapping,),
+            fields={
+                "labels": Shape(kind=(list,), items=_STRING),
+                "match": _STRING,
+                "captures": _INT,
+                "flows": _INT,
+                "flows_without_origin": _INT,
+                # `minimum=1` because `blfile` refuses `--limit 0` on the command line, and a
+                # document path that accepts what the CLI refuses put the failure on exit 1.
+                "limit": Shape(kind=(int,), reject_bool=True, nullable=True, minimum=1),
+                "allow_missing_origin": _BOOL,
+                "as_of": Shape(kind=(str,), nullable=True),
+            },
+        ),
+        "runs": Shape(
+            kind=(list,),
+            non_empty=True,
+            items=Shape(
+                kind=(Mapping,),
+                embeds=True,
+                fields={
+                    "run_id": _STRING,
+                    "capture_sha256": _STRING,
+                    "supplies": Shape(kind=(list,), non_empty=True, items=_INT),
+                },
+            ),
+        ),
+        "labels": Shape(
+            kind=(list,),
+            items=Shape(
+                kind=(Mapping,),
+                fields={
+                    # `capture_sha256` and `flow_key` are the pair `differences` keys its record
+                    # index on (§3.2), so they must be hashable strings or the index raises.
+                    "origin": Shape(
+                        kind=(Mapping,), embeds=True, fields={"capture_sha256": _STRING}
+                    ),
+                    "flow": Shape(kind=(Mapping,), embeds=True, fields={"flow_key": _STRING}),
+                    "best_tier": _INT,
+                    "labels": Shape(kind=(list,), items=Shape(kind=(Mapping,))),
+                    "sources": Shape(kind=(list,), items=Shape(kind=(Mapping,))),
+                },
+            ),
+        ),
+    },
+)
+
+
+def _named(kinds: tuple[type, ...]) -> str:
+    return " or ".join("object" if kind is Mapping else kind.__name__ for kind in kinds)
+
+
+def validate_document(
+    document: object, shape: Shape = DOCUMENT_SHAPE, path: str = "the document"
+) -> None:
+    """Walk `document` against `shape`, raising `NotACollection` naming the path that is wrong.
+
+    Every message names the path, because "not an object" is useless without knowing which one.
+    """
+    if document is None:
+        if shape.nullable:
+            return
+        raise NotACollection(f"{path} is null")
+    if not isinstance(document, shape.kind):
+        raise NotACollection(f"{path} is a {type(document).__name__}, not {_named(shape.kind)}")
+    if shape.reject_bool and isinstance(document, bool):
+        raise NotACollection(
+            f"{path} is a bool; `True` is an int in Python and would be read as the number 1"
+        )
+    if shape.minimum is not None and isinstance(document, int) and document < shape.minimum:
+        raise NotACollection(
+            f"{path} is {document}, and the smallest legal value is {shape.minimum}"
+        )
+    if shape.non_empty and not document:
+        raise NotACollection(f"{path} is empty")
+    if shape.items is not None:
+        for index, item in enumerate(document):
+            validate_document(item, shape.items, f"{path}[{index}]")
+    if shape.fields is not None:
+        for name, field in shape.fields.items():
+            if name not in document:
+                raise NotACollection(f"{path} has no {name!r}")
+            validate_document(document[name], field, f"{path}.{name}")
+
+
 def read_prior(document: Mapping[str, Any]) -> Prior:
     """A prior `labels-collection` as a `Prior`, or a readable refusal.
 
-    **The document type is checked, not assumed.** §9 says a collection must never be stamped with
-    `labels.json`'s `schema_version`, and the other direction matters just as much here: handed a
-    `labels.json`, `--rebuild` would read `selection` as absent, rebuild from an empty pinned set,
-    and report a perfect reproduction of nothing.
+    Three steps, in this order and for this reason:
+
+    1. **Identity** — `document_type` and `schema_version`. §9 says a collection must never be
+       stamped with `labels.json`'s version, and the other direction matters as much: handed a
+       `labels.json`, `--rebuild` would read no selection, rebuild from an empty pin, and report a
+       perfect reproduction of nothing.
+    2. **Shape** — one walk of `DOCUMENT_SHAPE`, which is the whole of the type checking. This
+       replaced four rounds of per-field `isinstance` calls, each of which covered every field but
+       one; see that declaration for the history.
+    3. **Meaning** — the things a type cannot say: that the document canonicalises, and that it
+       does not name one run under two captures.
     """
     if not isinstance(document, Mapping):
-        raise NotACollection(
-            f"the file holds a {type(document).__name__}, not an object. Every check below reads "
-            f"keys, and letting it through reached the interpreter as exit 1 — the code this tool "
-            f"publishes as a refusal about the store"
-        )
+        raise NotACollection(f"the file holds a {type(document).__name__}, not an object")
     kind = document.get("document_type")
     if kind != DOCUMENT_TYPE:
         raise NotACollection(
@@ -319,96 +471,29 @@ def read_prior(document: Mapping[str, Any]) -> Prior:
             f"schema_version is {version!r} and this build writes {SCHEMA_VERSION!r}. Reproducing "
             f"across a document version is not what §6.5 promises"
         )
-    selection = document.get("selection") or {}
-    if not isinstance(selection, Mapping):
-        raise NotACollection(f"`selection` is a {type(selection).__name__}, not an object")
-    limit = selection.get("limit")
-    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)):
-        # `bool` first: `True` is an `int` in Python and `chosen[:True]` silently means one flow.
-        raise NotACollection(f"`selection.limit` is {limit!r}, not a whole number or null")
-    records = document.get("labels")
-    if records is not None and (
-        not isinstance(records, list) or any(not isinstance(item, Mapping) for item in records)
-    ):
-        raise NotACollection("`labels` is not a list of objects")
-    for index, record in enumerate(records or ()):
-        # `record.get("origin", {})` returns `None` for a key that is PRESENT and null, so the
-        # default does not save the `.get` that follows it. `differences` then raised
-        # `AttributeError` — and a document mixing records with and without an origin raised
-        # `TypeError` on `sorted()` over keys of mixed type. Both were reported as "a DEFECT in
-        # blfile" at exit 3, for a file the operator passed in.
-        for field in ("origin", "flow"):
-            if not isinstance(record.get(field), Mapping):
-                raise NotACollection(
-                    f"`labels[{index}].{field}` is {record.get(field)!r}, not an object"
-                )
+
+    validate_document(document)
+
     try:
         # Catches a `NaN`/`Infinity` literal — `json.loads` accepts them and `serialise` refuses
-        # them (`allow_nan=False`, spec §10) — plus anything else that cannot be canonicalised. One
-        # check here rather than a crash from inside `comparable` two layers down.
+        # them (`allow_nan=False`, spec §10) — plus anything else that cannot be canonicalised. It
+        # is also what covers every field the shape deliberately does not spec, since a value that
+        # survives canonicalisation can only ever be compared, never indexed.
         serialise(document)
     except ValueError as error:
         raise NotACollection(f"this document cannot be canonicalised: {error}") from error
-    if not isinstance(document.get("builder") or {}, Mapping):
-        raise NotACollection("`builder` is not an object")
-    runs = document.get("runs")
-    if runs is None:
-        raise NotACollection("no `runs` block, so there is no pinned run set to rebuild from")
-    if not isinstance(runs, list) or any(not isinstance(entry, Mapping) for entry in runs):
-        raise NotACollection("`runs` is not a list of objects, so no pinned set can be read")
-    if not runs:
-        # **`runs: []` used to reproduce unconditionally**, and it is the most likely document an
-        # operator has on disk today: every archived run predates `--source-uri`, so bare `blfile`
-        # emits 0 flows and therefore pins nothing. Every query short-circuits on an empty id list,
-        # so nothing was read — not the exclusions, not the runs, not a row — and the tool printed
-        # "REPRODUCED … 0 flow(s)" and exited 0. It did so even against a dataset that does not
-        # exist. This docstring's own reasoning for refusing a `labels.json` is that it would
-        # "rebuild from an empty pinned set, and report a perfect reproduction of nothing"; the same
-        # thing reached the same end through this door.
-        raise NotACollection(
-            "this document pins no runs, so there is nothing to reproduce. A collection with no "
-            "flows records no run set — rebuild it with the selection that produced it instead"
-        )
-    pinned = [entry.get("run_id") for entry in runs]
-    incomplete = [
-        index
-        for index, entry in enumerate(runs)
-        if not entry.get("run_id") or not entry.get("capture_sha256") or not entry.get("supplies")
-    ]
-    if incomplete:
-        raise NotACollection(
-            f"{len(incomplete)} of {len(runs)} `runs` entries do not carry `run_id`, "
-            f"`capture_sha256` and `supplies`. Documents written before LS-9 omitted them, and "
-            f"without `supplies` the pinned set cannot be read: `tiers_attested` is what a run "
-            f"CLAIMED, not what it supplies here, and treating them as the same makes every "
-            f"partially superseded capture un-rebuildable"
-        )
+
+    selection = document["selection"]
+    runs = document["runs"]
+    pinned = [entry["run_id"] for entry in runs]
+    # Types are `DOCUMENT_SHAPE`'s job. What is left is the one thing a type cannot say: §3.3
+    # derives a run id from one capture, so no run may be listed under two. The store cannot
+    # produce that — but a hand-edited document can, and it used to reach `build`'s own guard and
+    # be reported as "a DEFECT in blfile" at exit 3 for a bad input file.
     by_run: dict[str, str] = {}
     for entry in runs:
-        if not isinstance(entry["supplies"], list) or not all(
-            isinstance(tier, int) and not isinstance(tier, bool) for tier in entry["supplies"]
-        ):
-            raise NotACollection(
-                f"run {entry['run_id']}'s `supplies` is {entry['supplies']!r}, not a list of tier "
-                f"numbers"
-            )
-        if not isinstance(entry["run_id"], str):
-            # The other two fields were checked and this one was not — and it is the one
-            # `by_run.setdefault` hashes and `sorted(set(pinned))` orders. A list run_id raised
-            # `TypeError: unhashable type`, and mixing an int with a str raised on the sort; both
-            # escaped this function and reached the interpreter as exit 1, the code reserved for a
-            # refusal about the store. One field to the left of where the last fix looked.
-            raise NotACollection(f"a `runs` entry's `run_id` is {entry['run_id']!r}, not a string")
-        if not isinstance(entry["capture_sha256"], str):
-            raise NotACollection(
-                f"run {entry['run_id']}'s `capture_sha256` is not a string: "
-                f"{entry['capture_sha256']!r}"
-            )
         seen = by_run.setdefault(entry["run_id"], entry["capture_sha256"])
         if seen != entry["capture_sha256"]:
-            # §3.3 derives a run id from one capture, so the store cannot produce this — but a
-            # hand-edited document can, and it used to reach `build`'s own guard and be reported as
-            # "a DEFECT in blfile" at exit 3. It is a fact about the file, so it is exit 2.
             raise NotACollection(
                 f"run {entry['run_id']} is listed under two captures ({seen}, "
                 f"{entry['capture_sha256']}). §3.3 derives a run id from one capture, so this "
@@ -554,11 +639,11 @@ def differences(prior: Mapping[str, Any], rebuilt: Mapping[str, Any]) -> list[st
                 f"the {label} carries two records for one (capture, flow_key); §3.2 makes that "
                 f"pair a flow's identity, so this is a defect in whatever wrote it"
             )
-    for key in sorted(set(old) - set(new)):
+    for key in sorted(set(old) - set(new), key=str):
         found.append(
             f"flow {key[1]} of capture {key[0]} was in the document and is not in the rebuild"
         )
-    for key in sorted(set(new) - set(old)):
+    for key in sorted(set(new) - set(old), key=str):
         found.append(
             f"flow {key[1]} of capture {key[0]} is in the rebuild and was not in the document"
         )
@@ -570,7 +655,7 @@ def differences(prior: Mapping[str, Any], rebuilt: Mapping[str, Any]) -> list[st
             "the records are the same but their order differs; §6.4's canonical ordering is part "
             "of the document"
         )
-    for key in sorted(set(old) & set(new)):
+    for key in sorted(set(old) & set(new), key=str):
         if old[key] != new[key]:
             found.append(
                 f"flow {key[1]} of capture {key[0]} differs: "
@@ -599,7 +684,13 @@ def _run_entry(run_id: str, supplied: tuple[str, list[int]], block: Mapping[str,
     """
     collisions = [key for key in PIN_KEYS if key in block]
     if collisions:
-        raise ValueError(
+        # **`StoreInconsistent`, not `ValueError`.** The trigger is `runs.run_block`, a STRING
+        # column `_run_blocks` records as deliberately unvalidated on ingest — so this is a fact
+        # about a row the store holds. A bare `ValueError` reached `main`'s catch-all and printed
+        # "This is a DEFECT in blfile" with a developer-facing message and no operator workaround.
+        # `_run_blocks` already raises `StoreInconsistent` for an unparseable block, for this
+        # reason.
+        raise merge.StoreInconsistent(
             f"run {run_id}'s block carries {collisions}, which §6.4's entry uses for the pinned "
             f"set. Spreading the block last would let it decide what this document pins; rename "
             f"the pin keys or nest them before this can ship"

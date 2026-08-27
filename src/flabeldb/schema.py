@@ -421,14 +421,25 @@ def render_view(name: str, dataset: str, *, as_of: bool = False, ddl: bool = Tru
             "render the DDL for `flabel-db apply`, or the bare SELECT for `blfile --as-of`"
         )
     text = (VIEWS / f"{name}.sql").read_text(encoding="utf-8")
-    if "{header}" not in text:
+    # **Comments do not count, and both placeholders are required.** This file's own comment records
+    # that naming a placeholder in a comment injects the substitution into it, and line 4 already
+    # names `{dataset}` that way — so a guard that greps the whole text is satisfied by prose. And
+    # checking only the header left the other half open: a file with a header and no as-of site
+    # renders, for `blfile --as-of`, as the view body with **no cutoff predicate**, while
+    # `selection.as_of` still claims one. That is a provenance falsehood, which is a worse outcome
+    # than the "apply succeeds at nothing" case the guard was added for.
+    executable = "\n".join(line.split("--")[0] for line in text.splitlines())
+    absent = [name for name in ("{header}", "{as_of}") if name not in executable]
+    if absent:
         # Before LS-9 each view file carried its own literal `CREATE OR REPLACE VIEW`; now the
         # CREATE only appears where the placeholder is. A new view file without one would be run by
         # `flabel-db apply` as a plain SELECT — printing "view <name>", exiting 0, and creating
         # nothing. `apply` is the gate, so it must not be able to succeed at nothing.
         raise ValueError(
-            f"{name}.sql has no header placeholder, so rendering it as DDL would produce a bare "
-            f"SELECT that `apply` runs and reports as a created view"
+            f"{name}.sql is missing {absent} outside its comments. Without the header, rendering "
+            f"as DDL produces a bare SELECT that `apply` runs and reports as a created view; "
+            f"without the as-of site, `blfile --as-of` silently applies no cutoff while the "
+            f"document it writes claims one"
         )
     header = f"CREATE OR REPLACE VIEW `{dataset}.{name}` AS" if ddl else ""
     return (

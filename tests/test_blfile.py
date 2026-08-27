@@ -1200,7 +1200,7 @@ def test_read_prior_refuses_a_document_written_before_run_ids_were_recorded():
     document["runs"] = [
         {key: value for key, value in document["runs"][0].items() if key != "run_id"}
     ]
-    with pytest.raises(collection.NotACollection, match="do not carry"):
+    with pytest.raises(collection.NotACollection, match="runs\\[0\\]"):
         collection.read_prior(document)
 
 
@@ -1345,26 +1345,45 @@ def test_rebuild_refuses_a_flag_it_would_silently_ignore(flag, value, tmp_path, 
     assert "silently ignored" in message
 
 
-def test_the_refusal_list_covers_every_flag_that_shapes_the_selection():
-    """A flag added to the parser and not to `REBUILD_REFUSES` would be quietly ignored under
-    `--rebuild`, which is the exact failure the refusal exists to prevent.
+#: Every flag `blfile` has, and whether `--rebuild` must refuse it. Pinned as a literal so that
+#: adding a flag to the parser fails **here** rather than being quietly allowed — deciding which
+#: column a new flag belongs in is the whole judgement, and it must be made deliberately.
+#:
+#: Two earlier versions of this could not fail. The first compared `REBUILD_REFUSES` to a
+#: hand-written copy of the same five names, so whoever added a flag updated both literals in one
+#: edit. The second derived the shaping set from the parser and subtracted a hardcoded allowlist —
+#: which moved the one-edit escape to the other side of the subtraction, and would also have
+#: mislabelled a genuinely non-shaping flag like `--verbose` as one that must be refused.
+FLAGS_AND_WHETHER_REBUILD_REFUSES_THEM = {
+    "help": False,
+    "project": False,  # where to read
+    "dataset": False,  # where to read
+    "local_adc": False,  # how to authenticate
+    "output": False,  # where to write
+    "rebuild": False,  # the flag itself
+    "label": True,  # every one of these shapes a selection --rebuild takes from the document
+    "capture": True,
+    "limit": True,
+    "allow_missing_origin": True,
+    "as_of": True,
+}
 
-    **Derived from the parser, not from a second copy of the list.** An earlier version compared
-    `REBUILD_REFUSES` to a hand-written set of the same five names — so whoever added a flag would
-    update both literals in one edit and the test could never fire. It claimed to catch exactly the
-    thing it could not see.
-    """
-    # Everything that does not shape a selection: where to read, where to write, and how to auth.
-    allowed = {"help", "project", "dataset", "local_adc", "output", "rebuild"}
-    dests = {
-        action.dest for action in blfile.build_parser()._actions if action.dest != "==SUPPRESS=="
-    }
-    shaping = dests - allowed
-    assert shaping == set(blfile.REBUILD_REFUSES), (
-        f"these parser flags shape the selection and --rebuild does not refuse them: "
-        f"{sorted(shaping - set(blfile.REBUILD_REFUSES))}; and these are refused but are not "
-        f"parser flags: {sorted(set(blfile.REBUILD_REFUSES) - shaping)}"
+
+def test_every_parser_flag_is_classified():
+    """A flag added to the parser and to neither column is the gap the refusal exists to close."""
+    dests = {action.dest for action in blfile.build_parser()._actions}
+    assert dests == set(FLAGS_AND_WHETHER_REBUILD_REFUSES_THEM), (
+        f"unclassified: {sorted(dests - set(FLAGS_AND_WHETHER_REBUILD_REFUSES_THEM))}; "
+        f"listed but not a flag: "
+        f"{sorted(set(FLAGS_AND_WHETHER_REBUILD_REFUSES_THEM) - dests)}. Decide which column it "
+        f"belongs in — that decision is what this test exists to force."
     )
+
+
+def test_the_refusal_list_matches_the_classification():
+    """`--rebuild` must refuse exactly the flags classified as shaping a selection."""
+    expected = {name for name, refuses in FLAGS_AND_WHETHER_REBUILD_REFUSES_THEM.items() if refuses}
+    assert set(blfile.REBUILD_REFUSES) == expected
 
 
 def test_rebuild_reports_the_conflict_before_validating_the_labels(tmp_path, capsys):
@@ -1736,33 +1755,65 @@ def test_a_rebuild_notices_when_the_rows_really_did_change(monkeypatch):
 # --- the rest of the 2026-08-25 review -----------------------------------------------------------
 
 
+def _wrong_shape(**override) -> str:
+    """A minimally valid-looking collection with one field replaced, as JSON text.
+
+    It pins a plausible run so each case reaches the refusal it is named for rather than the
+    empty-`runs` one — see the parametrisation below for why that mattered.
+    """
+    document = {
+        "document_type": "labels-collection",
+        "schema_version": "1.0",
+        "built_at": BUILT_AT,
+        "builder": {},
+        "selection": {
+            "labels": ["verdict"],
+            "match": "all",
+            "captures": 1,
+            "flows": 0,
+            "flows_without_origin": 0,
+            "limit": None,
+            "allow_missing_origin": False,
+            "as_of": None,
+        },
+        "runs": [{"run_id": TIER2_RUN, "capture_sha256": CAPTURE, "supplies": [2]}],
+        "labels": [],
+    }
+    document.update(override)
+    return json.dumps(document)
+
+
 @pytest.mark.parametrize(
-    "contents",
+    ("contents", "expected"),
     [
-        "[]",
-        "5",
-        '"x"',
-        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": 42}',
-        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": [1]}',
-        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": [],'
-        ' "selection": ["x"]}',
-        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": [],'
-        ' "builder": ["x"]}',
-        '{"document_type": "labels-collection", "schema_version": "1.0", "runs": [],'
-        ' "labels": [1, 2]}',
+        ("[]", "holds a list, not an object"),
+        ("5", "holds a int, not an object"),
+        ('"x"', "holds a str, not an object"),
+        ("{}", "document_type"),
+        # **Each fixture must reach the refusal it is named for.** These all carried `"runs": []`,
+        # so once the empty-runs refusal was added they died on *that* — and the parametrisation
+        # asserted only exit 2 and "cannot be rebuilt", so the `builder` case stayed green with its
+        # own guard deleted. Each now pins a plausible run and asserts a distinguishing substring.
+        (_wrong_shape(runs=42), "runs is a int"),
+        (_wrong_shape(runs=[1]), "runs[0] is a int"),
+        (_wrong_shape(selection=["x"]), "selection is a list"),
+        (_wrong_shape(builder=["x"]), "builder is a list"),
+        (_wrong_shape(labels=[1, 2]), "labels[0] is a int"),
     ],
 )
-def test_a_valid_json_file_of_the_wrong_shape_is_a_usage_error(contents, tmp_path, capsys):
+def test_a_valid_json_file_of_the_wrong_shape_is_a_usage_error(
+    contents, expected, tmp_path, capsys
+):
     """**Each of these used to reach the interpreter as exit 1** — the code this tool publishes as a
-    refusal about the store — because `read_prior` only checked `document_type`, `schema_version`
-    and `runs[].run_id`, and everything else indexed blindly.
-
-    It is an operator's file, so it is exit 2: a fact about the argument, not about the dataset.
+    refusal about the store — because `read_prior` checked a handful of fields by hand and indexed
+    the rest blindly. It is an operator's file, so it is exit 2.
     """
     target = tmp_path / "c.json"
     target.write_text(contents, encoding="utf-8")
     assert blfile.main(["--rebuild", str(target)]) == blfile.EXIT_USAGE
-    assert "cannot be rebuilt" in capsys.readouterr().err
+    message = capsys.readouterr().err
+    assert "cannot be rebuilt" in message
+    assert expected in message, f"reached the wrong refusal: {message}"
 
 
 def test_a_non_finite_number_in_a_rebuild_file_is_the_operators_problem(
@@ -1816,6 +1867,13 @@ def test_rebuild_refuses_limit_zero_rather_than_calling_it_absent(tmp_path, caps
         "20260825",
         "2026-W35-1",
         "2026-08-25T00:00:00,5",
+        # **Measured against the live service, 2026-08-25.** BigQuery refuses both, and the gate
+        # accepted both until then: `:SS` was optional, and the offset was matched but never
+        # range-checked. Neither was in this list, so the sabotages that restored those two holes
+        # stayed green.
+        "2026-08-25T14:30",
+        "2026-08-25T00:00:00+99:99",
+        "2026-08-25T00:00:00+2400",
         # And two the digit classes match but the calendar does not.
         "2026-02-30",
         "2026-08-25T25:00:00",
@@ -1926,7 +1984,7 @@ def test_read_prior_refuses_a_supplies_that_is_not_tier_numbers(supplies):
 def test_read_prior_refuses_a_capture_that_is_not_a_string():
     document = prior_document()
     document["runs"][0]["capture_sha256"] = ["a" * 64]
-    with pytest.raises(collection.NotACollection, match="not a string"):
+    with pytest.raises(collection.NotACollection, match="not str"):
         collection.read_prior(document)
 
 
@@ -1971,14 +2029,14 @@ def test_a_run_id_that_is_not_a_string_is_a_usage_error():
     exit 1, the code reserved for a refusal about the store."""
     document = prior_document()
     document["runs"][0]["run_id"] = ["x"]
-    with pytest.raises(collection.NotACollection, match="not a string"):
+    with pytest.raises(collection.NotACollection, match="not str"):
         collection.read_prior(document)
 
 
 def test_run_ids_of_mixed_type_do_not_reach_the_sort():
     document = prior_document()
     document["runs"].append({**document["runs"][0], "run_id": 7, "capture_sha256": "b" * 64})
-    with pytest.raises(collection.NotACollection, match="not a string"):
+    with pytest.raises(collection.NotACollection, match="not str"):
         collection.read_prior(document)
 
 
@@ -1995,7 +2053,7 @@ def test_a_document_that_pins_no_runs_is_refused_rather_than_reproduced():
     document = prior_document()
     document["runs"] = []
     document["labels"] = []
-    with pytest.raises(collection.NotACollection, match="pins no runs"):
+    with pytest.raises(collection.NotACollection, match="runs is empty"):
         collection.read_prior(document)
 
 
@@ -2016,7 +2074,7 @@ def test_a_zero_flow_rebuild_cannot_report_success_against_a_dataset_that_is_not
     assert blfile.main(["--rebuild", str(target), "--dataset", "no_such_dataset"]) == (
         blfile.EXIT_USAGE
     )
-    assert "pins no runs" in capsys.readouterr().err
+    assert "runs is empty" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -2040,7 +2098,7 @@ def test_a_selection_limit_that_is_not_a_whole_number_is_a_usage_error(limit):
     already makes for `Detection.tier`."""
     document = prior_document()
     document["selection"]["limit"] = limit
-    with pytest.raises(collection.NotACollection, match="whole number"):
+    with pytest.raises(collection.NotACollection):
         collection.read_prior(document)
 
 
@@ -2057,18 +2115,28 @@ def test_a_run_block_that_shadows_a_pin_key_is_refused():
     assert module.PIN_KEYS == ("run_id", "capture_sha256", "supplies")
     for key in module.PIN_KEYS:
         block = {**json.loads(run_row(TIER2_RUN)["run_block"]), key: "hijacked"}
-        with pytest.raises(ValueError, match="pinned set"):
+        with pytest.raises(merge.StoreInconsistent, match="pinned set"):
             built(run_rows=[{"run_id": TIER2_RUN, "run_block": json.dumps(block)}])
 
 
 def test_the_same_run_listed_twice_is_reported():
     """`runs` is excluded from the top-level key loop, so its LENGTH is never compared — the same
-    symmetry gap the labels index already had a check for."""
+    symmetry gap the labels index already had a check for.
+
+    **Asserted in the DOCUMENT direction, which is the only one that can happen**: the rebuilt side
+    is machine-generated by `build`, which cannot emit a duplicate entry. An earlier version passed
+    the doubled document as the *rebuilt* side, so deleting the document branch of the guard left
+    this green while the reachable case went back to reporting REPRODUCED.
+    """
     document = prior_document()
     doubled = json.loads(json.dumps(document))
     doubled["runs"] = doubled["runs"] + doubled["runs"]
+
+    found = collection.differences(collection.comparable(doubled), collection.comparable(document))
+    assert any("the document lists the same run twice" in line for line in found), found
+    # The other branch still reports, so neither is dead.
     found = collection.differences(collection.comparable(document), collection.comparable(doubled))
-    assert any("lists the same run twice" in line for line in found)
+    assert any("the rebuild lists the same run twice" in line for line in found), found
 
 
 def test_a_view_file_with_no_header_placeholder_is_refused(monkeypatch, tmp_path):
@@ -2082,5 +2150,181 @@ def test_a_view_file_with_no_header_placeholder_is_refused(monkeypatch, tmp_path
     (scratch / "headerless.sql").write_text("SELECT 1 AS x\n", encoding="utf-8")
     monkeypatch.setattr(schema, "VIEWS", scratch)
     assert schema.view_names() == ("headerless",)
-    with pytest.raises(ValueError, match="no header placeholder"):
+    with pytest.raises(ValueError, match=r"missing \['\{header\}', '\{as_of\}'\]"):
         schema.render_view("headerless", "flabel")
+
+
+def test_a_view_file_missing_only_the_as_of_site_is_refused(monkeypatch, tmp_path):
+    """The other half, and the worse one. A file with a header and no as-of site renders, for
+    `blfile --as-of`, as the view body with **no cutoff predicate** — while `selection.as_of` in the
+    document it writes still claims one. That is a provenance falsehood, which is worse than the
+    "apply succeeds at nothing" case the guard was originally added for."""
+    from flabeldb import schema
+
+    scratch = tmp_path / "views"
+    scratch.mkdir()
+    (scratch / "halfway.sql").write_text("{header}\nSELECT 1 AS x\n", encoding="utf-8")
+    monkeypatch.setattr(schema, "VIEWS", scratch)
+    with pytest.raises(ValueError, match=r"missing \['\{as_of\}'\]"):
+        schema.render_view("halfway", "flabel")
+
+
+def test_a_placeholder_named_only_in_a_comment_does_not_satisfy_the_guard(monkeypatch, tmp_path):
+    """`views/authoritative_runs.sql` documents this hazard in its own comments and line 4 already
+    names `{dataset}` that way — so a guard that greps the whole file is satisfied by prose."""
+    from flabeldb import schema
+
+    scratch = tmp_path / "views"
+    scratch.mkdir()
+    (scratch / "commented.sql").write_text(
+        "-- see {header} and {as_of} below\nSELECT 1 AS x\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(schema, "VIEWS", scratch)
+    with pytest.raises(ValueError, match="outside its comments"):
+        schema.render_view("commented", "flabel")
+
+
+# --- the declaration, and the test that stops it having a next missed field -----------------------
+
+
+def _unspecced(value, shape, path="the document"):
+    """Keys a real document carries at a level the declaration constrains, that it does not name.
+
+    Walks the two together. An earlier version flattened each side to a set of paths and subtracted
+    — which was circular: it filtered the document's paths to the ones the declaration mentioned
+    before comparing, so an undeclared key was excluded from the comparison by the very fact of
+    being undeclared. It passed with two new fields added to `build`.
+    """
+    found: list[str] = []
+    if shape.fields is not None and isinstance(value, dict):
+        if not shape.embeds:
+            # `embeds` maps wrap something written elsewhere — a verbatim run block, a §4.2
+            # sighting, a §4.3 flow struct — so naming every key would be a lie. Everywhere else is
+            # closed, and that is where this test has teeth.
+            for name in value:
+                if name not in shape.fields:
+                    found.append(f"{path}.{name}")
+        for name, field in shape.fields.items():
+            if name in value:
+                found += _unspecced(value[name], field, f"{path}.{name}")
+    if shape.items is not None and isinstance(value, list):
+        for index, item in enumerate(value):
+            found += _unspecced(item, shape.items, f"{path}[{index}]")
+    return found
+
+
+def test_the_declaration_covers_every_field_a_real_document_carries():
+    """**This is what makes the shape a guarantee rather than another checklist.**
+
+    Three consecutive review rounds found the same defect in `read_prior`: validation that covered
+    every field but one, and the one it missed reached the interpreter as exit 1 or was announced as
+    "a DEFECT in blfile" at exit 3. Round one missed the pinned tiers; round two validated two of
+    three pin fields and missed `run_id`; round three validated `run_id` and `limit` and missed
+    `selection.labels`.
+
+    So the field list is no longer maintained by hand-and-hope: adding a key to `build` without a
+    line in `DOCUMENT_SHAPE` fails **here**. Same arrangement as `RUN_ID_COLUMN` against
+    `schema.TABLES` and `LOAD_ORDER` against the declaration.
+
+    The walk stops where the declaration stops, on purpose: the interiors of `flow`, `sources`,
+    `labels[]` entries and `builder` are compared by equality and never indexed, so
+    `read_prior`'s canonicalisation check is their whole requirement.
+    """
+    missing = _unspecced(prior_document(), collection.DOCUMENT_SHAPE)
+    assert not missing, (
+        f"these keys are in a real document and not in DOCUMENT_SHAPE: {sorted(missing)}. "
+        f"Add a line to the declaration — a field with no spec is the next one to be missed."
+    )
+
+
+def test_the_declaration_names_nothing_a_real_document_lacks():
+    """The other direction: a spec for a field `build` does not emit would refuse every real
+    document, which is a gate that fails closed on nothing. `validate_document` requires every
+    declared field to be present, so a real document passing it proves this."""
+    collection.validate_document(prior_document())
+
+
+def test_a_scalar_where_a_list_belongs_is_refused_rather_than_iterated():
+    """`selection.labels = "verdict"` used to become seven one-character label kinds: no flow
+    carries them, the rebuild emits nothing, and `blfile` exits 1 saying "the rows those runs hold
+    have changed". Nothing had changed — the file was wrong."""
+    document = prior_document()
+    document["selection"]["labels"] = "verdict"
+    with pytest.raises(collection.NotACollection, match="not list"):
+        collection.read_prior(document)
+
+
+def test_an_unhashable_flow_key_is_refused_before_it_reaches_the_record_index():
+    """`differences` keys its index on `(origin.capture_sha256, flow.flow_key)`. A list there raised
+    `TypeError: unhashable type` — reported as "a DEFECT in blfile" at exit 3 — and the guard that
+    was supposed to cover it only checked that `flow` was an object."""
+    document = prior_document()
+    document["labels"][0]["flow"]["flow_key"] = ["x"]
+    with pytest.raises(collection.NotACollection, match="flow_key"):
+        collection.read_prior(document)
+
+
+def test_an_origin_with_no_capture_digest_is_refused():
+    """`origin: {}` passed the container check, yielded `capture_sha256 -> None`, and reached three
+    `sorted()` calls over keys of mixed type. The fix's own comment claimed to have closed this."""
+    document = prior_document()
+    document["labels"][0]["origin"] = {}
+    with pytest.raises(collection.NotACollection, match="capture_sha256"):
+        collection.read_prior(document)
+
+
+def test_a_limit_the_command_line_would_refuse_is_refused_in_a_document_too():
+    """`blfile --limit 0` exits 2, but the document path accepted `limit: 0` — and then the rebuild
+    emitted nothing and exited 1 announcing that the store's rows had changed."""
+    document = prior_document()
+    document["selection"]["limit"] = 0
+    with pytest.raises(collection.NotACollection, match="smallest legal value"):
+        collection.read_prior(document)
+
+
+def test_the_coverage_test_can_actually_fail():
+    """**The guard behind the guard.** `test_the_declaration_covers_every_field_a_real_document…`
+    is what stops `DOCUMENT_SHAPE` having a next missed field — so a version of it that could not
+    fail would be worse than none. An earlier version was exactly that: it flattened both sides to
+    path sets and subtracted, filtering the document's paths by the declaration *before* comparing,
+    so an undeclared key was excluded by the fact of being undeclared. It passed with two new
+    fields added to `build`.
+
+    Same shape as `test_the_stdlib_trap_this_guard_exists_for_is_still_real`.
+    """
+    document = prior_document()
+    document["a_field_nobody_declared"] = 1
+    document["selection"]["another_one"] = 2
+    missing = _unspecced(document, collection.DOCUMENT_SHAPE)
+    assert "the document.a_field_nobody_declared" in missing
+    assert "the document.selection.another_one" in missing
+
+
+def test_the_coverage_walk_stops_where_the_declaration_does():
+    """An `embeds` map wraps something written elsewhere, so its extra keys are not findings — but
+    the walk must still descend into the fields it *does* declare."""
+    document = prior_document()
+    document["runs"][0]["a_run_block_key"] = 1
+    document["labels"][0]["flow"]["another"] = 2
+    assert _unspecced(document, collection.DOCUMENT_SHAPE) == []
+
+
+def test_a_record_index_key_of_mixed_type_does_not_raise():
+    """`differences` sorts its record keys, and a `None` capture digest beside a string one used to
+    raise `TypeError` on `sorted()` — reported as "a DEFECT in blfile" at exit 3.
+
+    `read_prior` now refuses such a document outright, so this is belt-and-braces — but
+    `differences` is also called on freshly built documents that never went through `read_prior`,
+    and the cost of proving it cannot raise is one test.
+    """
+    left = {
+        "labels": [
+            {"origin": {"capture_sha256": None}, "flow": {"flow_key": "a"}},
+            {"origin": {"capture_sha256": "c"}, "flow": {"flow_key": "b"}},
+        ]
+    }
+    right = {"labels": []}
+    found = collection.differences(left, right)
+    assert len(found) == 2
+    found = collection.differences(right, left)
+    assert len(found) == 2
