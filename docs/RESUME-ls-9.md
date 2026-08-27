@@ -8,9 +8,9 @@ file is the operational half: where you are, what is decided, and what to do fir
 
 **Phase 3 is one merge from complete.** LS-7 and LS-8 are on `main`; LS-9 is PR #177, green on every
 check and `MERGEABLE`, waiting only on review approval. The production `flabel` dataset holds
-**1,955 rows** and reconciles clean against the archive. The one thing genuinely blocked is
-unrelated to Phase 3: **Zeek on this box cannot be brought to the pinned 8.0.9** — see the last
-section, which is a decision rather than a task.
+**1,955 rows** and reconciles clean against the archive. Nothing is blocked: the one open question
+outside Phase 3 — whether to bring Zeek down to the pinned 8.0.9 — was **decided on 2026-08-27 in
+favour of staying on 8.2.1**, and the last section records what that leaves behind.
 
 ## Where things stand
 
@@ -97,10 +97,11 @@ by review, not by tests. **A measured number in a doc deserves the same sceptici
 1. **Merge #177.** Phase 3 is complete with it.
 2. Then **Phase 4, or the unowned backlog** — see below. There is no LS-10.
 
-## The Zeek pin cannot be satisfied, and that is a decision
+## Zeek: decided — the box stays on 8.2.1
 
-Asked 2026-08-27 to bring local Zeek to **8.0.9**, which is `Dockerfile.toolchain`'s
-`ZEEK_PACKAGE_VERSION`. Measured, and it is not installable:
+**Decided 2026-08-27 (Craig): stay on the installed version. There is no downgrade to do.** Asked
+that day to bring local Zeek to **8.0.9**, which is `Dockerfile.toolchain`'s `ZEEK_PACKAGE_VERSION`.
+Measured first, and it could not have been done anyway:
 
 | | |
 | :-- | :-- |
@@ -112,24 +113,22 @@ Asked 2026-08-27 to bring local Zeek to **8.0.9**, which is `Dockerfile.toolchai
 
 **This is the shelf-life gap `status.yaml` already recorded** — *"the apt repos serve only
 newest-patch, so `Dockerfile.toolchain` will eventually stop being rebuildable and the pinned
-toolchain survives only as the GHCR image pinned by digest"* — arriving. The decision it says to
-make ("mirror the .debs/image or accept the bound in writing") is now due.
+toolchain survives only as the GHCR image pinned by digest"* — arriving. Staying on 8.2.1 settles
+which Zeek this box runs; it does not settle the gap, and the choice that entry names ("mirror the
+.debs/image or accept the bound in writing") is still open — see the last paragraph of this section.
 
-**And the target is worth questioning before it is pursued.** All 25 archived runs record
-`tools.zeek: 8.2.1` — so the corpus, and the 1,955 rows derived from it, were produced by 8.2.1. The
-box agrees with the data; only the *pin* says 8.0.9, and the pin can no longer be rebuilt. Three
-routes, and none is obviously right:
+**And 8.0.9 was the wrong target, which is why the decision went the other way.** All 25 archived
+runs record `tools.zeek: 8.2.1` — so the corpus, and the 1,955 rows derived from it, were produced by
+8.2.1. The box agrees with the data; only the *pin* says 8.0.9. Downgrading would have moved the box
+away from every row in the store to match a pin that can no longer be rebuilt, and it would have made
+the next run's `tools.zeek` differ from all 25 existing ones for no gain.
 
-- **Build 8.0.9 from source.** Reachable with no credentials; ~40–90 min on 4 cores; different build
-  flags from the OBS `.deb`, so it matches CI's *version* and not CI's *binary*.
-- **Extract 8.0.9 from the pinned image.** The most faithful — it is the exact build CI runs — and
-  needs a token with `read:packages` plus a way to unpack layers.
-- **Bump the pin to 8.2.x.** Aligns CI with the box *and* with every row in the store, and is
-  rebuildable. It changes what CI tests against, and it is the option that admits the pin has
-  already lost.
-
-Whichever is chosen, **any run after a Zeek change carries a different `tools.zeek` from all 25
-existing runs**, which is a Goal 2 consideration rather than a blocker.
+**What the decision does not close, and nobody owns:** `Dockerfile.toolchain` still pins
+`ZEEK_PACKAGE_VERSION=8.0.9-0`, now matching neither the box nor a single row in the store, and
+unobtainable from apt. **CI is green only because the image is pinned by digest** — so the digest is
+the real pin and that Dockerfile line documents a build no one can reproduce. Bumping it to 8.2.x is
+the rebuildable fix; it changes what CI tests against, so make it deliberately rather than in
+passing. Left unfiled on purpose — raise it with the rest of the backlog below.
 
 ## Still open and unowned
 
