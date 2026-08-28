@@ -571,7 +571,7 @@ part:
 
   Two precisions this bullet got wrong at first. The branch that fired is §2.4's **strict equality**
   (`loaded != total`, two rules short), not #142's specified shape of Suricata 7.0.3 refusing an 8.0
-  ruleset and loading none of it — so pinning the Suricata version may not clear this, and two
+  ruleset and loading 84,958 of its 84,960 rules — so pinning the Suricata version may not clear this, and two
   uncompilable rules would still block attestation. And it is **not newly observed**: the identical
   measurement is in `docs/RESUME-ls-5.md`, dated 2026-08-24, before `flabel` held a row. Attestation
   is computed at ingest from the tarball's run block, so it is a property of the archive, and

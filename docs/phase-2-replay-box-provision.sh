@@ -5,7 +5,7 @@ exec > >(tee -a /var/log/fl-startup.log) 2>&1
 echo "=== fl-replay startup $(date -Is) ==="
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
+apt-get update -y || die "apt-get update failed — every install below depends on it"
 
 # Replay + capture toolchain. tcpreplay brings tcpprep/tcprewrite, which we need for
 # the direction split and for rewriting destination MACs at the FW's replay legs.
@@ -14,22 +14,31 @@ apt-get update -y
 # `git` is needed by the ja4 commit check and is NOT present on every image; `ca-certificates`
 # by add-apt-repository and by the curl below. Both were assumed before.
 apt-get install -y tcpreplay python3-pip curl gnupg jq chrony ethtool \
-  software-properties-common git ca-certificates
+  software-properties-common git ca-certificates \
+  || die "the base toolchain did not install"
 
 #: A package is at a pinned version only if dpkg says it is INSTALLED at it. `${Version}` alone is
 #: printed for a removed-but-conffiles (`rc`) package too, so a box where Suricata was removed by
 #: hand would report the pin and skip the install — leaving no engine at all. `grep -F` because a
 #: Debian version is full of regex metacharacters: `1:8.0.6` matches `1X8Y0Z6` without it.
 pinned_at() {
-  dpkg-query -W -f='${db:Status-Status} ${Version}' "$1" 2>/dev/null | grep -Fqx "installed $2"
+  # `grep -Fx >/dev/null`, NOT `grep -Fqx`: -q exits on the first match and closes the pipe, so
+  # dpkg-query can take SIGPIPE and exit 141 — and `set -o pipefail` then makes this function
+  # report "not pinned" for a correctly pinned package, which now costs a spurious `die`.
+  dpkg-query -W -f='${db:Status-Status} ${Version}' "$1" 2>/dev/null | grep -Fx "installed $2" >/dev/null
 }
 
 #: Fail the whole provision, loudly. This script runs WITHOUT `set -e`, so every step that must
-#: not be skipped past has to say so itself. Writing straight to the log as well as stderr,
-#: because stdout is piped through a background `tee` that can lose the last buffered lines.
+#: not be skipped past has to say so itself.
+#:
+#: **One write, and a pause.** A first version also appended straight to /var/log/fl-startup.log
+#: "in case tee loses it", which duplicated every fatal line in that log — measured. The real
+#: problem is different: line 4's `tee` is a BACKGROUND process, so exiting immediately can kill
+#: it with the last lines still buffered, losing exactly the diagnostic you most want. The sleep
+#: lets it drain. Measured: one line, and it survives.
 die() {
   echo "fl-startup: FATAL: $*" >&2
-  echo "fl-startup: FATAL: $*" >> /var/log/fl-startup.log
+  sleep 0.2
   exit 1
 }
 
@@ -56,7 +65,10 @@ if ! pinned_at suricata "$SURICATA_PACKAGE_VERSION"; then
   # flabel calls suricata-update — rules/{fetch,admit,snapshot} do that job — and the only
   # reverse-dependency was Ubuntu's own suricata. `|| true` because on a fresh box it is absent
   # and remove fails, which is not an error here.
-  apt-get remove -y suricata suricata-update || true
+  # ONLY suricata-update: it is the package that owns the conflicting /usr/bin/suricata-update.
+  # Removing `suricata` too was gratuitous, and it is what turned a failed install into a box
+  # with no engine at all before the die below could fire.
+  apt-get remove -y suricata-update || true
   # --allow-downgrades because pinning BACKWARDS is a legitimate operation and apt refuses it
   # under -y otherwise; --allow-change-held-packages so a leftover hold cannot veto the pin.
   apt-get install -y --allow-downgrades --allow-change-held-packages \
@@ -67,7 +79,11 @@ fi
 # is not installed at all (measured), so the marker would outlive the thing it claims to pin.
 pinned_at suricata "$SURICATA_PACKAGE_VERSION" \
   || die "suricata is not installed at $SURICATA_PACKAGE_VERSION after the install step"
-apt-mark hold suricata >/dev/null
+apt-mark hold suricata >/dev/null || die "could not hold suricata — the pin would be unprotected"
+# The hold is VERIFIED, not assumed: `apt-mark hold` succeeds on a package that is not installed
+# (measured), so its exit code is weak evidence. This block also *unheld* above, so a silently
+# failed hold leaves the box LESS protected than before the run.
+apt-mark showhold | grep -Fx suricata >/dev/null || die "suricata is not held after apt-mark hold"
 
 # Wireshark from ppa:wireshark-dev/stable, for the same reason as Suricata: noble ships 4.2.2 and
 # the pin is 4.6.6. editcap and capinfos are not incidental tools here — editcap performs capture
@@ -93,24 +109,33 @@ pinned_at wireshark-common "$WIRESHARK_PACKAGE_VERSION" \
   || die "wireshark-common is not installed at $WIRESHARK_PACKAGE_VERSION"
 pinned_at tshark "$WIRESHARK_PACKAGE_VERSION" \
   || die "tshark is not installed at $WIRESHARK_PACKAGE_VERSION"
-apt-mark hold wireshark-common tshark >/dev/null
+apt-mark hold wireshark-common tshark >/dev/null || die "could not hold wireshark-common tshark — the pin would be unprotected"
+# The hold is VERIFIED, not assumed: `apt-mark hold` succeeds on a package that is not installed
+# (measured), so its exit code is weak evidence. This block also *unheld* above, so a silently
+# failed hold leaves the box LESS protected than before the run.
+apt-mark showhold | grep -Fx wireshark-common >/dev/null || die "wireshark-common is not held after apt-mark hold"
 
-# **/etc/suricata is deliberately left unreadable, and the resulting log noise is deliberate too.**
-# The OISF package installs it 0750 suricata:suricata where Ubuntu's was world-readable, so Suricata
-# — which resolves `reference-config-file` and `threshold-file` against that directory even though
-# flabel's own config names neither — logs "Permission denied" for both on every run.
+# **/etc/suricata is left as the package installs it (0750), and that is NOT isolation.**
 #
-# An earlier version of this script chmod'ed the directory readable to silence that. THAT WAS THE
-# WRONG FIX and it is worth recording why. src/flabel/data/suricata.yaml states the rule:
-# reproducibility cannot hold while an unrecorded file on one machine decides which rules match.
-# reference.config is genuinely inert (measured: 0 rules). **threshold.config is not** — it is
-# Suricata's SUPPRESSION file. Making it readable would let an unhashed, package-managed,
-# machine-local file silently drop alerts from the corpus, and `config_sha256` covers only the two
-# files in flabel's own data directory, so nothing would record that it had.
+# Measured 2026-08-28, on the path production actually takes: tools/flabel-run invokes flabel under
+# `$SUDO`, so Suricata runs as ROOT, and root is not stopped by a 0750 directory. The production
+# run's own log says `threshold-config: Threshold config parsed: 0 rule(s) found` — it READ the
+# file. The "Permission denied" lines only appear for a non-root caller, i.e. when a developer runs
+# the suite by hand.
 #
-# Permission denied means the engine IGNORES both files, which is exactly the isolation we want.
-# The proper fix is for flabel to name both paths at files it owns and hash them; until then the
-# error line in the log is the cheaper problem. Do not "fix" it here.
+# So an earlier chmod here was pointless, and the comment that replaced it — claiming the 0750 mode
+# isolated the corpus from an unhashed file — was simply wrong. Both are recorded because the wrong
+# reasoning is the instructive part: a permission bit cannot isolate a process that runs as root.
+#
+# The real exposure: Suricata resolves `reference-config-file` and `threshold-file` against
+# /etc/suricata when flabel's config names neither, and threshold.config is its SUPPRESSION file.
+# It holds 0 rules today, so nothing is suppressed — but it is an unhashed, package-managed,
+# machine-local file that can drop alerts from the corpus, and `config_sha256` covers only the
+# files in flabel's own data directory.
+#
+# The fix belongs in flabel, not here: name both paths at files flabel owns and hash them, so the
+# isolation is a property of the configuration rather than of one machine's directory mode. Until
+# that lands, do not chmod anything here — it would make the exposure worse, not better.
 
 # Zeek from the upstream OpenSUSE build service repo (Ubuntu has no zeek package).
 #
@@ -124,28 +149,43 @@ apt-mark hold wireshark-common tshark >/dev/null
 # key in the file, so an extra key is as bad as a wrong one. OBS keys do rotate — verify upstream,
 # then update the literal.
 ZEEK_REPO_KEY_FPR=F9FA0223B56B116C363737EF5DA57BDD6DD785CA
+
+# **Outside the `command -v zeek` guard, deliberately.** A first version put all of this inside it,
+# which made the whole fix dead code on every box that already had Zeek — i.e. on fl-replay, the
+# only box this protects. Worse, the line that removes the old globally-trusted key sat inside the
+# branch that only runs when no previous run installed one: self-cancelling by construction.
+#
+# Every step here is idempotent, so running it on each boot is both safe and the point: a key check
+# that only runs at first install is a key check that never re-checks a rotated key.
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL "https://download.opensuse.org/repositories/security:zeek/xUbuntu_24.04/Release.key" \
+  | gpg --dearmor > /etc/apt/keyrings/security-zeek.gpg.new \
+  || die "could not fetch the Zeek repo signing key"
+colons="$(gpg --show-keys --with-colons /etc/apt/keyrings/security-zeek.gpg.new)"
+served="$(echo "$colons" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;exit}')"
+keys="$(echo "$colons" | grep -c '^pub:' || true)"
+if [ "$keys" != "1" ] || [ "$served" != "$ZEEK_REPO_KEY_FPR" ]; then
+  echo "fl-startup: Zeek repo key check FAILED." >&2
+  echo "fl-startup:   expected exactly 1 primary key, fingerprint $ZEEK_REPO_KEY_FPR" >&2
+  echo "fl-startup:   served $keys key(s), primary fingerprint: ${served:-none}" >&2
+  echo "fl-startup: signed-by trusts EVERY key in the file, so an extra key is as bad as a wrong" >&2
+  echo "fl-startup: one. OBS keys do rotate: verify upstream, then update the literal." >&2
+  rm -f /etc/apt/keyrings/security-zeek.gpg.new
+  die "refusing to add the Zeek repo with an unverified signing key"
+fi
+mv /etc/apt/keyrings/security-zeek.gpg.new /etc/apt/keyrings/security-zeek.gpg
+# Retire the globally-trusted copy earlier versions installed. A key in trusted.gpg.d is a valid
+# signer for EVERY repo including Ubuntu's own, so leaving it is the whole problem, not a leftover.
+rm -f /etc/apt/trusted.gpg.d/security_zeek.gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/security-zeek.gpg] http://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/ /" \
+  > /etc/apt/sources.list.d/security-zeek.list
+
+# Zeek from the upstream OpenSUSE build service repo (Ubuntu has no zeek package).
 if ! command -v zeek >/dev/null 2>&1; then
-  install -d -m 0755 /etc/apt/keyrings
-  curl -fsSL "https://download.opensuse.org/repositories/security:zeek/xUbuntu_24.04/Release.key" \
-    | gpg --dearmor > /etc/apt/keyrings/security-zeek.gpg \
-    || die "could not fetch the Zeek repo signing key"
-  colons="$(gpg --show-keys --with-colons /etc/apt/keyrings/security-zeek.gpg)"
-  served="$(echo "$colons" | awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;exit}')"
-  keys="$(echo "$colons" | grep -c '^pub:' || true)"
-  if [ "$keys" != "1" ] || [ "$served" != "$ZEEK_REPO_KEY_FPR" ]; then
-    echo "fl-startup: Zeek repo key check FAILED." >&2
-    echo "fl-startup:   expected exactly 1 primary key, fingerprint $ZEEK_REPO_KEY_FPR" >&2
-    echo "fl-startup:   served $keys key(s), primary fingerprint: ${served:-none}" >&2
-    rm -f /etc/apt/keyrings/security-zeek.gpg
-    die "refusing to add the Zeek repo with an unverified signing key"
-  fi
-  # Remove the old globally-trusted copy if a previous run of this script installed one.
-  rm -f /etc/apt/trusted.gpg.d/security_zeek.gpg
-  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/security-zeek.gpg] http://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/ /" \
-    > /etc/apt/sources.list.d/security-zeek.list
   apt-get update -y
   apt-get install -y zeek || die "zeek did not install"
 fi
+
 # Symlinks, NOT a profile.d PATH export. Measured 2026-08-17: /etc/profile.d is read by login
 # shells only, so `sudo flabel ...` — which is how a replay runs, because tcpreplay needs raw
 # sockets — could not find zeek at all. The tool was installed and invisible at the same time,
@@ -177,28 +217,37 @@ done
 JA4_PACKAGE_VERSION=v0.18.8
 JA4_PACKAGE_COMMIT=3ecddb5f1d0b92210535171a62901bf3d596c7b8
 JA4_OK=yes
+# Install only. Verification is deliberately NOT here — see the commit-pin block below, which runs
+# on every boot rather than only when this branch is taken.
 if ! /opt/zeek/bin/zeek --parse-only -e '@load ja4' >/dev/null 2>&1; then
   zkg autoconfig
   if ! zkg install --force --version "$JA4_PACKAGE_VERSION" zeek/foxio/ja4; then
+    # Said plainly, because the first version blamed a moved tag for this: a failed install leaves
+    # no clone, so the commit comparison below would find nothing and report a tag rewrite.
     echo "fl-startup: zkg install of ja4 FAILED (network? zkg deps?) — NOT a moved tag." >&2
     JA4_OK=no
   fi
-  # **Three failures, three messages.** The first version of this block reported ANY of them as
-  # "a moved tag changes JA4 values on labels", because a failed install leaves no clone, `git`
-  # prints nothing, and `resolved` is empty — which compares unequal to the pin. A network blip
-  # was diagnosed as an upstream tag rewrite.
-  if [ "$JA4_OK" = yes ]; then
-    clone="$(zkg config | sed -n 's/^state_dir = //p' | head -1)/clones/package/ja4"
-    if ! command -v git >/dev/null 2>&1; then
-      echo "fl-startup: git is missing, so the ja4 COMMIT pin cannot be checked." >&2
-      JA4_OK=no
-    elif [ ! -d "$clone/.git" ]; then
+fi
+
+# **The commit pin is checked on EVERY boot, not only when ja4 was just installed.** The first
+# version of this put the comparison inside the `if ! zeek --parse-only` above — so on any box that
+# already had ja4, which is fl-replay and every re-run, the commit was never compared to the pin at
+# all. The pin exists precisely because a tag is mutable: a moved tag, a hand-install, or a leftover
+# from an older pin would have provisioned clean and green while changing the JA4 values that ride
+# on published labels. A check that only runs on first install is not a pin.
+if [ "$JA4_OK" = yes ]; then
+  if ! command -v git >/dev/null 2>&1; then
+    echo "fl-startup: git is missing, so the ja4 COMMIT pin cannot be checked." >&2
+    JA4_OK=no
+  else
+    clone="$(zkg config 2>/dev/null | sed -n 's/^state_dir = //p' | head -1)/clones/package/ja4"
+    if [ ! -d "$clone/.git" ]; then
       echo "fl-startup: no ja4 clone at $clone, so the commit pin cannot be checked." >&2
       JA4_OK=no
     else
-      resolved="$(git -C "$clone" rev-parse HEAD)"
-      if [ "$resolved" != "$JA4_PACKAGE_COMMIT" ]; then
-        echo "fl-startup: ja4 tag $JA4_PACKAGE_VERSION resolved to $resolved, expected $JA4_PACKAGE_COMMIT." >&2
+      JA4_INSTALLED_COMMIT="$(git -C "$clone" rev-parse HEAD 2>/dev/null)"
+      if [ "$JA4_INSTALLED_COMMIT" != "$JA4_PACKAGE_COMMIT" ]; then
+        echo "fl-startup: ja4 is at commit ${JA4_INSTALLED_COMMIT:-unknown}, expected $JA4_PACKAGE_COMMIT." >&2
         echo "fl-startup: a MOVED TAG changes JA4 values on labels. Verify upstream, then update the pin." >&2
         JA4_OK=no
       fi
@@ -268,19 +317,26 @@ fi
   zeek_v="$(/opt/zeek/bin/zeek --version 2>/dev/null | semver)"
   suricata_v="$(suricata -V 2>/dev/null | semver)"
   wireshark_v="$(editcap --version 2>/dev/null | semver)"
-  ja4_commit=""
-  if command -v git >/dev/null 2>&1; then
-    clone="$(zkg config 2>/dev/null | sed -n 's/^state_dir = //p' | head -1)/clones/package/ja4"
-    [ -d "$clone/.git" ] && ja4_commit="$(git -C "$clone" rev-parse HEAD 2>/dev/null)"
-  fi
+  # **ja4 is recorded only if it actually verified.** $JA4_PACKAGE_VERSION is a shell literal, so
+  # writing it unconditionally would put "v0.18.8" on every label from a box where the package is
+  # absent or at the wrong commit — provenance.py reads this file and has no other source. A
+  # missing key is handled correctly downstream; a confident wrong answer is not.
+  # ja4_commit is required too, matching Dockerfile.toolchain rather than being laxer than CI.
   for pair in "zeek:$zeek_v" "suricata:$suricata_v" "wireshark:$wireshark_v"; do
     case "$pair" in *:) die "empty version for ${pair%:*} — the --version parse failed";; esac
   done
-  printf '{\n  "zeek": "%s",\n  "suricata": "%s",\n  "wireshark": "%s",\n' \
-      "$zeek_v" "$suricata_v" "$wireshark_v" > /etc/flabel-toolchain.json
-  printf '  "ja4_zeek_package": "%s",\n  "ja4_zeek_commit": "%s"\n}\n' \
-      "$JA4_PACKAGE_VERSION" "$ja4_commit" >> /etc/flabel-toolchain.json
+  {
+    printf '{\n  "zeek": "%s",\n  "suricata": "%s",\n  "wireshark": "%s"' \
+        "$zeek_v" "$suricata_v" "$wireshark_v"
+    if [ "$JA4_OK" = yes ]; then
+      [ -n "${JA4_INSTALLED_COMMIT:-}" ] || die "ja4 verified but no commit was recorded"
+      printf ',\n  "ja4_zeek_package": "%s",\n  "ja4_zeek_commit": "%s"' \
+          "$JA4_PACKAGE_VERSION" "$JA4_INSTALLED_COMMIT"
+    fi
+    printf '\n}\n'
+  } > /etc/flabel-toolchain.json || die "could not write /etc/flabel-toolchain.json"
   chmod 0644 /etc/flabel-toolchain.json
+  jq -e . /etc/flabel-toolchain.json >/dev/null || die "/etc/flabel-toolchain.json is not valid JSON"
 }
 
 # --- versions: ASSERTED, not merely printed ----------------------------------------------------
