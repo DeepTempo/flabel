@@ -9,7 +9,40 @@ apt-get update -y
 
 # Replay + capture toolchain. tcpreplay brings tcpprep/tcprewrite, which we need for
 # the direction split and for rewriting destination MACs at the FW's replay legs.
-apt-get install -y tcpreplay tshark suricata python3-pip curl gnupg jq chrony ethtool
+apt-get install -y tcpreplay tshark python3-pip curl gnupg jq chrony ethtool software-properties-common
+
+# Suricata from ppa:oisf/suricata-stable, NOT plain apt (#142). noble/universe tops out at
+# 7.0.3, and 7.0.3 skips any rule marked `requires: version >= 8.0.0` — measured on 2026-08-24 as
+# "84958 rules successfully loaded, 0 rules failed, 2 rules were skipped because the running
+# Suricata version 7.0.3 is less than 8.0.0". §2.4 attests a tier only on rules_loaded ==
+# total_admitted, so those 2 skipped rules meant tier 2 was NEVER attested and every tier-2 run
+# contributed rows that could not become current.
+#
+# The version is pinned and then HELD. Pinned because it must equal Dockerfile.toolchain's
+# SURICATA_PACKAGE_VERSION or CI and the box disagree about what produced a label; held because
+# an unattended `apt upgrade` would otherwise move the engine underneath a corpus already
+# labelled with it, and nothing in the store would record that it happened.
+SURICATA_PACKAGE_VERSION=1:8.0.6-0ubuntu0
+if ! dpkg-query -W -f='${Version}' suricata 2>/dev/null | grep -qx "$SURICATA_PACKAGE_VERSION"; then
+  add-apt-repository -y ppa:oisf/suricata-stable
+  apt-get update -y
+  # The OISF package bundles /usr/bin/suricata-update, which Ubuntu ships as its own package;
+  # dpkg refuses to overwrite across packages, so the standalone one goes first. Nothing in
+  # flabel calls suricata-update — rules/{fetch,admit,snapshot} do that job — and the only
+  # reverse-dependency was Ubuntu's own suricata.
+  apt-get remove -y suricata suricata-update || true
+  apt-get install -y "suricata=$SURICATA_PACKAGE_VERSION"
+  apt-mark hold suricata
+fi
+
+# The OISF package installs /etc/suricata as 0750 suricata:suricata; Ubuntu's was world-readable.
+# Suricata resolves `reference-config-file` and `threshold-config` against /etc/suricata even when
+# flabel's own config declines to name them, so an unreadable directory turns every run's log into
+# "Error: reference-config: Permission denied". Measured harmless to label content — flabel's
+# suricata.yaml records that the reference config changes the load by 0 rules — but it is noise in
+# a log that is read, and it fails the regression test that asserts the engine parses our config
+# cleanly. Nothing secret lives in that directory.
+[ -d /etc/suricata ] && chmod o+rx /etc/suricata && chmod o+r /etc/suricata/*.config /etc/suricata/*.yaml 2>/dev/null
 
 # Zeek from the upstream OpenSUSE build service repo (Ubuntu has no zeek package).
 if ! command -v zeek >/dev/null 2>&1; then
