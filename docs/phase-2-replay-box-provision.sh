@@ -28,6 +28,46 @@ for b in zeek zeek-config zeekctl zkg; do
   [ -x "/opt/zeek/bin/$b" ] && ln -sf "/opt/zeek/bin/$b" "/usr/local/bin/$b"
 done
 
+# The Zeek JA4 package. Installed here rather than by hand, because a tool installed by hand
+# is a box that cannot be rebuilt — the lesson #142 records about Suricata, which this script
+# still installs from plain apt and which is therefore still wrong (Phase 4 P4-1).
+#
+# Pinned to the same tag AND commit as Dockerfile.toolchain. The commit check is not
+# ceremony: JA4 values ride on published labels, so a moved tag would silently change what
+# the store holds, and the two would disagree with no version number moving. If it fires,
+# verify upstream before touching the pin.
+#
+# It must be a version pin and not `latest` for the same reason. zkg's own dependencies
+# (python3-git, python3-semantic-version) arrive with the zeek-zkg package, so nothing extra
+# is needed here — but zkg's shebang is `#!/usr/bin/env python3`, so it must not be called
+# with a virtualenv ahead of /usr/bin on PATH. At boot, as root, it is not.
+# zkg's shebang is `#!/usr/bin/env python3`, which resolves through PATH. Under `uv run` the
+# project virtualenv comes first and that interpreter has none of zkg's dependencies — so zkg
+# breaks only when called from a test, which is the one place it needs to work. Bind it to the
+# interpreter that actually has GitPython and semantic-version, exactly as Dockerfile.toolchain
+# does. Re-applied on every run because a zeek-zkg package upgrade restores the original.
+[ -x /opt/zeek/bin/zkg ] && sed -i '1s|.*|#!/usr/bin/python3|' /opt/zeek/bin/zkg
+
+JA4_PACKAGE_VERSION=v0.18.8
+JA4_PACKAGE_COMMIT=3ecddb5f1d0b92210535171a62901bf3d596c7b8
+if ! /opt/zeek/bin/zeek --parse-only -e '@load ja4' >/dev/null 2>&1; then
+  zkg autoconfig
+  zkg install --force --version "$JA4_PACKAGE_VERSION" zeek/foxio/ja4
+  clone="$(zkg config | sed -n 's/^state_dir = //p' | head -1)/clones/package/ja4"
+  resolved="$(git -C "$clone" rev-parse HEAD)"
+  if [ "$resolved" != "$JA4_PACKAGE_COMMIT" ]; then
+    echo "ja4 tag $JA4_PACKAGE_VERSION resolved to $resolved, expected $JA4_PACKAGE_COMMIT." >&2
+    echo "A moved tag changes JA4 values on labels. Verify upstream, then update the pin." >&2
+    exit 1
+  fi
+fi
+# The gate is the capability, not the directory: a package installed somewhere Zeek will not
+# load it is exactly the failure worth catching, and it is how src/flabel/zeek.py asks.
+/opt/zeek/bin/zeek --parse-only -e '@load ja4' || {
+  echo "ja4 installed but @load ja4 still fails — check ZEEKPATH and the zkg install." >&2
+  exit 1
+}
+
 # uv, for running flabel itself (zero runtime deps, dev-managed by uv).
 if ! command -v uv >/dev/null 2>&1; then
   curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh

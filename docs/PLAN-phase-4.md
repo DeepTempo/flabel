@@ -10,7 +10,10 @@ from four candidates, on the evidence in the next section.
 
 ## Why this phase, and not one of the others
 
-Three facts, all measured against the 1,955 production rows on 2026-08-27, all with one cause:
+Three facts, all measured against the 1,955 production rows on 2026-08-27. **They have three
+different causes, not one** — an earlier draft of this plan claimed one, and the review was right
+that the claim shaped the plan badly. They can each fail independently, so they are accepted
+independently (see P4-5):
 
 | | |
 | :-- | :-- |
@@ -19,6 +22,12 @@ Three facts, all measured against the 1,955 production rows on 2026-08-27, all w
 | **Cross-tier composition has only fixtures behind it** | It follows from the two above. The merge rule LS-7 exists to implement has never once run on real two-tier data (#144). |
 
 The store is not broken. It has never been given data that exercises it.
+
+**Revision 2, 2026-08-27**, after a fresh `eng-reviewer` pass. The destination is unchanged; the
+route is not. The review found that the original route — `--both` on all 24 captures — was the
+riskiest one available and would not even have exercised the merge rule it was chosen for. Revision 1
+is preserved in git history. Findings verified before acting, and one of the two BLOCKING ones was
+wrong: see "What the review changed" at the end.
 
 ## What makes this phase cheap, and it is worth stating up front
 
@@ -30,118 +39,208 @@ Every prerequisite was verified present before this plan was written, rather tha
   so the corpus grows from 17 to 24 in the same pass, at no extra step.
 - **Suricata's pin is obtainable**, unlike Zeek's: the OISF stable PPA carries
   `1:8.0.6-0ubuntu0`, character-for-character the string `Dockerfile.toolchain` pins.
-- **The tier-1 device answers on 443**, so `--both` is viable.
+- **The tier-1 device answers on 443** — which the chosen route no longer depends on, and that
+  is the point: it is available for P4-6 rather than load-bearing for the corpus.
 
 ## Shape of the work
 
 ```
-P4-1  Suricata 8.0.6 (#142)   ── blocks every tier-2 result
+P4-0  pre-flight: digests, snapshot, baseline   ── cheap, and it is what makes P4-4 reversible
    │
-P4-2  ja4 on the box          ── decide BEFORE the re-run, not after
+P4-1  Suricata 8.0.6 (#142)                     ── blocks every tier-2 result
    │
-P4-3  prove --both ONCE       ── it has never run on this box
+P4-2  ja4 on the box              ✅ DONE 2026-08-27
    │
-P4-4  re-label the corpus     ── 24 captures from gs://, --both
+P4-3  one --offline gs:// run on a capture the store already knows
+   │      └─ the highest-information experiment available: it proves the whole route
    │
-P4-5  ingest, reconcile, verify
+P4-4  --offline from gs:// on the 17 known captures, then the 7 new ones
+   │
+P4-5  reconcile and verify, per symptom
+   ·
+P4-6  one --both run, OFF the critical path   ── still unproven on this box, still worth proving
 ```
 
-Sequential throughout. P4-2 is a decision that must be taken before P4-4 and could be declined; every
-other step blocks the next.
+**The route is `--offline`, not `--both`, and that is the review's most valuable finding.** Spec
+§6.4 already anticipated this situation: *"`origin` resolves to the lowest authoritative tier that
+actually recorded one … This is not hypothetical: every run in the archive predates `--source-uri`,
+so a strict lowest-tier rule would refuse a flow whose origin the store demonstrably holds from a
+newer run at the other tier."* So a tier-2-only run from a `gs://` URI:
+
+- **records the origin** — a new `captures` sighting carrying the `gs://` URI, which is all bare
+  `blfile` needs;
+- **attests tier 2**, making tier-2 knowledge selectable for the first time;
+- **leaves the existing tier-1 runs authoritative** — nothing is superseded, so there is nothing to
+  roll back and no dependency on the device;
+- and gives the cross-tier merge rule its **real** first test: tier 1 from an August replay run and
+  tier 2 from a new offline run — *two different runs*, which is what `merge.py`'s rule 2 actually
+  implements.
+
+`--both` would have done none of that last part. `src/flabel/cli.py:835` correlates both tiers
+*together in one run*, producing one `Label` with a multi-tier `sources[]` — so it arrives as a
+single `flow_labels` row, one iteration in `merge.py`, and rule 2 is never taken. A `--both` corpus
+would have proven cross-tier *correlation* while leaving cross-tier *merge* exactly as untested as it
+is today, at the cost of superseding every tier-1 verdict in the store.
 
 ---
 
+## P4-0 — Pre-flight, before anything is run
+
+Cheap, and it is what makes the rest reversible.
+
+**The digest triangle.** `tools/flabel-run:290` short-circuits on `if [ -f "$LOCAL" ]` — a capture
+already staged locally is reused **with no digest check**, while `--source-uri` is set from the
+`gs://` argument regardless. So a stale local copy would publish an origin the bytes did not come
+from, which is the one thing CLAUDE.md's top guardrail forbids. **Measured 2026-08-27 and currently
+green:** all 17 captures are byte-identical across bucket, local staging directory, and the
+`capture_sha256` the store recorded. Re-check it immediately before P4-4 rather than trusting this
+line, and file the missing check against `flabel-run` — it is latent, not benign.
+
+**Pin the ruleset snapshot.** The plan said nothing about this and it decides what the whole new
+corpus says. `--ruleset-snapshot` defaults to *newest available*, so a `flabel rules update` between
+capture 12 and 13 would split the corpus across two rulesets with nothing recording that it happened.
+Decide whether to update first, then **pass the same explicit snapshot id on all runs** and record it
+here.
+
+**Build the baseline.** P4-5 rebuilds "a document built before the re-run", and no step created one.
+Build it now: `blfile --allow-missing-origin` over the current store, kept with a per-capture label
+count. That flag is required — bare `blfile` emits zero flows today, which is the whole problem —
+and it cannot be combined with `--rebuild` later, because `--rebuild` reads the value back out of
+the document's own `selection`.
+
+**Know the rollback.** It exists and the plan did not name it: `run_exclusions` (§4.5) retracts a run,
+and `authoritative_runs` anti-joins it, so a bad run can be withdrawn without deleting anything.
+§5.5 warns that exclusions are **not** reproduced by a rebuild and must be backed up separately.
+
 ## P4-1 — Suricata 8.0.6 on `fl-replay` (#142)
 
-**The blocker.** Until it is fixed, every tier-2 run contributes rows that can never become current,
-and §2.4 is what stops them: the engine refuses rules written for 8.0, so the attested set is empty.
+**The blocker for tier 2.** Until it is fixed, §2.4's strict equality refuses to attest tier 2.
 
-Measured 2026-08-27: installed `1:7.0.3-1build3` from `noble/universe`, which is the newest apt can
-reach. The route apt *can* reach is the **OISF stable PPA**, confirmed to serve
-`1:8.0.6-0ubuntu0` for noble — the exact pinned version, so this aligns the box with CI rather than
-merely moving it forward.
+The review argued this step's premise was wrong — that the 2 missing rules were duplicate SIDs, which
+no upgrade would fix. **Checked, and it is not so.** Suricata's own log for the 2026-08-24 run says:
 
-Per #142's own scope, **record the route in the provisioning script rather than doing it by hand on
-the box.** That is the whole difference between fixing this instance and fixing the gap.
+```
+Info:   detect: 1 rule files processed. 84958 rules successfully loaded, 0 rules failed, 2 …
+Notice: requires: 2 rules were skipped because the running Suricata version 7.0.3 is less than 8.0.0
+```
 
-**Done when:** the admitted ruleset loads in full (N of N, not N−2); a tier-2 run attests tier 2; and
-Goal 2's reproducibility tests stop being non-deterministic — #142 records them failing 1, 2 or 3 at
-random under 7.0.3, so *stably green over three consecutive runs* is the check, not one green run.
+`0 rules failed`, and the skip is explicitly a version predicate. The upgrade is the fix.
 
-## P4-2 — Decide `ja4` before re-labelling, not after
+Route: the **OISF stable PPA**, confirmed 2026-08-27 to serve `1:8.0.6-0ubuntu0` for noble — the exact
+string `Dockerfile.toolchain` pins, so this aligns the box with CI rather than merely moving it
+forward. **Pin the version in the install**, or a later `apt upgrade` moves the engine underneath the
+corpus.
 
-`tools.ja4_status` reads `not-installed` on this box, so every stored `ja4` is **unmeasured, not
-absent** — a distinction the run block is careful to record and a consumer cannot recover later.
+Per #142's scope, put the route in `docs/phase-2-replay-box-provision.sh`, whose line 12 still
+installs `suricata` from plain apt — that line *is* the bug.
 
-The re-run replaces the authoritative rows for every capture. Doing it with `ja4` still missing bakes
-that gap into the new corpus and makes it the permanent state of the store. `Dockerfile.toolchain`
-pins the package by tag *and* commit, so installing it on the box is a bounded change with an exact
-target.
+**Also correct the spec.** `docs/spec-label-store.md` §2.4 describes #142 as "Suricata 7.0.3 refuses
+an 8.0 ruleset and loads **none** of it". The measurement says 84,958 of 84,960. The spec sentence is
+the justification for §2.4's design, so it should say what actually happens.
 
-**This is a decision, and it belongs to Craig.** Install it and the corpus carries fingerprints;
-decline it and the corpus carries a documented hole. Either is defensible; discovering it afterwards
-is not.
+**Done when:** the ruleset loads N of N; a tier-2 run attests tier 2 *in the store*; and the
+reproducibility tests are **stably** green across three consecutive runs — #142 records them failing
+1, 2 or 3 at random under 7.0.3, so one green run proves nothing.
 
-## P4-3 — Prove `--both` once, on one capture
+## P4-2 — `ja4` on the box ✅ done 2026-08-27
 
-**`--both` has never run on this box.** Of 48 local run directories: 46 `replay`, 2 `offline`, zero
-`--both`. The mode this whole phase depends on is unexercised in production, and Phase 3's clearest
-lesson is that a path production never took is where the defect lives (#171).
+Installed at the pinned tag `v0.18.8`, which still resolves to the pinned commit
+`3ecddb5f…c7b8` — checked, because a moved tag would silently change JA4 values on published labels.
+Verified four ways: the commit matches; `zeek --parse-only -e '@load ja4'` exits 0; `zkg list` reports
+the pinned version; and `flabel`'s own probe returns `present`. Then verified where it actually
+counts — a real production capture produced a real fingerprint in `ssl_json.log`, which is the file
+`zeek.py` parses.
 
-So: one capture, end to end, examined by hand before committing to 24. Both tiers attested, both
-present in `sources[]`, the run block's `tiers_attested` equal to `[1, 2]`, and — the one that
-matters — at least one flow carrying entries from *both* tiers, which is the first real input the
-merge rule has ever had.
+The route is recorded in `docs/phase-2-replay-box-provision.sh`, idempotent and re-applying the
+shebang fix, rather than left in a shell history.
 
-## P4-4 — Re-label the corpus from `gs://`
+**Two things to carry forward.** `zeek.py:245` leaves `ja4_package_version` `None` on purpose and
+lets `provenance.py` substitute it from `/etc/flabel-toolchain.json` — a file that exists only in the
+CI container. So runs from this box will record `ja4_status: present` with **no package version**.
+And `zkg list` still fails for the unprivileged run user (it wants write access to its state dir),
+which leaves `test_installed_ja4_version_matches_the_pin` skipping locally. Neither affects labelling
+— the run path never calls `zkg` — but the second means the pin is unverified on the box.
 
-24 captures through `flabel-run gs://<bucket>/<object>.pcap --both`. The `gs://` argument is what
-makes `--source-uri` fire, and `--source-uri` is what records the origin — LS-5 sets it only for a
-`gs://` argument, deliberately, because a local path would assert an origin that is false.
+## P4-3 — One `--offline` run from `gs://`, on a capture the store already knows
 
-**Three things to settle before starting, not during:**
+The single highest-information experiment available: it proves the entire route end to end.
 
-1. **Supersession is the point, and it is still worth stating.** Each re-run replaces prior knowledge
-   of the tiers it attests, per capture (§5.1). The 24 existing tier-1 runs stop being current. That
-   is the design working, not data loss — the superseded rows survive as a record — but it means
-   this is a one-way operation on what the store currently serves.
-2. **Goal 2:** the new runs carry a different `tools.suricata` from anything in the store, and a
-   `tools.ja4_status` that depends on P4-2. Zeek does **not** change — the box and all 25 existing
-   runs are already 8.2.1, which is why 8.0.9 was not pursued (2026-08-27). #142 notes the store keys
-   flows on content rather than Zeek's `uid`, so no stored flow fragments.
-3. **Cost:** replay runs at `FLABEL_REPLAY_MULTIPLIER=1000` with a 60s settle, over captures up to
-   175 MB. Measure one (P4-3) and multiply before scheduling 24, rather than discovering it at
-   capture 19.
+**Done when,** after ingest: the run attests tier 2; bare `blfile` emits that capture's flows, having
+resolved the origin from the new tier-2 sighting; and the composed flow carries **tier-1 entries from
+the old August run and tier-2 entries from this one**. That last is the first real exercise of
+`merge.py` rule 2 and the thing that closes #144 properly.
 
-## P4-5 — Ingest, reconcile, verify
+**Check attestation in the store, not the run block.** `tiers_attested` is a `runs` *column* computed
+by `flabel-ingest` (§4.1); the run block carries only `tiers_attempted` and `tiers_unavailable`. An
+earlier draft of this plan told the implementer to grep the run block for a field that is not there.
 
-`flabel-ingest` each published tarball, then `tools/reconcile_store.py` against the archive — the
-LS-8 machinery, used for the job it was built for.
+Record the run's wall-clock, tarball size, and `eve.json` size — they are the only real input to the
+cost estimate for the rest.
 
-**Done when all three opening facts have flipped, checked as measurements and not as assertions:**
+## P4-4 — The corpus
 
-- **bare `blfile` emits flows** rather than refusing them for want of an origin — the headline
-  requirement, met for real rows for the first time;
-- **tier 2 is selectable** — `authoritative_runs` resolves tier 2 for the re-labelled captures;
-- **cross-tier composition runs on real data** (#144), with a flow whose `sources[]` carries both
-  tiers, which is the first non-fixture exercise of the merge rule.
+The 17 known captures first, then the 7 new ones, `--offline` from `gs://` with the pinned snapshot.
 
-Then update `docs/label-store-provision.md` with the new measurements, and re-run `blfile --rebuild`
-over a document built before the re-run to confirm reproduction still holds across a corpus change.
+**The 7 are not free, which the plan previously assumed.** The count that produced them looked only
+at run directories *containing a `labels.json`*, so it structurally could not see failed attempts —
+and there are two: `capture_2026-07-21` was attempted twice on 2026-08-20 and failed both times with
+`tcpprep` fatal, *"packet capture length 43 too small to process"*. Two things follow. That capture
+is known-bad for the **replay** path, and `tcpprep` is tier-1 only — so `--offline` may well succeed
+where `replay` failed, which is worth knowing rather than assuming in either direction. Run the 7
+**after** the 17 are done and verified, so a surprise among them cannot be confused with a problem in
+the part that matters.
+
+**Drive the batch explicitly.** A capture that fails writes no `labels.json`, is never published, and
+therefore leaves **no record in the store that it was attempted** — the failure exists only in a local
+`run.json`. `flabel-run` exits 5 for published-but-not-indexed, which under `set -e` stops the batch
+and without it goes unnoticed. So: capture the exit code per capture, keep going, and print a summary
+table. Run it under `nohup` or `systemd-run` — with no TTY, a rule-load shortfall defaults to
+continue instead of prompting `[Y/n]` per capture.
+
+**Ingest is not a later step.** `tools/flabel-run` already calls `flabel-ingest` after each successful
+publish, ordering archive-then-index. Only runs that exited 5 need re-indexing.
+
+## P4-5 — Reconcile and verify, per symptom
+
+`tools/reconcile_store.py` against the archive, then check the three opening facts **independently**,
+because they have independent causes and a partial result is the likely one:
+
+| Symptom | Check | Minimum to call it done |
+| :-- | :-- | :-- |
+| No origin | bare `blfile` emits flows | every capture that ran successfully |
+| Tier 2 unselectable | `authoritative_runs` resolves tier 2 | every capture that ran successfully |
+| #144 | a flow whose `sources[]` spans two runs, one per tier | **one** is enough — it is a yes/no |
+
+Then compare against the P4-0 baseline **per capture** and require a written explanation for any
+decrease in label count. Finally re-run `blfile --rebuild` over the baseline document to confirm
+reproduction survives a corpus change, and re-measure `docs/label-store-provision.md` rather than
+editing its numbers.
+
+**Reconcile gets slower.** It downloads and parses *every* tarball in the archive on every run, and a
+tier-2 tarball carries an `eve.json` with a flow record per flow, not just alerts. Use P4-3's measured
+size to predict it before being surprised by it.
+
+## P4-6 — One `--both` run, off the critical path
+
+Still never run on this box, still worth proving, no longer blocking anything. Do it on the **smallest**
+capture, after the corpus is fixed.
 
 ## Definition of done for Phase 4
 
 Ordered, because the eng-review is a gate and a gate placed after the merge is not a gate:
 
-1. #142 closed, with the install route in the provisioning script rather than in a shell history.
-2. The ja4 decision taken and written down, whichever way it went.
-3. `--both` proven on one capture before 24 were attempted.
-4. 24 captures labelled from `gs://`, ingested, and reconciling clean.
-5. Bare `blfile` emitting flows; tier 2 selectable; #144 closed by real rows.
-6. Tests and code, then the sabotage round, then a **fresh `eng-reviewer` pass on the diff**, then act
+1. P4-0's digest triangle re-checked green, the snapshot pinned and recorded, the baseline document
+   built, and the `flabel-run` staging-digest gap filed as an issue.
+2. #142 closed, the route in the provisioning script with the version pinned, and §2.4's "loads none
+   of it" sentence corrected.
+3. `--offline` from `gs://` proven end to end on one known capture before the batch.
+4. The 17 known captures done and verified; then the 7 new ones, reported separately.
+5. All three symptoms checked independently, with the per-capture baseline comparison written down.
+6. #144 closed by a flow composed from two runs — not by a single `--both` row.
+7. Tests and code, then the sabotage round, then a **fresh `eng-reviewer` pass on the diff**, then act
    on its findings, **then re-cut the diff and review again** — LS-9 needed three rounds and rounds 2
    and 3 each found defects in the previous round's fixes.
-7. `docs/status.yaml` current, and the provisioning doc's measurements re-measured rather than edited.
+8. `docs/status.yaml` current, and the provisioning doc's measurements re-measured rather than edited.
 
 ## What this phase deliberately does not do
 
@@ -152,3 +251,50 @@ Ordered, because the eng-review is a gate and a gate placed after the merge is n
   The pin still reads `8.0.9-0`, matching neither the box nor any row in the store, so the GHCR digest
   is the real pin — see `docs/RESUME-ls-9.md`.
 - **It does not measure a false-positive rate.** Still a PRD non-goal.
+
+## One thing this phase makes real that nobody has decided
+
+`docs/spec-label-store.md` §9 lists, under *"Open, and deliberately not decided here"*: **who may read
+the dataset.** Phase 3 added two destinations for non-anonymous network metadata — Zeek's DNS names,
+HTTP URIs and TLS server names — and `docs/spec.md` §13's standard is that a new destination is a
+decision someone writes down. Nobody has.
+
+This phase takes the store from **one** tier-2 run to **24**, and a tier-2 run's `eve.json` carries a
+record per flow rather than only alerts. So it is the moment that open question stops being
+theoretical. It does not have to be settled here, but it should be settled or explicitly deferred
+**in writing** before P4-4, rather than answered by default.
+
+## What the review changed, and what it got wrong
+
+A fresh `eng-reviewer` pass on revision 1 raised 2 BLOCKING, 6 HIGH, 5 MEDIUM and 5 LOW. Every
+finding acted on below was **verified first**, because the reviewer has no shell and no git — the same
+discipline that caught a reviewer claiming files were on `main` when they were only local (#171's
+review).
+
+**Changed the plan:**
+
+- **The route.** `--offline` from `gs://` instead of `--both` on 24 — reaches all three outcomes,
+  destroys nothing, drops the device dependency, and is the *only* one of the two that exercises the
+  cross-tier merge rule. Verified against `cli.py:835` and spec §6.4.
+- **`tiers_attested` is not in the run block.** Verified: the block carries `tiers_attempted` and
+  `tiers_unavailable`. The old acceptance criterion named a field that does not exist.
+- **The 7 "free" captures are not free.** Verified: `capture_2026-07-21` failed twice on `tcpprep`.
+  The count that missed it only looked at directories containing a `labels.json`.
+- **Ingest already happens** inside `flabel-run`, so P4-5 was describing work that P4-4 does.
+- **Three causes, not one**, so the symptoms are now accepted independently.
+- Added: the ruleset-snapshot pin, the baseline document, the rollback path, the batch driver, the
+  data-exposure note, and the digest triangle.
+
+**Wrong, and worth recording so it is not re-raised:**
+
+- **BLOCKING 1 — "the 2 skipped rules are duplicate SIDs, so no Suricata version will fix them."**
+  Carefully argued from `suricata.py`, `snapshot.py` and `attest.py`, and refuted by one grep of the
+  engine's own log: *"2 rules were skipped because the running Suricata version 7.0.3 is less than
+  8.0.0"*, with `0 rules failed`. It is a version predicate. Had this been taken on trust, the phase
+  would have grown a code change it does not need.
+- **HIGH 4 — "the provisioning script already installs ja4, so the box is out of compliance."** The
+  reviewer was reading the ja4 block **added to that file thirty minutes earlier**, in the same
+  session, uncommitted. A reviewer reads the working tree, not the state you think it reviewed.
+- **BLOCKING 2 — the digest triangle** was a real hazard in the *code* and not a live one in the
+  *data*: bucket, local staging and the store's `capture_sha256` are identical for all 17. Kept as a
+  pre-flight and an issue rather than a blocker.
