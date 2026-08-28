@@ -150,6 +150,9 @@ exit "${{FAKE_INGEST_EXIT:-0}}"
     )
     ingest.chmod(0o755)
 
+    provisioned = tmp_path / "provisioned-marker"
+    provisioned.write_text("")
+
     return {
         "FLABEL_RUN_INGEST": str(ingest),
         # Required by `flabel-ingest` and therefore by the indexing step (#171). The real box gets
@@ -160,6 +163,9 @@ exit "${{FAKE_INGEST_EXIT:-0}}"
         "_ingest_env": str(ingest_env),
         "_ingest_marker": str(ingest_marker),
         "FLABEL_RUN_CONF": str(conf),
+        # Every existing test drives a box that IS provisioned. The marker is a real file rather
+        # than a pointer at /dev/null so that the gate's absence case has something to remove.
+        "FLABEL_RUN_PROVISIONED": str(provisioned),
         "FLABEL_RUN_CAPTURES": str(tmp_path / "captures"),
         "FLABEL_RUN_RUNS": str(tmp_path / "runs"),
         "FLABEL_RUN_REPO": str(repo),
@@ -1654,3 +1660,40 @@ def test_the_environment_beats_the_config_file_for_the_project_that_receives_lab
         "the config file overrode the project given on the command line, so a scratch run would "
         "have written into production"
     )
+
+
+def test_an_unprovisioned_box_refuses_to_label(lab, tmp_path):
+    """The provisioning script's assertions are only worth what reads their marker.
+
+    `docs/phase-2-replay-box-provision.sh` writes `/var/lib/flabel/.provisioned` last, after it has
+    asserted that Suricata, Wireshark and the ja4 commit are all at their pins. Until 2026-08-28
+    nothing read it, so every one of those assertions was advisory — a GCE startup script that
+    exits 1 gets a log line and the instance boots and serves anyway. This test is the consumer
+    that turns them into a gate.
+
+    Exit 2, not 1: the operator's environment is wrong, not the capture (`docs/spec.md` §12). And
+    it must refuse **before** doing any work, because the point is that a box with an unpinned
+    toolchain must not publish labels at all.
+    """
+    pcap = capture(tmp_path)
+    Path(lab["FLABEL_RUN_PROVISIONED"]).unlink()
+
+    result = invoke(lab, str(pcap))
+
+    assert result.returncode == 2, result.stderr
+    assert "has not completed provisioning" in result.stderr
+    # Above all: nothing was published and nothing was indexed.
+    assert uploads(lab) == []
+    assert ingests(lab) == []
+
+
+def test_a_provisioned_box_is_not_refused(lab, tmp_path):
+    """Guard the guard: the gate must be satisfiable, or it would fail every run on the real box.
+
+    Without this, a typo in the marker path would refuse everything and the test above would still
+    pass — it only ever removes the file.
+    """
+    result = invoke(lab, str(capture(tmp_path)))
+
+    assert result.returncode == 0, result.stderr
+    assert "has not completed provisioning" not in result.stderr

@@ -489,7 +489,7 @@ def test_a_retracted_run_hands_authority_back_to_the_older_one(authoritative_row
 
 def test_a_tier_that_was_attempted_but_not_attested_supplies_nothing(authoritative_rows):
     """§2.4, and #142's exact shape: a run whose Suricata loaded NONE of the snapshot exits 0 and
-    would otherwise supersede good tier-2 knowledge with an empty result."""
+    would otherwise supersede good tier-2 knowledge with a near-complete one."""
     assert ("cap-d", 1, "run-d") in authoritative_rows
     assert not [row for row in authoritative_rows if row[0] == "cap-d" and row[1] == 2], (
         "an unattested tier supplied an authoritative row"

@@ -18,8 +18,10 @@
 --
 --   `tiers_attested`, not `tiers_attempted`. A failed run is never ingested and spec §10 says
 --   `tiers_unavailable` is empty on every successful run, so a rule built on attempted-minus-
---   unavailable would be inert -- and #142's run, whose Suricata loads NONE of the snapshot, exits
---   0 and would have superseded good tier-2 knowledge with an empty result.
+--   unavailable would be inert -- and #142's run, whose Suricata loaded 84,958 of the snapshot's
+--   84,960 rules, exits 0 and would have superseded good tier-2 knowledge with a result that was
+--   two rules short and looked complete. (Corrected 2026-08-27: this said "loads NONE". The real
+--   number is the better argument -- a near-miss is what a threshold would have waved through.)
 --
 --   `run_id` in the ORDER BY. `finished_at` alone is not a total order, and on a box that replays a
 --   whole capture in seconds two runs finishing in the same second is the ORDINARY case, so without

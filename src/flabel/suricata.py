@@ -86,6 +86,10 @@ LOG_FILE = "suricata.log"
 #: label-affecting things the operator's `/etc/suricata/suricata.yaml` would otherwise decide.
 CONFIG_FILE = "suricata.yaml"
 CLASSIFICATION_FILE = "classification.config"
+#: Owned so the engine cannot fall back to `/etc/suricata`. `threshold.config` is the one that
+#: matters — it is Suricata's suppression file, and a fallback copy is unhashed and per-machine.
+REFERENCE_FILE = "reference.config"
+THRESHOLD_FILE = "threshold.config"
 
 #: Timeouts, so a wedged Suricata becomes the `ToolFailure` spec §11 promises instead of a
 #: hung pipeline and a hung CI job. Generous rather than tuned: a real capture against a full
@@ -150,15 +154,29 @@ def config_files() -> tuple[Path, ...]:
     Fixed because `config_sha256` hashes them in this order: the digest identifies the whole
     configuration, not one file of it.
 
-    Two files, not three. `reference.config` was dropped after measuring: it only maps a
-    `reference:` keyword's prefix to a URL, nothing reads those URLs, and against a real
-    85,545-rule snapshot its absence changes the load by **0 rules** (the engine warns once per
-    unknown prefix). `classification.config` stays because without it Suricata warns once per
-    unknown classtype and its `alert.severity` defaults — neither fatal, but noise in a log an
+    **Four files, and the last two are here for a reason that took a production run to see.**
+    `reference.config` and `threshold.config` were once left unset, on the measurement that
+    reference mappings change the load by 0 rules against a real 85,545-rule snapshot. That
+    measured the wrong thing. Unset does not mean unused: Suricata falls back to
+    `/etc/suricata/<name>`, a package-managed file on whatever box is labelling — and
+    `threshold.config` is its **suppression** file, so a fallback copy can drop alerts from the
+    corpus with nothing in the run block recording it.
+
+    Measured 2026-08-28 on `fl-replay`: `tools/flabel-run` invokes flabel under sudo, so Suricata
+    runs as root, and the production run's own log reads `threshold-config: Threshold config
+    parsed: 0 rule(s) found` — it read the machine's file. A directory mode cannot isolate a
+    process running as root. Owning the path can, and it makes the isolation a property of this
+    configuration rather than of one machine's filesystem.
+
+    `classification.config` stays for its original reason: without it Suricata warns once per
+    unknown classtype and its `alert.severity` defaults — not fatal, but noise in a log an
     operator reads.
     """
     directory = data_dir()
-    return tuple(directory / name for name in (CONFIG_FILE, CLASSIFICATION_FILE))
+    return tuple(
+        directory / name
+        for name in (CONFIG_FILE, CLASSIFICATION_FILE, REFERENCE_FILE, THRESHOLD_FILE)
+    )
 
 
 def config_sha256() -> str:
@@ -275,6 +293,12 @@ def build_argv(
         # because the package's location is not knowable when the YAML is written.
         "--set",
         f"classification-file={directory / CLASSIFICATION_FILE}",
+        # Both named absolutely for the same reason as `classification-file`, and named at all so
+        # the engine cannot fall back to /etc/suricata — see `config_files`.
+        "--set",
+        f"reference-config-file={directory / REFERENCE_FILE}",
+        "--set",
+        f"threshold-file={directory / THRESHOLD_FILE}",
         "--set",
         f"default-rule-path={(rules_path or snapshot).resolve()}",
         "--set",

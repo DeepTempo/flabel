@@ -114,6 +114,85 @@ def test_dockerfile_args_match_the_pins(toolchain_pins):
     )
 
 
+def test_the_provisioning_script_pins_match_too(toolchain_pins):
+    """The replay box installs from a third copy of the same pins, and nothing bound it.
+
+    ``docs/phase-2-replay-box-provision.sh`` is what `fl-replay` actually runs, and `fl-replay` is
+    the only machine that produces the project's ground truth. Its pins were written by hand, from
+    ``Dockerfile.toolchain``, with a comment saying they must match — and a comment is not a gate.
+    ``docs/dev-setup.md``'s bump procedure did not mention the file at all, so the next bump would
+    have moved CI and left the box behind, with nothing failing.
+
+    That is the same class of defect as #142 itself: the box quietly running a different engine
+    from the one the repo describes, for months, while every test passed.
+
+    Substring rather than equality, for the reason the Dockerfile test gives: apt versions carry
+    epochs and suffixes (``1:8.0.6-0ubuntu0``, ``4.6.6-1~ubuntu24.04.0~ppa1``).
+    """
+    script = (REPO_ROOT / "docs" / "phase-2-replay-box-provision.sh").read_text()
+    assignments = re.findall(r"^(\w+)=(\S+)$", script, re.MULTILINE)
+
+    # `dict()` is last-wins, which would let a second assignment of the same name silently
+    # override the one the install actually uses. Refuse duplicates instead of picking one.
+    seen: dict[str, str] = {}
+    for name, value in assignments:
+        assert name not in seen or seen[name] == value, (
+            f"{name} is assigned twice in the provisioning script, with different values "
+            f"({seen.get(name)!r} then {value!r}). This test would silently take the last one"
+        )
+        seen[name] = value
+    pins = seen
+
+    for name in (
+        "SURICATA_PACKAGE_VERSION",
+        "WIRESHARK_PACKAGE_VERSION",
+        "JA4_PACKAGE_VERSION",
+        "JA4_PACKAGE_COMMIT",
+    ):
+        assert name in pins, (
+            f"the provisioning script no longer assigns {name} at the start of a line. If it moved "
+            f"or was templated, this test stops binding the box to the pins — fix the test, do not "
+            f"delete it"
+        )
+
+    for pin, var in (
+        ("suricata", "SURICATA_PACKAGE_VERSION"),
+        ("wireshark", "WIRESHARK_PACKAGE_VERSION"),
+    ):
+        assert toolchain_pins[pin] in pins[var], (
+            f"the box installs {var}={pins[var]} but the pin is {toolchain_pins[pin]} — "
+            f"fl-replay would label captures with a different {pin} than CI tests against"
+        )
+
+    assert pins["JA4_PACKAGE_VERSION"] == toolchain_pins["ja4_zeek_package"], (
+        f"the box installs ja4 {pins['JA4_PACKAGE_VERSION']} but the pin is "
+        f"{toolchain_pins['ja4_zeek_package']} — a different ja4 changes JA4 values on labels"
+    )
+    assert pins["JA4_PACKAGE_COMMIT"] == toolchain_pins["ja4_zeek_commit"], (
+        f"the box expects ja4 commit {pins['JA4_PACKAGE_COMMIT']} but the pin is "
+        f"{toolchain_pins['ja4_zeek_commit']}"
+    )
+
+    # A pin the install line does not reference is decoration. Without this, hardcoding a version
+    # into the apt-get line leaves the variable — and therefore this test — perfectly green.
+    for var in ("SURICATA_PACKAGE_VERSION", "WIRESHARK_PACKAGE_VERSION", "JA4_PACKAGE_VERSION"):
+        assert f"${var}" in script or f"${{{var}}}" in script, (
+            f"{var} is assigned but never referenced — the install is not using the pin"
+        )
+
+    # The Zeek repo signing-key fingerprint is a FOURTH hand-copied literal of a security-critical
+    # value, and the first version of this test bound the three version pins while introducing it
+    # unbound in the same commit. A key check that verifies a different fingerprint from the one
+    # CI verifies is one of the two build paths silently not verifying anything.
+    dockerfile = (REPO_ROOT / "Dockerfile.toolchain").read_text()
+    expected = re.search(r"expected=([0-9A-F]{40})", dockerfile)
+    assert expected is not None, "Dockerfile.toolchain no longer asserts a Zeek key fingerprint"
+    assert pins.get("ZEEK_REPO_KEY_FPR") == expected.group(1), (
+        f"the box verifies Zeek key {pins.get('ZEEK_REPO_KEY_FPR')} but the image verifies "
+        f"{expected.group(1)} — one of the two is trusting a key the other rejects"
+    )
+
+
 def test_ci_still_passes_the_toolchain_flags(toolchain_pins):
     """CI's own invocation is a gate, not a convention.
 

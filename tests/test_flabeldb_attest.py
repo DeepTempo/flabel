@@ -7,9 +7,9 @@ successful run — so every row in `runs` would have had `delivered == attempted
 inert in production and testable only against a hand-forged row.
 
 Worse, the hazard it was written for walks straight past it. #142 — `fl-replay`'s Suricata 7.0.3
-refusing an 8.0 ruleset and loading **none** of it — exits 0, writes `labels.json`, publishes, and
+refusing an 8.0 ruleset and loading only part of it — exits 0, writes `labels.json`, publishes, and
 reports `tiers_unavailable: []`. Under revision 1 it *delivered* tier 2 and superseded good
-knowledge with an empty result.
+knowledge with a result that was two rules short and looked complete.
 
 So delivery is attested from **positive evidence**, and these tests are the fixture-driven proof.
 `OFFLINE_RUN` is copied from a real `fl-replay --offline` run (2026-08-21), which the plan asks for
@@ -86,6 +86,10 @@ def test_a_run_that_loaded_every_admitted_rule_attests_tier_2():
 def test_142_the_hazard_attestation_EXISTS_for():
     """Suricata loads NONE of the snapshot, exits 0, publishes, `tiers_unavailable: []`.
 
+    Not #142's shape — that one loaded 84,958 of 84,960 and was caught by the equality
+    clause. This is the `0 == 0` case the non-zero clause exists for, and it is the only
+    case that clause uniquely catches.
+
     Under revision 1's rule this delivered tier 2 and superseded good knowledge with an empty
     result. It is the whole reason the mechanism was rewritten, so it gets its own test.
     """
@@ -120,17 +124,25 @@ def test_a_null_count_is_reported_as_NOT_MEASURED_and_not_as_zero():
     They are not one state. `docs/spec.md` §10 is emphatic throughout this project that `null` is
     "not measured" and `0` is "measured as none", and an operator reading `attestation_notes` acts
     differently on each: a null means the run block is malformed or the stage never ran, a zero
-    means Suricata ran and loaded nothing, which is #142.
+    means Suricata ran and loaded nothing.
+
+    Not #142: that run loaded 84,958 of 84,960 and was refused by the equality clause. The zero
+    case is its own hazard — `0 == 0` satisfies equality and proves nothing.
     """
     _, null_notes = attest.tiers(run(OFFLINE_RUN, counts={"rules_loaded": None}))
     _, zero_notes = attest.tiers(run(OFFLINE_RUN, counts={"rules_loaded": 0}))
 
-    # The discriminating assertion, and the second attempt at it. The first checked only that the
+    # The discriminating assertion, and the THIRD attempt at it. The first checked only that the
     # notes DIFFERED and that "None" appeared somewhere — both of which stay true when the null
     # branch is deleted, because the zero branch interpolates the value and renders it as `None`.
+    # The second discriminated on the string "142", which tied the test to an issue NUMBER in the
+    # message rather than to its meaning — and when that citation turned out to be a false
+    # attribution and was removed, this test failed for a reason that had nothing to do with the
+    # behaviour it guards.
+    #
     # What actually separates them is what each one CLAIMS: the zero message states that nothing
     # examined the capture, which is a measurement. On a null there is no measurement to state.
-    assert any("142" in note for note in zero_notes), zero_notes
+    assert any("examined the capture" in note for note in zero_notes), zero_notes
     assert not any("142" in note for note in null_notes), (
         f"a null was reported as #142's zero-rules-loaded case, which asserts a measurement that "
         f"was never made: {null_notes}"

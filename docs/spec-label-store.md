@@ -75,9 +75,15 @@ The chain, every link from `docs/spec.md`:
 3. Therefore every row in `runs` would have `tiers_delivered == tiers_attempted`. The concept is
    inert in production and testable only against a hand-forged row.
 
-And the disclosed hazard — #142, where `fl-replay`'s Suricata 7.0.3 refuses an 8.0 ruleset and loads
-**none** of it — exits 0, writes `labels.json`, publishes, and reports `tiers_unavailable: []`. Under
-revision 1 it *delivered* tier 2 and superseded good knowledge with an empty result. "Tier-2
+And the disclosed hazard — #142, where `fl-replay`'s Suricata 7.0.3 could not load the whole of an
+8.0 ruleset — exits 0, writes `labels.json`, publishes, and reports `tiers_unavailable: []`.
+(**Corrected 2026-08-27**: this said the engine "loads **none** of it". It was worse than that as an
+argument and milder as a fact — measured, 7.0.3 loaded 84,958 of 84,960 and skipped 2 marked
+`requires: version >= 8.0.0`. A shortfall of two rules out of eighty-five thousand is a *better*
+justification for attesting on strict equality than a total refusal would be, because it is the case
+a threshold would have waved through. Fixed by the 8.0.6 upgrade, which loads 84,960 of 84,960.) Under
+revision 1 it *delivered* tier 2 and superseded good knowledge with a result that was two rules
+short and looked complete — which is the more dangerous shape, not the milder one. "Tier-2
 ingestion is gated on #142" was a sentence, not a gate.
 
 So delivery must be **attested from positive evidence**:
