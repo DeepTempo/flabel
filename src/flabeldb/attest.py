@@ -8,7 +8,7 @@ run is never ingested (§2.5) and `docs/spec.md` §10 states `tiers_unavailable`
 successful run, so every row in `runs` would have carried `delivered == attempted`.
 
 And the hazard it was written for walked past it. #142 — `fl-replay`'s Suricata 7.0.3 refusing an
-8.0 ruleset and loading **none** of it — exits 0, writes `labels.json`, publishes, and reports
+8.0 ruleset and loading only part of it — exits 0, writes `labels.json`, publishes, and reports
 `tiers_unavailable: []`. Under revision 1 that run *delivered* tier 2 and superseded good knowledge
 with an empty result.
 
@@ -41,8 +41,13 @@ def _tier_2(run: Mapping[str, Any]) -> tuple[bool, str | None]:
     """§2.4: attested when `counts.rules_loaded == ruleset.total_admitted`, both non-null, non-zero.
 
     **`0 == 0` is the trap the non-zero clause closes.** A snapshot that admitted nothing and a
-    Suricata that loaded nothing agree perfectly and prove nothing at all — and that is #142's
-    exact shape, not a hypothetical.
+    Suricata that loaded nothing agree perfectly and prove nothing at all.
+
+    **Which clause caught #142, corrected 2026-08-27.** This said `0 == 0` was "#142's exact
+    shape". It was not, and the difference matters for what each clause is worth. Measured, #142
+    loaded 84,958 of 84,960 — so it was the **equality** clause that refused it, and a threshold
+    of "nearly all" would have let it through. The non-zero clause has no incident behind it and
+    stays on its own argument: two counts that are both zero are not evidence of agreement.
     """
     loaded = (run.get("counts") or {}).get("rules_loaded")
     total = (run.get("ruleset") or {}).get("total_admitted")

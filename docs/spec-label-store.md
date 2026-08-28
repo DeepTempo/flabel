@@ -82,7 +82,8 @@ argument and milder as a fact — measured, 7.0.3 loaded 84,958 of 84,960 and sk
 `requires: version >= 8.0.0`. A shortfall of two rules out of eighty-five thousand is a *better*
 justification for attesting on strict equality than a total refusal would be, because it is the case
 a threshold would have waved through. Fixed by the 8.0.6 upgrade, which loads 84,960 of 84,960.) Under
-revision 1 it *delivered* tier 2 and superseded good knowledge with an empty result. "Tier-2
+revision 1 it *delivered* tier 2 and superseded good knowledge with a result that was two rules
+short and looked complete — which is the more dangerous shape, not the milder one. "Tier-2
 ingestion is gated on #142" was a sentence, not a gate.
 
 So delivery must be **attested from positive evidence**:

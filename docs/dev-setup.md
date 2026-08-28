@@ -138,10 +138,16 @@ To bump the toolchain:
 1. Edit the `ARG` values in `Dockerfile.toolchain` — the exact apt versions
    (`SURICATA_PACKAGE_VERSION`, `WIRESHARK_PACKAGE_VERSION`, `ZEEK_PACKAGE_VERSION`) and, for
    JA4, both the tag and the commit it must resolve to.
-2. Update `[tool.flabel.toolchain]` in the same commit. The `toolchain` workflow runs the
+2. **Edit the matching variables in `docs/phase-2-replay-box-provision.sh`.** There is a *third*
+   copy of these pins, because `fl-replay` installs from apt rather than from the image — and
+   `fl-replay` is the only machine that produces ground truth. This step was missing from this
+   list until 2026-08-27, which is how the box came to run Suricata 7.0.3 against an 8.0 ruleset
+   for weeks with CI green (#142). `test_the_provisioning_script_pins_match_too` now fails if you
+   skip it, so this is a reminder rather than the guard.
+3. Update `[tool.flabel.toolchain]` in the same commit. The `toolchain` workflow runs the
    suite inside the new image with `--strict-toolchain`, so a Dockerfile bump without a
    matching pin bump fails there rather than silently publishing.
-3. Push; the workflow prints the new digest. Put it in `ci.yml`'s `container:` line.
+4. Push; the workflow prints the new digest. Put it in `ci.yml`'s `container:` line.
 
 The apt repositories serve only the newest patch of each release line, so an upstream patch
 release eventually makes a pinned version unavailable and the **image build** fails. That is

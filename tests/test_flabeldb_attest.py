@@ -7,7 +7,7 @@ successful run — so every row in `runs` would have had `delivered == attempted
 inert in production and testable only against a hand-forged row.
 
 Worse, the hazard it was written for walks straight past it. #142 — `fl-replay`'s Suricata 7.0.3
-refusing an 8.0 ruleset and loading **none** of it — exits 0, writes `labels.json`, publishes, and
+refusing an 8.0 ruleset and loading only part of it — exits 0, writes `labels.json`, publishes, and
 reports `tiers_unavailable: []`. Under revision 1 it *delivered* tier 2 and superseded good
 knowledge with an empty result.
 
