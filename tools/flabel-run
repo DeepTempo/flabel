@@ -12,6 +12,9 @@ set -euo pipefail
 # Overridable so the tests can drive this without /opt or /var, and so a second lab does not
 # need a forked copy. Defaults are what the provisioning script lays down.
 CONF="${FLABEL_RUN_CONF:-/var/lib/flabel/flabel.env}"
+#: The marker the provisioning script writes LAST, after every version assertion has passed.
+#: Overridable so the tests can exercise both its presence and its absence.
+PROVISIONED="${FLABEL_RUN_PROVISIONED:-/var/lib/flabel/.provisioned}"
 CAPTURES="${FLABEL_RUN_CAPTURES:-/var/lib/flabel/captures}"
 RUNS="${FLABEL_RUN_RUNS:-/var/lib/flabel/runs}"
 REPO="${FLABEL_RUN_REPO:-/opt/flabel/repo}"
@@ -257,6 +260,29 @@ _saved_env="$(export -p | grep -E '^(export |declare -x )(FLABEL_|GCP_PROJECT)' 
 # shellcheck disable=SC1090
 set -a; . "$CONF"; set +a
 eval "$_saved_env"
+
+# **Refuse to label on a box that has not finished provisioning.**
+#
+# `docs/phase-2-replay-box-provision.sh` writes $PROVISIONED last, after it has asserted that
+# Suricata, Wireshark and the ja4 package are all at their pins and that /etc/flabel-toolchain.json
+# is valid. Until 2026-08-28 *nothing read it*, which meant every one of those assertions was
+# advisory: a GCE startup script that exits 1 gets a line in a log, and the instance boots and
+# serves anyway. A gate nothing consumes is a comment.
+#
+# This is the consumer. It is deliberately here in `flabel-run` rather than in `flabel`: the
+# pipeline is runnable on a laptop that was never provisioned and has no business asserting
+# otherwise, while this wrapper exists only to run on the box.
+#
+# Exit 2, not 1: this is the operator's environment being wrong, not a refusal about the capture
+# (`docs/spec.md` §12). A missing marker means the box may be labelling with an unpinned toolchain,
+# and a label whose toolchain is unknown is exactly what Goal 2 says must not be published.
+if [ ! -f "$PROVISIONED" ]; then
+  echo "flabel-run: $PROVISIONED is missing, so this box has not completed provisioning." >&2
+  echo "flabel-run: the startup script writes it only after every tool version assertion passes," >&2
+  echo "flabel-run: so labelling now could publish labels from an unpinned toolchain." >&2
+  echo "flabel-run: re-run docs/phase-2-replay-box-provision.sh and read its FATAL lines." >&2
+  exit 2
+fi
 
 # **The origin, derived AFTER the config file has been read and the caller's environment restored
 # over it.** Renaming this `FLABEL_`-prefixed was the first attempt and it does not work: the

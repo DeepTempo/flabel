@@ -26,6 +26,7 @@ from __future__ import annotations
 import importlib.util
 import ipaddress
 import json
+import pathlib
 import re
 import struct
 import time
@@ -433,9 +434,19 @@ def test_argv_uses_flabels_own_config_not_the_machines():
     assert config.name == "suricata.yaml"
     assert config.is_absolute() and config.exists(), "the config must ship as package data"
     assert f"classification-file={config.parent / 'classification.config'}" in settings
-    assert not any(setting.startswith("reference-config-file=") for setting in settings), (
-        "reference.config was dropped: measured, its absence changes the rule load by 0 rules"
-    )
+    # **Reversed 2026-08-28, and the old assertion is worth remembering.** This used to assert that
+    # `reference-config-file` was NOT set, on the measurement that its absence changes the rule
+    # load by 0 rules. That measurement was true and irrelevant: unset does not mean unused, it
+    # means the engine resolves the path against /etc/suricata — a package-managed file on
+    # whatever box is labelling. The same is true of `threshold-file`, which is the SUPPRESSION
+    # file, so the fallback could drop alerts from the corpus with nothing recording it.
+    for key, name in (
+        ("reference-config-file", "reference.config"),
+        ("threshold-file", "threshold.config"),
+    ):
+        assert f"{key}={config.parent / name}" in settings, (
+            f"{key} is unset, so the engine falls back to /etc/suricata/{name}"
+        )
     assert f"default-rule-path={Path('/snap').resolve()}" in settings
 
 
@@ -468,7 +479,15 @@ def test_the_vendored_config_is_hashed_for_the_run_block():
 
     assert re.fullmatch(r"[0-9a-f]{64}", digest)
     names = [path.name for path in suricata.config_files()]
-    assert names == ["suricata.yaml", "classification.config"]
+    # Four, not two. `reference.config` and `threshold.config` joined on 2026-08-28: naming a path
+    # is only half of owning it — an owned file that nothing hashes is the same hole one directory
+    # along, and `threshold.config` decides which alerts survive.
+    assert names == [
+        "suricata.yaml",
+        "classification.config",
+        "reference.config",
+        "threshold.config",
+    ]
     assert all(path.exists() for path in suricata.config_files())
     assert suricata.config_sha256() == digest, "the digest must not depend on read order"
 
@@ -492,6 +511,41 @@ def test_the_vendored_config_makes_a_home_net_rule_fire(tmp_path):
         "a $HOME_NET -> $EXTERNAL_NET rule did not fire on an internal-to-internal capture, "
         "which is what HOME_NET: any in flabel's own suricata.yaml exists to prevent"
     )
+
+
+def test_flabel_owns_every_config_path_the_engine_resolves(tmp_path):
+    """The engine must never fall back to /etc/suricata for a file that can change labels.
+
+    `threshold.config` is Suricata's suppression file. Left unnamed, the engine resolves it against
+    ``/etc/suricata``, which is package-managed and per-machine — so a box could silently drop
+    alerts from the corpus while ``config_sha256`` reported the configuration unchanged.
+
+    This is not hypothetical and it is not a permissions problem. Measured 2026-08-28 on
+    ``fl-replay``: ``tools/flabel-run`` invokes flabel under sudo, so Suricata runs as **root** and
+    the fallback file's 0750 mode does not isolate it. The production run's own log recorded
+    ``threshold-config: Threshold config parsed: 0 rule(s) found``.
+
+    Asserted on the argv rather than on the log, because the argv is what makes it true on every
+    machine, and asserted together with the digest because owning the path is only half of it —
+    an owned file that nothing hashes is the same hole one directory along.
+    """
+    argv = suricata.build_argv(BENIGN, tmp_path, tmp_path / "out")
+    settings = dict(pair.split("=", 1) for pair in argv if "=" in pair and not pair.startswith("-"))
+    for key, name in (
+        ("classification-file", suricata.CLASSIFICATION_FILE),
+        ("reference-config-file", suricata.REFERENCE_FILE),
+        ("threshold-file", suricata.THRESHOLD_FILE),
+    ):
+        assert key in settings, f"{key} is not set, so the engine resolves it against /etc/suricata"
+        resolved = pathlib.Path(settings[key])
+        assert resolved.is_absolute(), f"{key}={resolved} is relative — it would resolve per-cwd"
+        assert resolved == suricata.data_dir() / name, (
+            f"{key} points at {resolved}, which is not the copy flabel owns"
+        )
+        assert resolved in suricata.config_files(), (
+            f"{key} points at a file flabel owns but config_sha256 does not cover — a change to "
+            f"it would not reach the run block"
+        )
 
 
 @pytest.mark.requires_tools

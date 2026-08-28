@@ -101,9 +101,17 @@ vars:
 # rather than resolving rule-referenced files against something real.
 default-rule-path: /nonexistent
 classification-file: classification.config
-# No `reference-config-file`. It only maps a `reference:` prefix to a URL, nothing in flabel reads
-# those URLs, and measured against a real 85,545-rule snapshot its absence changes the load by
-# **0 rules** — the engine warns once per unknown prefix. One fewer file to own.
+# `reference-config-file` and `threshold-file` are named too, and both are set absolutely at
+# invocation. Leaving them unset does NOT mean unused: Suricata falls back to /etc/suricata/<name>,
+# a package-managed file on whatever machine is labelling. threshold.config is the SUPPRESSION
+# file, so a fallback copy can silently drop alerts from the corpus — and the run block would not
+# record it, because config_sha256 can only cover files flabel owns.
+#
+# An earlier version left both unset on the measurement that reference mappings change the load by
+# 0 rules. True, and beside the point. Corrected 2026-08-28 after measuring that runs go through
+# sudo, so a 0750 /etc/suricata does not isolate them.
+reference-config-file: reference.config
+threshold-file: threshold.config
 
 # --- outputs -------------------------------------------------------------------------------
 #
