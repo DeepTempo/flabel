@@ -35,6 +35,22 @@ if ! dpkg-query -W -f='${Version}' suricata 2>/dev/null | grep -qx "$SURICATA_PA
   apt-mark hold suricata
 fi
 
+# Wireshark from ppa:wireshark-dev/stable, for the same reason as Suricata: noble ships 4.2.2 and
+# the pin is 4.6.6. editcap and capinfos are not incidental tools here — editcap performs capture
+# NORMALISATION, so a version the CI toolchain does not test is a version producing corpus input
+# nobody has checked. capinfos and editcap both come from wireshark-common; tshark is separate and
+# is what selects one link type out of a multi-interface pcapng.
+#
+# The setuid prompt is preseeded off because nothing on this box captures live traffic — it replays.
+WIRESHARK_PACKAGE_VERSION=4.6.6-1~ubuntu24.04.0~ppa1
+if ! dpkg-query -W -f='${Version}' wireshark-common 2>/dev/null | grep -qx "$WIRESHARK_PACKAGE_VERSION"; then
+  add-apt-repository -y ppa:wireshark-dev/stable
+  apt-get update -y
+  echo "wireshark-common wireshark-common/install-setuid boolean false" | debconf-set-selections
+  apt-get install -y "wireshark-common=$WIRESHARK_PACKAGE_VERSION" "tshark=$WIRESHARK_PACKAGE_VERSION"
+  apt-mark hold wireshark-common tshark
+fi
+
 # The OISF package installs /etc/suricata as 0750 suricata:suricata; Ubuntu's was world-readable.
 # Suricata resolves `reference-config-file` and `threshold-config` against /etc/suricata even when
 # flabel's own config declines to name them, so an unreadable directory turns every run's log into
