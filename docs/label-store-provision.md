@@ -591,7 +591,7 @@ questions. A capture labelled *after* LS-5 will carry its `gs://` origin and nee
 
 One real `coverage` block, **as measured on this date** — it carries no `tiers_supplying` because
 that field postdates it (#184), and a document from this state could not have read `[1, 2]` anyway:
-with no attested tier 2 anywhere, the paragraph above, no capture had two supplying tiers. An
+with no attested tier 2 anywhere — see the paragraph above — no capture had two supplying tiers. An
 earlier edit pasted the field in here to keep the example current, which would have made a block
 captioned "one real" carry a value the build that produced it could not emit:
 

@@ -422,14 +422,23 @@ DOCUMENT_SHAPE = Shape(
                                 kind=(Mapping,),
                                 fields={
                                     "input_status": Shape(kind=(str,), nullable=True),
+                                    # `(int, float)` like its sibling below: `_total` sums
+                                    # values read out of `run_block`, which is a STRING column
+                                    # nothing validates on the way in, so a block carrying `2.0`
+                                    # would make `build` write a float `read_prior` then refuses.
                                     "unmatched": Shape(
-                                        kind=(int,), nullable=True, reject_bool=True
+                                        kind=(int, float), nullable=True, reject_bool=True
                                     ),
                                     "unmatched_ratio": Shape(
                                         kind=(int, float), nullable=True, reject_bool=True
                                     ),
                                     "loss_conditions_fired": Shape(kind=(list,), items=_STRING),
-                                    "tiers_supplying": Shape(kind=(list,), items=_INT),
+                                    # `non_empty` for the reason `_coverage`'s docstring gives and
+                                    # `runs[].supplies` already encodes: a capture is here because
+                                    # some tier supplies it, so `[]` is a falsehood, not an absence.
+                                    "tiers_supplying": Shape(
+                                        kind=(list,), items=_INT, non_empty=True
+                                    ),
                                 },
                             ),
                         },
@@ -982,8 +991,12 @@ def _record(
     # **Not `coverage or {}`.** A blank block would be written by `build` and then REFUSED by
     # `read_prior`, which requires `tiers_supplying` inside it — the write path and the read path
     # disagreeing about what is required, which is #185's shape one field along. §3.3 makes a
-    # capture without an authority entry unreachable, and `build` already refuses rather than
-    # writing past that assumption elsewhere, so this does too.
+    # capture without an authority entry unreachable, so this refuses rather than writing past it.
+    #
+    # Not claimed: that `build` refuses everywhere else it could. It does not — it writes
+    # `runs: []` when nothing is selected, and `read_prior` then refuses that document for
+    # `non_empty`. `test_a_document_that_pins_no_runs_is_refused_rather_than_reproduced` records
+    # it as known and accepted, and it is the same write/read disagreement one field over.
     if coverage is None:
         raise merge.StoreInconsistent(
             f"capture {record.capture_sha256} has a merged flow but no coverage block, so it is "

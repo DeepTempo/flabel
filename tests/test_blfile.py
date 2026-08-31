@@ -19,6 +19,7 @@ import json
 import pytest
 
 from flabel import labels as labels_module
+from flabel import models
 from flabel.models import LABEL_KINDS
 from flabeldb import blfile, collection, merge
 from test_flabeldb_merge import (
@@ -2590,31 +2591,58 @@ def test_a_key_added_to_coverage_without_a_declaration_fails_the_coverage_test(m
 def test_the_schema_version_moves_when_the_record_shape_does():
     """#184 recurring is a matter of when, not whether, without this.
 
-    The version was bumped to "1.1" BY HAND because `coverage.tiers_supplying` changed the record
-    shape. Nothing connects the two: declare a tenth key, satisfy the coverage test, leave the
+    The version was bumped to "1.1" by hand because `coverage.tiers_supplying` changed the record
+    shape. Nothing connected the two: declare a new key, satisfy the coverage test, leave the
     version alone, and every pre-existing document again rebuilds to one difference per record
-    while `blfile` blames the store. That is #184 verbatim, and the only existing assertion on the
-    literal fires when you CHANGE the version, never when you fail to.
+    while `blfile` blames the store.
 
-    So the shape is digested and pinned beside the version, in the arrangement `RUN_ID_COLUMN` has
-    against `schema.TABLES`. If this fails, decide deliberately: a change to what a record CARRIES
-    is a version move; a change to a declaration's types or nullability alone is not, and the
-    digest should then be updated with the reason in the commit.
+    **This digests a REAL DOCUMENT, not `DOCUMENT_SHAPE`, and that is the whole point.** A first
+    version walked the declaration — which covers a strict subset of what `differences` compares.
+    Measured: adding one field inside `sources[]` makes all 880 records of the production corpus
+    differ, while the declaration names only `.labels[].sources` and never its contents. Same for
+    `labels[]`, `origin.run_ids`, `flow` and the run block, all of which are compared and none of
+    which is declared. So a declaration digest would have promised protection it could not give —
+    the exact over-promise this change was made to fix, one artefact along.
+
+    If this fails, decide deliberately: a change to what a record CARRIES is a version move
+    (§6.4). A change that only closes more of the declaration is not — that moves nothing here,
+    because this walks the document.
     """
+    document = prior_document()
+
     paths: list[str] = []
 
-    def walk(shape, path):
-        if shape.fields:
-            for name, field in sorted(shape.fields.items()):
+    def walk(value, path):
+        if isinstance(value, dict):
+            for name in sorted(value):
                 paths.append(f"{path}.{name}")
-                walk(field, f"{path}.{name}")
-        if shape.items is not None:
-            walk(shape.items, f"{path}[]")
+                walk(value[name], f"{path}.{name}")
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, f"{path}[]")
 
-    walk(collection.DOCUMENT_SHAPE, "")
-    digest = hashlib.sha256("\n".join(paths).encode()).hexdigest()[:16]
+    walk(document, "")
 
-    assert (digest, collection.SCHEMA_VERSION) == ("6f2588481f3eddf4", "1.1")
+    # **The fixture's `sources[]` and `labels[]` are dicts, not real dataclasses**, so walking the
+    # document alone would not see a field added to `models.SourceEntry` or `LabelEntry` — and
+    # `_record` puts both through `dataclasses.asdict`, so such a field reaches every record of
+    # every document. Measured: adding one to `SourceEntry` left the entire suite green while
+    # making all 880 records of the production corpus differ. Folding the real field names in is
+    # what makes this cover the surface `differences` compares rather than the surface the fixture
+    # happens to build.
+    paths.extend(f".labels[].sources[].{name}" for name in merge.SOURCE_FIELDS)
+    paths.extend(
+        f".labels[].labels[].{field.name}" for field in dataclasses.fields(models.LabelEntry)
+    )
+    paths.extend(f".labels[].flow.{name}" for name in merge.FLOW_FIELDS)
+    digest = hashlib.sha256("\n".join(sorted(set(paths))).encode()).hexdigest()[:16]
+
+    assert (digest, collection.SCHEMA_VERSION) == ("a85221e58930b126", "1.1"), (
+        f"the document's key paths digest to {digest!r}. If a record now carries a field it did "
+        f"not before, §6.4 says that is a version move: bump SCHEMA_VERSION and update this "
+        f"literal together. If nothing a record carries changed, update the literal alone and say "
+        f"why in the commit"
+    )
 
 
 def test_the_declaration_validates_the_shape_production_actually_wrote():
@@ -2627,14 +2655,24 @@ def test_the_declaration_validates_the_shape_production_actually_wrote():
     reality turns a valid document into a refused one, which is worse than the hole it replaced.
     """
     document = json.loads(
-        collection.serialise(built(sightings=[], allow_missing_origin=True).document)
+        collection.serialise(
+            built(
+                sightings=[sighting(run_id=TIER2_RUN, recorded=False)],
+                allow_missing_origin=True,
+            ).document
+        )
     )
 
     (record,) = document["labels"]
     origin = record["origin"]
-    assert (origin["uri"], origin["filename"], origin["link_type"]) == (None, None, None)
+    # The archive's real shape: `uri` null, but `filename`/`link_type`/`snaplens` POPULATED from
+    # the sighting. A first version of this test passed `sightings=[]`, which exercises
+    # `_record`'s no-sighting fallback — a different shape that production never wrote, so the one
+    # shape the archive really took stayed unvalidated inside the test meant to validate it.
+    assert origin["uri"] is None
+    assert origin["filename"] is not None and origin["link_type"] is not None
     assert origin["uri_status"] == collection.NOT_RECORDED
-    assert origin["snaplens"] == []
+    assert origin["snaplens"] != []
 
     collection.validate_document(document)  # must not raise
     collection.read_prior(document)
