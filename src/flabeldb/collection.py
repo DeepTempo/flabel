@@ -155,7 +155,10 @@ def build(
     origins = _origins(auth, sightings)
     coverage = {
         capture: _coverage(
-            [blocks[run_id] for run_id in sorted(set(tiers.values())) if run_id in blocks]
+            [blocks[run_id] for run_id in sorted(set(tiers.values())) if run_id in blocks],
+            # The keys, not the values: a capture supplied by one run at both tiers still has two
+            # tiers, and `set(tiers.values())` would collapse it to one block and one tier.
+            sorted(tiers),
         )
         for capture, tiers in auth.by_capture.items()
     }
@@ -792,12 +795,30 @@ def _origins(
 # --- coverage (§6.4) ------------------------------------------------------------------------------
 
 
-def _coverage(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _coverage(
+    blocks: Sequence[Mapping[str, Any]], tiers: Sequence[int] = ()
+) -> dict[str, Any]:
     """What was lost about this capture, over every run currently supplying a tier of it.
 
     `loss_conditions` is `null` per flag when the stage that would know never ran (§10), and a
     `null` is emphatically not a fired condition — "JA4 was fine" and "nothing ever probed JA4" are
     different facts, which is the whole reason that field is tri-state.
+
+    **`tiers_supplying` (#184) is here rather than left to the consumer**, because `origin.run_ids`
+    is per *flow* — it names the tiers that contributed to that flow — so a tier-2-only flow reads
+    `{"2": ...}` whether the capture had a tier-1 run that did not flag it or was never replayed at
+    all. §2.5 exists to keep those apart and Phase 4 put both populations in one corpus. §6.4's own
+    standard is that "recoverable with effort by cross-referencing three fields" is weaker than a
+    field, and that argument applies to itself.
+
+    **It reports authority, not attempt, and the name is doing work.** A run that attempted a tier
+    without attesting it (§2.4), or one since excluded (§4.5), supplies nothing and is absent here.
+    `tiers_examined` was the name in #184 and would have invited the opposite reading. What a
+    consumer is actually asking is whether *currently valid* evidence from that tier exists,
+    because that is what makes the absence of a label mean anything. Measured 2026-08-28 before
+    choosing: no capture in production has an attempted tier without an authoritative run, so the
+    two readings agree on today's data and diverge only on a future exclusion or attestation
+    failure — which is exactly when a consumer must not be misled.
     """
     statuses = {
         (block.get("input") or {}).get("input_status")
@@ -822,6 +843,7 @@ def _coverage(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "unmatched": unmatched,
         "unmatched_ratio": _ratio(unmatched, unsupported, detections),
         "loss_conditions_fired": sorted(fired),
+        "tiers_supplying": sorted(tiers),
     }
 
 

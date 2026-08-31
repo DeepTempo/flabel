@@ -2328,3 +2328,104 @@ def test_a_record_index_key_of_mixed_type_does_not_raise():
     assert len(found) == 2
     found = collection.differences(right, left)
     assert len(found) == 2
+
+
+# --- coverage.tiers_supplying (#184) ---------------------------------------------------------
+
+
+def test_coverage_names_the_tiers_supplying_the_capture():
+    """#184: a record could not tell you whether a tier ever looked at its capture.
+
+    `origin.run_ids` is per **flow** — it names only the tiers that contributed a source to that
+    flow — so a tier-2-only flow reads `{"2": ...}` whether the capture had a tier-1 run that
+    simply did not flag it, or was never replayed at all. Those are the two facts `docs/spec.md`
+    §2.5 exists to keep apart, and Phase 4 put both populations in one corpus: 17 captures with
+    tier 1 and tier 2, 7 with tier 2 only.
+
+    The consequence is a model that learns which captures happened to be replayed rather than
+    anything about traffic, so this is published per capture rather than left to a consumer to
+    reconstruct — §6.4's own standard is that "recoverable with effort by cross-referencing three
+    fields" is weaker than a field.
+    """
+    both = authority_of(tier1=TIER1_RUN, tier2=TIER2_RUN)
+    document = built(
+        rows=[row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)])],
+        auth=both,
+        run_rows=[run_row(TIER1_RUN), run_row(TIER2_RUN)],
+        sightings=[sighting(run_id=TIER1_RUN), sighting(run_id=TIER2_RUN)],
+    ).document
+
+    (record,) = document["labels"]
+    # The flow carries a tier-2 source only ...
+    assert sorted({entry["tier"] for entry in record["sources"]}) == [2]
+    assert sorted(record["origin"]["run_ids"]) == ["2"]
+    # ... but the CAPTURE was supplied by both tiers, and that is now readable from the record.
+    assert record["origin"]["coverage"]["tiers_supplying"] == [1, 2]
+
+
+def test_a_tier_2_only_capture_says_so_rather_than_looking_identical():
+    """The other half of #184, and the one that makes the field worth having.
+
+    Without it this record is byte-identical to the one above in every field a consumer would
+    think to read.
+    """
+    document = built().document  # the default fixture: tier 2 only
+
+    (record,) = document["labels"]
+    assert sorted(record["origin"]["run_ids"]) == ["2"]
+    assert record["origin"]["coverage"]["tiers_supplying"] == [2]
+
+
+def test_tiers_supplying_reports_authority_and_not_mere_attempt():
+    """The distinction the field is named for, and the reason it is not called `tiers_examined`.
+
+    A run that attempted a tier and did not attest it (§2.4), or one later excluded (§4.5),
+    supplies nothing — so the tier is absent here even though a run "looked". That is the honest
+    reading: the question a consumer is really asking is whether *currently valid* evidence from
+    that tier exists, because that is what makes the absence of a label meaningful.
+
+    Measured 2026-08-28 before choosing: no capture in production has an attempted tier without an
+    authoritative run, so the two definitions agree on today's data and would diverge only on a
+    future exclusion or attestation failure. The name is what stops that divergence being read the
+    wrong way.
+    """
+    # TIER1_RUN is in the run rows and has a sighting, but supplies nothing.
+    document = built(
+        auth=authority_of(tier2=TIER2_RUN),
+        run_rows=[run_row(TIER1_RUN), run_row(TIER2_RUN)],
+        sightings=[sighting(run_id=TIER1_RUN), sighting(run_id=TIER2_RUN)],
+    ).document
+
+    (record,) = document["labels"]
+    assert record["origin"]["coverage"]["tiers_supplying"] == [2]
+
+
+def test_tiers_supplying_survives_a_rebuild_and_is_compared_by_it():
+    """The LS-9 lesson applied to a new field, and it needs its own test for a specific reason.
+
+    `origin` is declared `embeds=True` in `DOCUMENT_SHAPE`, so the coverage test that would
+    normally fail for a key the declaration does not know **structurally cannot see this one**.
+    That is deliberate — the origin block wraps something written elsewhere — but it means the
+    guard that caught three missing-field defects in LS-9 is not watching here.
+
+    What *is* watching is `differences`, which compares records key by key, so an unstable
+    `tiers_supplying` would surface as every record differing on a rebuild. It is stable because a
+    rebuild recovers authority from the document's own pinned `runs[].supplies` rather than from
+    the live store — which is precisely the defect LS-9's CRITICAL was about, one field along.
+    """
+    document = prior_document(
+        rows=[row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)])],
+        auth=authority_of(tier1=TIER1_RUN, tier2=TIER2_RUN),
+        run_rows=[run_row(TIER1_RUN), run_row(TIER2_RUN)],
+        sightings=[sighting(run_id=TIER1_RUN), sighting(run_id=TIER2_RUN)],
+    )
+    (record,) = document["labels"]
+    assert record["origin"]["coverage"]["tiers_supplying"] == [1, 2]
+
+    # A rebuild of the same store must agree, record for record — including this field.
+    assert collection.differences(document, document) == []
+
+    # And the field is genuinely in the compared surface: perturb it and `differences` says so.
+    perturbed = json.loads(json.dumps(document))
+    perturbed["labels"][0]["origin"]["coverage"]["tiers_supplying"] = [2]
+    assert collection.differences(document, perturbed) != []

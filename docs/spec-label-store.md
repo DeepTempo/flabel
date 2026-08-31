@@ -609,7 +609,8 @@ after someone has looked at real rows. §6.5 keeps their design so it is not re-
                   "link_type": 1, "snaplens": [262144],
                   "run_ids": { "1": "a1b2c3d4e5f60718", "2": "9f8e7d6c5b4a3928" },
                   "coverage": { "input_status": "complete", "unmatched": 0,
-                                "unmatched_ratio": 0.0, "loss_conditions_fired": [] } },
+                                "unmatched_ratio": 0.0, "loss_conditions_fired": [],
+                                "tiers_supplying": [1, 2] } },
       "flow": { "flow_key": "3c9a…", "…": "as labels.json" },
       "best_tier": 1, "labels": [ … ], "sources": [ … ] }
   ]
@@ -626,6 +627,23 @@ Four things revision 1 got wrong here:
   tier-1 entry from an August replay run and a tier-2 entry from a December offline run — a `Label` no
   single run ever asserted. `docs/spec.md` §13 requires every assertion to *name* what produced it,
   and "recoverable with effort by cross-referencing three fields" is weaker than that.
+- **`coverage.tiers_supplying`** (#184) — the tiers that have an authoritative run for this
+  **capture**, ascending. It is here because `origin.run_ids` is per *flow*: it names only the tiers
+  that contributed a source to that flow, so a tier-2-only flow reads `{"2": …}` whether the capture
+  had a tier-1 run that did not flag it or was never replayed at all. §2.5 exists to keep those two
+  apart, and Phase 4 put both populations in one corpus — 17 captures with both tiers and 7 with
+  tier 2 only — where a consumer training on the result would otherwise learn which captures happened
+  to be replayed. The bullet below argues that a count no consumer can reach is not published; the
+  same argument applies to a distinction no consumer can make.
+
+  **It reports authority, not attempt.** A run that attempted a tier without attesting it (§2.4), or
+  one since excluded (§4.5), supplies nothing and does not appear. `tiers_examined` was the name in
+  #184 and would have invited the opposite reading; what makes the absence of a label meaningful is
+  whether *currently valid* evidence exists, not whether something once ran. Measured 2026-08-28
+  before the name was chosen: no capture in production has an attempted tier without an
+  authoritative run, so the two readings agree on today's data and diverge only on a future
+  exclusion or attestation failure — exactly when the wrong reading would matter.
+
 - **`coverage` per capture**, because §4.4 stores `unmatched` precisely so a consumer is not misled by
   a short label list — and then revision 1's document dropped it, re-creating the misreading at corpus
   level. `docs/spec.md` §10 requires this answerable "in one lookup", not by reading twenty run blocks.
