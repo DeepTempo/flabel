@@ -593,7 +593,7 @@ One real `coverage` block:
 
 ```json
 {"input_status": "complete", "unmatched": 0, "unmatched_ratio": 0.0,
- "loss_conditions_fired": ["ja4_unavailable"]}
+ "loss_conditions_fired": ["ja4_unavailable"], "tiers_supplying": [1, 2]}
 ```
 
 `ja4_unavailable` is correct and not a defect: the `ja4` Zeek package is in the CI container and not

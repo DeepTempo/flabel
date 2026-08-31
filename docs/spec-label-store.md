@@ -621,7 +621,7 @@ after someone has looked at real rows. §6.5 keeps their design so it is not re-
 snapshots and `labels.json`'s single `run` block has no honest value to hold. A `labels.json` consumer
 fails on this document, which is correct.
 
-Four things revision 1 got wrong here:
+Five things revision 1 got wrong here, plus one found in Phase 4:
 
 - **`run_ids` is a `{tier: run_id}` map, not a flat list.** A merged record's `sources` can hold a
   tier-1 entry from an August replay run and a tier-2 entry from a December offline run — a `Label` no
@@ -643,6 +643,12 @@ Four things revision 1 got wrong here:
   before the name was chosen: no capture in production has an attempted tier without an
   authoritative run, so the two readings agree on today's data and diverge only on a future
   exclusion or attestation failure — exactly when the wrong reading would matter.
+
+  **It is scoped to the selection, like everything else in the document.** On the fresh path the
+  tiers come from `authoritative_runs` as filtered by `--as-of`; on `--rebuild` they come from the
+  document's own pinned `runs[]`. So two collections of one capture built with different cutoffs can
+  carry different `tiers_supplying`, and that is the field reporting its selection rather than
+  disagreeing with itself.
 
 - **`coverage` per capture**, because §4.4 stores `unmatched` precisely so a consumer is not misled by
   a short label list — and then revision 1's document dropped it, re-creating the misreading at corpus

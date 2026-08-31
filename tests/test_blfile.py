@@ -146,7 +146,10 @@ def test_the_document_names_its_own_type_and_version():
     correct — and it must not be stamped with the pipeline's `schema_version`."""
     document = built().document
     assert document["document_type"] == "labels-collection"
-    assert document["schema_version"] == "1.0"
+    # §6.4's literal. Bumped to "1.1" when #184 added `coverage.tiers_supplying` to every record:
+    # the document shape changed, so the version that gates `read_prior` had to change with it, or
+    # a rebuild of an older document reports every record differing and blames the store.
+    assert document["schema_version"] == "1.1"
     assert document["schema_version"] != labels_module.SCHEMA_VERSION
     assert "run" not in document
     assert isinstance(document["runs"], list)
@@ -1763,7 +1766,10 @@ def _wrong_shape(**override) -> str:
     """
     document = {
         "document_type": "labels-collection",
-        "schema_version": "1.0",
+        # The CONSTANT, not a literal. With "1.0" hardcoded, bumping SCHEMA_VERSION made every
+        # case here reach the version refusal instead of the shape refusal it is named for — six
+        # tests passing for the wrong reason, which is the failure they exist to catch.
+        "schema_version": collection.SCHEMA_VERSION,
         "built_at": BUILT_AT,
         "builder": {},
         "selection": {
@@ -2400,18 +2406,20 @@ def test_tiers_supplying_reports_authority_and_not_mere_attempt():
     assert record["origin"]["coverage"]["tiers_supplying"] == [2]
 
 
-def test_tiers_supplying_survives_a_rebuild_and_is_compared_by_it():
-    """The LS-9 lesson applied to a new field, and it needs its own test for a specific reason.
+def test_tiers_supplying_survives_a_real_rebuild(monkeypatch):
+    """The LS-9 lesson applied to a new field — and the second attempt at this test.
 
-    `origin` is declared `embeds=True` in `DOCUMENT_SHAPE`, so the coverage test that would
-    normally fail for a key the declaration does not know **structurally cannot see this one**.
-    That is deliberate — the origin block wraps something written elsewhere — but it means the
-    guard that caught three missing-field defects in LS-9 is not watching here.
+    `origin` used to be `embeds=True` in `DOCUMENT_SHAPE`, so the declaration-coverage guard could
+    not see this field; that hole is closed now, but the reproduction surface still needs its own
+    check, because `differences` compares records key by key and an unstable `tiers_supplying`
+    would report every record as differing.
 
-    What *is* watching is `differences`, which compares records key by key, so an unstable
-    `tiers_supplying` would surface as every record differing on a rebuild. It is stable because a
-    rebuild recovers authority from the document's own pinned `runs[].supplies` rather than from
-    the live store — which is precisely the defect LS-9's CRITICAL was about, one field along.
+    **The first version of this test asserted `differences(document, document) == []`** — a
+    document against itself, which is `[] == []` for any implementation, including one that
+    returned a random number. It was written while quoting the LS-9 lesson about tests that cannot
+    fail. This one drives `collect_rebuild` against a stubbed store, which is what the claim is
+    about: a rebuild recovers authority from the document's own pinned `runs[].supplies`, not from
+    live `authoritative_runs`.
     """
     document = prior_document(
         rows=[row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)])],
@@ -2422,10 +2430,131 @@ def test_tiers_supplying_survives_a_rebuild_and_is_compared_by_it():
     (record,) = document["labels"]
     assert record["origin"]["coverage"]["tiers_supplying"] == [1, 2]
 
-    # A rebuild of the same store must agree, record for record — including this field.
-    assert collection.differences(document, document) == []
+    prior = collection.read_prior(document)
+    monkeypatch.setattr(blfile.query, "exclusions", lambda bq, dataset, run_ids: [])
+    monkeypatch.setattr(
+        blfile.query, "runs", lambda bq, dataset, run_ids: [run_row(TIER1_RUN), run_row(TIER2_RUN)]
+    )
+    monkeypatch.setattr(
+        blfile.query,
+        "flow_labels",
+        lambda bq, dataset, run_ids: [row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)])],
+    )
+    monkeypatch.setattr(
+        blfile.query,
+        "sightings",
+        lambda bq, dataset, run_ids: [sighting(run_id=TIER1_RUN), sighting(run_id=TIER2_RUN)],
+    )
+    rebuilt = blfile.collect_rebuild(object(), "flabel", prior, built_at=BUILT_AT)
 
-    # And the field is genuinely in the compared surface: perturb it and `differences` says so.
+    (rebuilt_record,) = rebuilt.document["labels"]
+    assert rebuilt_record["origin"]["coverage"]["tiers_supplying"] == [1, 2]
+    assert (
+        collection.differences(
+            collection.comparable(document), collection.comparable(rebuilt.document)
+        )
+        == []
+    )
+
+
+def test_a_change_to_tiers_supplying_is_reported_rather_than_passed_over():
+    """Guard the guard: the field must be inside the compared surface, not merely emitted.
+
+    Named in the difference line too, because a bare `!= []` would also pass if `differences`
+    reported some unrelated key.
+    """
+    document = prior_document()
     perturbed = json.loads(json.dumps(document))
-    perturbed["labels"][0]["origin"]["coverage"]["tiers_supplying"] = [2]
-    assert collection.differences(document, perturbed) != []
+    perturbed["labels"][0]["origin"]["coverage"]["tiers_supplying"] = [1, 2]
+
+    found = collection.differences(document, perturbed)
+
+    assert found != []
+    assert any("tiers_supplying" in line for line in found)
+
+
+def test_one_run_supplying_both_tiers_still_reports_two_tiers():
+    """The case the call site's comment exists for, and it was untested.
+
+    `_coverage` is passed the tier map's KEYS. Passing `set(tiers.values())` instead would collapse
+    a capture supplied at both tiers by a single run to one tier — and the sabotage that was
+    supposed to catch that only failed by accident of type, because the usual fixture uses two
+    distinct runs so `values()` yields run-id strings and the comparison fails on `str` vs `int`.
+    With one run supplying both, `values()` yields a length-1 list of ints and nothing would
+    notice.
+    """
+    both = authority_of(tier1=BOTH_RUN, tier2=BOTH_RUN)
+    document = built(
+        rows=[row(run_id=BOTH_RUN, sources=[source(tier=2, sid=2001)])],
+        auth=both,
+        run_rows=[run_row(BOTH_RUN)],
+        sightings=[sighting(run_id=BOTH_RUN)],
+    ).document
+
+    (record,) = document["labels"]
+    assert record["origin"]["coverage"]["tiers_supplying"] == [1, 2]
+    (run,) = document["runs"]
+    assert run["supplies"] == [1, 2]
+
+
+def test_the_origin_shape_is_not_an_embedding():
+    """Assert the declaration directly, because sabotage showed nothing else does.
+
+    Putting `embeds=True` back on `origin` left all 165 tests green. That is exactly how
+    `coverage.tiers_supplying` (#184) came to be emitted with no declaration: `_unspecced` skips an
+    embedded subtree, so the coverage test below reports nothing either way and its docstring's
+    promise — that a key added to `build` without a line in `DOCUMENT_SHAPE` fails here — was false
+    for the whole `origin` block.
+
+    `embeds` is about the DECLARATION, not the validator: `validate_document` only checks that
+    declared fields are present and well-typed, and never rejects an extra key. So the protection
+    for a closed shape is the coverage test, and the protection for the coverage test is this.
+
+    `origin` may be closed because `_origins` builds an explicit six-key dict and `_record` adds
+    two — nothing unknown can reach it, unlike `flow` (`dict(record.flow)`) and `runs[]`
+    (`**block`), which genuinely embed and must stay embeddings.
+    """
+    record = collection.DOCUMENT_SHAPE.fields["labels"].items
+    assert record.fields["origin"].embeds is False, (
+        "origin was re-declared as an embedding, which silently switches off the coverage test "
+        "for every field in it"
+    )
+    # The two that genuinely wrap someone else's dict must stay embeddings, or every field they
+    # inherit has to be declared here and the declaration becomes a second schema.
+    assert record.fields["flow"].embeds is True
+    assert collection.DOCUMENT_SHAPE.fields["runs"].items.embeds is True
+
+
+def test_a_key_added_to_origin_without_a_declaration_fails_the_coverage_test(monkeypatch):
+    """And the consequence, exercised rather than asserted.
+
+    With `origin` closed, adding a key to what `build` emits must be caught by the declaration
+    -coverage test. This drives that path directly so the guard is known to work, rather than
+    trusted because it is present.
+    """
+    real = collection._record
+
+    def _with_an_extra_key(*args, **kwargs):
+        record = real(*args, **kwargs)
+        record["origin"]["undeclared_addition"] = 1
+        return record
+
+    monkeypatch.setattr(collection, "_record", _with_an_extra_key)
+    document = built().document
+
+    assert _unspecced(document, collection.DOCUMENT_SHAPE) == [
+        "the document.labels[0].origin.undeclared_addition"
+    ]
+
+
+def test_an_unknown_key_inside_coverage_is_allowed_because_coverage_embeds():
+    """The deliberate other half, so the line between them is pinned rather than assumed.
+
+    `coverage` stays an embedding: it is a per-capture block that gains fields as loss conditions
+    are added, and closing it would make every such addition a breaking read. `tiers_supplying` is
+    named inside it because a rebuild path reads it; the rest is free to grow.
+    """
+    document = prior_document()
+    document["labels"][0]["origin"]["coverage"]["some_future_loss_metric"] = 3
+
+    assert collection.read_prior(document).document is document

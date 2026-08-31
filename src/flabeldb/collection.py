@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
@@ -49,7 +49,7 @@ DOCUMENT_TYPE = "labels-collection"
 
 #: **Not `labels.json`'s.** §9: a collection stamped with the pipeline's `schema_version` would
 #: invite a consumer to read it as one, and this document has no `run` block.
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 TOOL = "blfile"
 
@@ -394,8 +394,30 @@ DOCUMENT_SHAPE = Shape(
                 fields={
                     # `capture_sha256` and `flow_key` are the pair `differences` keys its record
                     # index on (§3.2), so they must be hashable strings or the index raises.
+                    # **NOT `embeds=True`, and that was a real hole.** `origin` was declared
+                    # an embedding on the grounds that it "wraps §4.2's sighting" — but `_origins`
+                    # builds an explicit six-key dict and `_record` adds two more. Nothing unknown
+                    # can appear in it, unlike `flow` (`dict(record.flow)`) and `runs[]`
+                    # (`**block`), which genuinely embed. The cost of the mislabel: #184's
+                    # `coverage.tiers_supplying` was added to `build` and the declaration-coverage
+                    # test — whose docstring promises that a new key fails it — could not see the
+                    # field, because the whole subtree was switched off.
                     "origin": Shape(
-                        kind=(Mapping,), embeds=True, fields={"capture_sha256": _STRING}
+                        kind=(Mapping,),
+                        fields={
+                            "capture_sha256": _STRING,
+                            "uri": Shape(kind=(str,), nullable=True),
+                            "uri_status": _STRING,
+                            "filename": Shape(kind=(str,), nullable=True),
+                            "link_type": Shape(kind=(int,), nullable=True, reject_bool=True),
+                            "snaplens": Shape(kind=(list,), items=_INT),
+                            "run_ids": Shape(kind=(Mapping,), embeds=True),
+                            "coverage": Shape(
+                                kind=(Mapping,),
+                                embeds=True,
+                                fields={"tiers_supplying": Shape(kind=(list,), items=_INT)},
+                            ),
+                        },
                     ),
                     "flow": Shape(kind=(Mapping,), embeds=True, fields={"flow_key": _STRING}),
                     "best_tier": _INT,
@@ -795,9 +817,7 @@ def _origins(
 # --- coverage (§6.4) ------------------------------------------------------------------------------
 
 
-def _coverage(
-    blocks: Sequence[Mapping[str, Any]], tiers: Sequence[int] = ()
-) -> dict[str, Any]:
+def _coverage(blocks: Sequence[Mapping[str, Any]], tiers: Collection[int]) -> dict[str, Any]:
     """What was lost about this capture, over every run currently supplying a tier of it.
 
     `loss_conditions` is `null` per flag when the stage that would know never ran (§10), and a
@@ -819,6 +839,12 @@ def _coverage(
     choosing: no capture in production has an attempted tier without an authoritative run, so the
     two readings agree on today's data and diverge only on a future exclusion or attestation
     failure — which is exactly when a consumer must not be misled.
+
+    `tiers` is **required, with no default**. A capture appears in `Authority.by_capture` precisely
+    because some tier supplies it, so an empty list here is unrepresentable in valid data — which
+    means a default could only ever publish a falsehood ("no tier supplies this capture") rather
+    than an absence. `Collection[int]` rather than `Sequence[int]` because what this needs is
+    membership and iteration, not order — it sorts whatever it is given.
     """
     statuses = {
         (block.get("input") or {}).get("input_status")
