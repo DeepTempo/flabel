@@ -412,10 +412,25 @@ DOCUMENT_SHAPE = Shape(
                             "link_type": Shape(kind=(int,), nullable=True, reject_bool=True),
                             "snaplens": Shape(kind=(list,), items=_INT),
                             "run_ids": Shape(kind=(Mapping,), embeds=True),
+                            # Closed for the same reason as `origin`, and round 2 was right that
+                            # leaving it open moved the hole down a level rather than shutting it.
+                            # The justification for embedding it — "it gains fields as loss
+                            # conditions are added" — was simply false: `_coverage` returns a
+                            # literal five-key dict, and a new loss condition appends to
+                            # `loss_conditions_fired`, it does not add a key.
                             "coverage": Shape(
                                 kind=(Mapping,),
-                                embeds=True,
-                                fields={"tiers_supplying": Shape(kind=(list,), items=_INT)},
+                                fields={
+                                    "input_status": Shape(kind=(str,), nullable=True),
+                                    "unmatched": Shape(
+                                        kind=(int,), nullable=True, reject_bool=True
+                                    ),
+                                    "unmatched_ratio": Shape(
+                                        kind=(int, float), nullable=True, reject_bool=True
+                                    ),
+                                    "loss_conditions_fired": Shape(kind=(list,), items=_STRING),
+                                    "tiers_supplying": Shape(kind=(list,), items=_INT),
+                                },
                             ),
                         },
                     ),
@@ -494,7 +509,9 @@ def read_prior(document: Mapping[str, Any]) -> Prior:
     if version != SCHEMA_VERSION:
         raise NotACollection(
             f"schema_version is {version!r} and this build writes {SCHEMA_VERSION!r}. Reproducing "
-            f"across a document version is not what §6.5 promises"
+            f"across a document version is not what §6.5 promises. The document is still readable "
+            f"— only reproduction is refused. To get a document this build can reproduce, re-run "
+            f"blfile without --rebuild over the same selection"
         )
 
     validate_document(document)
@@ -962,7 +979,18 @@ def _record(
         }
     )
     resolved["run_ids"] = dict(record.run_ids)
-    resolved["coverage"] = dict(coverage or {})
+    # **Not `coverage or {}`.** A blank block would be written by `build` and then REFUSED by
+    # `read_prior`, which requires `tiers_supplying` inside it — the write path and the read path
+    # disagreeing about what is required, which is #185's shape one field along. §3.3 makes a
+    # capture without an authority entry unreachable, and `build` already refuses rather than
+    # writing past that assumption elsewhere, so this does too.
+    if coverage is None:
+        raise merge.StoreInconsistent(
+            f"capture {record.capture_sha256} has a merged flow but no coverage block, so it is "
+            f"absent from the authority this document was built from. A record cannot be written "
+            f"without one: the reader requires it"
+        )
+    resolved["coverage"] = dict(coverage)
     return {
         "origin": resolved,
         "flow": _flow(record),

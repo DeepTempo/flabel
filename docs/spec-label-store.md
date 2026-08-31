@@ -593,7 +593,7 @@ after someone has looked at real rows. §6.5 keeps their design so it is not re-
 ```json
 {
   "document_type": "labels-collection",
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "built_at": "2026-08-20T14:02:11.402931Z",
   "builder": { "tool": "blfile", "version": "0.1.0",
                "store_schema": "9f3c1a20d4e78b61", "label_kinds": "c41d0e77a9b28305" },
@@ -627,6 +627,20 @@ Five things revision 1 got wrong here, plus one found in Phase 4:
   tier-1 entry from an August replay run and a tier-2 entry from a December offline run — a `Label` no
   single run ever asserted. `docs/spec.md` §13 requires every assertion to *name* what produced it,
   and "recoverable with effort by cross-referencing three fields" is weaker than that.
+- **`schema_version` moved to `1.1`** when `coverage.tiers_supplying` was added, and the contrast
+  with §6.1 is the reason. There, additive `run.input` fields deliberately do **not** bump the
+  version, because a reader that ignores them reads the document correctly. Here the consumer that
+  matters is not a reader but `--rebuild`, which compares records key by key: an added field makes
+  every pre-existing document report one difference per record and exit 1 saying *"the rows those
+  runs hold have changed"*. Measured against the P4-5 baseline before the bump: 409 difference
+  lines, on nothing but the new key. So the rule is **a change to what a record carries is a
+  version move**; a change to a declaration's types or nullability alone is not.
+
+  The cost is stated rather than hidden: a `1.0` document can no longer be reproduced by this
+  build. It is still readable — only reproduction is refused, and the refusal says so and names the
+  remedy. A test pins a digest of the declared field paths beside the version so the next added
+  field cannot repeat #184.
+
 - **`coverage.tiers_supplying`** (#184) — the tiers that have an authoritative run for this
   **capture**, ascending. It is here because `origin.run_ids` is per *flow*: it names only the tiers
   that contributed a source to that flow, so a tier-2-only flow reads `{"2": …}` whether the capture

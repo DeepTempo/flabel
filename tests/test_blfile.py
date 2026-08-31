@@ -13,6 +13,7 @@ agreed with itself about the row shape would prove nothing about the store.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 
 import pytest
@@ -2407,19 +2408,20 @@ def test_tiers_supplying_reports_authority_and_not_mere_attempt():
 
 
 def test_tiers_supplying_survives_a_real_rebuild(monkeypatch):
-    """The LS-9 lesson applied to a new field — and the second attempt at this test.
+    """The LS-9 lesson applied to a new field — third attempt at this test.
 
-    `origin` used to be `embeds=True` in `DOCUMENT_SHAPE`, so the declaration-coverage guard could
-    not see this field; that hole is closed now, but the reproduction surface still needs its own
-    check, because `differences` compares records key by key and an unstable `tiers_supplying`
-    would report every record as differing.
+    The first asserted `differences(document, document) == []`, a document against itself, which is
+    `[] == []` for any implementation. The second drove `collect_rebuild` but hand-rolled four
+    stubs that ignored the `run_ids` they were handed, so a rebuild querying the WRONG pinned set
+    would still have reproduced — the exact defect `--rebuild` exists to detect. This one uses
+    `fake_store`, which filters by `run_ids` for that reason, and a `built_at` different from the
+    document's so `comparable`'s exclusion of it is actually exercised.
 
-    **The first version of this test asserted `differences(document, document) == []`** — a
-    document against itself, which is `[] == []` for any implementation, including one that
-    returned a random number. It was written while quoting the LS-9 lesson about tests that cannot
-    fail. This one drives `collect_rebuild` against a stubbed store, which is what the claim is
-    about: a rebuild recovers authority from the document's own pinned `runs[].supplies`, not from
-    live `authoritative_runs`.
+    Scope, stated honestly: this shows the field is stable across a real rebuild and inside the
+    compared surface. It does **not** discriminate "authority from the pin" against "authority from
+    the store" — the stub's answer and the pin agree by construction. The test that discriminates
+    is `test_a_rebuild_reproduces_a_partially_superseded_capture`, where a run attests two tiers and
+    supplies one.
     """
     document = prior_document(
         rows=[row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)])],
@@ -2430,22 +2432,13 @@ def test_tiers_supplying_survives_a_real_rebuild(monkeypatch):
     (record,) = document["labels"]
     assert record["origin"]["coverage"]["tiers_supplying"] == [1, 2]
 
+    fake_store(
+        [row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)])],
+        [sighting(run_id=TIER1_RUN), sighting(run_id=TIER2_RUN)],
+        [run_row(TIER1_RUN), run_row(TIER2_RUN)],
+    )(monkeypatch)
     prior = collection.read_prior(document)
-    monkeypatch.setattr(blfile.query, "exclusions", lambda bq, dataset, run_ids: [])
-    monkeypatch.setattr(
-        blfile.query, "runs", lambda bq, dataset, run_ids: [run_row(TIER1_RUN), run_row(TIER2_RUN)]
-    )
-    monkeypatch.setattr(
-        blfile.query,
-        "flow_labels",
-        lambda bq, dataset, run_ids: [row(run_id=TIER2_RUN, sources=[source(tier=2, sid=2001)])],
-    )
-    monkeypatch.setattr(
-        blfile.query,
-        "sightings",
-        lambda bq, dataset, run_ids: [sighting(run_id=TIER1_RUN), sighting(run_id=TIER2_RUN)],
-    )
-    rebuilt = blfile.collect_rebuild(object(), "flabel", prior, built_at=BUILT_AT)
+    rebuilt = blfile.collect_rebuild(object(), "flabel", prior, built_at="2099-01-01T00:00:00.0Z")
 
     (rebuilt_record,) = rebuilt.document["labels"]
     assert rebuilt_record["origin"]["coverage"]["tiers_supplying"] == [1, 2]
@@ -2470,7 +2463,13 @@ def test_a_change_to_tiers_supplying_is_reported_rather_than_passed_over():
     found = collection.differences(document, perturbed)
 
     assert found != []
-    assert any("tiers_supplying" in line for line in found)
+    # On the VALUES, not the field name. `differences` formats a record difference as the whole
+    # `origin` dict's repr, which always contains the string "tiers_supplying" — so perturbing
+    # `uri` instead would satisfy a name-only assertion just as well. Measured before fixing.
+    assert any("'tiers_supplying': [2]" in line for line in found)
+    assert any("'tiers_supplying': [1, 2]" in line for line in found)
+    # The control: an unperturbed document must report nothing.
+    assert collection.differences(document, json.loads(json.dumps(document))) == []
 
 
 def test_one_run_supplying_both_tiers_still_reports_two_tiers():
@@ -2547,14 +2546,95 @@ def test_a_key_added_to_origin_without_a_declaration_fails_the_coverage_test(mon
     ]
 
 
-def test_an_unknown_key_inside_coverage_is_allowed_because_coverage_embeds():
-    """The deliberate other half, so the line between them is pinned rather than assumed.
+def test_the_coverage_shape_is_closed_too():
+    """Round 2's finding, and it is the pattern this project keeps re-learning.
 
-    `coverage` stays an embedding: it is a per-capture block that gains fields as loss conditions
-    are added, and closing it would make every such addition a breaking read. `tiers_supplying` is
-    named inside it because a rebuild path reads it; the rest is free to grow.
+    Closing `origin` moved the hole down one level rather than shutting it: `coverage` was left an
+    embedding, so `input_status`, `unmatched`, `unmatched_ratio` and `loss_conditions_fired` stayed
+    undeclared and a sixth key would have shipped undeclared with the suite green — which is
+    precisely how `tiers_supplying` shipped in the first place.
+
+    The justification for embedding it was false on inspection: `_coverage` returns a literal
+    five-key dict, and a new loss condition appends to `loss_conditions_fired` rather than adding a
+    key. So the argument for closing `origin` applied to it word for word.
     """
-    document = prior_document()
-    document["labels"][0]["origin"]["coverage"]["some_future_loss_metric"] = 3
+    record = collection.DOCUMENT_SHAPE.fields["labels"].items
+    coverage = record.fields["origin"].fields["coverage"]
+    assert coverage.embeds is False
+    assert set(coverage.fields) == {
+        "input_status",
+        "unmatched",
+        "unmatched_ratio",
+        "loss_conditions_fired",
+        "tiers_supplying",
+    }
 
-    assert collection.read_prior(document).document is document
+
+def test_a_key_added_to_coverage_without_a_declaration_fails_the_coverage_test(monkeypatch):
+    """And the behavioural half, since a declaration test alone is what let this recur."""
+    real = collection._coverage
+
+    def _with_an_extra_key(*args, **kwargs):
+        block = real(*args, **kwargs)
+        block["some_future_loss_metric"] = 3
+        return block
+
+    monkeypatch.setattr(collection, "_coverage", _with_an_extra_key)
+    document = built().document
+
+    assert _unspecced(document, collection.DOCUMENT_SHAPE) == [
+        "the document.labels[0].origin.coverage.some_future_loss_metric"
+    ]
+
+
+def test_the_schema_version_moves_when_the_record_shape_does():
+    """#184 recurring is a matter of when, not whether, without this.
+
+    The version was bumped to "1.1" BY HAND because `coverage.tiers_supplying` changed the record
+    shape. Nothing connects the two: declare a tenth key, satisfy the coverage test, leave the
+    version alone, and every pre-existing document again rebuilds to one difference per record
+    while `blfile` blames the store. That is #184 verbatim, and the only existing assertion on the
+    literal fires when you CHANGE the version, never when you fail to.
+
+    So the shape is digested and pinned beside the version, in the arrangement `RUN_ID_COLUMN` has
+    against `schema.TABLES`. If this fails, decide deliberately: a change to what a record CARRIES
+    is a version move; a change to a declaration's types or nullability alone is not, and the
+    digest should then be updated with the reason in the commit.
+    """
+    paths: list[str] = []
+
+    def walk(shape, path):
+        if shape.fields:
+            for name, field in sorted(shape.fields.items()):
+                paths.append(f"{path}.{name}")
+                walk(field, f"{path}.{name}")
+        if shape.items is not None:
+            walk(shape.items, f"{path}[]")
+
+    walk(collection.DOCUMENT_SHAPE, "")
+    digest = hashlib.sha256("\n".join(paths).encode()).hexdigest()[:16]
+
+    assert (digest, collection.SCHEMA_VERSION) == ("6f2588481f3eddf4", "1.1")
+
+
+def test_the_declaration_validates_the_shape_production_actually_wrote():
+    """#171's arrangement, avoided: the closed declaration must accept the real archive's shape.
+
+    Every one of the 25 pre-Phase-4 `captures` rows carries `uri_status: not-recorded`, so the
+    path the archive really took is the one where `_record`'s fallback fires and `uri`, `filename`
+    and `link_type` are all null. The other origin tests use a sighting that populates `filename`,
+    `link_type` and `snaplens`, so none of them reaches it — and a declaration stricter than
+    reality turns a valid document into a refused one, which is worse than the hole it replaced.
+    """
+    document = json.loads(
+        collection.serialise(built(sightings=[], allow_missing_origin=True).document)
+    )
+
+    (record,) = document["labels"]
+    origin = record["origin"]
+    assert (origin["uri"], origin["filename"], origin["link_type"]) == (None, None, None)
+    assert origin["uri_status"] == collection.NOT_RECORDED
+    assert origin["snaplens"] == []
+
+    collection.validate_document(document)  # must not raise
+    collection.read_prior(document)

@@ -589,11 +589,15 @@ emits **0 flows** and refuses 408 for want of a recorded origin — every archiv
 designed: the shortfall is counted and said out loud rather than being a short label list nobody
 questions. A capture labelled *after* LS-5 will carry its `gs://` origin and need no flag.
 
-One real `coverage` block:
+One real `coverage` block, **as measured on this date** — it carries no `tiers_supplying` because
+that field postdates it (#184), and a document from this state could not have read `[1, 2]` anyway:
+with no attested tier 2 anywhere, the paragraph above, no capture had two supplying tiers. An
+earlier edit pasted the field in here to keep the example current, which would have made a block
+captioned "one real" carry a value the build that produced it could not emit:
 
 ```json
 {"input_status": "complete", "unmatched": 0, "unmatched_ratio": 0.0,
- "loss_conditions_fired": ["ja4_unavailable"], "tiers_supplying": [1, 2]}
+ "loss_conditions_fired": ["ja4_unavailable"]}
 ```
 
 `ja4_unavailable` is correct and not a defect: the `ja4` Zeek package is in the CI container and not
