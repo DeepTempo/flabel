@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
@@ -49,7 +49,7 @@ DOCUMENT_TYPE = "labels-collection"
 
 #: **Not `labels.json`'s.** §9: a collection stamped with the pipeline's `schema_version` would
 #: invite a consumer to read it as one, and this document has no `run` block.
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 TOOL = "blfile"
 
@@ -155,7 +155,10 @@ def build(
     origins = _origins(auth, sightings)
     coverage = {
         capture: _coverage(
-            [blocks[run_id] for run_id in sorted(set(tiers.values())) if run_id in blocks]
+            [blocks[run_id] for run_id in sorted(set(tiers.values())) if run_id in blocks],
+            # The keys, not the values: a capture supplied by one run at both tiers still has two
+            # tiers, and `set(tiers.values())` would collapse it to one block and one tier.
+            sorted(tiers),
         )
         for capture, tiers in auth.by_capture.items()
     }
@@ -391,8 +394,54 @@ DOCUMENT_SHAPE = Shape(
                 fields={
                     # `capture_sha256` and `flow_key` are the pair `differences` keys its record
                     # index on (§3.2), so they must be hashable strings or the index raises.
+                    # **NOT `embeds=True`, and that was a real hole.** `origin` was declared
+                    # an embedding on the grounds that it "wraps §4.2's sighting" — but `_origins`
+                    # builds an explicit six-key dict and `_record` adds two more. Nothing unknown
+                    # can appear in it, unlike `flow` (`dict(record.flow)`) and `runs[]`
+                    # (`**block`), which genuinely embed. The cost of the mislabel: #184's
+                    # `coverage.tiers_supplying` was added to `build` and the declaration-coverage
+                    # test — whose docstring promises that a new key fails it — could not see the
+                    # field, because the whole subtree was switched off.
                     "origin": Shape(
-                        kind=(Mapping,), embeds=True, fields={"capture_sha256": _STRING}
+                        kind=(Mapping,),
+                        fields={
+                            "capture_sha256": _STRING,
+                            "uri": Shape(kind=(str,), nullable=True),
+                            "uri_status": _STRING,
+                            "filename": Shape(kind=(str,), nullable=True),
+                            "link_type": Shape(kind=(int,), nullable=True, reject_bool=True),
+                            "snaplens": Shape(kind=(list,), items=_INT),
+                            "run_ids": Shape(kind=(Mapping,), embeds=True),
+                            # Closed for the same reason as `origin`, and round 2 was right that
+                            # leaving it open moved the hole down a level rather than shutting it.
+                            # The justification for embedding it — "it gains fields as loss
+                            # conditions are added" — was simply false: `_coverage` returns a
+                            # literal five-key dict, and a new loss condition appends to
+                            # `loss_conditions_fired`, it does not add a key.
+                            "coverage": Shape(
+                                kind=(Mapping,),
+                                fields={
+                                    "input_status": Shape(kind=(str,), nullable=True),
+                                    # `(int, float)` like its sibling below: `_total` sums
+                                    # values read out of `run_block`, which is a STRING column
+                                    # nothing validates on the way in, so a block carrying `2.0`
+                                    # would make `build` write a float `read_prior` then refuses.
+                                    "unmatched": Shape(
+                                        kind=(int, float), nullable=True, reject_bool=True
+                                    ),
+                                    "unmatched_ratio": Shape(
+                                        kind=(int, float), nullable=True, reject_bool=True
+                                    ),
+                                    "loss_conditions_fired": Shape(kind=(list,), items=_STRING),
+                                    # `non_empty` for the reason `_coverage`'s docstring gives and
+                                    # `runs[].supplies` already encodes: a capture is here because
+                                    # some tier supplies it, so `[]` is a falsehood, not an absence.
+                                    "tiers_supplying": Shape(
+                                        kind=(list,), items=_INT, non_empty=True
+                                    ),
+                                },
+                            ),
+                        },
                     ),
                     "flow": Shape(kind=(Mapping,), embeds=True, fields={"flow_key": _STRING}),
                     "best_tier": _INT,
@@ -469,7 +518,9 @@ def read_prior(document: Mapping[str, Any]) -> Prior:
     if version != SCHEMA_VERSION:
         raise NotACollection(
             f"schema_version is {version!r} and this build writes {SCHEMA_VERSION!r}. Reproducing "
-            f"across a document version is not what §6.5 promises"
+            f"across a document version is not what §6.5 promises. The document is still readable "
+            f"— only reproduction is refused. To get a document this build can reproduce, re-run "
+            f"blfile without --rebuild over the same selection"
         )
 
     validate_document(document)
@@ -792,12 +843,34 @@ def _origins(
 # --- coverage (§6.4) ------------------------------------------------------------------------------
 
 
-def _coverage(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _coverage(blocks: Sequence[Mapping[str, Any]], tiers: Collection[int]) -> dict[str, Any]:
     """What was lost about this capture, over every run currently supplying a tier of it.
 
     `loss_conditions` is `null` per flag when the stage that would know never ran (§10), and a
     `null` is emphatically not a fired condition — "JA4 was fine" and "nothing ever probed JA4" are
     different facts, which is the whole reason that field is tri-state.
+
+    **`tiers_supplying` (#184) is here rather than left to the consumer**, because `origin.run_ids`
+    is per *flow* — it names the tiers that contributed to that flow — so a tier-2-only flow reads
+    `{"2": ...}` whether the capture had a tier-1 run that did not flag it or was never replayed at
+    all. §2.5 exists to keep those apart and Phase 4 put both populations in one corpus. §6.4's own
+    standard is that "recoverable with effort by cross-referencing three fields" is weaker than a
+    field, and that argument applies to itself.
+
+    **It reports authority, not attempt, and the name is doing work.** A run that attempted a tier
+    without attesting it (§2.4), or one since excluded (§4.5), supplies nothing and is absent here.
+    `tiers_examined` was the name in #184 and would have invited the opposite reading. What a
+    consumer is actually asking is whether *currently valid* evidence from that tier exists,
+    because that is what makes the absence of a label mean anything. Measured 2026-08-28 before
+    choosing: no capture in production has an attempted tier without an authoritative run, so the
+    two readings agree on today's data and diverge only on a future exclusion or attestation
+    failure — which is exactly when a consumer must not be misled.
+
+    `tiers` is **required, with no default**. A capture appears in `Authority.by_capture` precisely
+    because some tier supplies it, so an empty list here is unrepresentable in valid data — which
+    means a default could only ever publish a falsehood ("no tier supplies this capture") rather
+    than an absence. `Collection[int]` rather than `Sequence[int]` because what this needs is
+    membership and iteration, not order — it sorts whatever it is given.
     """
     statuses = {
         (block.get("input") or {}).get("input_status")
@@ -822,6 +895,7 @@ def _coverage(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "unmatched": unmatched,
         "unmatched_ratio": _ratio(unmatched, unsupported, detections),
         "loss_conditions_fired": sorted(fired),
+        "tiers_supplying": sorted(tiers),
     }
 
 
@@ -914,7 +988,22 @@ def _record(
         }
     )
     resolved["run_ids"] = dict(record.run_ids)
-    resolved["coverage"] = dict(coverage or {})
+    # **Not `coverage or {}`.** A blank block would be written by `build` and then REFUSED by
+    # `read_prior`, which requires `tiers_supplying` inside it — the write path and the read path
+    # disagreeing about what is required, which is #185's shape one field along. §3.3 makes a
+    # capture without an authority entry unreachable, so this refuses rather than writing past it.
+    #
+    # Not claimed: that `build` refuses everywhere else it could. It does not — it writes
+    # `runs: []` when nothing is selected, and `read_prior` then refuses that document for
+    # `non_empty`. `test_a_document_that_pins_no_runs_is_refused_rather_than_reproduced` records
+    # it as known and accepted, and it is the same write/read disagreement one field over.
+    if coverage is None:
+        raise merge.StoreInconsistent(
+            f"capture {record.capture_sha256} has a merged flow but no coverage block, so it is "
+            f"absent from the authority this document was built from. A record cannot be written "
+            f"without one: the reader requires it"
+        )
+    resolved["coverage"] = dict(coverage)
     return {
         "origin": resolved,
         "flow": _flow(record),

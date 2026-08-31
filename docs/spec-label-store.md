@@ -593,7 +593,7 @@ after someone has looked at real rows. §6.5 keeps their design so it is not re-
 ```json
 {
   "document_type": "labels-collection",
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "built_at": "2026-08-20T14:02:11.402931Z",
   "builder": { "tool": "blfile", "version": "0.1.0",
                "store_schema": "9f3c1a20d4e78b61", "label_kinds": "c41d0e77a9b28305" },
@@ -609,7 +609,8 @@ after someone has looked at real rows. §6.5 keeps their design so it is not re-
                   "link_type": 1, "snaplens": [262144],
                   "run_ids": { "1": "a1b2c3d4e5f60718", "2": "9f8e7d6c5b4a3928" },
                   "coverage": { "input_status": "complete", "unmatched": 0,
-                                "unmatched_ratio": 0.0, "loss_conditions_fired": [] } },
+                                "unmatched_ratio": 0.0, "loss_conditions_fired": [],
+                                "tiers_supplying": [1, 2] } },
       "flow": { "flow_key": "3c9a…", "…": "as labels.json" },
       "best_tier": 1, "labels": [ … ], "sources": [ … ] }
   ]
@@ -620,12 +621,49 @@ after someone has looked at real rows. §6.5 keeps their design so it is not re-
 snapshots and `labels.json`'s single `run` block has no honest value to hold. A `labels.json` consumer
 fails on this document, which is correct.
 
-Four things revision 1 got wrong here:
+Five things revision 1 got wrong here, plus one found in Phase 4:
 
 - **`run_ids` is a `{tier: run_id}` map, not a flat list.** A merged record's `sources` can hold a
   tier-1 entry from an August replay run and a tier-2 entry from a December offline run — a `Label` no
   single run ever asserted. `docs/spec.md` §13 requires every assertion to *name* what produced it,
   and "recoverable with effort by cross-referencing three fields" is weaker than that.
+- **`schema_version` moved to `1.1`** when `coverage.tiers_supplying` was added, and the contrast
+  with §6.1 is the reason. There, additive `run.input` fields deliberately do **not** bump the
+  version, because a reader that ignores them reads the document correctly. Here the consumer that
+  matters is not a reader but `--rebuild`, which compares records key by key: an added field makes
+  every pre-existing document report one difference per record and exit 1 saying *"the rows those
+  runs hold have changed"*. Measured against the P4-5 baseline before the bump: 409 difference
+  lines, on nothing but the new key. So the rule is **a change to what a record carries is a
+  version move**; a change to a declaration's types or nullability alone is not.
+
+  The cost is stated rather than hidden: a `1.0` document can no longer be reproduced by this
+  build. It is still readable — only reproduction is refused, and the refusal says so and names the
+  remedy. A test pins a digest of the declared field paths beside the version so the next added
+  field cannot repeat #184.
+
+- **`coverage.tiers_supplying`** (#184) — the tiers that have an authoritative run for this
+  **capture**, ascending. It is here because `origin.run_ids` is per *flow*: it names only the tiers
+  that contributed a source to that flow, so a tier-2-only flow reads `{"2": …}` whether the capture
+  had a tier-1 run that did not flag it or was never replayed at all. §2.5 exists to keep those two
+  apart, and Phase 4 put both populations in one corpus — 17 captures with both tiers and 7 with
+  tier 2 only — where a consumer training on the result would otherwise learn which captures happened
+  to be replayed. The bullet below argues that a count no consumer can reach is not published; the
+  same argument applies to a distinction no consumer can make.
+
+  **It reports authority, not attempt.** A run that attempted a tier without attesting it (§2.4), or
+  one since excluded (§4.5), supplies nothing and does not appear. `tiers_examined` was the name in
+  #184 and would have invited the opposite reading; what makes the absence of a label meaningful is
+  whether *currently valid* evidence exists, not whether something once ran. Measured 2026-08-28
+  before the name was chosen: no capture in production has an attempted tier without an
+  authoritative run, so the two readings agree on today's data and diverge only on a future
+  exclusion or attestation failure — exactly when the wrong reading would matter.
+
+  **It is scoped to the selection, like everything else in the document.** On the fresh path the
+  tiers come from `authoritative_runs` as filtered by `--as-of`; on `--rebuild` they come from the
+  document's own pinned `runs[]`. So two collections of one capture built with different cutoffs can
+  carry different `tiers_supplying`, and that is the field reporting its selection rather than
+  disagreeing with itself.
+
 - **`coverage` per capture**, because §4.4 stores `unmatched` precisely so a consumer is not misled by
   a short label list — and then revision 1's document dropped it, re-creating the misreading at corpus
   level. `docs/spec.md` §10 requires this answerable "in one lookup", not by reading twenty run blocks.
